@@ -64,10 +64,28 @@ inline float dot_q6_k(const uint8_t* row, const float* x, int64_t k) {
   return acc;
 }
 
+// Q8_0 (32 weights, 34 bytes): fp16 d, then 32 int8; w = q * d.
+inline float dot_q8_0(const uint8_t* row, const float* x, int64_t k) {
+  float acc = 0;
+  for (int64_t b = 0; b < k / 32; ++b) {
+    const uint8_t* blk = row + b * 34;
+    const int8_t* qs = reinterpret_cast<const int8_t*>(blk + 2);
+    float s = 0;
+    for (int j = 0; j < 32; ++j) s += float(qs[j]) * x[b * 32 + j];
+    acc += half_at(blk) * s;
+  }
+  return acc;
+}
+
 inline float weight_at(gguf::Type t, const uint8_t* row, int64_t i) {
   switch (t) {
     case gguf::Type::F32: return reinterpret_cast<const float*>(row)[i];
     case gguf::Type::F16: return half_at(row + 2 * i);
+    case gguf::Type::BF16: return sycl::bit_cast<float>(uint32_t(row[2 * i] | row[2 * i + 1] << 8) << 16);
+    case gguf::Type::Q8_0: {
+      const uint8_t* blk = row + (i / 32) * 34;
+      return half_at(blk) * float(reinterpret_cast<const int8_t*>(blk + 2)[i % 32]);
+    }
     case gguf::Type::Q4_0: {
       const uint8_t* blk = row + (i / 32) * 18;
       const int j = int(i % 32);
@@ -83,7 +101,9 @@ void check_type(const Weight& w) {
   switch (w.type) {
     case gguf::Type::F32:
     case gguf::Type::F16:
+    case gguf::Type::BF16:
     case gguf::Type::Q4_0:
+    case gguf::Type::Q8_0:
     case gguf::Type::Q6_K: return;
     default: throw std::runtime_error(std::string("ref: no reference kernel for ") + gguf::type_name(w.type));
   }
@@ -116,7 +136,7 @@ void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, flo
   check_type(w);
   // Rows per launch: a fraction of a second for these kernels, about 2e10 multiply-adds for Q4_0;
   // Q6_K and the generic path decode each weight separately and get a tenth of that.
-  const double budget = w.type == gguf::Type::Q4_0 ? 2e10 : 2e9;
+  const double budget = w.type == gguf::Type::Q4_0 || w.type == gguf::Type::Q8_0 ? 2e10 : 2e9;
   const int64_t per = std::max<int64_t>(1, int64_t(budget / double(w.n * w.k)));
   for (int64_t m0 = 0; m0 < m_rows; m0 += per) {
     const int64_t mc = std::min(per, m_rows - m0);
@@ -127,6 +147,7 @@ void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, flo
        const float* xm = x + m * ww.k;
        float acc;
        if (ww.type == gguf::Type::Q4_0) acc = dot_q4_0(row, xm, ww.k);
+       else if (ww.type == gguf::Type::Q8_0) acc = dot_q8_0(row, xm, ww.k);
        else if (ww.type == gguf::Type::Q6_K) acc = dot_q6_k(row, xm, ww.k);
        else {
          acc = 0;
@@ -194,6 +215,49 @@ void attention(sycl::queue& q, const float* Q, const float* K, const float* V, i
                    })
         .wait();
   }
+}
+
+void attention_bidir(sycl::queue& q, const float* Q, const float* K, const float* V, int64_t n_tok, int64_t n_head,
+                     int64_t n_head_kv, int64_t head_dim, int64_t half_window, float scale_by, float* out) {
+  const int64_t group = n_head / n_head_kv;
+  const int64_t keys = half_window > 0 ? std::min(2 * half_window + 1, n_tok) : n_tok;
+  const int64_t per = std::max<int64_t>(1, int64_t(2e8 / double(n_head * keys)));
+  for (int64_t t0 = 0; t0 < n_tok; t0 += per) {
+    const int64_t tc = std::min(per, n_tok - t0);
+    q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(tc * n_head), size_t(head_dim)),
+                                     sycl::range<2>(1, size_t(head_dim))),
+                   [=](sycl::nd_item<2> it) {
+                     const int64_t th = t0 * n_head + int64_t(it.get_global_id(0)), d = int64_t(it.get_local_id(1));
+                     const int64_t t = th / n_head, h = th % n_head, kh = h / group;
+                     const float qd = Q[(t * n_head + h) * head_dim + d];
+                     const int64_t first = half_window > 0 ? std::max<int64_t>(0, t - half_window) : 0;
+                     const int64_t last = half_window > 0 ? std::min<int64_t>(n_tok - 1, t + half_window) : n_tok - 1;
+                     float m = -INFINITY, l = 0, acc = 0;
+                     for (int64_t j = first; j <= last; ++j) {
+                       const float part = qd * K[(j * n_head_kv + kh) * head_dim + d];
+                       const float sc = sycl::reduce_over_group(it.get_group(), part, sycl::plus<float>()) * scale_by;
+                       const float mn = sycl::fmax(m, sc);
+                       const float corr = sycl::exp(m - mn), p = sycl::exp(sc - mn);
+                       l = l * corr + p;
+                       acc = acc * corr + p * V[(j * n_head_kv + kh) * head_dim + d];
+                       m = mn;
+                     }
+                     out[(t * n_head + h) * head_dim + d] = acc / l;
+                   })
+        .wait();
+  }
+}
+
+void gelu(sycl::queue& q, const float* x, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+     const float g = x[id[0]];
+     const float k0 = 0.7978845608028654f, k1 = 0.044715f;
+     out[id[0]] = 0.5f * g * (1.0f + sycl::tanh(k0 * (g + k1 * g * g * g)));
+   }).wait();
+}
+
+void mul(sycl::queue& q, const float* a, const float* b, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = a[id[0]] * b[id[0]]; }).wait();
 }
 
 void gelu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out) {

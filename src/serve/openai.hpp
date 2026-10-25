@@ -17,13 +17,18 @@
 
 namespace eklow::serve {
 
-// A request the server refuses, with the HTTP status and OpenAI's error type and code.
+// A request the server refuses, with the HTTP status and OpenAI's error type and code, and any
+// numbers to report beside them.
 struct ApiError : std::runtime_error {
   ApiError(int status, std::string type, std::string code, const std::string& message)
       : std::runtime_error(message), status(status), type(std::move(type)), code(std::move(code)) {}
   int status;
   std::string type, code;
+  std::vector<std::pair<std::string, int64_t>> numbers;
 };
+// llama.cpp's answer to a prompt longer than the context, which clients match by its wording and
+// fields (exceed_context_size_error, n_prompt_tokens, n_ctx).
+ApiError context_exceeded(int64_t prompt_tokens, int64_t n_ctx);
 std::string error_json(const ApiError& e);
 
 struct ChatDefaults {

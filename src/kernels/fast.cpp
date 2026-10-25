@@ -8,7 +8,6 @@ namespace eklow::fast {
 
 namespace {
 
-inline float half_at(const uint8_t* p) { return float(sycl::bit_cast<sycl::half>(uint16_t(p[0] | p[1] << 8))); }
 
 // The 6-bit value (0..63) of element i of a Q6_K block (ql[128], qh[64], int8 scales[16], fp16 d),
 // as ggml lays it out.
@@ -196,7 +195,7 @@ void matmul_q6(sycl::queue& q, const Q6& w, const float* x, int64_t rows, float*
 #pragma unroll
         for (int j = 0; j < 16; ++j) {
           const uint32_t l = j < 8 ? lo.x() : lo.y();
-          wv[j] = float(int((l >> (4 * (j % 8))) & 15 | ((hi >> (2 * j)) & 3) << 4) - 32);
+          wv[j] = float(int(((l >> (4 * (j % 8))) & 15) | ((hi >> (2 * j)) & 3) << 4) - 32);
         }
 #pragma unroll
         for (int r = 0; r < kRows; ++r) {

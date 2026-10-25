@@ -27,11 +27,13 @@ json::Value template_messages(const json::Value& msgs) {
   for (const auto& m : msgs.items()) {
     if (!m.is_object()) throw bad("each message must be an object");
     json::Value c = m;
+    // Worded as clients expect, so that they drop images rather than retry them.
     if (const json::Value* content = field(m, "content"); content && content->is_array())
       for (const auto& part : content->items()) {
         const json::Value* type = field(part, "type");
         if (!type || !type->is_string() || type->as_string() != "text")
-          throw ApiError(400, "invalid_request_error", "unsupported_content", "only text content is supported");
+          throw ApiError(400, "invalid_request_error", "unsupported_content",
+                         "image_url is not supported: this server does not support image input yet, only text parts");
       }
     if (const json::Value* calls = field(m, "tool_calls"); calls && calls->is_array()) {
       json::Value fixed = json::Value::array();
@@ -70,11 +72,19 @@ std::string random_hex(int n) {
 
 std::string error_json(const ApiError& e) {
   json::Writer w(false);
-  w.begin_object().key("error").begin_object().kv("message", std::string(e.what())).kv("type", e.type);
+  w.begin_object().key("error").begin_object();
   if (!e.code.empty()) w.kv("code", e.code);
-  else w.key("code").null();
+  else w.kv("code", int64_t(e.status));
+  w.kv("message", std::string(e.what())).kv("type", e.type);
+  for (const auto& [k, v] : e.numbers) w.kv(k, v);
   w.end_object().end_object();
   return w.str();
+}
+
+ApiError context_exceeded(int64_t prompt_tokens, int64_t n_ctx) {
+  ApiError e(400, "exceed_context_size_error", "", "the request exceeds the available context size, try increasing it");
+  e.numbers = {{"n_prompt_tokens", prompt_tokens}, {"n_ctx", n_ctx}};
+  return e;
 }
 
 ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, const ChatDefaults& d) {
@@ -92,9 +102,11 @@ ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, cons
   if (const json::Value* t = field(body, "tools"); t && t->is_array() && !t->items().empty() && !tools_off) tools = *t;
   r.tools = !tools.is_null();
 
-  // Gemma 4's template only turns thinking on or off: any effort but "none" turns it on, and the
-  // template variable wins when both are given.
+  // Gemma 4's template only turns thinking on or off. On unless the request says otherwise:
+  // reasoning_effort "none", or think / enable_thinking false (the template variable wins).
+  r.thinking = true;
   if (const json::Value* e = field(body, "reasoning_effort"); e && e->is_string()) r.thinking = e->as_string() != "none";
+  if (const json::Value* t = field(body, "think"); t && t->is_bool()) r.thinking = t->as_bool();
   if (const json::Value* k = field(body, "chat_template_kwargs"); k && k->is_object()) {
     if (const json::Value* e = k->find("reasoning_effort"); e && e->is_string()) r.thinking = e->as_string() != "none";
     if (const json::Value* t = k->find("enable_thinking"); t && !t->is_null()) r.thinking = t->truthy();
@@ -117,9 +129,7 @@ ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, cons
     const std::string open = "<|channel>thought\n";
     r.in_thinking = text.size() >= open.size() && text.compare(text.size() - open.size(), open.size(), open) == 0;
   }
-  if (int64_t(r.prompt.size()) >= d.max_ctx)
-    throw ApiError(400, "invalid_request_error", "context_length_exceeded",
-                   "the prompt is " + std::to_string(r.prompt.size()) + " tokens, more than the context of " + std::to_string(d.max_ctx));
+  if (int64_t(r.prompt.size()) >= d.max_ctx) throw context_exceeded(int64_t(r.prompt.size()), d.max_ctx);
 
   if (const json::Value* v = field(body, "temperature"); v && !v->is_null()) r.sampling.temperature = float(number(*v, "temperature"));
   if (const json::Value* v = field(body, "top_p"); v && !v->is_null()) r.sampling.top_p = float(number(*v, "top_p"));

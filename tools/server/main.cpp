@@ -1,11 +1,12 @@
 // eklow-server: Gemma 4 on the A770M behind an OpenAI-compatible HTTP API.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
-//                [--batch N] [--chunk N]
+//                [--batch N] [--chunk N] [--embed-model GGUF --embed-port N [--embed-alias NAME]]
 //
 // --ctx is the context of each slot (positions); --batch the tokens of one engine step and --chunk
 // the prefill tokens of one sequence in a step. Endpoints: POST /v1/chat/completions (streamed or
-// whole), GET /v1/models, GET /health.
+// whole), GET /v1/models, GET /health; with an embedding model, POST /v1/embeddings, GET /v1/models
+// and GET /health on its own port (the house runs chat and embeddings as separate upstreams).
 #include <httplib.h>
 
 #include <atomic>
@@ -14,12 +15,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <mutex>
 #include <string>
 #include <thread>
 
 #include "core/json.hpp"
 #include "core/json_value.hpp"
 #include "engine/engine.hpp"
+#include "model/embed_gemma2.hpp"
 #include "model/gguf.hpp"
 #include "rt/device.hpp"
 #include "serve/openai.hpp"
@@ -40,11 +44,95 @@ void reply_error(httplib::Response& res, const serve::ApiError& e) {
   res.set_content(serve::error_json(e), "application/json");
 }
 
+std::string models_json(const std::string& id, int64_t ctx, int64_t slots) {
+  // context_length first: clients take the first context key they find.
+  json::Writer w(false);
+  w.begin_object().kv("object", "list").key("data").begin_array().begin_object().kv("id", id).kv("context_length", ctx);
+  w.kv("object", "model").kv("created", now_s()).kv("owned_by", "eklow");
+  w.key("meta").begin_object().kv("n_ctx", ctx).kv("n_slots", slots).end_object();
+  w.end_object().end_array().end_object();
+  return w.str();
+}
+
+// The embedding endpoint: inputs one at a time through the model (each its own sequence,
+// attended both ways), each at most max_tokens long.
+void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::Tokenizer& tok, std::mutex& mu,
+                      const std::string& alias, int64_t max_tokens) {
+  http.Get("/health", [](const httplib::Request&, httplib::Response& res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
+  http.Get("/v1/models", [alias, max_tokens](const httplib::Request&, httplib::Response& res) {
+    res.set_content(models_json(alias, max_tokens, 1), "application/json");
+  });
+  http.Post("/v1/embeddings", [&m, &tok, &mu, alias, max_tokens](const httplib::Request& req, httplib::Response& res) {
+    try {
+      json::Value body;
+      try {
+        body = json::parse(req.body);
+      } catch (const std::exception& e) {
+        throw serve::ApiError(400, "invalid_request_error", "", std::string("the body is not JSON: ") + e.what());
+      }
+      const json::Value* input = body.is_object() ? body.find("input") : nullptr;
+      if (!input) throw serve::ApiError(400, "invalid_request_error", "", "input is required");
+      // A string, strings, token ids, or arrays of token ids.
+      std::vector<std::vector<int32_t>> seqs;
+      auto text = [&](const std::string& str) {
+        std::vector<int32_t> ids{tok.bos()};
+        for (int32_t id : tok.encode(str)) ids.push_back(id);
+        ids.push_back(tok.eos());
+        return ids;
+      };
+      auto ids_of = [&](const json::Value& a) {
+        std::vector<int32_t> ids;
+        for (const auto& v : a.items()) {
+          if (!v.is_int()) throw serve::ApiError(400, "invalid_request_error", "", "token ids must be integers");
+          ids.push_back(int32_t(std::stoll(v.int_digits())));
+        }
+        return ids;
+      };
+      if (input->is_string()) seqs.push_back(text(input->as_string()));
+      else if (input->is_array() && !input->items().empty() && input->items()[0].is_int()) seqs.push_back(ids_of(*input));
+      else if (input->is_array())
+        for (const auto& v : input->items()) {
+          if (v.is_string()) seqs.push_back(text(v.as_string()));
+          else if (v.is_array()) seqs.push_back(ids_of(v));
+          else throw serve::ApiError(400, "invalid_request_error", "", "input must hold strings or token ids");
+        }
+      else throw serve::ApiError(400, "invalid_request_error", "", "input must be a string or an array");
+      if (seqs.empty()) throw serve::ApiError(400, "invalid_request_error", "", "input is empty");
+      int64_t total = 0;
+      for (const auto& q : seqs) {
+        if (int64_t(q.size()) > max_tokens)
+          throw serve::ApiError(400, "invalid_request_error", "",
+                                "input is too large to process: " + std::to_string(q.size()) + " tokens, at most " + std::to_string(max_tokens));
+        for (int32_t id : q)
+          if (id < 0 || size_t(id) >= tok.size()) throw serve::ApiError(400, "invalid_request_error", "", "token id out of range");
+        total += int64_t(q.size());
+      }
+      json::Writer w(false);
+      w.begin_object().kv("object", "list").kv("model", alias).key("data").begin_array();
+      {
+        std::lock_guard lk(mu);
+        for (size_t i = 0; i < seqs.size(); ++i) {
+          const std::vector<float> e = m.embed(seqs[i]);
+          w.begin_object().kv("object", "embedding").kv("index", int64_t(i)).key("embedding").begin_array();
+          for (float v : e) w.value(double(v));
+          w.end_array().end_object();
+        }
+      }
+      w.end_array().key("usage").begin_object().kv("prompt_tokens", total).kv("total_tokens", total).end_object().end_object();
+      res.set_content(w.str(), "application/json");
+    } catch (const serve::ApiError& e) {
+      reply_error(res, e);
+    } catch (const std::exception& e) {
+      reply_error(res, serve::ApiError(500, "server_error", "", e.what()));
+    }
+  });
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_path, alias = "gemma-4-12b", host = "127.0.0.1";
-  int port = 8081, slots = 2;
+  std::string model_path, alias = "gemma-4-12b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2";
+  int port = 8081, slots = 2, embed_port = 8082;
   int64_t ctx = 65536, batch = 2048, chunk = 1024;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -57,9 +145,12 @@ int main(int argc, char** argv) {
     else if (a == "--ctx") ctx = std::atoll(next().c_str());
     else if (a == "--batch") batch = std::atoll(next().c_str());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
+    else if (a == "--embed-model") embed_path = next();
+    else if (a == "--embed-port") embed_port = std::atoi(next().c_str());
+    else if (a == "--embed-alias") embed_alias = next();
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
-                           "[--batch N] [--chunk N]\n");
+                           "[--batch N] [--chunk N] [--embed-model GGUF --embed-port N [--embed-alias NAME]]\n");
       return 2;
     }
   }
@@ -96,11 +187,7 @@ int main(int argc, char** argv) {
       res.set_content("{\"status\":\"ok\"}", "application/json");
     });
     http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-      json::Writer w(false);
-      w.begin_object().kv("object", "list").key("data").begin_array().begin_object().kv("id", alias).kv("object", "model");
-      w.kv("created", now_s()).kv("owned_by", "eklow").key("meta").begin_object().kv("n_ctx", ec.max_ctx).kv("n_slots", int64_t(slots));
-      w.end_object().end_object().end_array().end_object();
-      res.set_content(w.str(), "application/json");
+      res.set_content(models_json(alias, ec.max_ctx, slots), "application/json");
     });
     http.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
       serve::ChatRequest cr;
@@ -123,8 +210,8 @@ int main(int argc, char** argv) {
       r->in_thinking = cr.in_thinking;
       try {
         sched.submit(r);
-      } catch (const std::invalid_argument& e) {
-        return reply_error(res, serve::ApiError(400, "invalid_request_error", "context_length_exceeded", e.what()));
+      } catch (const std::invalid_argument&) {
+        return reply_error(res, serve::context_exceeded(int64_t(r->prompt.size()), ec.max_ctx));
       }
       auto out = std::make_shared<serve::ChatResponse>(serve::new_completion_id(), cr.model.empty() ? alias : cr.model, now_s());
       if (!cr.stream) {
@@ -162,17 +249,44 @@ int main(int argc, char** argv) {
           [r](bool) { r->cancel(); });
     });
 
+    // The embedding model: its own queue on the card, so its work does not wait behind steps.
+    std::unique_ptr<gguf::File> embed_file;
+    std::unique_ptr<text::Tokenizer> embed_tok;
+    std::unique_ptr<sycl::queue> embed_q;
+    std::unique_ptr<model::EmbedGemma2> embed_model;
+    std::mutex embed_mu;
+    httplib::Server embed_http;
+    std::thread embed_thread;
+    if (!embed_path.empty()) {
+      embed_file = std::make_unique<gguf::File>(gguf::File::open(embed_path));
+      embed_tok = std::make_unique<text::Tokenizer>(text::Tokenizer::from_gguf(*embed_file));
+      embed_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
+      embed_model = std::make_unique<model::EmbedGemma2>(*embed_q, *embed_file);
+      embed_http.new_task_queue = [] { return new httplib::ThreadPool(4); };
+      serve_embeddings(embed_http, *embed_model, *embed_tok, embed_mu, embed_alias, 8192);
+      std::fprintf(stderr, "eklow-server: %s, %.2f GiB, listening on %s:%d\n", embed_alias.c_str(), embed_model->bytes() / 1073741824.0,
+                   host.c_str(), embed_port);
+      embed_thread = std::thread([&] {
+        if (!embed_http.listen(host, embed_port)) {
+          std::fprintf(stderr, "eklow-server: cannot listen on %s:%d\n", host.c_str(), embed_port);
+          g_stop = true;
+        }
+      });
+    }
+
     std::signal(SIGINT, [](int) { g_stop = true; });
     std::signal(SIGTERM, [](int) { g_stop = true; });
     std::thread stopper([&] {
       while (!g_stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
       http.stop();
+      embed_http.stop();
     });
     std::fprintf(stderr, "eklow-server: listening on %s:%d\n", host.c_str(), port);
     if (!http.listen(host, port)) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
     g_stop = true;
     stopper.join();
     engine_thread.join();
+    if (embed_thread.joinable()) embed_thread.join();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-server: %s\n", e.what());
     return 1;

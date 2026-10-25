@@ -50,8 +50,17 @@ void rope_neox(sycl::queue& q, float* x, int64_t n_tok, int64_t n_head, int64_t 
 void attention(sycl::queue& q, const float* Q, const float* K, const float* V, int64_t n_tok, int64_t n_head,
                int64_t n_head_kv, int64_t head_dim, int64_t window, float scale, float* out);
 
+// Attention within one sequence in both directions: query t sees keys j with |t - j| <=
+// half_window, or all of them when half_window is 0 (llama.cpp's symmetric sliding window).
+void attention_bidir(sycl::queue& q, const float* Q, const float* K, const float* V, int64_t n_tok, int64_t n_head,
+                     int64_t n_head_kv, int64_t head_dim, int64_t half_window, float scale, float* out);
+
 // out = gelu_tanh(gate) * up
 void gelu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out);
+// out = gelu_tanh(x)
+void gelu(sycl::queue& q, const float* x, int64_t n, float* out);
+// out = a * b
+void mul(sycl::queue& q, const float* a, const float* b, int64_t n, float* out);
 // out = a + b
 void add(sycl::queue& q, const float* a, const float* b, int64_t n, float* out);
 // x *= s

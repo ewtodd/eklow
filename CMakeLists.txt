@@ -68,6 +68,7 @@ add_library(eklow_model STATIC
   src/kernels/fast.cpp
   src/kernels/ref.cpp
   src/kernels/xmx.cpp
+  src/model/embed_gemma2.cpp
   src/model/gemma4.cpp
 )
 target_link_libraries(eklow_model PUBLIC eklow_host eklow_rt)
@@ -76,6 +77,10 @@ eklow_sycl(eklow_model)
 add_executable(eklow-kernel-test tools/kernel_test/main.cpp)
 target_link_libraries(eklow-kernel-test PRIVATE eklow_model)
 eklow_sycl(eklow-kernel-test)
+
+add_executable(eklow-embed tools/embed/main.cpp)
+target_link_libraries(eklow-embed PRIVATE eklow_model eklow_text)
+eklow_sycl(eklow-embed)
 
 add_executable(eklow-attn-test tools/attn_test/main.cpp)
 target_link_libraries(eklow-attn-test PRIVATE eklow_model)
@@ -126,4 +131,4 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-engine-run eklow-engine-bench eklow-server RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-engine-run eklow-engine-bench eklow-server RUNTIME DESTINATION bin)
