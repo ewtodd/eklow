@@ -21,6 +21,7 @@ cd ~/eklow
 nix develop path:. -c bash -c 'cmake -S . -B build -G Ninja && ninja -C build'
 nix develop path:. -c ./build/eklow-probe --json probe.json
 nix develop path:. -c ./build/eklow-gguf ~/models/gemma-4-12b-it-qat-q4_0.gguf --tensors
+nix develop path:. -c ./build/eklow-xmx-bench --json xmx.json
 ```
 
 ## Milestone 1 (foundation)
@@ -28,8 +29,9 @@ nix develop path:. -c ./build/eklow-gguf ~/models/gemma-4-12b-it-qat-q4_0.gguf -
 - [x] flake + CMake (intel-llvm stdenv, AOT for DG2)
 - [x] GGUF loader, identical to the gguf Python package on the 12B (DECISIONS 2026-10-24)
 - [x] `eklow-probe`: memory, transfers, launch/sync, host-signal latency (DECISIONS 2026-10-24)
-- [ ] Level Zero runtime in fiona's system config (intel-compute-runtime)
-- [ ] XMX microbenchmarks: fp16 and Q4_0 x int8 `dpas` peak and memory-fed GEMM
+- [x] `eklow-xmx-bench`: dpas layouts verified, fp16 98.8 TFLOPS, s8 x s4 with Q4_0 scales 222.8 TOPS,
+      VRAM read 399 GB/s (DECISIONS 2026-10-24)
+- [ ] Level Zero runtime in fiona's system config: `/etc/nixos` ee3be49b, not deployed yet
 
 ## Open
 

@@ -1,0 +1,122 @@
+{
+  "device": "Intel(R) Arc(TM) A770M Graphics",
+  "eus": 512,
+  "max_clock_mhz": 2050,
+  "verify": [
+    {
+      "kind": "fp16",
+      "layout": "vnni ops=2",
+      "max_err": 1.62981451e-07,
+      "ok": true
+    },
+    {
+      "kind": "s8",
+      "layout": "vnni ops=4",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xs4",
+      "layout": "vnni ops=4",
+      "max_err": 5984,
+      "ok": false
+    },
+    {
+      "kind": "s8xs4",
+      "layout": "vnni ops=8",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s4",
+      "layout": "vnni ops=8",
+      "max_err": 0,
+      "ok": true
+    }
+  ],
+  "throughput": [
+    {
+      "kind": "fp16",
+      "seconds": 0.089008021,
+      "tops": 98.8235995
+    },
+    {
+      "kind": "bf16",
+      "seconds": 0.089007708,
+      "tops": 98.823947
+    },
+    {
+      "kind": "s8",
+      "seconds": 0.089007708,
+      "tops": 197.647894
+    },
+    {
+      "kind": "s8xs4",
+      "seconds": 0.089007708,
+      "tops": 197.647894
+    },
+    {
+      "kind": "s4",
+      "seconds": 0.089007708,
+      "tops": 395.295788
+    },
+    {
+      "kind": "s8xs4+scale",
+      "seconds": 0.039478021,
+      "tops": 222.809877
+    },
+    {
+      "kind": "fp16+dequant",
+      "seconds": 0.330964167,
+      "tops": 26.5771763
+    }
+  ],
+  "read_bandwidth": [
+    {
+      "threads": 8192,
+      "loads_in_flight": 2,
+      "gbps": 384.695686
+    },
+    {
+      "threads": 8192,
+      "loads_in_flight": 4,
+      "gbps": 386.730661
+    },
+    {
+      "threads": 8192,
+      "loads_in_flight": 8,
+      "gbps": 393.176932
+    },
+    {
+      "threads": 16384,
+      "loads_in_flight": 2,
+      "gbps": 399.00597
+    },
+    {
+      "threads": 16384,
+      "loads_in_flight": 4,
+      "gbps": 392.010777
+    },
+    {
+      "threads": 16384,
+      "loads_in_flight": 8,
+      "gbps": 394.365253
+    },
+    {
+      "threads": 32768,
+      "loads_in_flight": 2,
+      "gbps": 395.27275
+    },
+    {
+      "threads": 32768,
+      "loads_in_flight": 4,
+      "gbps": 387.588631
+    },
+    {
+      "threads": 32768,
+      "loads_in_flight": 8,
+      "gbps": 391.757478
+    }
+  ],
+  "read_bandwidth_gbps": 399.00597
+}

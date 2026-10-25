@@ -42,4 +42,10 @@ add_executable(eklow-probe tools/probe/probe.cpp)
 target_link_libraries(eklow-probe PRIVATE eklow_host PkgConfig::LEVEL_ZERO)
 eklow_sycl(eklow-probe)
 
-install(TARGETS eklow-gguf eklow-probe RUNTIME DESTINATION bin)
+# eklow-xmx-bench: dpas layouts checked against the CPU, XMX throughput, the Q4_0 inner loops and
+# VRAM read bandwidth.
+add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
+target_link_libraries(eklow-xmx-bench PRIVATE eklow_host)
+eklow_sycl(eklow-xmx-bench)
+
+install(TARGETS eklow-gguf eklow-probe eklow-xmx-bench RUNTIME DESTINATION bin)

@@ -90,3 +90,38 @@ version picked the Iris Xe and its allocation test ran fiona out of memory (the 
 little-titles server, which restarted, and the fiona user manager). The probe now considers only
 Level Zero GPUs, never runs the allocation test on an integrated one, caps it at the reported
 size, and stops if the host's available memory falls by more than 512 MiB.
+
+## 2026-10-24 — XMX: int8 activations times the GGUF's own 4-bit weights
+
+`eklow-xmx-bench`, record in `docs/bench/xmx-fiona-2026-10-24.json` (register-resident loops, no
+memory traffic, except the last row):
+
+| inner loop | measured |
+|---|---|
+| fp16 / bf16 `dpas` | 98.8 TFLOPS |
+| s8 `dpas` | 197.6 TOPS |
+| s8 activations x s4 weights | 197.6 TOPS |
+| s4 `dpas` | 395.3 TOPS |
+| s8 x s4 plus the Q4_0 block scales after each K=32 `dpas` | 222.8 TOPS |
+| Q4_0 unpacked to fp16 in registers, then fp16 `dpas` | 26.6 TFLOPS |
+| VRAM read (block loads) | 399 GB/s |
+
+The rates stand in exact 1:2:4 ratios and match 128 fp16 FLOP per clock per EU at about 1.5 GHz
+sustained; the driver reports a 2050 MHz maximum, the A770M's rated boost is 1650 MHz.
+
+Layouts, each checked against a CPU reference: the B (weight) operand of fp16 `dpas` packs pairs of
+consecutive k per column, s8 groups of 4. With s8 activations and s4 weights, B packs groups of 8
+consecutive k per column (one dword), not 4; groups of 4 give wrong sums.
+
+Decision: prefill GEMMs quantize activations to int8 per 32-element block, as llama.cpp's MMQ path
+does, and feed the Q4_0 nibbles to `dpas` as s4 (q - 8 is the nibble with bit 3 flipped), applying
+the weight and activation block scales after each K=32 `dpas`. The scale work hides under the XMX
+pipe; unpacking to fp16 is 8x slower. fp16/bf16 `dpas` stays for attention.
+
+What it means for the targets: the 12B's weight GEMMs cost about 22 GFLOP per token, ~4,500 tok/s
+at half the int8 rate, so the 1500 tok/s prefill target at 16k leaves room for attention. Decode
+reads ~6.5 GB per token: 399 GB/s caps one stream near 60 tok/s.
+
+Measurement notes: the first runs used 11-29 ms kernels and came out 25-50% low because the clock
+was still ramping; each kernel now runs once untimed and is timed best of three at ~90 ms. A
+`memset` of 0x01 had also made the fp16 inputs denormal.
