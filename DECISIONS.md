@@ -248,3 +248,22 @@ template port, tokenizes them, feeds the generated part to `eklow-parse` one tok
 compares: 2 x 20,000 turns (reasoning, 1-3 tool calls with nested arguments of every JSON kind,
 content) recovered exactly. Keeping the template's trailing newline in the reasoning shows up as
 974 differences in 2,000.
+
+## 2026-10-24 — the first XMX matmuls, and what limits them
+
+`src/kernels/xmx.cpp`: Q4_0 weights are repacked at load into dpas tiles (8 columns x 32 K, 128
+bytes, signed nibbles in groups of 8 along K, K-block-major so that threads working on the same K
+step read adjacent memory) with fp16 scales; activations are quantized to int8 per 32-block by
+eklow's own kernel straight into 8-row tiles with fp32 scales. `eklow-kernel-test` runs real
+layer weights: every sampled output matches a CPU emulation of the quantized arithmetic to ~1e-6.
+
+- One register file only: the 256-register mode (`grf_size<256>`) is ignored on DG2 (IGC dump:
+  `numGRF=128`), so 16 x 32 output tiles are the largest that fit without spilling; 32 x 32 spills
+  3.3 KB and runs at 15 TOPS.
+- Decode (1-8 rows), a K-split GEMV: 110-240 GB/s of weights (ffn_down 243 GB/s), against 399 the
+  card reads. Interleaving the weight tiles K-block-major gained 10-20%.
+- 16-256 rows, a column-group kernel (each thread applies one weight tile to up to 64 rows): ~11
+  TOPS; the tile GEMM was ten times slower there, rereading weight tiles for every 16 rows.
+- 2048 rows, the 16 x 32 tile GEMM: 28-53 TOPS. Enough for the weight GEMMs to run at ~1,200-2,000
+  tok/s, short of the 1,500 tok/s prefill target with attention on top; the fix is the standard one,
+  work-group tiles staged through shared local memory, in M4.

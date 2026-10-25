@@ -64,6 +64,15 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
       recovered exactly from 40,000 random turns rendered by the template (DECISIONS 2026-10-24)
 - [ ] image input (bidirectional attention among an image's tokens on sliding layers): with M3
 
+## Milestone 4 (speed), started early
+
+- [x] XMX matmul for Q4_0 (`src/kernels/xmx.cpp`): weights repacked to dpas tiles at load,
+      activations quantized to int8 per block; exact against a CPU emulation of the quantized
+      arithmetic. GEMV 110-240 GB/s (decode), column groups ~11 TOPS (64-256 rows), tile GEMM 28-53
+      TOPS (2048 rows) (`eklow-kernel-test`, docs/bench/kernels-fiona-2026-10-24.json)
+- [ ] GEMM through shared local memory (cooperative tiles, double buffering) for >= 100 TOPS
+- [ ] decode GEMV toward the 399 GB/s the card reads
+
 ## Open
 
 1. Host-to-GPU signals must use `zeMemAllocHost` with the uncached bias; `sycl::malloc_host` is

@@ -62,10 +62,15 @@ eklow_sycl(eklow_rt)
 # The model: configuration, weights on the card, reference kernels and the reference forward.
 add_library(eklow_model STATIC
   src/kernels/ref.cpp
+  src/kernels/xmx.cpp
   src/model/gemma4.cpp
 )
 target_link_libraries(eklow_model PUBLIC eklow_host eklow_rt)
 eklow_sycl(eklow_model)
+
+add_executable(eklow-kernel-test tools/kernel_test/main.cpp)
+target_link_libraries(eklow-kernel-test PRIVATE eklow_model)
+eklow_sycl(eklow-kernel-test)
 
 add_executable(eklow-ref-run tools/ref_run/main.cpp)
 target_link_libraries(eklow-ref-run PRIVATE eklow_model)
@@ -85,4 +90,4 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test RUNTIME DESTINATION bin)
