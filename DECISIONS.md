@@ -143,3 +143,21 @@ cosine never below 0.98. eklow against the oracle should land in that band.
 A false alarm on the way: on the raw text "The capital of France is", both backends predict
 digits ("011111111111"). That is the instruction-tuned model off its chat format, not a bug; with
 the chat format both put probability 1.0 on "The". Checks use chat-formatted prompts.
+
+## 2026-10-24 — the tokenizer follows Hugging Face, not llama.cpp
+
+Google's `tokenizer.json` for Gemma 4 (in e-desktop's Hugging Face cache with the bf16 weights)
+defines: the 24 added tokens split out first; spaces replaced by U+2581; a pre-tokenizer that
+splits on spaces, of which none remain, so each stretch between added tokens is one BPE word; BPE
+with byte fallback, lowest merge rank first and leftmost first among equal ranks. llama.cpp also
+splits on newlines before merging; eklow does not. The GGUF holds everything needed: its 17
+control and 7 user-defined tokens are exactly the 24 added tokens, and its 256 byte tokens the
+fallback.
+
+`tools/ref/tok_compare.py` runs Hugging Face's `tokenizers` on `tokenizer.json` against
+`eklow-tok`: hand-written edge cases (whitespace runs, CRLF, every script at hand, emoji with ZWJ
+and modifiers, combining marks, control characters, partial and adjacent special tokens), the same
+wrapped in the chat template, 20,000 random strings over a mixed alphabet, and five real files
+whole and line by line. 27,607 strings, 1.34M tokens: no difference in encoding or decoding.
+Reversing the tie-break among equal ranks gives 9 differences in 3,142 strings, so the comparison
+catches the rule that matters. Encoding runs at 1.5M tokens/s on one core; loading takes 0.10 s.

@@ -48,7 +48,8 @@ nix develop -c python3 tools/ref/compare_dumps.py REF_DIR TEST_DIR
 - [x] oracle: `eklow-oracle` (llama.cpp CPU at the fleet's ea0c4c2c, AVX2), tensor dumps and
       `tools/ref/compare_dumps.py`; CPU vs CUDA noise floor on a chat prompt: mean KL 4.7e-3,
       top-1 96% (DECISIONS 2026-10-24)
-- [ ] tokenizer, checked against Hugging Face's
+- [x] tokenizer (`src/text/tokenizer.cpp`): identical to Hugging Face's `tokenizers` on 27,607
+      strings / 1.34M tokens, encode and decode; 1.5M tokens/s (DECISIONS 2026-10-24)
 - [ ] chat template (the official Jinja), golden tests
 - [ ] reference kernels and the reference forward, compared per layer against the oracle
 

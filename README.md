@@ -11,6 +11,8 @@ stand and `DECISIONS.md` for the evidence behind each choice.
   most memory (or `ONEAPI_DEVICE_SELECTOR=level_zero:N`).
 - `eklow-xmx-bench [--json FILE]`: `dpas` layouts checked against the CPU, XMX throughput per
   operand type, the Q4_0 inner loops, and VRAM read bandwidth.
+- `eklow-tok GGUF encode|decode|bench`: the tokenizer; `tools/ref/tok_compare.py` checks it against
+  Hugging Face's `tokenizers` on Google's `tokenizer.json`.
 - `eklow-gguf FILE [--tensors] [--json]`: what the GGUF loader reads from a file;
   `tools/ref/gguf_compare.py FILE JSON` checks it against the gguf Python package.
 

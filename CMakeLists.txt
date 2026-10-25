@@ -34,6 +34,15 @@ function(eklow_sycl target)
   target_link_options(${target} PRIVATE -fsycl -fsycl-targets=${EKLOW_SYCL_TARGETS})
 endfunction()
 
+# Serving text layer: the tokenizer (and, later, the chat template and output parser). No device code.
+add_library(eklow_text STATIC
+  src/text/tokenizer.cpp
+)
+target_link_libraries(eklow_text PUBLIC eklow_host)
+
+add_executable(eklow-tok tools/tok/main.cpp)
+target_link_libraries(eklow-tok PRIVATE eklow_text)
+
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
@@ -48,4 +57,4 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-probe eklow-xmx-bench RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-probe eklow-xmx-bench RUNTIME DESTINATION bin)

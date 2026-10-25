@@ -69,6 +69,7 @@
           (python3.withPackages (ps: [
             ps.numpy
             ps.gguf
+            ps.tokenizers
           ]))
         ];
         shellHook = ''
