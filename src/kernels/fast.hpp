@@ -8,6 +8,7 @@
 #include <cstdint>
 
 #include "kernels/ref.hpp"
+#include "kernels/xmx.hpp"
 
 namespace eklow::fast {
 
@@ -37,6 +38,24 @@ void rope_neox(sycl::queue& q, float* x, const int32_t* pos, int64_t n_tok, int6
                int64_t n_rot, const float* inv_freq);
 
 void gelu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out);
+
+// The heads of a layer from its fused projection, row t of qkv = [q (n_head x D) | k (n_head_kv x
+// D) | v (n_head_kv x D, when has_v)]: Q = rope(rmsnorm_per_head(q) * q_norm), K = rope(rmsnorm(k)
+// * k_norm), V = rmsnorm(v, or k's projection without has_v), unweighted. One work-group per head,
+// one work-item per RoPE pair. Q [t][n_head][D], K and V [t][n_head_kv][D].
+void qkv_heads(sycl::queue& q, const float* qkv, int64_t n_tok, int64_t n_head, int64_t n_head_kv, int64_t head_dim,
+               bool has_v, const float* q_norm, const float* k_norm, float eps, const int32_t* pos, const float* inv_freq,
+               float* Q, float* K, float* V);
+
+// A residual and the norm before the next matmul, quantized for it, one row per work-group:
+//   o given:  x_out = (x + rmsnorm(o) * w_o) * scale;  otherwise x_out is x and is not written
+//   w_next given: rmsnorm(x_out) * w_next into h_out (if given) and, quantized, into act.
+// cols must be a multiple of 128 and at most 8192.
+void residual_norm_quant(sycl::queue& q, const float* o, const float* w_o, const float* x, float scale, float* x_out,
+                         const float* w_next, float eps, int64_t rows, int64_t cols, xmx::Activations* act, float* h_out);
+
+// gelu(gate) * up from the fused projection, row t of gu = [gate (n) | up (n)], quantized into act.
+void gelu_quant(sycl::queue& q, const float* gu, int64_t rows, int64_t n, xmx::Activations& act);
 // out = (a + b) * s
 void add_scale(sycl::queue& q, const float* a, const float* b, float s, int64_t n, float* out);
 void softcap(sycl::queue& q, float* x, float cap, int64_t n);

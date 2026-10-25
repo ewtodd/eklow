@@ -115,13 +115,22 @@ void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a) {
        *sc = 0;
        return;
      }
-     const float* src = x + r * k + b * 32;
-     float amax = 0;
-     for (int j = 0; j < 32; ++j) amax = sycl::fmax(amax, sycl::fabs(src[j]));
-     const float d = amax / 127.0f, id_ = d != 0 ? 1.0f / d : 0.0f;
-     for (int j = 0; j < 32; ++j) dst[j] = int8_t(sycl::round(src[j] * id_));
-     *sc = d;
+     float v[32], amax = 0;
+     for (int j = 0; j < 32; ++j) {
+       v[j] = x[r * k + b * 32 + j];
+       amax = sycl::fmax(amax, sycl::fabs(v[j]));
+     }
+     *sc = quantize_run(v, amax, dst);
    });
+}
+
+void set_rows(Activations& a, int64_t m, int64_t k) {
+  if (k % 32) throw std::runtime_error("xmx: activation width not a multiple of 32");
+  const int64_t m_pad = (m + 31) / 32 * 32;
+  if (m_pad * k > a.capacity) throw std::runtime_error("xmx: activation buffer too small");
+  a.m = m;
+  a.m_pad = m_pad;
+  a.k = k;
 }
 
 namespace {

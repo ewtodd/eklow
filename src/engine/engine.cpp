@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cmath>
 #include <numeric>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -36,21 +37,38 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   };
   auto vec = [&](const std::string& name) { return reinterpret_cast<const float*>(upload(need(name))); };
 
-  // Q4_0 matrices go through one staging buffer and are repacked for the matrix units.
+  // Q4_0 matrices go through one staging buffer and are repacked for the matrix units. Matrices
+  // that read the same input are stacked into one (their outputs side by side in each row), so a
+  // decode step launches one matmul for Q, K and V and one for gate and up.
   uint64_t staging_bytes = 0;
+  for (int l = 0; l < cfg_.n_layer; ++l)
+    for (const char* group : {"attn_q.weight|attn_k.weight|attn_v.weight", "ffn_gate.weight|ffn_up.weight"}) {
+      uint64_t sum = 0;
+      std::stringstream names(group);
+      for (std::string n; std::getline(names, n, '|');)
+        if (const gguf::Tensor* t = f.tensor("blk." + std::to_string(l) + "." + n)) sum += t->nbytes;
+      staging_bytes = std::max(staging_bytes, sum);
+    }
   for (const auto& t : f.tensors())
     if (t.type == gguf::Type::Q4_0) staging_bytes = std::max(staging_bytes, t.nbytes);
   auto* staging = sycl::malloc_device<uint8_t>(staging_bytes, q_);
   if (!staging) throw std::runtime_error("engine: out of device memory for weight staging");
-  auto matrix = [&](const std::string& name) {
-    const gguf::Tensor& t = need(name);
-    if (t.type != gguf::Type::Q4_0) throw std::runtime_error(f.path() + ": " + name + " is not Q4_0");
-    q_.memcpy(staging, t.data, t.nbytes).wait();
-    ref::Weight raw{t.type, int64_t(t.ne[0]), int64_t(t.ne[1]), staging, t.nbytes / t.ne[1]};
+  auto matrix = [&](const std::vector<const gguf::Tensor*>& parts) {
+    uint64_t at = 0;
+    int64_t n = 0;
+    for (const gguf::Tensor* t : parts) {
+      if (t->type != gguf::Type::Q4_0) throw std::runtime_error(f.path() + ": " + t->name + " is not Q4_0");
+      if (t->ne[0] != parts[0]->ne[0]) throw std::runtime_error(f.path() + ": stacked matrices of different widths");
+      q_.memcpy(staging + at, t->data, t->nbytes);
+      at += t->nbytes;
+      n += int64_t(t->ne[1]);
+      weight_bytes_ += t->nbytes;
+    }
+    q_.wait();
+    const ref::Weight raw{gguf::Type::Q4_0, int64_t(parts[0]->ne[0]), n, staging, parts[0]->nbytes / parts[0]->ne[1]};
     xmx::Weight w = xmx::repack_q4_0(q_, raw);
     owned_.push_back(w.tiles);
     owned_.push_back(w.scales);
-    weight_bytes_ += t.nbytes;
     return w;
   };
 
@@ -87,17 +105,16 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     const std::string b = "blk." + std::to_string(l) + ".";
     Layer L{};
     L.attn_norm = vec(b + "attn_norm.weight");
-    L.wq = matrix(b + "attn_q.weight");
-    L.wk = matrix(b + "attn_k.weight");
-    if (f.tensor(b + "attn_v.weight")) L.wv = matrix(b + "attn_v.weight");
-    L.wo = matrix(b + "attn_output.weight");
+    L.has_v = f.tensor(b + "attn_v.weight") != nullptr;
+    L.wqkv = L.has_v ? matrix({&need(b + "attn_q.weight"), &need(b + "attn_k.weight"), &need(b + "attn_v.weight")})
+                     : matrix({&need(b + "attn_q.weight"), &need(b + "attn_k.weight")});
+    L.wo = matrix({&need(b + "attn_output.weight")});
     L.q_norm = vec(b + "attn_q_norm.weight");
     L.k_norm = vec(b + "attn_k_norm.weight");
     L.attn_post_norm = vec(b + "post_attention_norm.weight");
     L.ffn_norm = vec(b + "ffn_norm.weight");
-    L.gate = matrix(b + "ffn_gate.weight");
-    L.up = matrix(b + "ffn_up.weight");
-    L.down = matrix(b + "ffn_down.weight");
+    L.gate_up = matrix({&need(b + "ffn_gate.weight"), &need(b + "ffn_up.weight")});
+    L.down = matrix({&need(b + "ffn_down.weight")});
     L.ffn_post_norm = vec(b + "post_ffw_norm.weight");
     const gguf::Tensor* os = f.tensor(b + "layer_output_scale.weight");
     L.out_scale = os ? *reinterpret_cast<const float*>(os->data) : 1.0f;
@@ -148,8 +165,10 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   att_ = dev(B * H * Dg);
   kb_ = dev(B * kv_max);
   vb_ = dev(B * kv_max);
-  gate_ = dev(B * F);
-  up_ = dev(B * F);
+  int64_t qkv_max = 0;
+  for (const Layer& L : layers_) qkv_max = std::max(qkv_max, L.wqkv.n);
+  qkv_ = dev(B * qkv_max);
+  gu_ = dev(B * 2 * F);
   rows_ = dev(c_.max_logits * E);
   logits_ = dev(c_.max_logits * cfg_.n_vocab);
   // At most one chunk per slot in a step, so at most n_slots partial tiles per K/V head.
@@ -259,14 +278,12 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     q_.memcpy(host.data(), p, size_t(n) * sizeof(float)).wait();
     dump->put(name, host, ne);
   };
-  auto mm = [&](const float* x, int64_t k, const xmx::Weight& w, float* out) {
-    act_.k = k;
-    xmx::quantize(q_, x, T, act_);
-    xmx::matmul(q_, act_, w, out);
-  };
 
+  // Each layer starts with its attention input already normed and quantized in act_: by the
+  // fused kernel at the end of the layer before, or here for the first.
   fast::embed(q_, head_, tok_, T, std::sqrt(float(E)), x_);
   emit("inp_scaled", x_, {E, T});
+  fast::residual_norm_quant(q_, nullptr, nullptr, x_, 1.0f, nullptr, layers_[0].attn_norm, cfg_.eps, T, E, &act_, h_);
   mark("embed");
   for (int l = 0; l < cfg_.n_layer; ++l) {
     const Layer& L = layers_[size_t(l)];
@@ -274,26 +291,15 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     const bool sliding = cfg_.sliding[size_t(l)];
     const int64_t D = cfg_.head_dim(l), Hkv = cfg_.n_head_kv[size_t(l)];
     const float* inv = sliding ? inv_freq_sliding_ : inv_freq_global_;
-
-    fast::rmsnorm(q_, x_, L.attn_norm, T, E, cfg_.eps, h_);
     emit("attn_norm" + s, h_, {E, T});
-    mark("norms");
-    act_.k = E;
-    xmx::quantize(q_, h_, T, act_);
-    xmx::matmul(q_, act_, L.wq, qb_);
-    xmx::matmul(q_, act_, L.wk, kb_);
-    if (L.wv.tiles) xmx::matmul(q_, act_, L.wv, vb_);
-    else q_.memcpy(vb_, kb_, size_t(T * Hkv * D) * sizeof(float));
+
+    xmx::matmul(q_, act_, L.wqkv, qkv_);
     mark("qkv");
-    fast::rmsnorm(q_, qb_, L.q_norm, T * H, D, cfg_.eps, qb_);
-    fast::rope_neox(q_, qb_, pos_, T, H, D, D, inv);
+    fast::qkv_heads(q_, qkv_, T, H, Hkv, D, L.has_v, L.q_norm, L.k_norm, cfg_.eps, pos_, inv, qb_, kb_, vb_);
     emit("Qcur_pos" + s, qb_, {D, H, T});
-    fast::rmsnorm(q_, kb_, L.k_norm, T * Hkv, D, cfg_.eps, kb_);
-    fast::rope_neox(q_, kb_, pos_, T, Hkv, D, D, inv);
     emit("Kcur_pos" + s, kb_, {D, Hkv, T});
-    fast::rmsnorm(q_, vb_, nullptr, T * Hkv, D, cfg_.eps, vb_);
     emit("Vcur_normed" + s, vb_, {D, Hkv, T});
-    mark("qkv_norm_rope");
+    mark("qkv_heads");
 
     if (sliding) {
       const attn::Cache cache{ring_k_ + L.ring_index * ring_layer_stride_, ring_v_ + L.ring_index * ring_layer_stride_, nullptr,
@@ -309,28 +315,24 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       mark("attn_global");
     }
     emit("kqv_out" + s, att_, {H * D, T});
-    mm(att_, H * D, L.wo, o_);
+    act_.k = H * D;
+    xmx::quantize(q_, att_, T, act_);
+    xmx::matmul(q_, act_, L.wo, o_);
     mark("wo");
-    fast::rmsnorm(q_, o_, L.attn_post_norm, T, E, cfg_.eps, o_);
-    fast::add_scale(q_, o_, x_, 1.0f, T * E, x2_);
+    fast::residual_norm_quant(q_, o_, L.attn_post_norm, x_, 1.0f, x2_, L.ffn_norm, cfg_.eps, T, E, &act_, h_);
     emit("attn_out" + s, x2_, {E, T});
-    mark("norms");
+    mark("post_attn");
 
-    fast::rmsnorm(q_, x2_, L.ffn_norm, T, E, cfg_.eps, h_);
-    mark("norms");
-    act_.k = E;
-    xmx::quantize(q_, h_, T, act_);
-    xmx::matmul(q_, act_, L.gate, gate_);
-    xmx::matmul(q_, act_, L.up, up_);
+    xmx::matmul(q_, act_, L.gate_up, gu_);
     mark("gate_up");
-    fast::gelu_mul(q_, gate_, up_, T * F, gate_);
+    fast::gelu_quant(q_, gu_, T, F, act_);
     mark("gelu");
-    mm(gate_, F, L.down, o_);
+    xmx::matmul(q_, act_, L.down, o_);
     mark("down");
-    fast::rmsnorm(q_, o_, L.ffn_post_norm, T, E, cfg_.eps, o_);
-    fast::add_scale(q_, o_, x2_, L.out_scale, T * E, x_);
+    const float* next_norm = l + 1 < cfg_.n_layer ? layers_[size_t(l) + 1].attn_norm : nullptr;
+    fast::residual_norm_quant(q_, o_, L.ffn_post_norm, x2_, L.out_scale, x_, next_norm, cfg_.eps, T, E, &act_, h_);
     emit("l_out" + s, x_, {E, T});
-    mark("norms");
+    mark("post_ffn");
   }
 
   for (const auto& c : chunks) slots_[size_t(c.slot)].length += int64_t(c.tokens.size());

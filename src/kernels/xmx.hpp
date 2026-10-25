@@ -44,6 +44,21 @@ void free_activations(sycl::queue& q, Activations& a);
 // scale = max|x| / 127, q = round(x / scale).
 void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a);
 
+// For kernels that produce activations themselves: where element (row, k) of a matrix with kb
+// 32-blocks per row goes, where its block's scale goes, and the quantization rule applied to a run
+// of values sharing one block (amax: the block's max |x|).
+inline int64_t act_index(int64_t row, int64_t k, int64_t kb) { return ((row / 8) * kb + k / 32) * 256 + (row % 8) * 32 + k % 32; }
+inline int64_t act_scale_index(int64_t row, int64_t k, int64_t kb) { return ((row / 8) * kb + k / 32) * 8 + row % 8; }
+template <int N>
+inline float quantize_run(const float (&x)[N], float amax, int8_t* dst) {
+  const float d = amax / 127.0f, id = d != 0 ? 1.0f / d : 0.0f;
+  for (int j = 0; j < N; ++j) dst[j] = int8_t(sycl::round(x[j] * id));
+  return d;
+}
+// Marks `a` as holding m rows of width k written that way. Rows from m to the padded count keep
+// whatever they held; matmul never stores their results.
+void set_rows(Activations& a, int64_t m, int64_t k);
+
 // out[m][n] = sum over blocks of (a block . w block) * a.scale * w.scale, fp32, row-major.
 // Small m (decode) runs a K-split GEMV schedule, larger m a tiled GEMM. quantize and matmul only
 // enqueue (the queue must be in order); the caller waits.

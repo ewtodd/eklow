@@ -87,8 +87,8 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] `eklow-engine-bench`: prefill 1,141 / 1,057 / 867 tok/s at 1k / 4k / 16k, decode 22.2 /
       20.8 / 19.4 tok/s at 0 / 4k / 16k (docs/bench/engine-fiona-2026-10-24.json); `--profile`
       times each section of the forward pass on the card
-- [ ] decode: fuse the per-layer kernels (about 32 launches a layer at ~7 us each on the card)
-      and the QKV and gate/up matmuls
+- [x] decode: stacked QKV and gate/up matmuls, fused layer tails (about 16 launches a layer, from
+      34): decode 32.2 / 29.1 / 27.6 tok/s at 0 / 4k / 16k
 - [ ] attention: K/V blocks staged through shared local memory, shared by several query tiles
 - [ ] GEMM through shared local memory (cooperative tiles, double buffering) for >= 100 TOPS
 - [ ] decode GEMV toward the 399 GB/s the card reads

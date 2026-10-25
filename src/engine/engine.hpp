@@ -65,7 +65,8 @@ class Engine {
 
  private:
   struct Layer {
-    xmx::Weight wq, wk, wv, wo, gate, up, down;  // wv.tiles is null on global layers
+    xmx::Weight wqkv, wo, gate_up, down;  // wqkv: Q, K and (has_v) V stacked; gate_up likewise
+    bool has_v;
     const float *attn_norm, *q_norm, *k_norm, *attn_post_norm, *ffn_norm, *ffn_post_norm;
     float out_scale;
     int ring_index, page_index;  // index among the sliding / global layers
@@ -98,7 +99,7 @@ class Engine {
   std::vector<Slot> slots_;
 
   // workspace, sized for max_batch tokens
-  float *x_, *x2_, *h_, *qb_, *kb_, *vb_, *att_, *o_, *gate_, *up_, *rows_, *logits_;
+  float *x_, *x2_, *h_, *qkv_, *qb_, *kb_, *vb_, *att_, *o_, *gu_, *rows_, *logits_;
   int32_t *tok_, *slot_, *pos_, *tiles_sliding_, *tiles_global_;
   int64_t max_tiles_sliding_ = 0, max_tiles_global_ = 0;
   xmx::Activations act_;
