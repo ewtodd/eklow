@@ -4,8 +4,8 @@ Live state. Design and targets: `DESIGN.md`; history and evidence: `DECISIONS.md
 
 ## Where things are
 
-- Source of truth: this repo (`~/Software/eklow` on e-desktop); the build/run tree on fiona is
-  `~/eklow` (rsync, no `.git`).
+- Source of truth: `github.com/ewtodd/eklow` (working copy `~/Software/eklow` on e-desktop); the
+  build/run tree on fiona is `~/eklow` (rsync, no `.git`).
 - Weights: `fiona:~/models/gemma-4-12b-it-qat-q4_0.gguf` (sha256 93567e57..., the file fiona's
   llama.cpp serves from `/var/cache/llama-cache`, which the fiona user cannot read).
 - Toolchain: the fleet's nixpkgs (c3f15ff4): intel-llvm 7.1.1, level-zero 1.32.0,
@@ -31,7 +31,8 @@ nix develop path:. -c ./build/eklow-xmx-bench --json xmx.json
 - [x] `eklow-probe`: memory, transfers, launch/sync, host-signal latency (DECISIONS 2026-10-24)
 - [x] `eklow-xmx-bench`: dpas layouts verified, fp16 98.8 TFLOPS, s8 x s4 with Q4_0 scales 222.8 TOPS,
       VRAM read 399 GB/s (DECISIONS 2026-10-24)
-- [ ] Level Zero runtime in fiona's system config: `/etc/nixos` ee3be49b, not deployed yet
+- [x] Level Zero runtime in fiona's system config (`/etc/nixos` ee3be49b, deployed); the package's
+      binaries find it through /run/opengl-driver
 
 ## Open
 

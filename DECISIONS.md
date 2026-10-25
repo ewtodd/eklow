@@ -53,8 +53,11 @@ on e-desktop (not in this repo: the items carry snippets of scraped web pages).
   nixpkgs so host and engine agree on the driver stack.
 - AOT device code goes through `ocloc`, which dlopens `libigc.so.2` by soname; the build puts
   intel-graphics-compiler on `LD_LIBRARY_PATH` (nix/package.nix).
-- Until fiona's system config carries intel-compute-runtime, the dev shell puts the Level Zero and
-  OpenCL drivers from the same nixpkgs on the loader path.
+- fiona's system config carries intel-compute-runtime (`/etc/nixos` ee3be49b). nixpkgs'
+  `libze_loader.so.1` has no runpath and dlopens the driver itself, so a runpath on eklow's
+  binaries would not reach it; the package wraps them with `/run/opengl-driver/lib` on
+  `LD_LIBRARY_PATH`. Checked on fiona: the store-built probe runs with no dev shell. The dev shell
+  carries its own copy of the drivers, so it works on any host.
 - Same working method as unholy: this repo is the source of truth; fiona builds an rsync of it
   without `.git` in `~/eklow`.
 

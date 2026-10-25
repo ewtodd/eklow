@@ -21,8 +21,8 @@
 
       pkgs = import nixpkgs { inherit system; };
       eklow = mkEklow { inherit pkgs; };
-      # Level Zero and OpenCL drivers from this nixpkgs, for hosts whose /run/opengl-driver does not
-      # carry intel-compute-runtime (fiona's system config gains it with M1).
+      # Level Zero and OpenCL drivers from this nixpkgs, so the shell works whatever the host's
+      # /run/opengl-driver carries (installed binaries use the system's, see nix/package.nix).
       driverLibs = with pkgs; [
         level-zero
         intel-compute-runtime

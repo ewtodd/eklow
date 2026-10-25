@@ -21,8 +21,9 @@ nix build            # AOT for DG2 (intel_gpu_dg2_g10)
 nix develop -c bash -c 'cmake -S . -B build -G Ninja && ninja -C build'
 ```
 
-The dev shell puts the Level Zero and OpenCL drivers on the loader path, so it runs on a host
-whose system config does not carry intel-compute-runtime.
+Installed binaries use the system's Level Zero driver from `/run/opengl-driver` (on NixOS,
+`hardware.graphics.extraPackages = [ pkgs.intel-compute-runtime ]`). The dev shell carries its own
+copy of the drivers, so it runs on any host.
 
 ## License
 

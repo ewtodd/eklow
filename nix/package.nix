@@ -6,7 +6,9 @@
   intel-compute-runtime,
   intel-graphics-compiler,
   level-zero,
+  addDriverRunpath,
   cmake,
+  makeWrapper,
   ninja,
   pkg-config,
   syclTargets,
@@ -28,6 +30,7 @@ intel-llvm.stdenv.mkDerivation {
 
   nativeBuildInputs = [
     cmake
+    makeWrapper
     ninja
     pkg-config
     # ocloc, which -fsycl-targets=intel_gpu_* calls for the ahead-of-time device code.
@@ -44,6 +47,19 @@ intel-llvm.stdenv.mkDerivation {
     (lib.cmakeFeature "CMAKE_BUILD_TYPE" "Release")
     (lib.cmakeFeature "EKLOW_SYCL_TARGETS" (lib.concatStringsSep "," syclTargets))
   ];
+
+  # nixpkgs' Level Zero loader has no runpath, so it never finds the system driver in
+  # /run/opengl-driver; a runpath on these binaries would not help, since the loader dlopens the
+  # driver itself. Sysman's environment path fails under xe, so free-memory queries go through
+  # zesInit.
+  postFixup = ''
+    for b in $out/bin/*; do
+      wrapProgram "$b" \
+        --prefix LD_LIBRARY_PATH : ${addDriverRunpath.driverLink}/lib \
+        --set-default UR_L0_ENABLE_ZESINIT_DEFAULT 1 \
+        --set-default UR_L0_ENABLE_SYSMAN_ENV_DEFAULT 0
+    done
+  '';
 
   meta = {
     description = "Serving engine for Gemma 4 on an Intel Arc A770M";
