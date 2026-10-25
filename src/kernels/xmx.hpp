@@ -31,8 +31,11 @@ struct Weight {
 };
 
 // Repacks a Q4_0 matrix (ggml layout, on the device) into a new allocation; the caller frees both
-// with free_weight / its own allocator. K must be a multiple of 32 and N of 8.
-Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw);
+// with free_weight / its own allocator. K must be a multiple of 32 and N of 8. With interleave,
+// the two halves of raw's rows (stacked gate and up projections) alternate in tiles of 8 columns:
+// output columns 16i..16i+7 are rows 8i..8i+7 of the first half and 16i+8..16i+15 the same rows of
+// the second, so that one thread of a matmul holds a gate tile and its up tile.
+Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave = false);
 void free_weight(sycl::queue& q, Weight& w);
 
 // Rows above which matmul takes fp16 activations.
@@ -76,5 +79,10 @@ void set_rows(Activations& a, int64_t m, int64_t k);
 // activations the shared-memory GEMM (n a multiple of 128). quantize and matmul only enqueue (the
 // queue must be in order); the caller waits.
 void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out);
+
+// GeGLU: gelu_tanh(gate) * up for w a gate|up matrix repacked with interleave, into `out` (n/2
+// wide) in the form the next matmul takes. On fp16 activations it is the GEMM's epilogue; the
+// int8 path goes through `scratch` (fp32, m x n).
+void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activations& out, float* scratch);
 
 }  // namespace eklow::xmx

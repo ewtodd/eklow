@@ -53,7 +53,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     if (t.type == gguf::Type::Q4_0) staging_bytes = std::max(staging_bytes, t.nbytes);
   auto* staging = sycl::malloc_device<uint8_t>(staging_bytes, q_);
   if (!staging) throw std::runtime_error("engine: out of device memory for weight staging");
-  auto matrix = [&](const std::vector<const gguf::Tensor*>& parts) {
+  auto matrix = [&](const std::vector<const gguf::Tensor*>& parts, bool interleave = false) {
     uint64_t at = 0;
     int64_t n = 0;
     for (const gguf::Tensor* t : parts) {
@@ -66,7 +66,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     }
     q_.wait();
     const ref::Weight raw{gguf::Type::Q4_0, int64_t(parts[0]->ne[0]), n, staging, parts[0]->nbytes / parts[0]->ne[1]};
-    xmx::Weight w = xmx::repack_q4_0(q_, raw);
+    xmx::Weight w = xmx::repack_q4_0(q_, raw, interleave);
     owned_.push_back(w.tiles);
     owned_.push_back(w.scales);
     return w;
@@ -113,7 +113,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     L.k_norm = vec(b + "attn_k_norm.weight");
     L.attn_post_norm = vec(b + "post_attention_norm.weight");
     L.ffn_norm = vec(b + "ffn_norm.weight");
-    L.gate_up = matrix({&need(b + "ffn_gate.weight"), &need(b + "ffn_up.weight")});
+    L.gate_up = matrix({&need(b + "ffn_gate.weight"), &need(b + "ffn_up.weight")}, true);
     L.down = matrix({&need(b + "ffn_down.weight")});
     L.ffn_post_norm = vec(b + "post_ffw_norm.weight");
     const gguf::Tensor* os = f.tensor(b + "layer_output_scale.weight");
@@ -168,7 +168,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   int64_t qkv_max = 0;
   for (const Layer& L : layers_) qkv_max = std::max(qkv_max, L.wqkv.n);
   qkv_ = dev(B * qkv_max);
-  gu_ = dev(B * 2 * F);
+  gu_ = dev(std::min(B, xmx::kFp16Rows) * 2 * F);  // the GeGLU's int8 path only
   rows_ = dev(c_.max_logits * E);
   logits_ = dev(c_.max_logits * cfg_.n_vocab);
   // At most one chunk per slot in a step, so at most n_slots partial tiles per K/V head.
@@ -180,12 +180,14 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     if (!*p) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(*p);
   }
-  act_ = xmx::alloc_activations(q_, B, std::max<int64_t>({E, F, H * Dg}));
+  act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * Dg));
+  act_ffn_ = xmx::alloc_activations(q_, B, F);
 }
 
 Engine::~Engine() {
   q_.wait();
   xmx::free_activations(q_, act_);
+  xmx::free_activations(q_, act_ffn_);
   if (attn_scratch_.q) sycl::free(attn_scratch_.q, q_);
   if (attn_scratch_.part) sycl::free(attn_scratch_.part, q_);
   for (void* p : owned_) sycl::free(p, q_);
@@ -323,11 +325,9 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     emit("attn_out" + s, x2_, {E, T});
     mark("post_attn");
 
-    xmx::matmul(q_, act_, L.gate_up, gu_);
+    xmx::matmul_geglu(q_, act_, L.gate_up, act_ffn_, gu_);
     mark("gate_up");
-    fast::gelu_quant(q_, gu_, T, F, act_);
-    mark("gelu");
-    xmx::matmul(q_, act_, L.down, o_);
+    xmx::matmul(q_, act_ffn_, L.down, o_);
     mark("down");
     const float* next_norm = l + 1 < cfg_.n_layer ? layers_[size_t(l) + 1].attn_norm : nullptr;
     fast::residual_norm_quant(q_, o_, L.ffn_post_norm, x2_, L.out_scale, x_, next_norm, cfg_.eps, T, E, &act_, h_);

@@ -65,7 +65,7 @@ class Engine {
 
  private:
   struct Layer {
-    xmx::Weight wqkv, wo, gate_up, down;  // wqkv: Q, K and (has_v) V stacked; gate_up likewise
+    xmx::Weight wqkv, wo, gate_up, down;  // wqkv: Q, K and (has_v) V stacked; gate_up interleaved
     bool has_v;
     const float *attn_norm, *q_norm, *k_norm, *attn_post_norm, *ffn_norm, *ffn_post_norm;
     float out_scale;
@@ -102,7 +102,7 @@ class Engine {
   float *x_, *x2_, *h_, *qkv_, *qb_, *kb_, *vb_, *att_, *o_, *gu_, *rows_, *logits_;
   int32_t *tok_, *slot_, *pos_, *tiles_sliding_, *tiles_global_;
   int64_t max_tiles_sliding_ = 0, max_tiles_global_ = 0;
-  xmx::Activations act_;
+  xmx::Activations act_, act_ffn_;  // matmul inputs: of width E or H x D, and of the FFN's width
   attn::Scratch attn_scratch_;
   std::map<std::string, double>* profile_ = nullptr;
   double enqueue_s_ = 0;

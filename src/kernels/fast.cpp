@@ -79,27 +79,6 @@ void rmsnorm(sycl::queue& q, const float* x, const float* w, int64_t rows, int64
   });
 }
 
-void rope_neox(sycl::queue& q, float* x, const int32_t* pos, int64_t n_tok, int64_t n_head, int64_t head_dim,
-               int64_t n_rot, const float* inv_freq) {
-  const int64_t half = n_rot / 2;
-  q.parallel_for(sycl::range<3>(size_t(n_tok), size_t(n_head), size_t(half)), [=](sycl::id<3> id) {
-    const int64_t t = int64_t(id[0]), h = int64_t(id[1]), i = int64_t(id[2]);
-    const float theta = float(pos[t]) * inv_freq[i];
-    const float c = sycl::cos(theta), s = sycl::sin(theta);
-    float* v = x + (t * n_head + h) * head_dim;
-    const float a = v[i], b = v[i + half];
-    v[i] = a * c - b * s;
-    v[i + half] = a * s + b * c;
-  });
-}
-
-void gelu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out) {
-  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
-    const float g = gate[id[0]];
-    out[id[0]] = 0.5f * g * (1.0f + sycl::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g))) * up[id[0]];
-  });
-}
-
 void qkv_heads(sycl::queue& q, const float* qkv, int64_t n_tok, int64_t n_head, int64_t n_head_kv, int64_t head_dim,
                bool has_v, const float* q_norm, const float* k_norm, float eps, const int32_t* pos, const float* inv_freq,
                float* Q, float* K, float* V) {
@@ -188,38 +167,6 @@ void residual_norm_quant(sycl::queue& q, const float* o, const float* w_o, const
     const float d = xmx::quantize_run(v, amax, aq + xmx::act_index(r, c0, kb));
     if (c0 % 32 == 0) as[xmx::act_scale_index(r, c0, kb)] = d;
   });
-}
-
-void gelu_quant(sycl::queue& q, const float* gu, int64_t rows, int64_t n, xmx::Activations& act) {
-  if (n % 512) throw std::runtime_error("fast::gelu_quant: width not a multiple of 512");
-  xmx::set_rows(act, rows, n);
-  int8_t* aq = act.q;
-  float* as = act.s;
-  sycl::half* ah = act.fp16 ? act.h : nullptr;
-  const int32_t N = int32_t(n), kb = N / 32;
-  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(rows), size_t(n / 8)), sycl::range<2>(1, 64)),
-                 [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
-                   const int32_t r = int32_t(it.get_global_id(0)), c0 = int32_t(it.get_global_id(1)) * 8;
-                   float v[8], amax = 0;
-                   for (int i = 0; i < 8; ++i) {
-                     const float g = gu[r * 2 * N + c0 + i], u = gu[r * 2 * N + N + c0 + i];
-                     v[i] = 0.5f * g * (1.0f + sycl::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g))) * u;
-                     amax = sycl::fmax(amax, sycl::fabs(v[i]));
-                   }
-                   if (ah) {
-                     for (int i = 0; i < 8; ++i) ah[xmx::act16_index(r, c0 + i, N / 16)] = sycl::half(v[i]);
-                     return;
-                   }
-                   auto sg = it.get_sub_group();
-                   amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 1));
-                   amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 2));
-                   const float d = xmx::quantize_run(v, amax, aq + xmx::act_index(r, c0, kb));
-                   if (c0 % 32 == 0) as[xmx::act_scale_index(r, c0, kb)] = d;
-                 });
-}
-
-void add_scale(sycl::queue& q, const float* a, const float* b, float s, int64_t n, float* out) {
-  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = (a[id[0]] + b[id[0]]) * s; });
 }
 
 void softcap(sycl::queue& q, float* x, float cap, int64_t n) {
