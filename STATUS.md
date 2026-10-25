@@ -70,10 +70,17 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
       chunks and decode tokens from several slots, paged fp16 KV (sliding rings, global page
       tables); within the oracle's noise floor for one chunk, chunked prefill, decode and two slots
       at once (DECISIONS 2026-10-24)
-- [ ] sampler, OpenAI-compatible server (streaming, tools, thinking), scheduler with continuous
-      batching, prefix cache, grammar-constrained tool calls
-- [ ] EmbeddingGemma 2 in the same process
-- [ ] NixOS module and fiona's config
+- [x] `eklow-server`: OpenAI-compatible /v1/chat/completions (streamed or whole; reasoning_content,
+      tool calls, thinking on unless turned off), /v1/models, /health; host sampler with the model
+      card's defaults; scheduler with continuous batching and per-slot prefix reuse; matches what
+      son-of-anton sends and reads (a survey of its client, DECISIONS 2026-10-25)
+- [x] EmbeddingGemma 2 in the same process, /v1/embeddings on its own port: cosine 0.9996-0.99995
+      against the llama.cpp server it replaces (reference kernels, 50-80 ms an input)
+- [x] NixOS module (`nix/module.nix`, models pinned by revision and hash) and fiona's config
+      (/etc/nixos 9c56ee15, build-checked; not deployed)
+- [ ] son-of-anton's Signal probe scenarios on eklow against llama.cpp
+- [ ] grammar-constrained tool calls
+- [ ] image input (llama.cpp's server on fiona had no projector either)
 
 ## Milestone 4 (speed), started early
 

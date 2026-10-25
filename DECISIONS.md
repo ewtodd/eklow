@@ -375,3 +375,29 @@ rescale when no maximum moved spilled 1.7 KB; both ran slower.
 At 16k depth the engine prefills 962 tok/s (2,048 tokens in 2.13 s): global attention 0.88 s at
 ~10.6 TFLOPS, the weight GEMMs 0.96 s at ~46.5 TOPS. 1,500 tok/s needs both: global attention near
 20 TFLOPS and the GEMMs near 60.
+
+## 2026-10-25 — the server, against what son-of-anton sends
+
+`eklow-server` (tools/server, src/serve): /v1/chat/completions renders the request with the
+template port, samples on the host and parses the output token by token; a scheduler thread runs
+continuous batching over the slots (one decode token per generating sequence, then prefill chunks)
+and gives a new request the free slot whose cached tokens share the longest prefix with its prompt.
+
+The compatibility surface comes from a read of son-of-anton's client, not from OpenAI's spec:
+- thinking is on unless the request says otherwise (reasoning_effort "none", think or
+  chat_template_kwargs.enable_thinking false); llama.cpp's server thinks by default too (231 of
+  239 baseline probe calls carried reasoning), and the agent's main turns send no reasoning field;
+- reasoning goes in delta.reasoning_content, tool calls as indexed deltas, usage in a final chunk
+  with empty choices and prompt_tokens_details.cached_tokens;
+- an over-long prompt fails as llama.cpp's 400 exceed_context_size_error with n_prompt_tokens and
+  n_ctx (the client matches the wording and compacts), while a max_tokens past the window is
+  capped (the agent asks for 65,536 on a 64k window);
+- image parts are refused with "image_url is not supported" / "does not support image input", which
+  the client takes as "strip images for this session";
+- /v1/models lists context_length first: the client takes the first context key it finds in an
+  entry, which on llama.cpp's listing is n_ctx_train.
+
+EmbeddingGemma 2 (llama.cpp's gemma-embedding2 graph: bidirectional attention, a symmetric
+sliding window of 512 positions either side, gated per-layer inputs, a 768-wide projection, mean
+pooling, L2 norm) runs on the reference kernels on its own queue; the house's llama.cpp embedding
+server on fiona gives the same vectors to cosine 0.9996-0.99995.
