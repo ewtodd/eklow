@@ -79,7 +79,7 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] NixOS module (`nix/module.nix`, models pinned by revision and hash) and fiona's config
       (/etc/nixos 9c56ee15, build-checked; not deployed)
 - [ ] son-of-anton's Signal probe scenarios on eklow against llama.cpp
-- [ ] grammar-constrained tool calls
+- [x] grammar-constrained tool calls (`src/serve/tool_grammar.cpp`, `eklow-grammar-test`)
 - [ ] image input (llama.cpp's server on fiona had no projector either)
 
 ## Milestone 4 (speed), started early
@@ -103,7 +103,8 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] fp16 GEMM through shared local memory for prefill: 48-52 TFLOPS in isolation; prefill 1,364 /
       1,243 / 993 tok/s at 1k / 4k / 16k (DECISIONS 2026-10-24, "fp16 GEMM")
 - [ ] decode GEMV toward the 399 GB/s the card reads
-- [ ] global KV for 2 x 262k: 8.6 GB in fp16 does not fit beside the weights
+- [x] int8 global KV (`--kv-int8`): 2 x 262k in ~4.8 GB, within the noise floor
+- [ ] 2 x 262k run end to end
 
 ## Open
 

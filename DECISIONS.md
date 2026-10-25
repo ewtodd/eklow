@@ -401,3 +401,26 @@ EmbeddingGemma 2 (llama.cpp's gemma-embedding2 graph: bidirectional attention, a
 sliding window of 512 positions either side, gated per-layer inputs, a 768-wide projection, mean
 pooling, L2 norm) runs on the reference kernels on its own queue; the house's llama.cpp embedding
 server on fiona gives the same vectors to cosine 0.9996-0.99995.
+
+## 2026-10-25 — int8 for the global layers' cache, and constrained tool calls
+
+2 x 262k does not fit in fp16: the eight global layers' K/V would be 8.6 GB beside 6.5 GB of
+weights and 1.3 GB of sliding rings. `--kv-int8` keeps them as int8 in the places the fp16 tiles
+use, with an fp16 scale per position and 16 dimensions (2 x 262k: ~4.8 GB). Against fp16 on the
+2,616-token prompt with decode the logits differ by mean KL 6.5e-3, under the oracle's noise floor
+(1.75e-2). A single scale per position over all 512 dimensions would let decode skip the
+per-element multiply (the K scale factors out of each score, the V scale into each probability)
+but cost KL 2.1e-2 against fp16: K and V have outlier dimensions. Decode is slower with int8 (470
+against 320 us a global layer at 16k; threads wait on loads, not bytes, and the conversion adds to
+the chain), so fp16 stays the default and int8 is for contexts fp16 cannot hold. Prefill is
+unchanged: its loader threads dequantize each block into shared memory.
+
+Tool calls are constrained. Inside <|tool_call>...<tool_call|> the scheduler samples only tokens the
+tool-call grammar allows (src/serve/tool_grammar.cpp): a pushdown automaton over the syntax the
+output parser accepts, with the name limited to the request's tools and nothing but <tool_call|>
+ending a call. A token is allowed if its bytes run through the automaton; the 262k-token vocabulary
+is bucketed by first byte, inside strings everything but other special tokens is allowed outright,
+and allowed sets are cached by state (mode, open containers, and the name or word so far) across
+requests. eklow-grammar-test on the vocabulary: 5,000 random well-formed calls accepted token by
+token; 4,997 random walks through the allowed sets closed, and every one parsed into a call of a
+declared tool.
