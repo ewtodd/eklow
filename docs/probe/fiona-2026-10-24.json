@@ -1,0 +1,301 @@
+{
+  "device": {
+    "name": "Intel(R) Arc(TM) A770M Graphics",
+    "vendor": "Intel(R) Corporation",
+    "driver_version": "1.17.39395",
+    "backend": "level_zero",
+    "compute_units": 512,
+    "max_work_group_size": 1024,
+    "global_mem_size": 16225243136,
+    "max_mem_alloc_size": 4294959104,
+    "local_mem_size": 65536,
+    "max_clock_mhz": 2050,
+    "sub_group_sizes": [
+      8,
+      16,
+      32
+    ],
+    "eu_count": 512,
+    "eu_simd_width": 8,
+    "slices": 8,
+    "subslices_per_slice": 4,
+    "eus_per_subslice": 16,
+    "threads_per_eu": 8,
+    "memory_clock_mhz": 0,
+    "memory_bus_width": 64,
+    "max_mem_bandwidth": null,
+    "free_memory": 16157835264,
+    "pci_address": "0000:03:00.0",
+    "device_id": 22160
+  },
+  "env": {
+    "ONEAPI_DEVICE_SELECTOR": null,
+    "UR_L0_USE_IMMEDIATE_COMMANDLISTS": null,
+    "UR_L0_ENABLE_ZESINIT_DEFAULT": "1",
+    "SYCL_PI_LEVEL_ZERO_USE_IMMEDIATE_COMMANDLISTS": null
+  },
+  "allocation": {
+    "chunk_bytes": 268435456,
+    "allocated_bytes": 16106127360,
+    "host_available_before": 29089579008,
+    "host_available_after": 29087248384,
+    "allocated_gib": 15,
+    "stopped_by": "reached the reported size",
+    "seconds": 0.132858342,
+    "verified": true
+  },
+  "copies": [
+    {
+      "host": "pinned",
+      "direction": "h2d",
+      "bytes": 4096,
+      "repeats": 2000,
+      "best_gbps": 3.42761506,
+      "median_gbps": 3.34914146,
+      "median_us": 1.223
+    },
+    {
+      "host": "pinned",
+      "direction": "h2d",
+      "bytes": 65536,
+      "repeats": 2000,
+      "best_gbps": 3.31425104,
+      "median_gbps": 1.20899515,
+      "median_us": 54.207
+    },
+    {
+      "host": "pinned",
+      "direction": "h2d",
+      "bytes": 1048576,
+      "repeats": 2000,
+      "best_gbps": 10.1633777,
+      "median_gbps": 8.68242113,
+      "median_us": 120.77
+    },
+    {
+      "host": "pinned",
+      "direction": "h2d",
+      "bytes": 16777216,
+      "repeats": 205,
+      "best_gbps": 11.5360686,
+      "median_gbps": 11.4302096,
+      "median_us": 1467.796
+    },
+    {
+      "host": "pinned",
+      "direction": "h2d",
+      "bytes": 268435456,
+      "repeats": 14,
+      "best_gbps": 11.7557024,
+      "median_gbps": 11.6892536,
+      "median_us": 22964.294
+    },
+    {
+      "host": "pinned",
+      "direction": "h2d",
+      "bytes": 1073741824,
+      "repeats": 4,
+      "best_gbps": 11.7577557,
+      "median_gbps": 11.6795887,
+      "median_us": 91933.188
+    },
+    {
+      "host": "pinned",
+      "direction": "d2h",
+      "bytes": 4096,
+      "repeats": 2000,
+      "best_gbps": 0.294930876,
+      "median_gbps": 0.116436409,
+      "median_us": 35.178
+    },
+    {
+      "host": "pinned",
+      "direction": "d2h",
+      "bytes": 65536,
+      "repeats": 2000,
+      "best_gbps": 1.84973187,
+      "median_gbps": 1.64086129,
+      "median_us": 39.94
+    },
+    {
+      "host": "pinned",
+      "direction": "d2h",
+      "bytes": 1048576,
+      "repeats": 2000,
+      "best_gbps": 8.54578202,
+      "median_gbps": 7.78123585,
+      "median_us": 134.757
+    },
+    {
+      "host": "pinned",
+      "direction": "d2h",
+      "bytes": 16777216,
+      "repeats": 187,
+      "best_gbps": 11.0830095,
+      "median_gbps": 10.2169271,
+      "median_us": 1642.1
+    },
+    {
+      "host": "pinned",
+      "direction": "d2h",
+      "bytes": 268435456,
+      "repeats": 13,
+      "best_gbps": 11.2564184,
+      "median_gbps": 11.2519553,
+      "median_us": 23856.783
+    },
+    {
+      "host": "pinned",
+      "direction": "d2h",
+      "bytes": 1073741824,
+      "repeats": 4,
+      "best_gbps": 11.3265197,
+      "median_gbps": 11.326069,
+      "median_us": 94802.691
+    },
+    {
+      "host": "pageable",
+      "direction": "h2d",
+      "bytes": 1048576,
+      "repeats": 2000,
+      "best_gbps": 9.47702541,
+      "median_gbps": 9.46009635,
+      "median_us": 110.842
+    },
+    {
+      "host": "pageable",
+      "direction": "h2d",
+      "bytes": 16777216,
+      "repeats": 173,
+      "best_gbps": 9.95638522,
+      "median_gbps": 9.73763005,
+      "median_us": 1722.926
+    },
+    {
+      "host": "pageable",
+      "direction": "h2d",
+      "bytes": 268435456,
+      "repeats": 12,
+      "best_gbps": 10.4077353,
+      "median_gbps": 10.3328181,
+      "median_us": 25978.92
+    },
+    {
+      "host": "pageable",
+      "direction": "h2d",
+      "bytes": 1073741824,
+      "repeats": 3,
+      "best_gbps": 10.4303185,
+      "median_gbps": 10.4241987,
+      "median_us": 103004.735
+    },
+    {
+      "host": "pageable",
+      "direction": "d2h",
+      "bytes": 1048576,
+      "repeats": 1092,
+      "best_gbps": 3.9430082,
+      "median_gbps": 3.84168355,
+      "median_us": 272.947
+    },
+    {
+      "host": "pageable",
+      "direction": "d2h",
+      "bytes": 16777216,
+      "repeats": 107,
+      "best_gbps": 6.10694607,
+      "median_gbps": 6.02145832,
+      "median_us": 2786.238
+    },
+    {
+      "host": "pageable",
+      "direction": "d2h",
+      "bytes": 268435456,
+      "repeats": 8,
+      "best_gbps": 6.35681965,
+      "median_gbps": 6.30929593,
+      "median_us": 42546.024
+    },
+    {
+      "host": "pageable",
+      "direction": "d2h",
+      "bytes": 1073741824,
+      "repeats": 3,
+      "best_gbps": 6.39902309,
+      "median_gbps": 6.39173318,
+      "median_us": 167989.15
+    }
+  ],
+  "copy_round_trip_verified": true,
+  "launch": {
+    "submit_wait_us": {
+      "min": 5.206,
+      "median": 5.439,
+      "p99": 7.639,
+      "mean": 5.702238
+    },
+    "back_to_back_us": 3.2668114,
+    "device_time_us": {
+      "min": 1.145,
+      "median": 1.146,
+      "p99": 1.667,
+      "mean": 1.19066
+    }
+  },
+  "host_signal": [
+    {
+      "memory": "malloc_host",
+      "poll": "atomic",
+      "samples": 0,
+      "lost": 100
+    },
+    {
+      "memory": "malloc_host",
+      "poll": "atomic+fence",
+      "samples": 0,
+      "lost": 100
+    },
+    {
+      "memory": "malloc_host",
+      "poll": "uncached",
+      "samples": 0,
+      "lost": 100
+    },
+    {
+      "memory": "ze_uncached",
+      "poll": "atomic",
+      "samples": 100,
+      "lost": 0,
+      "round_trip_us": {
+        "min": 3.837,
+        "median": 3.876,
+        "p99": 4.235,
+        "mean": 3.90346
+      }
+    },
+    {
+      "memory": "ze_uncached",
+      "poll": "atomic+fence",
+      "samples": 100,
+      "lost": 0,
+      "round_trip_us": {
+        "min": 3.867,
+        "median": 3.925,
+        "p99": 4.181,
+        "mean": 3.94543
+      }
+    },
+    {
+      "memory": "ze_uncached",
+      "poll": "uncached",
+      "samples": 99,
+      "lost": 1,
+      "round_trip_us": {
+        "min": 2.647,
+        "median": 2.867,
+        "p99": 4.569,
+        "mean": 2.96878788
+      }
+    }
+  ]
+}
