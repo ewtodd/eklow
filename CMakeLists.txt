@@ -49,18 +49,36 @@ target_link_libraries(eklow-tok PRIVATE eklow_text)
 add_executable(eklow-chat tools/chat/main.cpp)
 target_link_libraries(eklow-chat PRIVATE eklow_text)
 
+# Device runtime: picking the card. SYCL plus Level Zero.
+add_library(eklow_rt STATIC src/rt/device.cpp)
+target_include_directories(eklow_rt PUBLIC src)
+target_link_libraries(eklow_rt PUBLIC PkgConfig::LEVEL_ZERO)
+eklow_sycl(eklow_rt)
+
+# The model: configuration, weights on the card, reference kernels and the reference forward.
+add_library(eklow_model STATIC
+  src/kernels/ref.cpp
+  src/model/gemma4.cpp
+)
+target_link_libraries(eklow_model PUBLIC eklow_host eklow_rt)
+eklow_sycl(eklow_model)
+
+add_executable(eklow-ref-run tools/ref_run/main.cpp)
+target_link_libraries(eklow-ref-run PRIVATE eklow_model)
+eklow_sycl(eklow-ref-run)
+
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
 # eklow-probe: what the card offers (memory, transfers, launch/sync and wake latency).
 add_executable(eklow-probe tools/probe/probe.cpp)
-target_link_libraries(eklow-probe PRIVATE eklow_host PkgConfig::LEVEL_ZERO)
+target_link_libraries(eklow-probe PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-probe)
 
 # eklow-xmx-bench: dpas layouts checked against the CPU, XMX throughput, the Q4_0 inner loops and
 # VRAM read bandwidth.
 add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
-target_link_libraries(eklow-xmx-bench PRIVATE eklow_host)
+target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-probe eklow-xmx-bench RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-probe eklow-xmx-bench eklow-ref-run RUNTIME DESTINATION bin)

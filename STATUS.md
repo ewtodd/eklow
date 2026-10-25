@@ -30,7 +30,10 @@ e-desktop, so it runs on e-desktop):
 ```
 nix build .#oracle
 ./result/bin/eklow-oracle --model gemma-4-12b-it-qat-q4_0.gguf --out DIR --prompt-file chat.txt
-nix develop -c python3 tools/ref/compare_dumps.py REF_DIR TEST_DIR
+scp DIR/tokens.json fiona:run/                                   # the same tokens for eklow
+nix develop path:. -c ./build/eklow-ref-run --model ~/models/gemma-4-12b-it-qat-q4_0.gguf \
+    --out ~/run --tokens-json ~/run/tokens.json                  # on fiona, Gemma's server stopped
+nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 ```
 
 ## Milestone 1 (foundation)
@@ -54,7 +57,11 @@ nix develop -c python3 tools/ref/compare_dumps.py REF_DIR TEST_DIR
       identical to transformers' `apply_chat_template` on 20,416 conversations and, tokenized with
       special tokens only in template text, on 3.82M tokens; request text cannot inject special
       tokens (DECISIONS 2026-10-24)
-- [ ] reference kernels and the reference forward, compared per layer against the oracle
+- [x] reference kernels (`src/kernels/ref.cpp`) and the reference forward (`src/model/gemma4.cpp`,
+      `eklow-ref-run`): on a 25-token chat prompt top-1 25/25, mean KL 3.9e-3; on 2,616 tokens top-1
+      31/32, mean KL 1.9e-2, the same band as llama.cpp CUDA against CPU (DECISIONS 2026-10-24)
+- [ ] streaming parser for the thinking channel and tool calls
+- [ ] image input (bidirectional attention among an image's tokens on sliding layers): with M3
 
 ## Open
 

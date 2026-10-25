@@ -3,8 +3,8 @@
 Usage: python3 tools/ref/compare_dumps.py REF_DIR TEST_DIR [--prefix P]
 
 For every tensor present in both (in REF's order): relative L2 error ||t - r|| / ||r||, max
-absolute difference and cosine similarity. Then, over the logits of every position: top-1
-agreement and the mean KL divergence KL(ref || test).
+absolute difference and cosine similarity. Then, over the logits of the positions both hold (a dump
+may keep only its last `logits_rows`): top-1 agreement and the mean KL divergence KL(ref || test).
 """
 
 import argparse
@@ -43,8 +43,12 @@ def main():
 
     n, V = ri["n_tokens"], ri["n_vocab"]
     if ti["n_tokens"] == n and ti["n_vocab"] == V:
-        lr = np.fromfile(Path(a.ref) / "logits.f32", dtype=np.float32).reshape(n, V).astype(np.float64)
-        lt = np.fromfile(Path(a.test) / "logits.f32", dtype=np.float32).reshape(n, V).astype(np.float64)
+        # Either side may hold only its last logits_rows positions; compare the overlap.
+        rr, tr = ri.get("logits_rows", n), ti.get("logits_rows", n)
+        rows = min(rr, tr)
+        lr = np.fromfile(Path(a.ref) / "logits.f32", dtype=np.float32).reshape(rr, V)[rr - rows:].astype(np.float64)
+        lt = np.fromfile(Path(a.test) / "logits.f32", dtype=np.float32).reshape(tr, V)[tr - rows:].astype(np.float64)
+        n = rows
 
         def logp(l):
             l = l - l.max(axis=1, keepdims=True)

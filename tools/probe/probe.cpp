@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "core/json.hpp"
+#include "rt/device.hpp"
 
 using namespace eklow;
 using Clock = std::chrono::steady_clock;
@@ -46,31 +47,6 @@ Stats stats(std::vector<double> v) {
 void write_stats(json::Writer& w, const char* key, const Stats& s, double scale) {
   w.key(key).begin_object().kv("min", s.min * scale).kv("median", s.median * scale).kv("p99", s.p99 * scale)
       .kv("mean", s.mean * scale).end_object();
-}
-
-// Level Zero's own flag; a device whose properties cannot be read counts as integrated, so the
-// allocation probe never runs on it.
-bool integrated(const sycl::device& d) {
-  ze_device_properties_t props{};
-  props.stype = ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES;
-  if (d.get_backend() != sycl::backend::ext_oneapi_level_zero ||
-      zeDeviceGetProperties(sycl::get_native<sycl::backend::ext_oneapi_level_zero>(d), &props) != ZE_RESULT_SUCCESS)
-    return true;
-  return props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED;
-}
-
-// The discrete Level Zero GPU with the most memory. The same cards also show up through OpenCL, and
-// an integrated GPU reports the host's RAM as its own, so it would win on size alone (fiona's Iris
-// Xe reports 28.6 GiB against the A770M's 16).
-sycl::device pick_device() {
-  std::vector<sycl::device> gpus;
-  for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
-    if (d.get_backend() == sycl::backend::ext_oneapi_level_zero) gpus.push_back(d);
-  if (gpus.empty()) throw std::runtime_error("no Level Zero GPUs (is the Level Zero driver on the loader path?)");
-  auto rank = [](const sycl::device& d) {
-    return std::pair{!integrated(d), d.get_info<sycl::info::device::global_mem_size>()};
-  };
-  return *std::max_element(gpus.begin(), gpus.end(), [&](const sycl::device& a, const sycl::device& b) { return rank(a) < rank(b); });
 }
 
 const char* backend_name(sycl::backend b) {
@@ -135,7 +111,7 @@ uint64_t mem_available() {
 // fiona out of memory that way), and it stops as soon as the host's available memory falls by more
 // than 512 MiB: xe can evict device allocations to system RAM under pressure.
 void alloc_probe(json::Writer& w, sycl::queue& q) {
-  if (integrated(q.get_device())) {
+  if (rt::integrated(q.get_device())) {
     w.key("allocation").begin_object().kv("skipped", "integrated GPU").end_object();
     std::printf("allocation: skipped on an integrated GPU\n");
     return;
@@ -381,7 +357,7 @@ int main(int argc, char** argv) {
     }
   }
   try {
-    sycl::device dev = pick_device();
+    sycl::device dev = rt::pick_device();
     sycl::queue q(dev, sycl::property::queue::in_order());
     json::Writer w;
     w.begin_object();

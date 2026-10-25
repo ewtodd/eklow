@@ -206,3 +206,28 @@ tokenization of the joined prompt whenever no request text spells a special toke
 tokenizes as A, <, |, turn, >, B. A GGUF whose `tokenizer.chat_template` is not this template
 (FNV-1a fingerprint) is refused rather than rendered wrong; a new Google template means a new port
 and a new comparison run.
+
+## 2026-10-24 — the reference forward pass matches the oracle within its noise floor
+
+`src/kernels/ref.cpp` holds plain SYCL reference kernels (fp32 activations and accumulation,
+Q4_0 and Q6_K dequantized as ggml stores them, RoPE angles computed on the host in double since the
+A770M has no fp64, every launch split well under xe's 5 s timeout) and `src/model/gemma4.cpp` the
+12B's forward pass, following llama.cpp's gemma4 graph: embeddings times sqrt(3840); q/k norms with
+weights, v norm without; V is K's projection, before K's norm, on the global layers; attention scale
+1; NeoX RoPE, base 1e4 on sliding layers and 1e6 divided by `rope_freqs` on global ones; sliding
+layers see the last 1024 positions; GeGLU with tanh gelu; post-attention and post-FFN norms;
+`layer_output_scale`; tied Q6_K head with a 30 softcap. `eklow-ref-run` dumps in the oracle's format.
+
+| | eklow reference vs CPU oracle | CUDA llama.cpp vs CPU oracle |
+|---|---|---|
+| 25-token chat prompt: layer outputs, relative L2 | 0.7-2.6% (cosine >= 0.9997) | 2-18% |
+| 25-token chat prompt: top-1, mean KL | 25/25, 3.9e-3 | 24/25, 4.7e-3 |
+| 2,616 tokens (DESIGN.md as a user turn): layer 35 / 46 | 10.8% / 8.8% | 9.8% / 8.5% |
+| 2,616 tokens: top-1 over the last 32, mean KL | 31/32, 1.9e-2 | 30/32, 1.75e-2 |
+
+The first matmul already differs by 0.4%, which is the oracle quantizing activations to Q8_0 for
+Q4_0 matmuls where the reference stays in fp32. On the long prompt the error grows with depth and
+with position for eklow and for CUDA alike, with no step at position 1024, so the sliding window and
+long-range RoPE are right; the drift is the quantized model's own sensitivity, which two llama.cpp
+backends show against each other. The reference runs 25 tokens in 12 s and 2,616 in 135 s on the
+A770M; speed is M4's job.

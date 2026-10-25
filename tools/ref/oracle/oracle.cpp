@@ -1,7 +1,7 @@
 // eklow-oracle: llama.cpp's CPU backend on the same GGUF, as the reference eklow is checked against.
 //
 //   eklow-oracle --model GGUF --out DIR (--prompt TEXT | --prompt-file FILE | --tokens 2,818,...)
-//                [--tensors PREFIX,...] [--list] [--threads N] [--ngl N]
+//                [--tensors PREFIX,...] [--list] [--threads N] [--ngl N] [--logits-last N]
 //
 // Runs one forward pass over the whole prompt (one ubatch, fp32 KV cache, no flash attention) and
 // writes to DIR:
@@ -9,7 +9,7 @@
 //                   parsed and BOS added as the model asks)
 //   index.json      one entry per dumped tensor: name, ggml shape (ne[0] fastest), file
 //   NAME.f32        the tensor as float32, in ggml order
-//   logits.f32      n_tokens x n_vocab logits for every position
+//   logits.f32      n_vocab logits for every position (or the last --logits-last), row by row
 // --tensors takes name prefixes matched against llama.cpp's graph tensor names (default: l_out-,
 // result_norm, result_output); --list prints every graph tensor name and shape once. --ngl offloads
 // layers to a GPU backend when the linked llama.cpp has one (default 0: CPU only).
@@ -100,7 +100,7 @@ std::vector<std::string> split(const std::string& s, char sep) {
 int usage() {
   std::fprintf(stderr,
                "usage: eklow-oracle --model GGUF --out DIR (--prompt TEXT | --prompt-file FILE | --tokens IDS)\n"
-               "                    [--tensors PREFIX,...] [--list] [--threads N] [--ngl N]\n");
+               "                    [--tensors PREFIX,...] [--list] [--threads N] [--ngl N] [--logits-last N]\n");
   return 2;
 }
 
@@ -109,7 +109,7 @@ int usage() {
 int main(int argc, char** argv) {
   std::string model_path, prompt, tokens_arg;
   bool have_prompt = false;
-  int threads = 0, ngl = 0;
+  int threads = 0, ngl = 0, logits_last = 0;
   Dump d;
   d.prefixes = {"l_out-", "result_norm", "result_output"};
   for (int i = 1; i < argc; ++i) {
@@ -127,6 +127,7 @@ int main(int argc, char** argv) {
     else if (a == "--list") d.list = true;
     else if (a == "--threads") threads = std::atoi(next().c_str());
     else if (a == "--ngl") ngl = std::atoi(next().c_str());
+    else if (a == "--logits-last") logits_last = std::atoi(next().c_str());
     else return usage();
   }
   if (model_path.empty() || d.dir.empty() || (!have_prompt && tokens_arg.empty())) return usage();
@@ -191,7 +192,7 @@ int main(int argc, char** argv) {
     batch.pos[i] = i;
     batch.n_seq_id[i] = 1;
     batch.seq_id[i][0] = 0;
-    batch.logits[i] = 1;
+    batch.logits[i] = logits_last <= 0 || i >= n_tok - logits_last;
   }
   batch.n_tokens = n_tok;
   if (d.list) std::printf("graph tensors:\n");
@@ -201,11 +202,13 @@ int main(int argc, char** argv) {
   }
 
   const int n_vocab = llama_vocab_n_tokens(vocab);
+  const int first = logits_last > 0 && logits_last < n_tok ? n_tok - logits_last : 0;
   std::ofstream lf(d.dir + "/logits.f32", std::ios::binary);
-  for (int i = 0; i < n_tok; ++i)
+  for (int i = first; i < n_tok; ++i)
     lf.write(reinterpret_cast<const char*>(llama_get_logits_ith(ctx, i)), size_t(n_vocab) * sizeof(float));
-  std::ofstream(d.dir + "/index.json") << "{\"n_tokens\": " << n_tok << ", \"n_vocab\": " << n_vocab << ", \"tensors\": ["
-                                       << d.index.str() << "\n]}\n";
+  std::ofstream(d.dir + "/index.json") << "{\"n_tokens\": " << n_tok << ", \"n_vocab\": " << n_vocab
+                                       << ", \"logits_rows\": " << n_tok - first << ", \"tensors\": [" << d.index.str()
+                                       << "\n]}\n";
   std::printf("oracle: %d tokens, %d vocab, wrote %s\n", n_tok, n_vocab, d.dir.c_str());
 
   llama_batch_free(batch);

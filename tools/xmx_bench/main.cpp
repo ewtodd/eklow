@@ -29,6 +29,7 @@
 #include <vector>
 
 #include "core/json.hpp"
+#include "rt/device.hpp"
 
 using namespace eklow;
 namespace esimd = sycl::ext::intel::esimd;
@@ -334,17 +335,6 @@ double run_bandwidth(sycl::queue& q, uint32_t* buf, size_t bytes, size_t threads
   return best;
 }
 
-sycl::device pick_device() {
-  std::vector<sycl::device> gpus;
-  for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))
-    if (d.get_backend() == sycl::backend::ext_oneapi_level_zero) gpus.push_back(d);
-  if (gpus.empty()) throw std::runtime_error("no Level Zero GPUs");
-  // The A770M has more execution units than any integrated GPU it shares a host with.
-  return *std::max_element(gpus.begin(), gpus.end(), [](const sycl::device& a, const sycl::device& b) {
-    return a.get_info<sycl::info::device::max_compute_units>() < b.get_info<sycl::info::device::max_compute_units>();
-  });
-}
-
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -357,7 +347,7 @@ int main(int argc, char** argv) {
     }
   }
   try {
-    sycl::device dev = pick_device();
+    sycl::device dev = rt::pick_device();
     sycl::queue q(dev, {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
     const unsigned eus = dev.get_info<sycl::info::device::max_compute_units>();
     const unsigned mhz = dev.get_info<sycl::info::device::max_clock_frequency>();
