@@ -55,6 +55,9 @@
     {
       lib.${system} = { inherit mkEklow; };
 
+      # services.eklow; the package is built with the host's nixpkgs.
+      nixosModules.default = ./nix/module.nix;
+
       packages.${system} = {
         default = eklow;
         inherit eklow oracle llamaCpuAvx2;

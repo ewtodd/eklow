@@ -8,7 +8,6 @@ namespace eklow::fast {
 
 namespace {
 
-
 // The 6-bit value (0..63) of element i of a Q6_K block (ql[128], qh[64], int8 scales[16], fp16 d),
 // as ggml lays it out.
 inline int q6k_value(const uint8_t* blk, int i) {
