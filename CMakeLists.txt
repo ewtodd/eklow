@@ -59,8 +59,10 @@ target_include_directories(eklow_rt PUBLIC src)
 target_link_libraries(eklow_rt PUBLIC PkgConfig::LEVEL_ZERO)
 eklow_sycl(eklow_rt)
 
-# The model: configuration, weights on the card, reference kernels and the reference forward.
+# The model: configuration, weights on the card, the kernels and the reference forward.
 add_library(eklow_model STATIC
+  src/kernels/attention.cpp
+  src/kernels/fast.cpp
   src/kernels/ref.cpp
   src/kernels/xmx.cpp
   src/model/gemma4.cpp
@@ -76,6 +78,15 @@ add_executable(eklow-ref-run tools/ref_run/main.cpp)
 target_link_libraries(eklow-ref-run PRIVATE eklow_model)
 eklow_sycl(eklow-ref-run)
 
+# The serving forward pass: KV cache, batched steps over several sequences.
+add_library(eklow_engine STATIC src/engine/engine.cpp)
+target_link_libraries(eklow_engine PUBLIC eklow_model)
+eklow_sycl(eklow_engine)
+
+add_executable(eklow-engine-run tools/engine_run/main.cpp)
+target_link_libraries(eklow-engine-run PRIVATE eklow_engine)
+eklow_sycl(eklow-engine-run)
+
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
@@ -90,4 +101,4 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-engine-run RUNTIME DESTINATION bin)
