@@ -3,7 +3,7 @@
 //
 //   eklow-engine-bench --model GGUF [--prefill 1024,4096,16384] [--chunk 2048]
 //                      [--depth 0,4096,16384] [--decode-ctx 0,4096,16384] [--decode-steps 64]
-//                      [--slots N] [--profile] [--json FILE]
+//                      [--slots N] [--profile] [--kv-int8] [--json FILE]
 //
 // Prefill: a fresh sequence of N tokens in chunks of --chunk; tokens per second over the whole
 // prompt. Depth (llama-bench's -d): the sequence first filled to D tokens untimed, then two chunks
@@ -63,7 +63,7 @@ int main(int argc, char** argv) {
   std::vector<int64_t> prefill = {1024, 4096, 16384}, decode_ctx = {0, 4096, 16384}, depth;
   int64_t chunk = 2048, decode_steps = 64;
   int slots = 1;
-  bool profile = false;
+  bool profile = false, kv_int8 = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -76,9 +76,10 @@ int main(int argc, char** argv) {
     else if (a == "--slots") slots = std::atoi(next().c_str());
     else if (a == "--profile") profile = true;
     else if (a == "--json") json_path = next();
+    else if (a == "--kv-int8") kv_int8 = true;
     else {
       std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--depth N,...] [--decode-ctx N,...] "
-                           "[--decode-steps N] [--slots N] [--profile] [--json FILE]\n");
+                           "[--decode-steps N] [--slots N] [--profile] [--kv-int8] [--json FILE]\n");
       return 2;
     }
   }
@@ -92,6 +93,7 @@ int main(int argc, char** argv) {
     ec.max_ctx = (longest + 255) / 256 * 256;
     ec.max_batch = std::max<int64_t>(chunk, slots);
     ec.max_chunk = chunk;
+    ec.int8_global_kv = kv_int8;
     ec.max_logits = slots;
 
     auto f = gguf::File::open(model);

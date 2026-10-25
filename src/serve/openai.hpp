@@ -44,6 +44,7 @@ struct ChatRequest {
   std::vector<std::string> stop;
   bool stream = false, include_usage = false, thinking = false, tools = false;
   bool in_thinking = false;  // the prompt ends inside the thought channel
+  std::vector<std::string> tool_names;
 };
 
 // Renders the conversation with Gemma 4's template and tokenizes it (request text without special

@@ -6,7 +6,8 @@
 // Correctness: two slots hold different random sequences of --len tokens, fed in the same steps as
 // prefill chunks of --chunk and then --decode single tokens; every output row is compared with the
 // reference over the whole sequence, for Gemma 4's sliding (head 256, 8 K/V heads, ring, window
-// 1024) and global (head 512, one K/V head, page table) layers. Speed: the cache filled to each
+// 1024) and global (head 512, one K/V head, page table) layers, with fp16 caches and int8 ones
+// (sliding8, global8). Speed: the cache filled to each
 // --time-ctx, one decode token and one 1024-token prefill chunk ending there, timed on the card.
 #include <sycl/sycl.hpp>
 
@@ -34,8 +35,10 @@ constexpr int64_t kHeads = 16;
 struct Kind {
   const char* name;
   int64_t head_dim, n_head_kv, window;
+  bool int8;
 };
-constexpr Kind kKinds[] = {{"sliding", 256, 8, 1024}, {"global", 512, 1, 0}};
+constexpr Kind kKinds[] = {{"sliding", 256, 8, 1024, false}, {"global", 512, 1, 0, false},
+                           {"sliding8", 256, 8, 1024, true}, {"global8", 512, 1, 0, true}};
 
 std::vector<int64_t> list(const std::string& s) {
   std::vector<int64_t> out;
@@ -78,9 +81,13 @@ struct TestCache {
         for (int64_t p = 0; p < c.pages; ++p) table[size_t(s * c.pages + p)] = int32_t(p * slots + (slots - 1 - s));
       table_dev = upload(q, table);
     }
-    const size_t halves = size_t(pages * k.n_head_kv * attn::kPage * k.head_dim);
-    c.k = sycl::malloc_device<sycl::half>(halves, q);
-    c.v = sycl::malloc_device<sycl::half>(halves, q);
+    const size_t elems = size_t(pages * k.n_head_kv * attn::kPage * k.head_dim);
+    c.k = sycl::malloc_device(elems * (k.int8 ? 1 : 2), q);
+    c.v = sycl::malloc_device(elems * (k.int8 ? 1 : 2), q);
+    if (k.int8) {
+      c.ks = sycl::malloc_device<sycl::half>(elems / 16, q);
+      c.vs = sycl::malloc_device<sycl::half>(elems / 16, q);
+    }
     c.table = table_dev;
     c.window = k.window;
     c.n_head_kv = k.n_head_kv;
@@ -89,6 +96,8 @@ struct TestCache {
   void free(sycl::queue& q) {
     sycl::free(c.k, q);
     sycl::free(c.v, q);
+    if (c.ks) sycl::free(c.ks, q);
+    if (c.vs) sycl::free(c.vs, q);
     if (table_dev) sycl::free(table_dev, q);
   }
 };
@@ -214,8 +223,8 @@ int main(int argc, char** argv) {
         }
       }
       const double rel = std::sqrt(err2 / ref2);
-      // fp16 probabilities and fp32 accumulation: a few 1e-4 relative.
-      const bool pass = rel < 2e-3;
+      // fp16 probabilities and fp32 accumulation: a few 1e-4 relative; int8 K/V a few 1e-3.
+      const bool pass = rel < (k.int8 ? 2e-2 : 2e-3);
       ok = ok && pass;
       std::printf("%-8s %zu steps, 2 slots: rel L2 %.3g, max abs %.3g %s\n", k.name, sched.size(), rel, max_abs, pass ? "ok" : "FAIL");
       w.begin_object().kv("kind", k.name).kv("rel_l2", rel).kv("max_abs", max_abs).kv("pass", pass).end_object();

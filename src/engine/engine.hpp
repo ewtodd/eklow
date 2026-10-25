@@ -28,6 +28,10 @@ struct Config {
   int64_t max_batch = 2048;  // tokens per step
   int64_t max_chunk = 1024;  // tokens per chunk: the sliding rings hold the window and one chunk
   int64_t max_logits = 64;   // logits rows per step
+  // The global layers' K/V as int8 with a scale per 16 dimensions (attention.hpp): half the
+  // memory, which 2 x 262k needs, at a cost to decode (the conversion adds to what each thread
+  // waits on) and within the oracle's noise.
+  bool int8_global_kv = false;
 };
 
 struct Chunk {
@@ -98,8 +102,13 @@ class Engine {
   std::vector<Layer> layers_;
 
   // KV cache
-  sycl::half *ring_k_ = nullptr, *ring_v_ = nullptr, *page_k_ = nullptr, *page_v_ = nullptr;
-  int64_t ring_layer_stride_ = 0, page_layer_stride_ = 0, ring_pages_ = 0, n_pages_ = 0, max_pages_ = 0;
+  sycl::half *ring_k_ = nullptr, *ring_v_ = nullptr;
+  struct GlobalCache {
+    void *k = nullptr, *v = nullptr;
+    sycl::half *ks = nullptr, *vs = nullptr;
+  };
+  std::vector<GlobalCache> global_;
+  int64_t ring_layer_stride_ = 0, ring_pages_ = 0, n_pages_ = 0, max_pages_ = 0;
   int64_t group_sliding_ = 0, group_global_ = 0, hkv_sliding_ = 0, hkv_global_ = 0;
   int32_t* page_table_ = nullptr;
   std::vector<int32_t> page_table_host_, free_pages_;

@@ -32,7 +32,7 @@ bool Request::cancelled() const {
 }
 
 Scheduler::Scheduler(engine::Engine& eng, const text::Tokenizer& tok, const SchedulerConfig& c)
-    : eng_(eng), tok_(tok), c_(c), seqs_(size_t(eng.n_slots())) {}
+    : eng_(eng), tok_(tok), vocab_(std::make_shared<ToolVocab>(tok)), c_(c), seqs_(size_t(eng.n_slots())) {}
 
 void Scheduler::submit(std::shared_ptr<Request> r) {
   if (r->prompt.empty()) throw std::invalid_argument("empty prompt");
@@ -85,6 +85,7 @@ bool Scheduler::admit() {
     q.called = false;
     q.parser = std::make_unique<text::OutputParser>(tok_, r->in_thinking);
     q.sampler = std::make_unique<Sampler>(r->sampling);
+    q.grammar = r->tools.empty() ? nullptr : std::make_unique<ToolGrammar>(vocab_, r->tools);
     q.req = std::move(r);
     waiting_.pop_front();
     --stats_.waiting;
@@ -148,7 +149,9 @@ void Scheduler::step() {
     if (q.next_token >= 0) q.next_token = -1;
     else q.fed += chunks[i].tokens.size();
     if (chunks[i].logits_rows == 0) continue;
-    const int32_t t = q.sampler->sample(std::span<const float>(logits.data() + row * V, V));
+    const std::span<const float> l(logits.data() + row * V, V);
+    const int32_t t = q.grammar && q.grammar->active() ? q.sampler->sample(l, &q.grammar->allowed()) : q.sampler->sample(l);
+    if (q.grammar) q.grammar->accept(t);
     ++row;
     on_token(owner[i], t);
   }
@@ -212,6 +215,7 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
   q.req.reset();
   q.parser.reset();
   q.sampler.reset();
+  q.grammar.reset();
   q.held.clear();
   q.next_token = -1;
   std::lock_guard lk(mu_);

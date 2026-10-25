@@ -7,6 +7,11 @@
 //      (dim d, pos n) at (d/2)*16 + n*2 + d%2);
 //   V: tiles of 16 positions x 8 dims, [pos/16][dim/8], each the B operand of P.V (element
 //      (pos k, dim n) at (k/2)*16 + n*2 + k%2).
+// A cache may instead hold int8 in the same places (half the bytes), with an fp16 scale per
+// position and 16 dimensions (q = round(x / scale), scale = max|x| / 127): for K [pos/8][dim/16][8
+// positions], a K tile's 8 scales together; for V [pos/16][dim/16][16 positions]. Attention turns
+// the tiles back into fp16 as it loads them. (A scale per position over all dims costs the model
+// twice the oracle's noise: K and V have outlier dimensions; DECISIONS 2026-10-25.)
 // Global layers find a slot's pages through its page table. Sliding layers keep a ring of
 // ring_pages pages per slot (page p of the sequence in ring page p % ring_pages); the ring holds
 // the window and a whole chunk, so a step writes its K/V first and attention reads every key from
@@ -32,11 +37,13 @@ namespace eklow::attn {
 constexpr int64_t kPage = 256;
 
 struct Cache {
-  sycl::half *k, *v;     // this layer's pages
+  void *k, *v;           // this layer's pages, fp16 or int8
   const int32_t* table;  // [slot][max_pages] physical pages, or null for a ring
   int64_t pages;         // table row length, or ring pages per slot
   int64_t window;        // 0 on global layers
   int64_t n_head_kv, head_dim;
+  sycl::half *ks = nullptr, *vs = nullptr;  // the scales of an int8 cache, null for fp16
+  bool int8() const { return ks != nullptr; }
 };
 
 // Per token of the step: its slot and position.

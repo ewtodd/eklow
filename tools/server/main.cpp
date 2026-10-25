@@ -1,12 +1,14 @@
 // eklow-server: Gemma 4 on the A770M behind an OpenAI-compatible HTTP API.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
-//                [--batch N] [--chunk N] [--embed-model GGUF --embed-port N [--embed-alias NAME]]
+//                [--batch N] [--chunk N] [--kv-int8]
+//                [--embed-model GGUF --embed-port N [--embed-alias NAME]]
 //
 // --ctx is the context of each slot (positions); --batch the tokens of one engine step and --chunk
-// the prefill tokens of one sequence in a step. Endpoints: POST /v1/chat/completions (streamed or
-// whole), GET /v1/models, GET /health; with an embedding model, POST /v1/embeddings, GET /v1/models
-// and GET /health on its own port (the house runs chat and embeddings as separate upstreams).
+// the prefill tokens of one sequence in a step; --kv-int8 keeps the global layers' K/V in int8.
+// Endpoints: POST /v1/chat/completions (streamed or whole), GET /v1/models, GET /health; with an
+// embedding model, POST /v1/embeddings, GET /v1/models and GET /health on its own port (the house
+// runs chat and embeddings as separate upstreams).
 #include <httplib.h>
 
 #include <atomic>
@@ -134,6 +136,7 @@ int main(int argc, char** argv) {
   std::string model_path, alias = "gemma-4-12b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2";
   int port = 8081, slots = 2, embed_port = 8082;
   int64_t ctx = 65536, batch = 2048, chunk = 1024;
+  bool kv_int8 = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -148,9 +151,10 @@ int main(int argc, char** argv) {
     else if (a == "--embed-model") embed_path = next();
     else if (a == "--embed-port") embed_port = std::atoi(next().c_str());
     else if (a == "--embed-alias") embed_alias = next();
+    else if (a == "--kv-int8") kv_int8 = true;
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
-                           "[--batch N] [--chunk N] [--embed-model GGUF --embed-port N [--embed-alias NAME]]\n");
+                           "[--batch N] [--chunk N] [--kv-int8] [--embed-model GGUF --embed-port N [--embed-alias NAME]]\n");
       return 2;
     }
   }
@@ -171,6 +175,7 @@ int main(int argc, char** argv) {
     ec.max_batch = batch;
     ec.max_chunk = chunk;
     ec.max_logits = slots;
+    ec.int8_global_kv = kv_int8;
     engine::Engine eng(q, file, ec);
     std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights, %.2f GiB of KV cache (%d slots of %lld), %.1f s\n",
                  alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / 1073741824.0,
@@ -208,6 +213,7 @@ int main(int argc, char** argv) {
       r->max_tokens = cr.max_tokens;
       r->stop = cr.stop;
       r->in_thinking = cr.in_thinking;
+      r->tools = cr.tool_names;
       try {
         sched.submit(r);
       } catch (const std::invalid_argument&) {

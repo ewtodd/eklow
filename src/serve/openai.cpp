@@ -101,6 +101,10 @@ ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, cons
   if (const json::Value* tc = field(body, "tool_choice"); tc && tc->is_string() && tc->as_string() == "none") tools_off = true;
   if (const json::Value* t = field(body, "tools"); t && t->is_array() && !t->items().empty() && !tools_off) tools = *t;
   r.tools = !tools.is_null();
+  if (r.tools)
+    for (const auto& t : tools.items())
+      if (const json::Value* fn = field(t, "function"); fn && fn->is_object())
+        if (const json::Value* n = fn->find("name"); n && n->is_string()) r.tool_names.push_back(n->as_string());
 
   // Gemma 4's template only turns thinking on or off. On unless the request says otherwise:
   // reasoning_effort "none", or think / enable_thinking false (the template variable wins).

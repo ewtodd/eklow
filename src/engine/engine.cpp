@@ -139,16 +139,28 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   ring_v_ = sycl::malloc_device<sycl::half>(ring_elems, q_);
   max_pages_ = c_.max_ctx / attn::kPage;
   n_pages_ = max_pages_ * c_.n_slots;
-  page_layer_stride_ = n_pages_ * hkv_global_ * attn::kPage * cfg_.head_dim_global;
-  const size_t page_elems = size_t(page_layer_stride_ * n_page);
-  page_k_ = sycl::malloc_device<sycl::half>(page_elems, q_);
-  page_v_ = sycl::malloc_device<sycl::half>(page_elems, q_);
+  // The global layers' pages, one allocation per layer and array: at 2 x 262k an fp16 layer is
+  // 537 MB, and Level Zero refuses single allocations above 4 GB.
+  const size_t page_elems = size_t(n_pages_ * hkv_global_ * attn::kPage * cfg_.head_dim_global);
+  const size_t elem = c_.int8_global_kv ? 1 : 2;
   page_table_ = sycl::malloc_device<int32_t>(size_t(c_.n_slots * max_pages_), q_);
-  if (!ring_k_ || !ring_v_ || !page_k_ || !page_v_ || !page_table_) throw std::runtime_error("engine: out of device memory for the KV cache");
-  for (void* p : {static_cast<void*>(ring_k_), static_cast<void*>(ring_v_), static_cast<void*>(page_k_),
-                  static_cast<void*>(page_v_), static_cast<void*>(page_table_)})
-    owned_.push_back(p);
-  cache_bytes_ = (ring_elems + page_elems) * 2 * sizeof(sycl::half);
+  if (!ring_k_ || !ring_v_ || !page_table_) throw std::runtime_error("engine: out of device memory for the KV cache");
+  for (void* p : {static_cast<void*>(ring_k_), static_cast<void*>(ring_v_), static_cast<void*>(page_table_)}) owned_.push_back(p);
+  cache_bytes_ = ring_elems * 2 * sizeof(sycl::half);
+  for (int l = 0; l < n_page; ++l) {
+    GlobalCache g;
+    g.k = sycl::malloc_device(page_elems * elem, q_);
+    g.v = sycl::malloc_device(page_elems * elem, q_);
+    if (c_.int8_global_kv) {
+      g.ks = sycl::malloc_device<sycl::half>(page_elems / 16, q_);
+      g.vs = sycl::malloc_device<sycl::half>(page_elems / 16, q_);
+    }
+    if (!g.k || !g.v || (c_.int8_global_kv && (!g.ks || !g.vs))) throw std::runtime_error("engine: out of device memory for the KV cache");
+    for (void* p : {g.k, g.v, static_cast<void*>(g.ks), static_cast<void*>(g.vs)})
+      if (p) owned_.push_back(p);
+    cache_bytes_ += 2 * page_elems * elem + (c_.int8_global_kv ? 2 * (page_elems / 16) * sizeof(sycl::half) : 0);
+    global_.push_back(g);
+  }
   page_table_host_.assign(size_t(c_.n_slots * max_pages_), 0);
   for (int64_t p = n_pages_ - 1; p >= 0; --p) free_pages_.push_back(int32_t(p));
   slots_.resize(size_t(c_.n_slots));
@@ -323,8 +335,8 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       attn::attend(q_, qb_, toks, tiles_s, tiles_sliding_, cache, H, 1.0f, att_, attn_scratch_);
       mark("attn_sliding");
     } else {
-      const attn::Cache cache{page_k_ + L.page_index * page_layer_stride_, page_v_ + L.page_index * page_layer_stride_,
-                              page_table_, max_pages_, 0, Hkv, D};
+      const GlobalCache& g = global_[size_t(L.page_index)];
+      const attn::Cache cache{g.k, g.v, page_table_, max_pages_, 0, Hkv, D, g.ks, g.vs};
       attn::write(q_, kb_, vb_, toks, cache);
       attn::attend(q_, qb_, toks, tiles_g, tiles_global_, cache, H, 1.0f, att_, attn_scratch_);
       mark("attn_global");

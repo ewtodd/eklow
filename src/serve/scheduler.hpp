@@ -2,7 +2,9 @@
 // is generating and fills the rest of the batch with prefill chunks of the sequences still reading
 // their prompts. A new request takes the free slot whose cached sequence shares the longest prefix
 // with its prompt and prefills only the rest. Generated tokens go through Gemma 4's output parser;
-// the reader gets reasoning, content and tool calls as they complete.
+// the reader gets reasoning, content and tool calls as they complete. Inside a tool call, sampling
+// is limited to the tokens the tool-call grammar allows, so a request with tools gets no malformed
+// call.
 #pragma once
 
 #include <atomic>
@@ -17,6 +19,7 @@
 
 #include "engine/engine.hpp"
 #include "serve/sampler.hpp"
+#include "serve/tool_grammar.hpp"
 #include "text/output_parser.hpp"
 #include "text/tokenizer.hpp"
 
@@ -38,6 +41,7 @@ class Request {
   int64_t max_tokens = 0;          // 0: as far as the context allows
   std::vector<std::string> stop;   // strings that end the content (not included)
   bool in_thinking = false;        // the prompt ends inside the thought channel
+  std::vector<std::string> tools;  // the request's tool names; tool calls are constrained to them
 
   // Reader side: waits up to `wait` for the next event.
   bool next(Event& e, std::chrono::milliseconds wait);
@@ -81,6 +85,7 @@ class Scheduler {
     int32_t next_token = -1;      // sampled, fed in the next step
     std::unique_ptr<text::OutputParser> parser;
     std::unique_ptr<Sampler> sampler;
+    std::unique_ptr<ToolGrammar> grammar;
     int64_t generated = 0, cached = 0;
     std::string held;             // content held back while it could start a stop string
     bool called = false;          // a tool call came out
@@ -94,6 +99,7 @@ class Scheduler {
 
   engine::Engine& eng_;
   const text::Tokenizer& tok_;
+  std::shared_ptr<const ToolVocab> vocab_;
   SchedulerConfig c_;
   std::vector<Seq> seqs_;
 

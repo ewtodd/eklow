@@ -3,7 +3,7 @@
 //
 //   eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens 2,105,...)
 //                    [--tensors PREFIX,...] [--logits-last N] [--chunk N] [--decode-last N]
-//                    [--twin] [--max-ctx N]
+//                    [--twin] [--max-ctx N] [--kv-int8]
 //
 // The prompt is fed in prefill chunks of --chunk tokens (default: one chunk), then its last
 // --decode-last tokens one per step, as decode would. --twin runs the same prompt in a second slot
@@ -68,7 +68,7 @@ int main(int argc, char** argv) {
   std::string model, out, tokens_json, tokens_arg;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   int64_t logits_last = 1, chunk = 0, decode_last = 0, max_ctx = 0;
-  bool twin = false;
+  bool twin = false, kv_int8 = false;
   double twin_tol = 0.05;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -82,12 +82,13 @@ int main(int argc, char** argv) {
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
     else if (a == "--decode-last") decode_last = std::atoll(next().c_str());
     else if (a == "--max-ctx") max_ctx = std::atoll(next().c_str());
+    else if (a == "--kv-int8") kv_int8 = true;
     else if (a == "--twin") twin = true;
     else if (a == "--twin-tol") twin_tol = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens IDS) "
                            "[--tensors PREFIX,...] [--logits-last N] [--chunk N] [--decode-last N] [--twin] "
-                           "[--twin-tol KL] [--max-ctx N]\n");
+                           "[--twin-tol KL] [--max-ctx N] [--kv-int8]\n");
       return 2;
     }
   }
@@ -122,6 +123,7 @@ int main(int argc, char** argv) {
     for (auto [a, b] : steps) widest = std::max(widest, b - a);
     ec.max_batch = twin ? 2 * widest : widest;
     ec.max_chunk = widest;
+    ec.int8_global_kv = kv_int8;
     ec.max_logits = twin ? 2 * std::min(widest, logits_last) : std::min(widest, logits_last);
 
     auto t0 = std::chrono::steady_clock::now();
