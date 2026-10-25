@@ -13,7 +13,7 @@ stdenv.mkDerivation {
 
   buildPhase = ''
     runHook preBuild
-    $CXX -O2 -std=c++17 -Wall -Wextra oracle.cpp -o eklow-oracle -lllama -lggml -lggml-base
+    $CXX -O2 -std=c++17 -Wall -Wextra oracle.cpp -o eklow-oracle -lmtmd -lllama -lggml -lggml-base
     runHook postBuild
   '';
 

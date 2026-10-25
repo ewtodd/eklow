@@ -34,6 +34,13 @@ void embed(sycl::queue& q, const Weight& table, const int32_t* tokens, int64_t n
 // out[r][:] = x[r][:] / sqrt(mean(x[r]^2) + eps) * (w ? w : 1), rows of `cols`.
 void rmsnorm(sycl::queue& q, const float* x, const float* w, int64_t rows, int64_t cols, float eps, float* out);
 
+// out[r][:] = (x[r][:] - mean) / sqrt(var + eps) * w + b, rows of `cols` (ggml_norm, then the
+// weight and bias as llama.cpp's build_norm applies them).
+void layernorm(sycl::queue& q, const float* x, const float* w, const float* b, int64_t rows, int64_t cols, float eps, float* out);
+
+// x[r][:] += v[:], rows of `cols`.
+void add_rows(sycl::queue& q, float* x, const float* v, int64_t rows, int64_t cols);
+
 // out[m][n] = sum_k x[m][k] * W[n][k] for rows m in [0, m_rows).
 void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, float* out);
 

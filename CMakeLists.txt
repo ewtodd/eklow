@@ -47,6 +47,17 @@ add_library(eklow_text STATIC
 )
 target_link_libraries(eklow_text PUBLIC eklow_host)
 
+# Images for Gemma 4's vision embedder: decoding (stb_image, vendored) and preparation. No device code.
+add_library(eklow_image STATIC
+  src/image/gemma4_image.cpp
+  src/image/stb_image.cpp
+)
+target_include_directories(eklow_image PUBLIC src third_party)
+set_source_files_properties(src/image/stb_image.cpp PROPERTIES COMPILE_OPTIONS "-w")
+
+add_executable(eklow-image tools/image/main.cpp)
+target_link_libraries(eklow-image PRIVATE eklow_image)
+
 add_executable(eklow-tok tools/tok/main.cpp)
 target_link_libraries(eklow-tok PRIVATE eklow_text)
 
@@ -69,9 +80,10 @@ add_library(eklow_model STATIC
   src/kernels/ref.cpp
   src/kernels/xmx.cpp
   src/model/embed_gemma2.cpp
+  src/model/vision_gemma4.cpp
   src/model/gemma4.cpp
 )
-target_link_libraries(eklow_model PUBLIC eklow_host eklow_rt)
+target_link_libraries(eklow_model PUBLIC eklow_host eklow_image eklow_rt)
 eklow_sycl(eklow_model)
 
 add_executable(eklow-kernel-test tools/kernel_test/main.cpp)
@@ -81,6 +93,10 @@ eklow_sycl(eklow-kernel-test)
 add_executable(eklow-embed tools/embed/main.cpp)
 target_link_libraries(eklow-embed PRIVATE eklow_model eklow_text)
 eklow_sycl(eklow-embed)
+
+add_executable(eklow-vision tools/vision/main.cpp)
+target_link_libraries(eklow-vision PRIVATE eklow_model)
+eklow_sycl(eklow-vision)
 
 add_executable(eklow-attn-test tools/attn_test/main.cpp)
 target_link_libraries(eklow-attn-test PRIVATE eklow_model)
@@ -138,4 +154,4 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-engine-run eklow-engine-bench eklow-server eklow-grammar-test RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-image eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-grammar-test RUNTIME DESTINATION bin)

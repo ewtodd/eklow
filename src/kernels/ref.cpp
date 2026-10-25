@@ -132,6 +132,26 @@ void rmsnorm(sycl::queue& q, const float* x, const float* w, int64_t rows, int64
    });
 }
 
+void layernorm(sycl::queue& q, const float* x, const float* w, const float* b, int64_t rows, int64_t cols, float eps, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(rows)), [=](sycl::id<1> id) {
+     const int64_t r = int64_t(id[0]);
+     const float* xr = x + r * cols;
+     float sum = 0;
+     for (int64_t i = 0; i < cols; ++i) sum += xr[i];
+     const float mean = sum / float(cols);
+     float ss = 0;
+     for (int64_t i = 0; i < cols; ++i) ss += (xr[i] - mean) * (xr[i] - mean);
+     const float inv = 1.0f / sycl::sqrt(ss / float(cols) + eps);
+     for (int64_t i = 0; i < cols; ++i) out[r * cols + i] = (xr[i] - mean) * inv * w[i] + b[i];
+   }).wait();
+}
+
+void add_rows(sycl::queue& q, float* x, const float* v, int64_t rows, int64_t cols) {
+  q.parallel_for(sycl::range<2>(size_t(rows), size_t(cols)), [=](sycl::id<2> id) {
+     x[int64_t(id[0]) * cols + int64_t(id[1])] += v[id[1]];
+   }).wait();
+}
+
 void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, float* out) {
   check_type(w);
   // Rows per launch: a fraction of a second for these kernels, about 2e10 multiply-adds for Q4_0;
