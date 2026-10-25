@@ -8,6 +8,7 @@
   level-zero,
   addDriverRunpath,
   cmake,
+  httplib,
   makeWrapper,
   ninja,
   pkg-config,
@@ -37,8 +38,12 @@ intel-llvm.stdenv.mkDerivation {
     intel-compute-runtime
   ];
 
-  # Level Zero itself, for allocations SYCL cannot ask for (uncached host memory in eklow-probe).
-  buildInputs = [ level-zero ];
+  # Level Zero itself, for allocations SYCL cannot ask for (uncached host memory in eklow-probe);
+  # cpp-httplib (header-only) for the server.
+  buildInputs = [
+    level-zero
+    httplib
+  ];
 
   # ocloc dlopens the graphics compiler (libigc) by soname, which is not on its runpath.
   env.LD_LIBRARY_PATH = lib.makeLibraryPath [ intel-graphics-compiler ];

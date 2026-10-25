@@ -206,6 +206,17 @@ void Engine::ensure_pages(int slot, int64_t positions) {
   }
 }
 
+void Engine::truncate(int slot, int64_t length) {
+  Slot& s = slots_.at(size_t(slot));
+  if (length < 0 || length > s.length) throw std::runtime_error("engine: truncate beyond the sequence");
+  const size_t keep = size_t((length + attn::kPage - 1) / attn::kPage);
+  while (s.pages.size() > keep) {
+    free_pages_.push_back(s.pages.back());
+    s.pages.pop_back();
+  }
+  s.length = length;
+}
+
 void Engine::release(int slot) {
   Slot& s = slots_.at(size_t(slot));
   for (int32_t p : s.pages) free_pages_.push_back(p);
@@ -214,7 +225,7 @@ void Engine::release(int slot) {
 }
 
 std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::DumpSink* dump) {
-  const int64_t E = cfg_.n_embd, F = cfg_.n_ff, H = cfg_.n_head, V = cfg_.n_vocab;
+  const int64_t E = cfg_.n_embd, H = cfg_.n_head, V = cfg_.n_vocab;
   std::vector<int32_t> tok, slot, pos, logit_rows;
   attn::TileList tiles_s(cfg_.head_dim_sliding), tiles_g(cfg_.head_dim_global);
   for (const auto& c : chunks) {

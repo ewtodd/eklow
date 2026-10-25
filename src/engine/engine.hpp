@@ -49,6 +49,12 @@ class Engine {
   std::vector<float> step(const std::vector<Chunk>& chunks, const model::DumpSink* dump = nullptr);
   // Forgets a slot's sequence and returns its pages.
   void release(int slot);
+  // Keeps the first `length` positions of a slot's sequence (a prompt that shares only a prefix
+  // with the last one) and returns the pages past them. The sliding rings still hold what was
+  // overwritten there: rewinding a slot by more than ring_slack() positions leaves the last window
+  // before `length` stale, and the caller must keep window positions fewer and prefill them again.
+  void truncate(int slot, int64_t length);
+  int64_t ring_slack() const { return ring_pages_ * attn::kPage - cfg_.window; }
   // Positions the slot holds (where its next chunk starts).
   int64_t length(int slot) const { return slots_[size_t(slot)].length; }
 
@@ -57,6 +63,7 @@ class Engine {
   void set_profile(std::map<std::string, double>* p) { profile_ = p; }
 
   const model::Gemma4Config& model() const { return cfg_; }
+  int n_slots() const { return c_.n_slots; }
   uint64_t weight_bytes() const { return weight_bytes_; }
   uint64_t cache_bytes() const { return cache_bytes_; }
   // Host time the last step took to enqueue its work; when it nears the step's wall time, the

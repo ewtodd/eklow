@@ -17,6 +17,9 @@ set(EKLOW_SYCL_TARGETS "intel_gpu_dg2_g10" CACHE STRING "comma-separated -fsycl-
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LEVEL_ZERO REQUIRED IMPORTED_TARGET level-zero)
+# cpp-httplib is header-only; its CMake package would also want OpenSSL, which eklow does not use.
+find_path(HTTPLIB_INCLUDE_DIR httplib.h REQUIRED)
+find_package(Threads REQUIRED)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
@@ -95,6 +98,20 @@ add_executable(eklow-engine-bench tools/engine_bench/main.cpp)
 target_link_libraries(eklow-engine-bench PRIVATE eklow_engine)
 eklow_sycl(eklow-engine-bench)
 
+# Serving: sampler and scheduler over the engine, and the OpenAI-compatible server.
+add_library(eklow_serve STATIC
+  src/serve/openai.cpp
+  src/serve/sampler.cpp
+  src/serve/scheduler.cpp
+)
+target_link_libraries(eklow_serve PUBLIC eklow_engine eklow_text)
+eklow_sycl(eklow_serve)
+
+add_executable(eklow-server tools/server/main.cpp)
+target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
+target_link_libraries(eklow-server PRIVATE eklow_serve Threads::Threads)
+eklow_sycl(eklow-server)
+
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
@@ -109,4 +126,4 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-engine-run eklow-engine-bench RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-engine-run eklow-engine-bench eklow-server RUNTIME DESTINATION bin)
