@@ -13,12 +13,25 @@ namespace eklow::attn {
 namespace esimd = sycl::ext::intel::esimd;
 namespace xmxd = sycl::ext::intel::esimd::xmx;
 
+// Tiles per prefill work-group: the K/V block staged in shared local memory and the scores
+// exchanged there must fit its 64 KB.
+TileList::TileList(int64_t head_dim) : per_group(head_dim >= 512 ? 4 : 8) {}
+
 void TileList::add_chunk(int32_t base, int64_t n_tok, int64_t last_pos, int64_t group, int64_t n_head_kv, int64_t window) {
   const int64_t rows = n_tok * group;
-  for (int64_t g = 0; g < n_head_kv; ++g)
+  for (int64_t g = 0; g < n_head_kv; ++g) {
+    const int64_t first = size();
     for (int64_t r0 = 0; r0 < rows; r0 += 8) desc.insert(desc.end(), {base, int32_t(rows), int32_t(r0), int32_t(g)});
+    for (int64_t t = first; t < size(); t += per_group) groups.insert(groups.end(), {int32_t(t), int32_t(std::min(per_group, size() - t))});
+  }
   // A tile's rows span at most 8 consecutive positions.
   max_keys = std::max(max_keys, window > 0 ? std::min(window + 7, last_pos + 1) : last_pos + 1);
+}
+
+std::vector<int32_t> TileList::packed() const {
+  std::vector<int32_t> p(desc);
+  p.insert(p.end(), groups.begin(), groups.end());
+  return p;
 }
 
 namespace {
@@ -209,10 +222,178 @@ struct Flash {
   }
 };
 
+// The prefill kernel: a work-group per group of QT tiles of one chunk and K/V head. Its NC compute
+// threads (P per tile, a 64-dimension slice each) run the tile loop of Flash over one shared copy
+// of each 16-key block of K and V in shared local memory; L loader threads keep the next block's
+// pieces in their registers and store them while the compute threads are past the point of
+// reading the old ones. Per block, between the two barriers of the score exchange: K of block b+1
+// (block b's Q.K^T is done) and V of block b (block b-1's P.V is done).
+template <int D, int G, int QT>
+struct FlashGroup {
+  static constexpr int P = D / kSlice, NC = QT * P, L = 16, NT = NC + L;
+  static constexpr int RPT = kRows / P, DC = kSlice / 16, DG = kSlice / 8;
+  static constexpr int kBlockBytes = kKeys * D * 2;            // one block of K, or of V
+  static constexpr int LP = kBlockBytes / 256 / L;             // 256-byte pieces of each per loader
+  static constexpr uint32_t kK = 0, kV = kBlockBytes, kScores = 2 * kBlockBytes, kProbs = kScores + NC * 512,
+                            kCorr = kProbs + QT * 256, kM = kCorr + QT * 32, kL = kM + QT * 32, kSlm = kL + QT * 32;
+  static_assert(kSlm <= 65536, "shared local memory");
+
+  const sycl::half* qt;
+  const int32_t* tiles;
+  const int32_t* groups;
+  const int32_t *slot_of, *pos_of;
+  const sycl::half *kc, *vc;
+  const int32_t* table;
+  int32_t pages, window, n_head_kv, n_head;
+  float* out;
+
+  int32_t page_at(int32_t slot, int32_t kvh, int32_t key) const SYCL_ESIMD_FUNCTION {
+    const int32_t logical = key / int32_t(kPage);
+    const int32_t phys = table ? table[slot * pages + logical] : slot * pages + logical % pages;
+    return (phys * n_head_kv + kvh) * int32_t(kPage * D);
+  }
+  // Block b's K (or, with v, V) tiles of this K/V head: one contiguous run of kBlockBytes.
+  const sycl::half* block(int32_t b, int32_t slot, int32_t kvh, bool v) const SYCL_ESIMD_FUNCTION {
+    const int32_t key0 = b * kKeys, in_page = key0 % int32_t(kPage), at = page_at(slot, kvh, key0);
+    return v ? vc + at + (in_page / 16) * (D / 8) * 128 : kc + at + (in_page / 8) * (D / 16) * 128;
+  }
+
+  void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+    esimd::slm_init<kSlm>();
+    const int tid = int(it.get_local_id(0));
+    const int32_t grp = int32_t(it.get_group(0)), t0 = groups[2 * grp], nt = groups[2 * grp + 1];
+    const int32_t base = tiles[t0 * 4], rows = tiles[t0 * 4 + 1], kvh = tiles[t0 * 4 + 3];
+    const int32_t t_first = base + tiles[t0 * 4 + 2] / G;
+    const int32_t t_last = base + (std::min(tiles[(t0 + nt - 1) * 4 + 2] + kRows, rows) - 1) / G;
+    const int32_t slot = slot_of[t_first];
+    const int32_t lo = window > 0 ? std::max(0, pos_of[t_first] - window + 1) : 0;
+    const int32_t b0 = lo / kKeys, b1 = pos_of[t_last] / kKeys + 1;
+
+    // Two loops with the same barriers: the loaders' registers and the compute threads' are never
+    // live together, which a shared loop made the compiler spill.
+    if (tid >= NC) {
+      const int l = tid - NC;
+      esimd::simd<uint32_t, 64> buf[2][LP];
+      auto load = [&](int32_t b, bool v, int into) SYCL_ESIMD_FUNCTION {
+        const uint32_t* src = reinterpret_cast<const uint32_t*>(block(b, slot, kvh, v));
+#pragma unroll
+        for (int i = 0; i < LP; ++i) buf[into][i] = esimd::block_load<uint32_t, 64>(src + (l + i * L) * 64);
+      };
+      auto store = [&](uint32_t region, int from) SYCL_ESIMD_FUNCTION {
+#pragma unroll
+        for (int i = 0; i < LP; ++i) esimd::slm_block_store<uint32_t, 64>(region + (l + i * L) * 256, buf[from][i]);
+      };
+      load(b0, false, 0);
+      store(kK, 0);
+      esimd::barrier();
+      for (int32_t b = b0; b < b1; ++b) {
+        load(b, true, 1);
+        if (b + 1 < b1) load(b + 1, false, 0);
+        esimd::barrier();
+        store(kV, 1);
+        if (b + 1 < b1) store(kK, 0);
+        esimd::barrier();
+      }
+      esimd::barrier();
+      return;
+    }
+
+    const int qi = tid / P, j = tid % P;
+    const bool active = qi < nt;
+    const int32_t tile = t0 + (active ? qi : 0), r0 = tiles[tile * 4 + 2];
+    int32_t hi[RPT], wlo[RPT];
+    float m[RPT], l_[RPT];
+#pragma unroll
+    for (int i = 0; i < RPT; ++i) {
+      const int32_t r = r0 + j * RPT + i;
+      hi[i] = active && r < rows ? pos_of[base + r / G] : -1;
+      wlo[i] = window > 0 ? hi[i] - window : -1;
+      m[i] = kNegBig;
+      l_[i] = 0;
+    }
+    esimd::simd<float, 64> O[DG];
+#pragma unroll
+    for (int g = 0; g < DG; ++g) O[g] = 0;
+    const sycl::half* qs = qt + tile * (kRows * D) + j * DC * 128;
+    const uint32_t sc_at = kScores + (qi * P + j) * 512, pr_at = kProbs + qi * 256, co_at = kCorr + qi * 32;
+    esimd::barrier();
+    for (int32_t b = b0; b < b1; ++b) {
+      if (active) {
+        esimd::simd<float, 64> S0 = 0, S1 = 0;
+#pragma unroll
+        for (int dc = 0; dc < DC; ++dc) {
+          const esimd::simd<sycl::half, 128> A = esimd::block_load<sycl::half, 128>(qs + dc * 128);
+          const esimd::simd<sycl::half, 128> B0 = esimd::slm_block_load<sycl::half, 128>(kK + (j * DC + dc) * 256);
+          const esimd::simd<sycl::half, 128> B1 = esimd::slm_block_load<sycl::half, 128>(kK + (D / 16 + j * DC + dc) * 256);
+          S0 = xmxd::dpas<8, 8, float>(S0, B0, A);
+          S1 = xmxd::dpas<8, 8, float>(S1, B1, A);
+        }
+        esimd::slm_block_store<float, 64>(sc_at, S0);
+        esimd::slm_block_store<float, 64>(sc_at + 256, S1);
+      }
+      esimd::barrier();
+      if (active) {
+        esimd::simd<float, 8 * RPT> s0 = 0, s1 = 0;
+#pragma unroll
+        for (int t = 0; t < P; ++t) {
+          s0 += esimd::slm_block_load<float, 8 * RPT>(kScores + (qi * P + t) * 512 + j * RPT * 32);
+          s1 += esimd::slm_block_load<float, 8 * RPT>(kScores + (qi * P + t) * 512 + 256 + j * RPT * 32);
+        }
+        const esimd::simd<int, 16> key(b * kKeys, 1);
+#pragma unroll
+        for (int i = 0; i < RPT; ++i) {
+          esimd::simd<float, 16> sc;
+          sc.select<8, 1>(0) = s0.template select<8, 1>(i * 8);
+          sc.select<8, 1>(8) = s1.template select<8, 1>(i * 8);
+          sc.merge(sc, esimd::simd<float, 16>(-std::numeric_limits<float>::infinity()), (key <= hi[i]) & (key > wlo[i]));
+          const float mx = std::max(m[i], esimd::hmax<float>(sc));
+          const esimd::simd<float, 16> p = esimd::exp(sc - mx);
+          const float corr = esimd::exp(m[i] - mx);
+          l_[i] = l_[i] * corr + esimd::reduce<float>(p, std::plus<>());
+          m[i] = mx;
+          esimd::slm_block_store<sycl::half, 16>(pr_at + (j * RPT + i) * 32, esimd::simd<sycl::half, 16>(p));
+          esimd::slm_scalar_store<float>(co_at + (j * RPT + i) * 4, corr);
+        }
+      }
+      esimd::barrier();
+      if (active) {
+        const esimd::simd<sycl::half, 128> Pa = esimd::slm_block_load<sycl::half, 128>(pr_at);
+        const esimd::simd<float, 8> corr = esimd::slm_block_load<float, 8>(co_at);
+        esimd::simd<float, 64> cr;
+#pragma unroll
+        for (int i = 0; i < kRows; ++i) cr.select<8, 1>(i * 8) = corr[i];
+#pragma unroll
+        for (int g = 0; g < DG; ++g) {
+          const esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(kV + (j * DG + g) * 256);
+          O[g] = xmxd::dpas<8, 8, float>(O[g] * cr, B, Pa);
+        }
+      }
+    }
+    if (active)
+#pragma unroll
+      for (int i = 0; i < RPT; ++i) esimd::slm_scalar_store<float>(kL + qi * 32 + (j * RPT + i) * 4, l_[i]);
+    esimd::barrier();
+    if (!active) return;
+    const esimd::simd<float, 8> Lr = esimd::slm_block_load<float, 8>(kL + qi * 32);
+#pragma unroll
+    for (int i = 0; i < kRows; ++i) {
+      const int32_t r = r0 + i;
+      if (r >= rows) break;
+      float* dst = out + ((base + r / G) * n_head + kvh * G + r % G) * D + j * kSlice;
+      const float inv = 1.0f / Lr[i];
+#pragma unroll
+      for (int g = 0; g < DG; ++g) esimd::block_store<float, 8>(dst + g * 8, O[g].template select<8, 1>(i * 8) * inv);
+    }
+  }
+};
+
+
 template <int D, int G>
-void run(sycl::queue& q, const float* Q, const Tokens& tok, const int32_t* tiles, int64_t n_tiles, int64_t max_keys,
-         const Cache& c, int64_t n_head, float scale, float* out, Scratch& scratch) {
-  constexpr int P = Flash<D, G>::P;
+void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* tiles, const Cache& c,
+         int64_t n_head, float scale, float* out, Scratch& scratch) {
+  constexpr int P = Flash<D, G>::P, QT = D >= 512 ? 4 : 8;
+  const int64_t n_tiles = list.size(), max_keys = list.max_keys;
+  if (list.per_group != QT) throw std::runtime_error("attention: tile list grouped for another head size");
   const int32_t H = int32_t(n_head);
   // Query tiles in fp16, the A operands of Q.K^T: [tile][D/16][8 rows][16].
   sycl::half* qt = grow(q, scratch.q, scratch.q_halves, size_t(n_tiles * kRows * D));
@@ -223,6 +404,14 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const int32_t* tiles
     if (r < rows) v = Q[((base + r / G) * H + kvh * G + r % G) * D + d] * scale;
     qt[tile * kRows * D + (d / 16) * 128 + i * 16 + d % 16] = sycl::half(v);
   });
+  // Enough groups to fill the card (a prefill chunk): the group kernel, one pass over the keys.
+  if (list.n_groups() * FlashGroup<D, G, QT>::NT >= 8192) {
+    FlashGroup<D, G, QT> k{qt,  tiles, tiles + 4 * n_tiles, tok.slot, tok.pos, c.k, c.v, c.table, int32_t(c.pages), int32_t(c.window),
+                           int32_t(c.n_head_kv), H, out};
+    constexpr int NT = FlashGroup<D, G, QT>::NT;
+    q.parallel_for(sycl::nd_range<1>(size_t(list.n_groups() * NT), NT), k);
+    return;
+  }
   // Enough threads to fill the card: when there are few tiles (decode), split each tile's keys.
   // Each block costs a thread several microseconds of load latency, so short splits win, but every
   // split adds partials to merge: at least 4 blocks a split, and at most 32 splits beyond that
@@ -259,12 +448,12 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const int32_t* tiles
 
 }  // namespace
 
-void attend(sycl::queue& q, const float* Q, const Tokens& tok, const int32_t* tiles, int64_t n_tiles, int64_t max_keys,
-            const Cache& c, int64_t n_head, float scale, float* out, Scratch& scratch) {
-  if (n_tiles == 0) return;
+void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* packed, const Cache& c,
+            int64_t n_head, float scale, float* out, Scratch& scratch) {
+  if (list.size() == 0) return;
   const int64_t group = n_head / c.n_head_kv;
-  if (c.head_dim == 256 && group == 2) run<256, 2>(q, Q, tok, tiles, n_tiles, max_keys, c, n_head, scale, out, scratch);
-  else if (c.head_dim == 512 && group == 16) run<512, 16>(q, Q, tok, tiles, n_tiles, max_keys, c, n_head, scale, out, scratch);
+  if (c.head_dim == 256 && group == 2) run<256, 2>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+  else if (c.head_dim == 512 && group == 16) run<512, 16>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   else throw std::runtime_error("attention: no kernel for head_dim " + std::to_string(c.head_dim) + ", group " + std::to_string(group));
 }
 

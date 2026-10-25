@@ -95,6 +95,7 @@ struct TestCache {
 
 // One step: chunk [a, b) of every slot's sequence. Q/K/V of slot s are rows of qs[s], ks[s], vs[s].
 struct Step {
+  explicit Step(int64_t head_dim) : tiles(head_dim) {}
   std::vector<int32_t> slot, pos;
   attn::TileList tiles;
   std::vector<float> Q, K, V;
@@ -102,7 +103,7 @@ struct Step {
 
 Step make_step(const std::vector<std::pair<int64_t, int64_t>>& ranges, const std::vector<std::vector<float>>& qs,
                const std::vector<std::vector<float>>& ks, const std::vector<std::vector<float>>& vs, const Kind& k) {
-  Step st;
+  Step st(k.head_dim);
   const int64_t D = k.head_dim, Hkv = k.n_head_kv;
   for (size_t s = 0; s < ranges.size(); ++s) {
     auto [a, b] = ranges[s];
@@ -182,7 +183,7 @@ int main(int argc, char** argv) {
       float *dq = sycl::malloc_device<float>(size_t(max_tok * kHeads * D), q), *dk = sycl::malloc_device<float>(size_t(max_tok * Hkv * D), q),
             *dv = sycl::malloc_device<float>(size_t(max_tok * Hkv * D), q), *dout = sycl::malloc_device<float>(size_t(max_tok * kHeads * D), q);
       int32_t *dslot = sycl::malloc_device<int32_t>(size_t(max_tok), q), *dpos = sycl::malloc_device<int32_t>(size_t(max_tok), q);
-      int32_t* dtiles = sycl::malloc_device<int32_t>(size_t(4 * Hkv * (max_tok * kHeads / Hkv / 8 + kSlots)), q);
+      int32_t* dtiles = sycl::malloc_device<int32_t>(size_t(6 * Hkv * (max_tok * kHeads / Hkv / 8 + kSlots)), q);
       double err2 = 0, ref2 = 0, max_abs = 0;
       std::vector<std::pair<int64_t, int64_t>> sched;
       for (int64_t a = 0; a < len - decode; a += chunk) sched.push_back({a, std::min(len - decode, a + chunk)});
@@ -195,10 +196,11 @@ int main(int argc, char** argv) {
         q.memcpy(dv, st.V.data(), st.V.size() * 4);
         q.memcpy(dslot, st.slot.data(), size_t(T) * 4);
         q.memcpy(dpos, st.pos.data(), size_t(T) * 4);
-        q.memcpy(dtiles, st.tiles.desc.data(), st.tiles.desc.size() * 4);
+        const std::vector<int32_t> packed = st.tiles.packed();
+        q.memcpy(dtiles, packed.data(), packed.size() * 4);
         const attn::Tokens tok{dslot, dpos, T};
         attn::write(q, dk, dv, tok, cache.c);
-        attn::attend(q, dq, tok, dtiles, st.tiles.size(), st.tiles.max_keys, cache.c, kHeads, scale, dout, scratch);
+        attn::attend(q, dq, tok, st.tiles, dtiles, cache.c, kHeads, scale, dout, scratch);
         std::vector<float> got(size_t(T * kHeads * D));
         q.memcpy(got.data(), dout, got.size() * 4).wait();
         for (int64_t i = 0; i < T; ++i) {
@@ -233,7 +235,7 @@ int main(int argc, char** argv) {
         float *dq = sycl::malloc_device<float>(size_t(pf * kHeads * D), q), *dk = sycl::malloc_device<float>(size_t(pf * Hkv * D), q),
               *dv = sycl::malloc_device<float>(size_t(pf * Hkv * D), q), *dout = sycl::malloc_device<float>(size_t(pf * kHeads * D), q);
         int32_t *dslot = sycl::malloc_device<int32_t>(size_t(pf), q), *dpos = sycl::malloc_device<int32_t>(size_t(pf), q);
-        int32_t* dtiles = sycl::malloc_device<int32_t>(size_t(4 * Hkv * (pf * kHeads / Hkv / 8 + 1)), q);
+        int32_t* dtiles = sycl::malloc_device<int32_t>(size_t(6 * Hkv * (pf * kHeads / Hkv / 8 + 1)), q);
         auto fill = [&](std::vector<float>& v) {
           v = randn(rng, v.size());
         };
@@ -244,21 +246,22 @@ int main(int argc, char** argv) {
         q.memcpy(dv, hv.data(), hv.size() * 4);
         q.memset(dslot, 0, size_t(pf) * 4).wait();
         // Fill positions 0..ctx with the same random rows (the speed does not depend on them).
-        attn::TileList tl;
+        attn::TileList tl(D);
         auto prepare = [&](int64_t a, int64_t b) {
           std::vector<int32_t> pos;
           for (int64_t t = a; t < b; ++t) pos.push_back(int32_t(t));
           tl.clear();
           tl.add_chunk(0, b - a, b - 1, kHeads / Hkv, Hkv, k.window);
           q.memcpy(dpos, pos.data(), pos.size() * 4);
-          q.memcpy(dtiles, tl.desc.data(), tl.desc.size() * 4).wait();
+          const std::vector<int32_t> packed = tl.packed();
+          q.memcpy(dtiles, packed.data(), packed.size() * 4).wait();
           return attn::Tokens{dslot, dpos, b - a};
         };
         for (int64_t a = 0; a <= ctx; a += pf) attn::write(q, dk, dv, prepare(a, std::min(ctx + 1, a + pf)), cache.c);
         q.wait();
         auto timed = [&](int64_t a, int64_t b, int reps) {
           const attn::Tokens tok = prepare(a, b);
-          auto go = [&] { attn::attend(q, dq, tok, dtiles, tl.size(), tl.max_keys, cache.c, kHeads, 1.0f / std::sqrt(float(D)), dout, scratch); };
+          auto go = [&] { attn::attend(q, dq, tok, tl, dtiles, cache.c, kHeads, 1.0f / std::sqrt(float(D)), dout, scratch); };
           go();  // warm-up, scratch sizes
           q.wait();
           return gpu_seconds(q, [&] {

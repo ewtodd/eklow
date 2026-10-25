@@ -174,8 +174,9 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   // At most one chunk per slot in a step, so at most n_slots partial tiles per K/V head.
   max_tiles_sliding_ = hkv_sliding_ * ((B * group_sliding_ + 7) / 8 + c_.n_slots);
   max_tiles_global_ = hkv_global_ * ((B * group_global_ + 7) / 8 + c_.n_slots);
-  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}, {&tiles_sliding_, 4 * max_tiles_sliding_},
-                      {&tiles_global_, 4 * max_tiles_global_}}) {
+  // Tile lists packed with their groups: 4 ints a tile, at most 2 a tile for its group.
+  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}, {&tiles_sliding_, 6 * max_tiles_sliding_},
+                      {&tiles_global_, 6 * max_tiles_global_}}) {
     *p = sycl::malloc_device<int32_t>(size_t(n), q_);
     if (!*p) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(*p);
@@ -215,7 +216,7 @@ void Engine::release(int slot) {
 std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::DumpSink* dump) {
   const int64_t E = cfg_.n_embd, F = cfg_.n_ff, H = cfg_.n_head, V = cfg_.n_vocab;
   std::vector<int32_t> tok, slot, pos, logit_rows;
-  attn::TileList tiles_s, tiles_g;
+  attn::TileList tiles_s(cfg_.head_dim_sliding), tiles_g(cfg_.head_dim_global);
   for (const auto& c : chunks) {
     if (c.slot < 0 || c.slot >= c_.n_slots) throw std::runtime_error("engine: bad slot");
     if (c.start_pos != slots_[size_t(c.slot)].length) throw std::runtime_error("engine: chunk does not continue its slot");
@@ -240,8 +241,9 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   q_.memcpy(tok_, tok.data(), size_t(T) * 4);
   q_.memcpy(slot_, slot.data(), size_t(T) * 4);
   q_.memcpy(pos_, pos.data(), size_t(T) * 4);
-  q_.memcpy(tiles_sliding_, tiles_s.desc.data(), tiles_s.desc.size() * 4);
-  q_.memcpy(tiles_global_, tiles_g.desc.data(), tiles_g.desc.size() * 4);
+  const std::vector<int32_t> packed_s = tiles_s.packed(), packed_g = tiles_g.packed();
+  q_.memcpy(tiles_sliding_, packed_s.data(), packed_s.size() * 4);
+  q_.memcpy(tiles_global_, packed_g.data(), packed_g.size() * 4);
   q_.memcpy(page_table_, page_table_host_.data(), page_table_host_.size() * 4);
   const attn::Tokens toks{slot_, pos_, T};
   // On a profiling queue each mark is an empty kernel whose end timestamp closes the section, so
@@ -307,13 +309,13 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       const attn::Cache cache{ring_k_ + L.ring_index * ring_layer_stride_, ring_v_ + L.ring_index * ring_layer_stride_, nullptr,
                               ring_pages_, cfg_.window, Hkv, D};
       attn::write(q_, kb_, vb_, toks, cache);
-      attn::attend(q_, qb_, toks, tiles_sliding_, tiles_s.size(), tiles_s.max_keys, cache, H, 1.0f, att_, attn_scratch_);
+      attn::attend(q_, qb_, toks, tiles_s, tiles_sliding_, cache, H, 1.0f, att_, attn_scratch_);
       mark("attn_sliding");
     } else {
       const attn::Cache cache{page_k_ + L.page_index * page_layer_stride_, page_v_ + L.page_index * page_layer_stride_,
                               page_table_, max_pages_, 0, Hkv, D};
       attn::write(q_, kb_, vb_, toks, cache);
-      attn::attend(q_, qb_, toks, tiles_global_, tiles_g.size(), tiles_g.max_keys, cache, H, 1.0f, att_, attn_scratch_);
+      attn::attend(q_, qb_, toks, tiles_g, tiles_global_, cache, H, 1.0f, att_, attn_scratch_);
       mark("attn_global");
     }
     emit("kqv_out" + s, att_, {H * D, T});
