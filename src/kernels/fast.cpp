@@ -1,5 +1,6 @@
 #include "kernels/fast.hpp"
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -9,36 +10,58 @@ namespace {
 
 inline float half_at(const uint8_t* p) { return float(sycl::bit_cast<sycl::half>(uint16_t(p[0] | p[1] << 8))); }
 
-// One Q6_K weight (block of 256: ql[128], qh[64], int8 scales[16], fp16 d), as ggml lays it out.
-inline float q6k_weight(const uint8_t* blk, int i) {
+// The 6-bit value (0..63) of element i of a Q6_K block (ql[128], qh[64], int8 scales[16], fp16 d),
+// as ggml lays it out.
+inline int q6k_value(const uint8_t* blk, int i) {
   const int half = i / 128, r = i % 128, l = r % 32, quarter = r / 32;
   const uint8_t* ql = blk + half * 64;
   const uint8_t* qh = blk + 128 + half * 32;
-  const int8_t* sc = reinterpret_cast<const int8_t*>(blk + 192) + half * 8;
-  int q;
   switch (quarter) {
-    case 0: q = (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4); break;
-    case 1: q = (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4); break;
-    case 2: q = (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4); break;
-    default: q = (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4); break;
+    case 0: return (ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4);
+    case 1: return (ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4);
+    case 2: return (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4);
+    default: return (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4);
   }
-  return half_at(blk + 208) * float(sc[l / 16 + 2 * quarter]) * float(q - 32);
 }
 
 }  // namespace
 
-void embed(sycl::queue& q, const ref::Weight& table, const int32_t* tokens, int64_t n_tok, float scale, float* out) {
-  const ref::Weight w = table;
-  if (w.type != gguf::Type::Q6_K && w.type != gguf::Type::F16 && w.type != gguf::Type::F32)
-    throw std::runtime_error(std::string("fast::embed: no kernel for ") + gguf::type_name(w.type));
+Q6 repack_q6k(sycl::queue& q, const ref::Weight& raw) {
+  if (raw.type != gguf::Type::Q6_K || raw.k % 256) throw std::runtime_error("fast::repack_q6k needs a Q6_K matrix");
+  const int64_t k = raw.k, n = raw.n;
+  const size_t lo = size_t(n * k / 2), hi = size_t(n * k / 4), sc = size_t(n * k / 16), d = size_t(n * k / 256) * 2;
+  auto* p = sycl::malloc_device<uint8_t>(lo + hi + sc + d, q);
+  if (!p) throw std::runtime_error("fast::repack_q6k: out of device memory");
+  Q6 w{k, n, p, p + lo, reinterpret_cast<int8_t*>(p + lo + hi), reinterpret_cast<sycl::half*>(p + lo + hi + sc)};
+  const ref::Weight r = raw;
+  // One work-item per 4 elements: one byte of high bits, two of low nibbles.
+  q.parallel_for(sycl::range<2>(size_t(n), size_t(k / 4)), [=](sycl::id<2> id) {
+    const int64_t row = int64_t(id[0]), e = int64_t(id[1]) * 4;
+    const uint8_t* blk = r.data + uint64_t(row) * r.row_bytes + uint64_t(e / 256) * 210;
+    int v[4];
+    for (int j = 0; j < 4; ++j) v[j] = q6k_value(blk, int((e + j) % 256));
+    const int64_t at = row * k + e;
+    w.lo[at / 2] = uint8_t((v[0] & 15) | (v[1] & 15) << 4);
+    w.lo[at / 2 + 1] = uint8_t((v[2] & 15) | (v[3] & 15) << 4);
+    w.hi[at / 4] = uint8_t(v[0] >> 4 | (v[1] >> 4) << 2 | (v[2] >> 4) << 4 | (v[3] >> 4) << 6);
+    if (e % 16 == 0) w.sc[at / 16] = int8_t(blk[192 + (e % 256) / 16]);
+    if (e % 256 == 0) w.d[at / 256] = sycl::bit_cast<sycl::half>(uint16_t(blk[208] | blk[209] << 8));
+  }).wait();
+  return w;
+}
+
+void free_q6(sycl::queue& q, Q6& w) {
+  sycl::free(w.lo, q);
+  w = Q6{};
+}
+
+void embed(sycl::queue& q, const Q6& table, const int32_t* tokens, int64_t n_tok, float scale, float* out) {
+  const Q6 w = table;
   q.parallel_for(sycl::range<2>(size_t(n_tok), size_t(w.k)), [=](sycl::id<2> id) {
     const int64_t t = int64_t(id[0]), i = int64_t(id[1]);
-    const uint8_t* row = w.data + uint64_t(tokens[t]) * w.row_bytes;
-    float v;
-    if (w.type == gguf::Type::Q6_K) v = q6k_weight(row + (i / 256) * 210, int(i % 256));
-    else if (w.type == gguf::Type::F16) v = half_at(row + 2 * i);
-    else v = reinterpret_cast<const float*>(row)[i];
-    out[t * w.k + i] = v * scale;
+    const int64_t e = int64_t(tokens[t]) * w.k + i;
+    const int v = (w.lo[e / 2] >> (4 * (e % 2)) & 15) | (w.hi[e / 4] >> (2 * (e % 4)) & 3) << 4;
+    out[t * w.k + i] = float(w.d[e / 256]) * float(w.sc[e / 16]) * float(v - 32) * scale;
   });
 }
 
@@ -85,34 +108,50 @@ void softcap(sycl::queue& q, float* x, float cap, int64_t n) {
   q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { x[id[0]] = cap * sycl::tanh(x[id[0]] / cap); });
 }
 
-void matmul_q6k(sycl::queue& q, const ref::Weight& w, const float* x, int64_t rows, float* out) {
-  if (w.type != gguf::Type::Q6_K || w.k % 256) throw std::runtime_error("fast::matmul_q6k needs a Q6_K matrix");
-  // One sub-group per output column; each lane takes Q6_K blocks of the row in turn and keeps a
-  // partial sum per input row (up to 8 per pass), reduced across the sub-group at the end.
-  constexpr int kSg = 16, kRows = 8;
-  const ref::Weight ww = w;
+void matmul_q6(sycl::queue& q, const Q6& w, const float* x, int64_t rows, float* out) {
+  // One sub-group per output column, 16 sub-groups per work-group. Per 256-element super-block
+  // each lane takes 16 consecutive elements: 8 bytes of low nibbles, 4 of high bits, one scale,
+  // for up to 8 input rows per pass, then the sub-group sums its lanes.
+  constexpr int kSg = 16, kRows = 8, kWg = 256;
+  const Q6 ww = w;
+  if (ww.n % (kWg / kSg)) throw std::runtime_error("fast::matmul_q6: rows not a multiple of 16");
   for (int64_t r0 = 0; r0 < rows; r0 += kRows) {
     const int64_t rc = std::min<int64_t>(kRows, rows - r0);
-    q.parallel_for(sycl::nd_range<1>(size_t(ww.n * kSg), kSg), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSg)]] {
-      const int64_t v = int64_t(it.get_group(0));
-      const int lane = int(it.get_local_id(0));
-      const uint8_t* row = ww.data + uint64_t(v) * ww.row_bytes;
+    q.parallel_for(sycl::nd_range<1>(size_t(ww.n * kSg), kWg), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSg)]] {
+      const int64_t v = int64_t(it.get_global_id(0)) / kSg;
+      const int lane = int(it.get_sub_group().get_local_id()[0]);
+      const int64_t k = ww.k;
       float acc[kRows] = {};
-      for (int64_t b = lane; b < ww.k / 256; b += kSg) {
-        const uint8_t* blk = row + b * 210;
-        for (int i = 0; i < 256; ++i) {
-          const float wv = q6k_weight(blk, i);
+      for (int64_t b = 0; b < k / 256; ++b) {
+        const int64_t e = v * k + b * 256 + lane * 16;
+        const sycl::uint2 lo = *reinterpret_cast<const sycl::uint2*>(ww.lo + e / 2);
+        const uint32_t hi = *reinterpret_cast<const uint32_t*>(ww.hi + e / 4);
+        const float s = float(ww.d[e / 256]) * float(ww.sc[e / 16]);
+        float wv[16];
 #pragma unroll
-          for (int r = 0; r < kRows; ++r)
-            if (r < rc) acc[r] += wv * x[(r0 + r) * ww.k + b * 256 + i];
+        for (int j = 0; j < 16; ++j) {
+          const uint32_t l = j < 8 ? lo.x() : lo.y();
+          wv[j] = float(int((l >> (4 * (j % 8))) & 15 | ((hi >> (2 * j)) & 3) << 4) - 32);
+        }
+#pragma unroll
+        for (int r = 0; r < kRows; ++r) {
+          if (r >= rc) break;
+          const sycl::float4* xr = reinterpret_cast<const sycl::float4*>(x + (r0 + r) * k + b * 256 + lane * 16);
+          float dot = 0;
+#pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            const sycl::float4 xv = xr[c];
+            dot += xv.x() * wv[4 * c] + xv.y() * wv[4 * c + 1] + xv.z() * wv[4 * c + 2] + xv.w() * wv[4 * c + 3];
+          }
+          acc[r] += dot * s;
         }
       }
       auto sg = it.get_sub_group();
 #pragma unroll
       for (int r = 0; r < kRows; ++r) {
         if (r >= rc) break;
-        const float s = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
-        if (lane == 0) out[(r0 + r) * ww.n + v] = s;
+        const float sum = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+        if (lane == 0) out[(r0 + r) * ww.n + v] = sum;
       }
     });
   }

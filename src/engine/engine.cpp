@@ -1,6 +1,7 @@
 #include "engine/engine.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <numeric>
 #include <stdexcept>
@@ -18,7 +19,7 @@ float* Engine::dev(int64_t n) {
 }
 
 Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), c_(cfg), cfg_(model::Gemma4Config::from_gguf(f)) {
-  if (c_.max_ctx % c_.page_size) throw std::runtime_error("engine: max_ctx must be a multiple of the page size");
+  if (c_.max_ctx % attn::kPage) throw std::runtime_error("engine: max_ctx must be a multiple of the page size");
   const int64_t E = cfg_.n_embd, F = cfg_.n_ff, H = cfg_.n_head;
   auto need = [&](const std::string& name) -> const gguf::Tensor& {
     const gguf::Tensor* t = f.tensor(name);
@@ -53,8 +54,17 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     return w;
   };
 
-  const gguf::Tensor& emb = need("token_embd.weight");
-  tok_embd_ = ref::Weight{emb.type, int64_t(emb.ne[0]), int64_t(emb.ne[1]), upload(emb), emb.nbytes / emb.ne[1]};
+  {
+    const gguf::Tensor& emb = need("token_embd.weight");
+    if (emb.type != gguf::Type::Q6_K) throw std::runtime_error(f.path() + ": token_embd.weight is not Q6_K");
+    auto* raw = sycl::malloc_device<uint8_t>(emb.nbytes, q_);
+    if (!raw) throw std::runtime_error("engine: out of device memory loading token_embd.weight");
+    q_.memcpy(raw, emb.data, emb.nbytes).wait();
+    head_ = fast::repack_q6k(q_, ref::Weight{emb.type, int64_t(emb.ne[0]), int64_t(emb.ne[1]), raw, emb.nbytes / emb.ne[1]});
+    sycl::free(raw, q_);
+    owned_.push_back(head_.lo);
+    weight_bytes_ += emb.nbytes;
+  }
   output_norm_ = vec("output_norm.weight");
 
   // RoPE inverse frequencies, computed in double and stored as fp32.
@@ -98,14 +108,21 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   sycl::free(staging, q_);
 
   // KV cache: rings for the sliding layers, a page pool for the global ones.
-  const int64_t hkv_s = cfg_.n_head_kv[size_t(std::find(cfg_.sliding.begin(), cfg_.sliding.end(), true) - cfg_.sliding.begin())];
-  ring_layer_stride_ = int64_t(c_.n_slots) * cfg_.window * hkv_s * cfg_.head_dim_sliding;
+  for (int l = 0; l < cfg_.n_layer; ++l) {
+    int64_t& hkv = cfg_.sliding[size_t(l)] ? hkv_sliding_ : hkv_global_;
+    if (hkv && hkv != cfg_.n_head_kv[size_t(l)]) throw std::runtime_error("engine: K/V heads differ between layers of a kind");
+    hkv = cfg_.n_head_kv[size_t(l)];
+  }
+  group_sliding_ = H / hkv_sliding_;
+  group_global_ = H / hkv_global_;
+  ring_pages_ = (cfg_.window + c_.max_chunk + attn::kPage - 1) / attn::kPage;
+  ring_layer_stride_ = int64_t(c_.n_slots) * ring_pages_ * hkv_sliding_ * attn::kPage * cfg_.head_dim_sliding;
   const size_t ring_elems = size_t(ring_layer_stride_ * n_ring);
   ring_k_ = sycl::malloc_device<sycl::half>(ring_elems, q_);
   ring_v_ = sycl::malloc_device<sycl::half>(ring_elems, q_);
-  max_pages_ = c_.max_ctx / c_.page_size;
+  max_pages_ = c_.max_ctx / attn::kPage;
   n_pages_ = max_pages_ * c_.n_slots;
-  page_layer_stride_ = n_pages_ * c_.page_size * cfg_.head_dim_global;
+  page_layer_stride_ = n_pages_ * hkv_global_ * attn::kPage * cfg_.head_dim_global;
   const size_t page_elems = size_t(page_layer_stride_ * n_page);
   page_k_ = sycl::malloc_device<sycl::half>(page_elems, q_);
   page_v_ = sycl::malloc_device<sycl::half>(page_elems, q_);
@@ -135,8 +152,12 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   up_ = dev(B * F);
   rows_ = dev(c_.max_logits * E);
   logits_ = dev(c_.max_logits * cfg_.n_vocab);
-  for (int32_t** p : {&tok_, &slot_, &pos_, &chunk_pos_, &chunk_base_, &chunk_last_}) {
-    *p = sycl::malloc_device<int32_t>(size_t(B), q_);
+  // At most one chunk per slot in a step, so at most n_slots partial tiles per K/V head.
+  max_tiles_sliding_ = hkv_sliding_ * ((B * group_sliding_ + 7) / 8 + c_.n_slots);
+  max_tiles_global_ = hkv_global_ * ((B * group_global_ + 7) / 8 + c_.n_slots);
+  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}, {&tiles_sliding_, 4 * max_tiles_sliding_},
+                      {&tiles_global_, 4 * max_tiles_global_}}) {
+    *p = sycl::malloc_device<int32_t>(size_t(n), q_);
     if (!*p) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(*p);
   }
@@ -146,13 +167,14 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
 Engine::~Engine() {
   q_.wait();
   xmx::free_activations(q_, act_);
-  if (attn_scratch_.p) sycl::free(attn_scratch_.p, q_);
+  if (attn_scratch_.q) sycl::free(attn_scratch_.q, q_);
+  if (attn_scratch_.part) sycl::free(attn_scratch_.part, q_);
   for (void* p : owned_) sycl::free(p, q_);
 }
 
 void Engine::ensure_pages(int slot, int64_t positions) {
   Slot& s = slots_[size_t(slot)];
-  const int64_t need = (positions + c_.page_size - 1) / c_.page_size;
+  const int64_t need = (positions + attn::kPage - 1) / attn::kPage;
   if (need > max_pages_) throw std::runtime_error("engine: sequence longer than max_ctx");
   while (int64_t(s.pages.size()) < need) {
     if (free_pages_.empty()) throw std::runtime_error("engine: out of KV pages");
@@ -171,34 +193,63 @@ void Engine::release(int slot) {
 
 std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::DumpSink* dump) {
   const int64_t E = cfg_.n_embd, F = cfg_.n_ff, H = cfg_.n_head, V = cfg_.n_vocab;
-  std::vector<int32_t> tok, slot, pos, cpos, cbase, clast, logit_rows;
+  std::vector<int32_t> tok, slot, pos, logit_rows;
+  attn::TileList tiles_s, tiles_g;
   for (const auto& c : chunks) {
     if (c.slot < 0 || c.slot >= c_.n_slots) throw std::runtime_error("engine: bad slot");
     if (c.start_pos != slots_[size_t(c.slot)].length) throw std::runtime_error("engine: chunk does not continue its slot");
     const int64_t base = int64_t(tok.size()), n = int64_t(c.tokens.size());
+    if (n > c_.max_chunk) throw std::runtime_error("engine: chunk longer than max_chunk");
+    if (n == 0) continue;
     for (int64_t i = 0; i < n; ++i) {
       tok.push_back(c.tokens[size_t(i)]);
       slot.push_back(c.slot);
       pos.push_back(int32_t(c.start_pos + i));
-      cpos.push_back(int32_t(c.start_pos));
-      cbase.push_back(int32_t(base));
-      clast.push_back(int32_t(c.start_pos + n - 1));
     }
+    tiles_s.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_sliding_, hkv_sliding_, cfg_.window);
+    tiles_g.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_global_, hkv_global_, 0);
     for (int64_t r = std::max<int64_t>(0, n - c.logits_rows); r < n; ++r) logit_rows.push_back(int32_t(base + r));
     ensure_pages(c.slot, c.start_pos + n);
   }
   const int64_t T = int64_t(tok.size()), R = int64_t(logit_rows.size());
   if (T == 0) return {};
+  const auto t_step = std::chrono::steady_clock::now();
   if (T > c_.max_batch) throw std::runtime_error("engine: step larger than max_batch");
   if (R > c_.max_logits) throw std::runtime_error("engine: too many logits rows");
   q_.memcpy(tok_, tok.data(), size_t(T) * 4);
   q_.memcpy(slot_, slot.data(), size_t(T) * 4);
   q_.memcpy(pos_, pos.data(), size_t(T) * 4);
-  q_.memcpy(chunk_pos_, cpos.data(), size_t(T) * 4);
-  q_.memcpy(chunk_base_, cbase.data(), size_t(T) * 4);
-  q_.memcpy(chunk_last_, clast.data(), size_t(T) * 4);
+  q_.memcpy(tiles_sliding_, tiles_s.desc.data(), tiles_s.desc.size() * 4);
+  q_.memcpy(tiles_global_, tiles_g.desc.data(), tiles_g.desc.size() * 4);
   q_.memcpy(page_table_, page_table_host_.data(), page_table_host_.size() * 4);
-  const attn::Meta meta{slot_, pos_, chunk_pos_, chunk_base_, chunk_last_, T, *std::max_element(pos.begin(), pos.end())};
+  const attn::Tokens toks{slot_, pos_, T};
+  // On a profiling queue each mark is an empty kernel whose end timestamp closes the section, so
+  // the card's own time is measured; otherwise the host waits at each mark.
+  const bool gpu_marks = profile_ && q_.has_property<sycl::property::queue::enable_profiling>();
+  std::vector<std::pair<const char*, sycl::event>> marks;
+  auto settle = [&] {
+    if (!gpu_marks || marks.empty()) return;
+    namespace ep = sycl::info::event_profiling;
+    uint64_t prev = marks[0].second.get_profiling_info<ep::command_end>();
+    for (size_t i = 1; i < marks.size(); ++i) {
+      const uint64_t end = marks[i].second.get_profiling_info<ep::command_end>();
+      (*profile_)[marks[i].first] += double(end - prev) * 1e-9;
+      prev = end;
+    }
+  };
+  auto t_mark = std::chrono::steady_clock::now();
+  auto mark = [&](const char* name) {
+    if (!profile_) return;
+    if (gpu_marks) {
+      marks.push_back({name, q_.single_task([] {})});
+      return;
+    }
+    q_.wait();
+    const auto now = std::chrono::steady_clock::now();
+    (*profile_)[name] += std::chrono::duration<double>(now - t_mark).count();
+    t_mark = now;
+  };
+  mark("upload");
 
   auto emit = [&](const std::string& name, const float* p, std::vector<int64_t> ne) {
     if (!dump || !dump->wants(name)) return;
@@ -214,8 +265,9 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     xmx::matmul(q_, act_, w, out);
   };
 
-  fast::embed(q_, tok_embd_, tok_, T, std::sqrt(float(E)), x_);
+  fast::embed(q_, head_, tok_, T, std::sqrt(float(E)), x_);
   emit("inp_scaled", x_, {E, T});
+  mark("embed");
   for (int l = 0; l < cfg_.n_layer; ++l) {
     const Layer& L = layers_[size_t(l)];
     const std::string s = "-" + std::to_string(l);
@@ -225,12 +277,14 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
 
     fast::rmsnorm(q_, x_, L.attn_norm, T, E, cfg_.eps, h_);
     emit("attn_norm" + s, h_, {E, T});
+    mark("norms");
     act_.k = E;
     xmx::quantize(q_, h_, T, act_);
     xmx::matmul(q_, act_, L.wq, qb_);
     xmx::matmul(q_, act_, L.wk, kb_);
     if (L.wv.tiles) xmx::matmul(q_, act_, L.wv, vb_);
     else q_.memcpy(vb_, kb_, size_t(T * Hkv * D) * sizeof(float));
+    mark("qkv");
     fast::rmsnorm(q_, qb_, L.q_norm, T * H, D, cfg_.eps, qb_);
     fast::rope_neox(q_, qb_, pos_, T, H, D, D, inv);
     emit("Qcur_pos" + s, qb_, {D, H, T});
@@ -239,49 +293,65 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     emit("Kcur_pos" + s, kb_, {D, Hkv, T});
     fast::rmsnorm(q_, vb_, nullptr, T * Hkv, D, cfg_.eps, vb_);
     emit("Vcur_normed" + s, vb_, {D, Hkv, T});
+    mark("qkv_norm_rope");
 
     if (sliding) {
-      const attn::Ring ring{ring_k_ + L.ring_index * ring_layer_stride_, ring_v_ + L.ring_index * ring_layer_stride_,
-                            cfg_.window * Hkv * D, cfg_.window};
-      attn::sliding(q_, qb_, kb_, vb_, meta, ring, H, Hkv, D, 1.0f, att_, attn_scratch_);
-      attn::write_ring(q_, kb_, vb_, meta, ring, Hkv, D);
+      const attn::Cache cache{ring_k_ + L.ring_index * ring_layer_stride_, ring_v_ + L.ring_index * ring_layer_stride_, nullptr,
+                              ring_pages_, cfg_.window, Hkv, D};
+      attn::write(q_, kb_, vb_, toks, cache);
+      attn::attend(q_, qb_, toks, tiles_sliding_, tiles_s.size(), tiles_s.max_keys, cache, H, 1.0f, att_, attn_scratch_);
+      mark("attn_sliding");
     } else {
-      const attn::Pages pages{page_k_ + L.page_index * page_layer_stride_, page_v_ + L.page_index * page_layer_stride_,
-                              page_table_, max_pages_, c_.page_size};
-      attn::write_pages(q_, kb_, vb_, meta, pages, D);
-      attn::global(q_, qb_, meta, pages, H, D, 1.0f, att_, attn_scratch_);
+      const attn::Cache cache{page_k_ + L.page_index * page_layer_stride_, page_v_ + L.page_index * page_layer_stride_,
+                              page_table_, max_pages_, 0, Hkv, D};
+      attn::write(q_, kb_, vb_, toks, cache);
+      attn::attend(q_, qb_, toks, tiles_global_, tiles_g.size(), tiles_g.max_keys, cache, H, 1.0f, att_, attn_scratch_);
+      mark("attn_global");
     }
     emit("kqv_out" + s, att_, {H * D, T});
     mm(att_, H * D, L.wo, o_);
+    mark("wo");
     fast::rmsnorm(q_, o_, L.attn_post_norm, T, E, cfg_.eps, o_);
     fast::add_scale(q_, o_, x_, 1.0f, T * E, x2_);
     emit("attn_out" + s, x2_, {E, T});
+    mark("norms");
 
     fast::rmsnorm(q_, x2_, L.ffn_norm, T, E, cfg_.eps, h_);
+    mark("norms");
     act_.k = E;
     xmx::quantize(q_, h_, T, act_);
     xmx::matmul(q_, act_, L.gate, gate_);
     xmx::matmul(q_, act_, L.up, up_);
+    mark("gate_up");
     fast::gelu_mul(q_, gate_, up_, T * F, gate_);
+    mark("gelu");
     mm(gate_, F, L.down, o_);
+    mark("down");
     fast::rmsnorm(q_, o_, L.ffn_post_norm, T, E, cfg_.eps, o_);
     fast::add_scale(q_, o_, x2_, L.out_scale, T * E, x_);
     emit("l_out" + s, x_, {E, T});
+    mark("norms");
   }
 
   for (const auto& c : chunks) slots_[size_t(c.slot)].length += int64_t(c.tokens.size());
   if (R == 0) {
+    enqueue_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_step).count();
     q_.wait();
+    settle();
     return {};
   }
   // Logits only for the rows asked for: gather them, final norm, tied head, softcap.
   for (int64_t r = 0; r < R; ++r) q_.memcpy(rows_ + r * E, x_ + int64_t(logit_rows[size_t(r)]) * E, size_t(E) * sizeof(float));
   fast::rmsnorm(q_, rows_, output_norm_, R, E, cfg_.eps, rows_);
   emit("result_norm", rows_, {E, R});
-  fast::matmul_q6k(q_, tok_embd_, rows_, R, logits_);
+  fast::matmul_q6(q_, head_, rows_, R, logits_);
   if (cfg_.softcap > 0) fast::softcap(q_, logits_, cfg_.softcap, R * V);
+  mark("head");
   std::vector<float> out(size_t(R * V));
-  q_.memcpy(out.data(), logits_, out.size() * sizeof(float)).wait();
+  auto done = q_.memcpy(out.data(), logits_, out.size() * sizeof(float));
+  enqueue_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_step).count();
+  done.wait();
+  settle();
   return out;
 }
 

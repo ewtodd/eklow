@@ -10,9 +10,12 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <map>
+#include <string>
 #include <vector>
 
 #include "kernels/attention.hpp"
+#include "kernels/fast.hpp"
 #include "kernels/xmx.hpp"
 #include "model/gemma4.hpp"
 #include "model/gguf.hpp"
@@ -21,10 +24,10 @@ namespace eklow::engine {
 
 struct Config {
   int n_slots = 2;
-  int64_t max_ctx = 131072;  // positions per slot
+  int64_t max_ctx = 131072;  // positions per slot, a multiple of attn::kPage
   int64_t max_batch = 2048;  // tokens per step
+  int64_t max_chunk = 1024;  // tokens per chunk: the sliding rings hold the window and one chunk
   int64_t max_logits = 64;   // logits rows per step
-  int64_t page_size = 256;
 };
 
 struct Chunk {
@@ -49,9 +52,16 @@ class Engine {
   // Positions the slot holds (where its next chunk starts).
   int64_t length(int slot) const { return slots_[size_t(slot)].length; }
 
+  // With a profile set, step waits after each section of the forward pass and adds its wall time
+  // under the section's name: slower, for finding where the time goes.
+  void set_profile(std::map<std::string, double>* p) { profile_ = p; }
+
   const model::Gemma4Config& model() const { return cfg_; }
   uint64_t weight_bytes() const { return weight_bytes_; }
   uint64_t cache_bytes() const { return cache_bytes_; }
+  // Host time the last step took to enqueue its work; when it nears the step's wall time, the
+  // card waits on the host.
+  double enqueue_seconds() const { return enqueue_s_; }
 
  private:
   struct Layer {
@@ -74,23 +84,27 @@ class Engine {
   std::vector<void*> owned_;
   uint64_t weight_bytes_ = 0, cache_bytes_ = 0;
 
-  ref::Weight tok_embd_;
+  fast::Q6 head_;  // token embedding and tied output head
   const float* output_norm_ = nullptr;
   const float *inv_freq_sliding_ = nullptr, *inv_freq_global_ = nullptr;
   std::vector<Layer> layers_;
 
   // KV cache
   sycl::half *ring_k_ = nullptr, *ring_v_ = nullptr, *page_k_ = nullptr, *page_v_ = nullptr;
-  int64_t ring_layer_stride_ = 0, page_layer_stride_ = 0, n_pages_ = 0, max_pages_ = 0;
+  int64_t ring_layer_stride_ = 0, page_layer_stride_ = 0, ring_pages_ = 0, n_pages_ = 0, max_pages_ = 0;
+  int64_t group_sliding_ = 0, group_global_ = 0, hkv_sliding_ = 0, hkv_global_ = 0;
   int32_t* page_table_ = nullptr;
   std::vector<int32_t> page_table_host_, free_pages_;
   std::vector<Slot> slots_;
 
   // workspace, sized for max_batch tokens
   float *x_, *x2_, *h_, *qb_, *kb_, *vb_, *att_, *o_, *gate_, *up_, *rows_, *logits_;
-  int32_t *tok_, *slot_, *pos_, *chunk_pos_, *chunk_base_, *chunk_last_;
+  int32_t *tok_, *slot_, *pos_, *tiles_sliding_, *tiles_global_;
+  int64_t max_tiles_sliding_ = 0, max_tiles_global_ = 0;
   xmx::Activations act_;
   attn::Scratch attn_scratch_;
+  std::map<std::string, double>* profile_ = nullptr;
+  double enqueue_s_ = 0;
 };
 
 }  // namespace eklow::engine

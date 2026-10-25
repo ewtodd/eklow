@@ -11,8 +11,22 @@
 
 namespace eklow::fast {
 
-// out[t][:] = dequant(table row tokens[t]) * scale; table Q6_K, F16 or F32.
-void embed(sycl::queue& q, const ref::Weight& table, const int32_t* tokens, int64_t n_tok, float scale, float* out);
+// A Q6_K matrix (the tied embedding and output head) split into aligned arrays, each [n][...]:
+// low 4 bits of element e in byte e/2 (low nibble for even e), its top 2 bits at bit 2*(e%4) of
+// byte e/4, Q6_K's int8 scale per 16 elements and fp16 scale per 256. The same 6.5625 bits per
+// weight and the same values as Q6_K, but every lane's loads are aligned and contiguous.
+struct Q6 {
+  int64_t k = 0, n = 0;
+  uint8_t *lo = nullptr, *hi = nullptr;
+  int8_t* sc = nullptr;
+  sycl::half* d = nullptr;
+};
+// From a Q6_K matrix in device memory; one allocation, freed with free_q6.
+Q6 repack_q6k(sycl::queue& q, const ref::Weight& raw);
+void free_q6(sycl::queue& q, Q6& w);
+
+// out[t][:] = table row tokens[t] * scale
+void embed(sycl::queue& q, const Q6& table, const int32_t* tokens, int64_t n_tok, float scale, float* out);
 
 // out[r][:] = x[r][:] / sqrt(mean(x[r]^2) + eps) * (w ? w : 1); out may be x.
 void rmsnorm(sycl::queue& q, const float* x, const float* w, int64_t rows, int64_t cols, float eps, float* out);
@@ -27,7 +41,7 @@ void gelu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, flo
 void add_scale(sycl::queue& q, const float* a, const float* b, float s, int64_t n, float* out);
 void softcap(sycl::queue& q, float* x, float cap, int64_t n);
 
-// out[r][v] = x[r] . W[v] for a Q6_K matrix (the tied output head), r < rows.
-void matmul_q6k(sycl::queue& q, const ref::Weight& w, const float* x, int64_t rows, float* out);
+// out[r][v] = x[r] . W[v], r < rows.
+void matmul_q6(sycl::queue& q, const Q6& w, const float* x, int64_t rows, float* out);
 
 }  // namespace eklow::fast

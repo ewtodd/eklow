@@ -64,14 +64,35 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
       recovered exactly from 40,000 random turns rendered by the template (DECISIONS 2026-10-24)
 - [ ] image input (bidirectional attention among an image's tokens on sliding layers): with M3
 
+## Milestone 3 (serving)
+
+- [x] the serving forward pass (`src/engine/engine.cpp`, `eklow-engine-run`): steps of prefill
+      chunks and decode tokens from several slots, paged fp16 KV (sliding rings, global page
+      tables); within the oracle's noise floor for one chunk, chunked prefill, decode and two slots
+      at once (DECISIONS 2026-10-24)
+- [ ] sampler, OpenAI-compatible server (streaming, tools, thinking), scheduler with continuous
+      batching, prefix cache, grammar-constrained tool calls
+- [ ] EmbeddingGemma 2 in the same process
+- [ ] NixOS module and fiona's config
+
 ## Milestone 4 (speed), started early
 
 - [x] XMX matmul for Q4_0 (`src/kernels/xmx.cpp`): weights repacked to dpas tiles at load,
       activations quantized to int8 per block; exact against a CPU emulation of the quantized
       arithmetic. GEMV 110-240 GB/s (decode), column groups ~11 TOPS (64-256 rows), tile GEMM 28-53
       TOPS (2048 rows) (`eklow-kernel-test`, docs/bench/kernels-fiona-2026-10-24.json)
+- [x] output head in an aligned Q6 layout: 3.4 ms of a decode step (was 69)
+- [x] flash attention on the matrix units with paged dpas-tiled KV (`src/kernels/attention.cpp`,
+      `eklow-attn-test`): decode 84-314 us per layer, prefill 6-9 TFLOPS (DECISIONS 2026-10-24)
+- [x] `eklow-engine-bench`: prefill 1,141 / 1,057 / 867 tok/s at 1k / 4k / 16k, decode 22.2 /
+      20.8 / 19.4 tok/s at 0 / 4k / 16k (docs/bench/engine-fiona-2026-10-24.json); `--profile`
+      times each section of the forward pass on the card
+- [ ] decode: fuse the per-layer kernels (about 32 launches a layer at ~7 us each on the card)
+      and the QKV and gate/up matmuls
+- [ ] attention: K/V blocks staged through shared local memory, shared by several query tiles
 - [ ] GEMM through shared local memory (cooperative tiles, double buffering) for >= 100 TOPS
 - [ ] decode GEMV toward the 399 GB/s the card reads
+- [ ] global KV for 2 x 262k: 8.6 GB in fp16 does not fit beside the weights
 
 ## Open
 

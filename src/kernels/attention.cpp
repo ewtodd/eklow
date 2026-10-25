@@ -1,170 +1,284 @@
 #include "kernels/attention.hpp"
 
+#include <sycl/ext/intel/esimd.hpp>
+
 #include <algorithm>
+#include <functional>
 #include <limits>
 #include <stdexcept>
+#include <string>
 
 namespace eklow::attn {
 
-namespace {
+namespace esimd = sycl::ext::intel::esimd;
+namespace xmxd = sycl::ext::intel::esimd::xmx;
 
-constexpr int kSg = 16;
-
-float* scratch_get(sycl::queue& q, Scratch& s, size_t need) {
-  if (need > s.floats) {
-    if (s.p) {
-      q.wait();
-      sycl::free(s.p, q);
-    }
-    s.floats = std::max(need, s.floats * 2);
-    s.p = sycl::malloc_device<float>(s.floats, q);
-    if (!s.p) throw std::runtime_error("attention: out of device memory for split partials");
-  }
-  return s.p;
+void TileList::add_chunk(int32_t base, int64_t n_tok, int64_t last_pos, int64_t group, int64_t n_head_kv, int64_t window) {
+  const int64_t rows = n_tok * group;
+  for (int64_t g = 0; g < n_head_kv; ++g)
+    for (int64_t r0 = 0; r0 < rows; r0 += 8) desc.insert(desc.end(), {base, int32_t(rows), int32_t(r0), int32_t(g)});
+  // A tile's rows span at most 8 consecutive positions.
+  max_keys = std::max(max_keys, window > 0 ? std::min(window + 7, last_pos + 1) : last_pos + 1);
 }
 
-// Where key j of query token t lives, as a lane's DL dimensions in fp32.
-struct SlidingSrc {
-  const float *k_new, *v_new;
-  Ring ring;
-  int64_t n_head_kv, head_dim;
-  template <int DL>
-  void load(const Meta& m, int64_t t, int64_t j, int64_t kh, int64_t d0, bool want_v, float (&out)[DL]) const {
-    if (j >= m.chunk_pos[t]) {
-      const float* row = (want_v ? v_new : k_new) + ((m.chunk_base[t] + (j - m.chunk_pos[t])) * n_head_kv + kh) * head_dim + d0;
+namespace {
+
+constexpr int kRows = 8, kKeys = 16, kSlice = 64;
+// The running maximum starts finite so that a row with no key yet in a block gets weight
+// exp(-inf - kNegBig) = 0 and correction exp(0) = 1 rather than NaN.
+constexpr float kNegBig = -1e30f;
+
+template <class T>
+T* grow(sycl::queue& q, T*& p, size_t& have, size_t need) {
+  if (need > have) {
+    if (p) {
+      q.wait();
+      sycl::free(p, q);
+    }
+    have = std::max(need, have * 2);
+    p = sycl::malloc_device<T>(have, q);
+    if (!p) throw std::runtime_error("attention: out of device memory for scratch");
+  }
+  return p;
+}
+
+inline int32_t part_stride(int32_t d) { return kRows * d + 2 * kRows; }
+
+// Index arithmetic below is in 32 bits with the query group size a template parameter: DG2 has no
+// integer division, and 64-bit divisions by runtime values were library calls that cost more than
+// a decode step's whole attention.
+template <int D, int G>
+struct Flash {
+  static constexpr int P = D / kSlice;     // threads per tile
+  static constexpr int RPT = kRows / P;    // rows each thread runs the softmax for
+  static constexpr int DC = kSlice / 16;   // Q.K^T steps per slice
+  static constexpr int DG = kSlice / 8;    // P.V output tiles per slice
+  // Shared local memory: partial scores [P][2 key halves][8 rows][8 keys] fp32, the probability
+  // tile [8 rows][16 keys] fp16, the correction per row, and at the end m and l per row.
+  static constexpr uint32_t kScores = 0, kProbs = P * 512, kCorr = kProbs + 256, kM = kCorr + 32, kL = kM + 32,
+                            kSlm = kL + 32;
+
+  const sycl::half* qt;
+  const int32_t* tiles;
+  const int32_t *slot_of, *pos_of;
+  const sycl::half *kc, *vc;
+  const int32_t* table;
+  int32_t pages, window, n_head_kv, n_head, splits;
+  float* out;
+  float* part;
+
+  // Offset of the page (this K/V head's part of it) holding position `key`.
+  int32_t page_at(int32_t slot, int32_t kvh, int32_t key) const SYCL_ESIMD_FUNCTION {
+    const int32_t logical = key / int32_t(kPage);
+    const int32_t phys = table ? table[slot * pages + logical] : slot * pages + logical % pages;
+    return (phys * n_head_kv + kvh) * int32_t(kPage * D);
+  }
+
+  // Thread j's K and V tiles of block b: K at kp + dc * 128 (keys 0-7) and + (D/16 + dc) * 128
+  // (keys 8-15), V at vp + g * 128.
+  void tiles_of(int32_t b, int32_t slot, int32_t kvh, int j, const sycl::half*& kp, const sycl::half*& vp) const SYCL_ESIMD_FUNCTION {
+    const int32_t key0 = b * kKeys, in_page = key0 % int32_t(kPage), at = page_at(slot, kvh, key0);
+    kp = kc + at + ((in_page / 8) * (D / 16) + j * DC) * 128;
+    vp = vc + at + ((in_page / 16) * (D / 8) + j * DG) * 128;
+  }
+
+  // Each tile is consumed by a dpas right after its load, so loads straight from VRAM leave the
+  // thread waiting on every one: the next block's tiles are prefetched into L1 a block ahead.
+  void prefetch(int32_t b, int32_t slot, int32_t kvh, int j) const SYCL_ESIMD_FUNCTION {
+    constexpr auto cached = esimd::properties{esimd::cache_hint_L1<esimd::cache_hint::cached>,
+                                              esimd::cache_hint_L2<esimd::cache_hint::cached>};
+    const sycl::half *kp, *vp;
+    tiles_of(b, slot, kvh, j, kp, vp);
 #pragma unroll
-      for (int i = 0; i < DL; ++i) out[i] = row[i];
-    } else {
-      const sycl::half* row = (want_v ? ring.v : ring.k) + m.slot[t] * ring.slot_stride +
-                              ((j % ring.window) * n_head_kv + kh) * head_dim + d0;
+    for (int dc = 0; dc < DC; ++dc) {
+      esimd::prefetch<uint32_t, 64>(reinterpret_cast<const uint32_t*>(kp + dc * 128), cached);
+      esimd::prefetch<uint32_t, 64>(reinterpret_cast<const uint32_t*>(kp + (D / 16 + dc) * 128), cached);
+    }
 #pragma unroll
-      for (int i = 0; i < DL; ++i) out[i] = float(row[i]);
+    for (int g = 0; g < DG; ++g) esimd::prefetch<uint32_t, 64>(reinterpret_cast<const uint32_t*>(vp + g * 128), cached);
+  }
+
+  void operator()(sycl::nd_item<2> it) const SYCL_ESIMD_KERNEL {
+    esimd::slm_init<kSlm>();
+    const int j = int(it.get_local_id(1));
+    const int32_t tile = int32_t(it.get_group(1)), s = int32_t(it.get_global_id(0));
+    const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r0 = tiles[tile * 4 + 2], kvh = tiles[tile * 4 + 3];
+    const int32_t t_first = base + r0 / G, t_last = base + (std::min(r0 + kRows, rows) - 1) / G;
+    const int32_t slot = slot_of[t_first];
+    const int32_t lo = window > 0 ? std::max(0, pos_of[t_first] - window + 1) : 0;
+    const int32_t blo = lo / kKeys, nblk = pos_of[t_last] / kKeys - blo + 1;
+    const int32_t per = (nblk + splits - 1) / splits;
+    const int32_t b0 = blo + s * per, b1 = std::min(blo + nblk, b0 + per);
+
+    // This thread's softmax rows: each one's last visible key, first visible key minus one, and
+    // running max and sum.
+    int32_t hi[RPT], wlo[RPT];
+    float m[RPT], l[RPT];
+#pragma unroll
+    for (int i = 0; i < RPT; ++i) {
+      const int32_t r = r0 + j * RPT + i;
+      hi[i] = r < rows ? pos_of[base + r / G] : -1;
+      wlo[i] = window > 0 ? hi[i] - window : -1;
+      m[i] = kNegBig;
+      l[i] = 0;
+    }
+    esimd::simd<float, 64> O[DG];
+#pragma unroll
+    for (int g = 0; g < DG; ++g) O[g] = 0;
+    const sycl::half* qs = qt + tile * (kRows * D) + j * DC * 128;
+    if (b0 < b1) prefetch(b0, slot, kvh, j);
+    for (int32_t b = b0; b < b1; ++b) {
+      const int32_t key0 = b * kKeys;
+      if (b + 1 < b1) prefetch(b + 1, slot, kvh, j);
+      const sycl::half *kp, *vp;
+      tiles_of(b, slot, kvh, j, kp, vp);
+      esimd::simd<float, 64> S0 = 0, S1 = 0;
+#pragma unroll
+      for (int dc = 0; dc < DC; ++dc) {
+        esimd::simd<sycl::half, 128> A = esimd::block_load<sycl::half, 128>(qs + dc * 128);
+        esimd::simd<sycl::half, 128> B0 = esimd::block_load<sycl::half, 128>(kp + dc * 128);
+        esimd::simd<sycl::half, 128> B1 = esimd::block_load<sycl::half, 128>(kp + (D / 16 + dc) * 128);
+        S0 = xmxd::dpas<8, 8, float>(S0, B0, A);
+        S1 = xmxd::dpas<8, 8, float>(S1, B1, A);
+      }
+      esimd::slm_block_store<float, 64>(kScores + j * 512, S0);
+      esimd::slm_block_store<float, 64>(kScores + j * 512 + 256, S1);
+      esimd::barrier();
+      {
+        esimd::simd<float, 8 * RPT> s0 = 0, s1 = 0;
+#pragma unroll
+        for (int t = 0; t < P; ++t) {
+          s0 += esimd::slm_block_load<float, 8 * RPT>(kScores + t * 512 + j * RPT * 32);
+          s1 += esimd::slm_block_load<float, 8 * RPT>(kScores + t * 512 + 256 + j * RPT * 32);
+        }
+        const esimd::simd<int, 16> key(key0, 1);
+#pragma unroll
+        for (int i = 0; i < RPT; ++i) {
+          esimd::simd<float, 16> sc;
+          sc.select<8, 1>(0) = s0.template select<8, 1>(i * 8);
+          sc.select<8, 1>(8) = s1.template select<8, 1>(i * 8);
+          sc.merge(sc, esimd::simd<float, 16>(-std::numeric_limits<float>::infinity()), (key <= hi[i]) & (key > wlo[i]));
+          const float mx = std::max(m[i], esimd::hmax<float>(sc));
+          const esimd::simd<float, 16> p = esimd::exp(sc - mx);
+          const float corr = esimd::exp(m[i] - mx);
+          l[i] = l[i] * corr + esimd::reduce<float>(p, std::plus<>());
+          m[i] = mx;
+          esimd::slm_block_store<sycl::half, 16>(kProbs + (j * RPT + i) * 32, esimd::simd<sycl::half, 16>(p));
+          esimd::slm_scalar_store<float>(kCorr + (j * RPT + i) * 4, corr);
+        }
+      }
+      esimd::barrier();
+      const esimd::simd<sycl::half, 128> Pa = esimd::slm_block_load<sycl::half, 128>(kProbs);
+      const esimd::simd<float, 8> corr = esimd::slm_block_load<float, 8>(kCorr);
+      esimd::simd<float, 64> cr;
+#pragma unroll
+      for (int i = 0; i < kRows; ++i) cr.select<8, 1>(i * 8) = corr[i];
+#pragma unroll
+      for (int g = 0; g < DG; ++g) {
+        esimd::simd<sycl::half, 128> B = esimd::block_load<sycl::half, 128>(vp + g * 128);
+        O[g] = xmxd::dpas<8, 8, float>(O[g] * cr, B, Pa);
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < RPT; ++i) {
+      esimd::slm_scalar_store<float>(kM + (j * RPT + i) * 4, m[i]);
+      esimd::slm_scalar_store<float>(kL + (j * RPT + i) * 4, l[i]);
+    }
+    esimd::barrier();
+    const esimd::simd<float, 8> L = esimd::slm_block_load<float, 8>(kL);
+#pragma unroll
+    for (int i = 0; i < kRows; ++i) {
+      const int32_t r = r0 + i;
+      if (r >= rows) break;
+      if (splits == 1) {
+        float* dst = out + ((base + r / G) * n_head + kvh * G + r % G) * D + j * kSlice;
+        const float inv = 1.0f / L[i];
+#pragma unroll
+        for (int g = 0; g < DG; ++g) esimd::block_store<float, 8>(dst + g * 8, O[g].template select<8, 1>(i * 8) * inv);
+      } else {
+        float* dst = part + (tile * splits + s) * part_stride(D) + i * D + j * kSlice;
+#pragma unroll
+        for (int g = 0; g < DG; ++g) esimd::block_store<float, 8>(dst + g * 8, O[g].template select<8, 1>(i * 8));
+      }
+    }
+    if (splits > 1 && j == 0) {
+      float* ml = part + (tile * splits + s) * part_stride(D) + kRows * D;
+      esimd::block_store<float, 8>(ml, esimd::slm_block_load<float, 8>(kM));
+      esimd::block_store<float, 8>(ml + 8, L);
     }
   }
 };
 
-struct PageSrc {
-  Pages pages;
-  int64_t head_dim;
-  template <int DL>
-  void load(const Meta& m, int64_t t, int64_t j, int64_t, int64_t d0, bool want_v, float (&out)[DL]) const {
-    const int64_t page = pages.table[m.slot[t] * pages.max_pages + j / pages.page_size];
-    const sycl::half* row = (want_v ? pages.v : pages.k) + (page * pages.page_size + j % pages.page_size) * head_dim + d0;
-#pragma unroll
-    for (int i = 0; i < DL; ++i) out[i] = float(row[i]);
-  }
-};
-
-template <int DL, class Src>
-void run(sycl::queue& q, const float* Q, const Meta& meta, const Src& src, int64_t n_head, int64_t n_head_kv,
-         int64_t head_dim, int64_t window, float scale, float* out, Scratch& scratch) {
-  if (head_dim != DL * kSg) throw std::runtime_error("attention: head_dim does not match the kernel");
-  const int64_t T = meta.n_tok, H = n_head, D = head_dim, group = n_head / n_head_kv;
-  const int64_t max_keys = window > 0 ? std::min<int64_t>(window, meta.max_pos + 1) : meta.max_pos + 1;
-  // Enough sub-groups to fill the card: split each query's keys when the batch is small (decode).
-  const int64_t splits = std::clamp<int64_t>(65536 / (T * H), 1, (max_keys + 255) / 256);
-  const int64_t split_len = (max_keys + splits - 1) / splits;
-  float* part = splits > 1 ? scratch_get(q, scratch, size_t(T * H * splits * (D + 2))) : nullptr;
-  const Meta m = meta;
-  q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(T), size_t(H * splits), kSg), sycl::range<3>(1, 1, kSg)),
-                 [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(kSg)]] {
-                   const int64_t t = int64_t(it.get_global_id(0)), hs = int64_t(it.get_global_id(1));
-                   const int64_t h = hs / splits, s = hs % splits, kh = h / group;
-                   const int lane = int(it.get_local_id(2));
-                   const int64_t d0 = lane * DL;
-                   auto sg = it.get_sub_group();
-                   const int64_t pos = m.pos[t];
-                   const int64_t lo = window > 0 ? std::max<int64_t>(0, pos - window + 1) : 0;
-                   const int64_t j0 = lo + s * split_len, j1 = std::min<int64_t>(pos + 1, j0 + split_len);
-                   float qv[DL];
-#pragma unroll
-                   for (int i = 0; i < DL; ++i) qv[i] = Q[(t * H + h) * D + d0 + i];
-                   float mx = -std::numeric_limits<float>::infinity(), l = 0, o[DL] = {};
-                   for (int64_t j = j0; j < j1; ++j) {
-                     float kv[DL];
-                     src.template load<DL>(m, t, j, kh, d0, false, kv);
-                     float part_dot = 0;
-#pragma unroll
-                     for (int i = 0; i < DL; ++i) part_dot += qv[i] * kv[i];
-                     const float sc = sycl::reduce_over_group(sg, part_dot, sycl::plus<float>()) * scale;
-                     const float mn = sycl::fmax(mx, sc);
-                     const float corr = sycl::exp(mx - mn), p = sycl::exp(sc - mn);
-                     l = l * corr + p;
-                     src.template load<DL>(m, t, j, kh, d0, true, kv);
-#pragma unroll
-                     for (int i = 0; i < DL; ++i) o[i] = o[i] * corr + p * kv[i];
-                     mx = mn;
-                   }
-                   if (splits == 1) {
-#pragma unroll
-                     for (int i = 0; i < DL; ++i) out[(t * H + h) * D + d0 + i] = o[i] / l;
-                   } else {
-                     float* dst = part + ((t * H + h) * splits + s) * (D + 2);
-#pragma unroll
-                     for (int i = 0; i < DL; ++i) dst[d0 + i] = o[i];
-                     if (lane == 0) {
-                       dst[D] = mx;
-                       dst[D + 1] = l;
-                     }
-                   }
-                 });
-  if (splits > 1)
-    q.parallel_for(sycl::range<2>(size_t(T * H), size_t(D)), [=](sycl::id<2> id) {
-      const int64_t th = int64_t(id[0]), d = int64_t(id[1]);
-      const float* base = part + th * splits * (D + 2);
-      float mx = -std::numeric_limits<float>::infinity();
-      for (int64_t s = 0; s < splits; ++s) mx = sycl::fmax(mx, base[s * (D + 2) + D]);
-      float l = 0, o = 0;
-      for (int64_t s = 0; s < splits; ++s) {
-        const float* p = base + s * (D + 2);
-        if (p[D + 1] == 0) continue;  // a split with no keys for this query
-        const float w = sycl::exp(p[D] - mx);
-        l += p[D + 1] * w;
-        o += p[d] * w;
-      }
-      out[th * D + d] = o / l;
-    });
+template <int D, int G>
+void run(sycl::queue& q, const float* Q, const Tokens& tok, const int32_t* tiles, int64_t n_tiles, int64_t max_keys,
+         const Cache& c, int64_t n_head, float scale, float* out, Scratch& scratch) {
+  constexpr int P = Flash<D, G>::P;
+  const int32_t H = int32_t(n_head);
+  // Query tiles in fp16, the A operands of Q.K^T: [tile][D/16][8 rows][16].
+  sycl::half* qt = grow(q, scratch.q, scratch.q_halves, size_t(n_tiles * kRows * D));
+  q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
+    const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), d = int32_t(id[2]);
+    const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];
+    float v = 0;
+    if (r < rows) v = Q[((base + r / G) * H + kvh * G + r % G) * D + d] * scale;
+    qt[tile * kRows * D + (d / 16) * 128 + i * 16 + d % 16] = sycl::half(v);
+  });
+  // Enough threads to fill the card: when there are few tiles (decode), split each tile's keys.
+  // Each block costs a thread several microseconds of load latency, so short splits win, but every
+  // split adds partials to merge: at least 4 blocks a split, and at most 32 splits beyond that
+  // (measured on the A770M, 2026-10-24).
+  const int64_t max_blocks = max_keys / kKeys + 2;
+  const int64_t per_split = std::max<int64_t>(4, max_blocks / 32);
+  const int64_t splits = std::clamp<int64_t>((8192 + n_tiles * P - 1) / (n_tiles * P), 1, std::max<int64_t>(1, max_blocks / per_split));
+  const int32_t sp = int32_t(splits);
+  float* part = splits > 1 ? grow(q, scratch.part, scratch.part_floats, size_t(n_tiles * splits * part_stride(D))) : nullptr;
+  Flash<D, G> k{qt,  tiles, tok.slot, tok.pos, c.k, c.v, c.table, int32_t(c.pages), int32_t(c.window), int32_t(c.n_head_kv),
+                H,   sp,    out,      part};
+  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(splits), size_t(n_tiles * P)), sycl::range<2>(1, P)), k);
+  if (splits == 1) return;
+  q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
+    const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), d = int32_t(id[2]);
+    const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];
+    if (r >= rows) return;
+    const float* p = part + tile * sp * part_stride(D);
+    float mx = kNegBig;
+    for (int32_t s = 0; s < sp; ++s)
+      if (p[s * part_stride(D) + kRows * D + kRows + i] > 0) mx = sycl::fmax(mx, p[s * part_stride(D) + kRows * D + i]);
+    float lsum = 0, o = 0;
+    for (int32_t s = 0; s < sp; ++s) {
+      const float* ps = p + s * part_stride(D);
+      const float ls = ps[kRows * D + kRows + i];
+      if (ls == 0) continue;  // a split with no keys for this row
+      const float w = sycl::exp(ps[kRows * D + i] - mx);
+      lsum += ls * w;
+      o += ps[i * D + d] * w;
+    }
+    out[((base + r / G) * H + kvh * G + r % G) * D + d] = o / lsum;
+  });
 }
 
 }  // namespace
 
-void sliding(sycl::queue& q, const float* Q, const float* K, const float* V, const Meta& m, const Ring& ring,
-             int64_t n_head, int64_t n_head_kv, int64_t head_dim, float scale, float* out, Scratch& scratch) {
-  SlidingSrc src{K, V, ring, n_head_kv, head_dim};
-  if (head_dim == 256) run<16>(q, Q, m, src, n_head, n_head_kv, head_dim, ring.window, scale, out, scratch);
-  else throw std::runtime_error("attention: sliding head_dim must be 256");
+void attend(sycl::queue& q, const float* Q, const Tokens& tok, const int32_t* tiles, int64_t n_tiles, int64_t max_keys,
+            const Cache& c, int64_t n_head, float scale, float* out, Scratch& scratch) {
+  if (n_tiles == 0) return;
+  const int64_t group = n_head / c.n_head_kv;
+  if (c.head_dim == 256 && group == 2) run<256, 2>(q, Q, tok, tiles, n_tiles, max_keys, c, n_head, scale, out, scratch);
+  else if (c.head_dim == 512 && group == 16) run<512, 16>(q, Q, tok, tiles, n_tiles, max_keys, c, n_head, scale, out, scratch);
+  else throw std::runtime_error("attention: no kernel for head_dim " + std::to_string(c.head_dim) + ", group " + std::to_string(group));
 }
 
-void global(sycl::queue& q, const float* Q, const Meta& m, const Pages& pages, int64_t n_head, int64_t head_dim,
-            float scale, float* out, Scratch& scratch) {
-  PageSrc src{pages, head_dim};
-  if (head_dim == 512) run<32>(q, Q, m, src, n_head, 1, head_dim, 0, scale, out, scratch);
-  else throw std::runtime_error("attention: global head_dim must be 512");
-}
-
-void write_ring(sycl::queue& q, const float* K, const float* V, const Meta& meta, const Ring& ring, int64_t n_head_kv,
-                int64_t head_dim) {
-  const Meta m = meta;
-  const Ring r = ring;
-  const int64_t row = n_head_kv * head_dim;
-  q.parallel_for(sycl::range<2>(size_t(m.n_tok), size_t(row)), [=](sycl::id<2> id) {
-    const int64_t t = int64_t(id[0]), i = int64_t(id[1]);
-    if (m.pos[t] <= m.chunk_last[t] - r.window) return;  // overwritten later in the same chunk
-    const int64_t dst = m.slot[t] * r.slot_stride + (m.pos[t] % r.window) * row + i;
-    r.k[dst] = sycl::half(K[t * row + i]);
-    r.v[dst] = sycl::half(V[t * row + i]);
-  });
-}
-
-void write_pages(sycl::queue& q, const float* K, const float* V, const Meta& meta, const Pages& pages, int64_t head_dim) {
-  const Meta m = meta;
-  const Pages p = pages;
-  q.parallel_for(sycl::range<2>(size_t(m.n_tok), size_t(head_dim)), [=](sycl::id<2> id) {
-    const int64_t t = int64_t(id[0]), d = int64_t(id[1]);
-    const int64_t page = p.table[m.slot[t] * p.max_pages + m.pos[t] / p.page_size];
-    const int64_t dst = (page * p.page_size + m.pos[t] % p.page_size) * head_dim + d;
-    p.k[dst] = sycl::half(K[t * head_dim + d]);
-    p.v[dst] = sycl::half(V[t * head_dim + d]);
+void write(sycl::queue& q, const float* K, const float* V, const Tokens& tok, const Cache& cache) {
+  const Cache c = cache;
+  const Tokens t = tok;
+  const int32_t D = int32_t(c.head_dim), Hkv = int32_t(c.n_head_kv), pages = int32_t(c.pages);
+  q.parallel_for(sycl::range<3>(size_t(t.n), size_t(Hkv), size_t(D)), [=](sycl::id<3> id) {
+    const int32_t i = int32_t(id[0]), h = int32_t(id[1]), d = int32_t(id[2]);
+    const int32_t pos = t.pos[i], n = pos % int32_t(kPage), logical = pos / int32_t(kPage), slot = t.slot[i];
+    const int32_t phys = c.table ? c.table[slot * pages + logical] : slot * pages + logical % pages;
+    const int32_t at = (phys * Hkv + h) * int32_t(kPage) * D, src = (i * Hkv + h) * D + d;
+    c.k[at + ((n / 8) * (D / 16) + d / 16) * 128 + ((d % 16) / 2) * 16 + (n % 8) * 2 + d % 2] = sycl::half(K[src]);
+    c.v[at + ((n / 16) * (D / 8) + d / 8) * 128 + ((n % 16) / 2) * 16 + (d % 8) * 2 + n % 2] = sycl::half(V[src]);
   });
 }
 

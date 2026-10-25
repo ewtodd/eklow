@@ -267,3 +267,71 @@ layer weights: every sampled output matches a CPU emulation of the quantized ari
 - 2048 rows, the 16 x 32 tile GEMM: 28-53 TOPS. Enough for the weight GEMMs to run at ~1,200-2,000
   tok/s, short of the 1,500 tok/s prefill target with attention on top; the fix is the standard one,
   work-group tiles staged through shared local memory, in M4.
+
+## 2026-10-24 — the serving forward pass
+
+`src/engine/engine.cpp` runs the 12B over a step: a list of chunks, each a prefill run or one decode
+token of one of the engine's slots, continuing where that slot left off. Q4_0 matrices go through
+the XMX kernels; everything else is a batched kernel in `src/kernels/fast.cpp` (embedding, RMS norm,
+NeoX RoPE from a position array with fp32 angles as llama.cpp and Hugging Face compute them, GELU,
+residuals, softcap) or the attention kernels.
+
+- KV cache: fp16 in 256-position pages. Global layers take pages from a pool through per-slot page
+  tables. Sliding layers keep a ring per slot of window + max_chunk positions (2,048 by default),
+  so a step writes its chunk's K/V before attending and every key comes from the cache; the
+  alternative, reading the chunk's own keys from the step's buffers, made the kernel branch per key.
+- The output head (the tied Q6_K embedding, 806 MB) is split at load into aligned arrays of low
+  nibbles, high bits, scales and super-block scales: the same bits and values, but a lane's loads
+  are aligned and contiguous. The first version, a thread per 256-weight block over the raw 210-byte
+  blocks, took 69 ms of a 124 ms decode step; the split layout takes 3.4 ms.
+- Logits only for the rows asked for (the last token of a prefill chunk, each decode token).
+
+Against the llama.cpp oracle on the 2,616-token prompt (the CPU-vs-CUDA floor: top-1 30/32, mean KL
+1.75e-2): one chunk 30/32, 1.49e-2; 512-token chunks 31/32, 1.40e-2; 1,000-token chunks then 32
+decode steps 31/32, 1.30e-2; with a second slot running the same prompt a step behind, 30-31/32 and
+0.99-2.43e-2 for the two slots. On the 25-token chat prompt 24/25, 4.9e-3. Runs that differ only in
+how the work was batched differ from each other by about as much as from the oracle: an int8
+activation that rounds the other way after a last-bit difference perturbs the next layer, and 48
+layers amplify it. One sequence prefilled in 900- and 1,000-token chunks gives bit-identical logits
+(the GEMM is independent of the chunk), so the spread comes only from different kernels (GEMV for 1
+or 2 decode rows, K-splits that depend on the batch's rows).
+
+The GEMM chose its K-split and its row tiles from the activation buffer's allocated rows, not the
+rows of the call: every prefill chunk was computed at the engine's full batch. Fixed in
+`xmx::quantize`, which now records the padded rows of each call.
+
+## 2026-10-24 — attention on the matrix units, and what a DG2 thread waits on
+
+`src/kernels/attention.cpp`. The cache stores K and V as fp16 dpas operands (K: 8 positions x 16
+dims, V: 16 positions x 8 dims, VNNI), each a contiguous 256-byte tile. Query rows are (token, head)
+pairs sharing a K/V head, 8 to a tile; a work-group of head_dim/64 threads takes a tile, each
+thread a 64-dimension slice of Q and of the output (DG2 has 128 registers of 32 bytes per thread,
+so an 8 x 256 fp32 output does not fit one thread). Per 16 keys: partial Q.K^T on each slice,
+summed through shared local memory, the online softmax by one thread per row, P.V on each slice.
+Long key ranges split across work-groups and merge (flash-decoding). `eklow-attn-test` drives it as
+the engine does (two slots, chunked prefill then decode, ring and page table) against
+`ref::attention`: relative L2 1.0e-4 (sliding) and 3.5e-4 (global).
+
+What the A770M made of it, from IGC's ISA dumps and a copy of the block loop with parts switched
+off (`eklow-attn-test`, and a scratch micro-benchmark):
+
+- Integer division by a runtime value is a library call on DG2, and 64-bit `/` and `%` in the
+  kernel's index math (`__vc_builtin_sdiv_i64`, `srem_i64`) cost more than the attention itself:
+  decode with one or two key blocks took 100-217 us. In 32 bits, with the query group size a
+  template parameter, 35 us.
+- Loads are the cost. Each 256-byte operand load is waited on before its dpas: ~375 ns per load
+  from VRAM, ~125 ns from cache, so a 16-key block takes a thread ~7 us when its tiles come from
+  memory, 0.9 us with them in registers (41-85 TFLOPS of dpas with no loads). Loading a block's
+  tiles up front spills; L1 cache hints and prefetching the next block changed nothing measurable.
+  Barriers and the softmax are minor (0.4 us per exchange).
+- A dependent chain of dpas runs at ~230 ns per dpas: accumulators need independent chains.
+- So decode wants many short splits, and their merging costs: at least 4 blocks per split, at
+  most 32 splits beyond that, measured best.
+
+Now (docs/bench/attn-fiona-2026-10-24.json): decode 92 us per sliding layer, 84 / 148 / 314 us per
+global layer at 1k / 4k / 16k; prefill of a 1,024-token chunk 6.1 TFLOPS (sliding), 7.2-8.9 TFLOPS
+(global). The engine (docs/bench/engine-fiona-2026-10-24.json): prefill 1,141 / 1,057 / 867 tok/s
+over 1k / 4k / 16k prompts; decode 22.2 / 20.8 / 19.4 tok/s at 0 / 4k / 16k. At 16k, attention is
+35% of prefill and the weight GEMMs at ~33 TOPS most of the rest. The next attention step is the
+standard one: a work-group stages each K/V block through shared local memory with double buffering,
+so several query tiles share one load and the next block's loads overlap this block's dpas.

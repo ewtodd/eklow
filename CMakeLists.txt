@@ -74,6 +74,10 @@ add_executable(eklow-kernel-test tools/kernel_test/main.cpp)
 target_link_libraries(eklow-kernel-test PRIVATE eklow_model)
 eklow_sycl(eklow-kernel-test)
 
+add_executable(eklow-attn-test tools/attn_test/main.cpp)
+target_link_libraries(eklow-attn-test PRIVATE eklow_model)
+eklow_sycl(eklow-attn-test)
+
 add_executable(eklow-ref-run tools/ref_run/main.cpp)
 target_link_libraries(eklow-ref-run PRIVATE eklow_model)
 eklow_sycl(eklow-ref-run)
@@ -86,6 +90,10 @@ eklow_sycl(eklow_engine)
 add_executable(eklow-engine-run tools/engine_run/main.cpp)
 target_link_libraries(eklow-engine-run PRIVATE eklow_engine)
 eklow_sycl(eklow-engine-run)
+
+add_executable(eklow-engine-bench tools/engine_bench/main.cpp)
+target_link_libraries(eklow-engine-bench PRIVATE eklow_engine)
+eklow_sycl(eklow-engine-bench)
 
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
@@ -101,4 +109,4 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-engine-run RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-engine-run eklow-engine-bench RUNTIME DESTINATION bin)

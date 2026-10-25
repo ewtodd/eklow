@@ -1,0 +1,70 @@
+{
+  "device": "Intel(R) Arc(TM) A770M Graphics",
+  "len": 3000,
+  "chunk": 512,
+  "check": [
+    {
+      "kind": "sliding",
+      "rel_l2": 0.00010136833967565461,
+      "max_abs": 0.0004794597625732422,
+      "pass": true
+    },
+    {
+      "kind": "global",
+      "rel_l2": 0.000348554243447798,
+      "max_abs": 0.0018215179443359375,
+      "pass": true
+    }
+  ],
+  "speed": [
+    {
+      "kind": "sliding",
+      "ctx": 1024,
+      "decode_us": 92.00624000000002,
+      "prefill_chunk": 1024,
+      "prefill_ms": 1.6167707999999998,
+      "prefill_tflops": 5.318207874610303
+    },
+    {
+      "kind": "sliding",
+      "ctx": 4096,
+      "decode_us": 91.92708,
+      "prefill_chunk": 1024,
+      "prefill_ms": 2.799271,
+      "prefill_tflops": 6.137265446610922
+    },
+    {
+      "kind": "sliding",
+      "ctx": 16384,
+      "decode_us": 92.74584000000002,
+      "prefill_chunk": 1024,
+      "prefill_ms": 2.7972292000000003,
+      "prefill_tflops": 6.141745261346477
+    },
+    {
+      "kind": "global",
+      "ctx": 1024,
+      "decode_us": 83.51458000000001,
+      "prefill_chunk": 1024,
+      "prefill_ms": 2.2215834,
+      "prefill_tflops": 7.740716103658318
+    },
+    {
+      "kind": "global",
+      "ctx": 4096,
+      "decode_us": 147.63750000000002,
+      "prefill_chunk": 1024,
+      "prefill_ms": 13.465458400000001,
+      "prefill_tflops": 8.932177273964916
+    },
+    {
+      "kind": "global",
+      "ctx": 16384,
+      "decode_us": 314.39582,
+      "prefill_chunk": 1024,
+      "prefill_ms": 73.847646,
+      "prefill_tflops": 7.212047380900942
+    }
+  ],
+  "pass": true
+}

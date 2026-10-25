@@ -121,6 +121,7 @@ int main(int argc, char** argv) {
     int64_t widest = 0;
     for (auto [a, b] : steps) widest = std::max(widest, b - a);
     ec.max_batch = twin ? 2 * widest : widest;
+    ec.max_chunk = widest;
     ec.max_logits = twin ? 2 * std::min(widest, logits_last) : std::min(widest, logits_last);
 
     auto t0 = std::chrono::steady_clock::now();
