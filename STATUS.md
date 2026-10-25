@@ -90,7 +90,8 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] decode: stacked QKV and gate/up matmuls, fused layer tails (about 16 launches a layer, from
       34): decode 32.2 / 29.1 / 27.6 tok/s at 0 / 4k / 16k
 - [ ] attention: K/V blocks staged through shared local memory, shared by several query tiles
-- [ ] GEMM through shared local memory (cooperative tiles, double buffering) for >= 100 TOPS
+- [x] fp16 GEMM through shared local memory for prefill: 48-52 TFLOPS in isolation; prefill 1,364 /
+      1,243 / 993 tok/s at 1k / 4k / 16k (DECISIONS 2026-10-24, "fp16 GEMM")
 - [ ] decode GEMV toward the 399 GB/s the card reads
 - [ ] global KV for 2 x 262k: 8.6 GB in fp16 does not fit beside the weights
 

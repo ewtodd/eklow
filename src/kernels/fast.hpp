@@ -49,12 +49,14 @@ void qkv_heads(sycl::queue& q, const float* qkv, int64_t n_tok, int64_t n_head, 
 
 // A residual and the norm before the next matmul, quantized for it, one row per work-group:
 //   o given:  x_out = (x + rmsnorm(o) * w_o) * scale;  otherwise x_out is x and is not written
-//   w_next given: rmsnorm(x_out) * w_next into h_out (if given) and, quantized, into act.
+//   w_next given: rmsnorm(x_out) * w_next into h_out (if given) and into act, in the form matmul
+//   takes for `rows` rows.
 // cols must be a multiple of 128 and at most 8192.
 void residual_norm_quant(sycl::queue& q, const float* o, const float* w_o, const float* x, float scale, float* x_out,
                          const float* w_next, float eps, int64_t rows, int64_t cols, xmx::Activations* act, float* h_out);
 
-// gelu(gate) * up from the fused projection, row t of gu = [gate (n) | up (n)], quantized into act.
+// gelu(gate) * up from the fused projection, row t of gu = [gate (n) | up (n)], into act in the form
+// matmul takes for `rows` rows.
 void gelu_quant(sycl::queue& q, const float* gu, int64_t rows, int64_t n, xmx::Activations& act);
 // out = (a + b) * s
 void add_scale(sycl::queue& q, const float* a, const float* b, float s, int64_t n, float* out);

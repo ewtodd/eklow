@@ -1,14 +1,19 @@
-// XMX matrix products for Q4_0 weights: activations quantized to int8 per 32-element block (as
-// llama.cpp's MMQ does), weights fed to dpas as signed 4-bit (a Q4_0 nibble q is the s4 value q - 8
-// with bit 3 flipped), each K=32 dpas one Q4_0 block, the activation and weight block scales applied
-// to its int32 result (DECISIONS 2026-10-24, "XMX").
+// XMX matrix products for Q4_0 weights, in two forms (DECISIONS 2026-10-24, "XMX", "fp16 GEMM"):
+//   up to kFp16Rows rows (decode): activations quantized to int8 per 32-element block (as
+//     llama.cpp's MMQ does), weights fed to dpas as signed 4-bit (a Q4_0 nibble q is the s4 value
+//     q - 8 with bit 3 flipped), each K=32 dpas one Q4_0 block with both block scales applied to its
+//     int32 result: least memory traffic, but the scaling costs the vector units about as much as
+//     the dpas;
+//   more rows (prefill): fp16 activations; each work-group dequantizes a K block's weight tiles to
+//     fp16 once in shared local memory for all its rows, and the dpas accumulate across all of K.
 //
-// Layouts, both written by eklow so that every load is contiguous:
-//   weights: tiles of 8 output columns x 32 K, [N/8][K/32], 128 bytes each, in the dpas B layout
-//     for s8 x s4: element (k, n) is nibble ((k/8)*8 + n)*8 + k%8, low nibble first; plus fp16
-//     scales [N/8][K/32][8];
-//   activations: tiles of 8 rows x 32 K, [M_pad/8][K/32], 256 bytes each, row-major (the dpas A
-//     layout); plus fp32 scales [M_pad/8][K/32][8]. Rows past M are zero.
+// Layouts, all written by eklow so that every load is contiguous:
+//   weights: tiles of 8 output columns x 32 K, [K/32][N/8] (K-block major), 128 bytes each, in the
+//     dpas B layout for s8 x s4: element (k, n) is nibble ((k/8)*8 + n)*8 + k%8, low nibble first;
+//     plus fp16 scales [K/32][N/8][8];
+//   int8 activations: tiles of 8 rows x 32 K, [M_pad/8][K/32], 256 bytes each, row-major (the dpas
+//     A layout); plus fp32 scales [M_pad/8][K/32][8];
+//   fp16 activations: tiles of 8 rows x 16 K, [M_pad/8][K/16], 256 bytes each, row-major.
 #pragma once
 
 #include <sycl/sycl.hpp>
@@ -30,24 +35,31 @@ struct Weight {
 Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw);
 void free_weight(sycl::queue& q, Weight& w);
 
+// Rows above which matmul takes fp16 activations.
+constexpr int64_t kFp16Rows = 32;
+
 struct Activations {
-  int64_t m = 0, m_pad = 0, k = 0;  // m_pad: m rounded up to 32
-  int64_t capacity = 0;              // int8 elements allocated: any m_pad x k up to it fits
+  int64_t m = 0, m_pad = 0, k = 0;  // m_pad: m rounded up to 32 (int8) or 256 (fp16)
+  int64_t capacity = 0;              // elements allocated in each form: any m_pad x k up to it fits
+  bool fp16 = false;                 // the form the last producer wrote
   int8_t* q = nullptr;
   float* s = nullptr;
+  sycl::half* h = nullptr;
 };
 // Buffers for up to `max_m` rows of `k`.
 Activations alloc_activations(sycl::queue& q, int64_t max_m, int64_t k);
 void free_activations(sycl::queue& q, Activations& a);
 
-// Quantizes x[m][k] (fp32, row-major) into `a` (sized for at least m rows): per row and 32-block,
-// scale = max|x| / 127, q = round(x / scale).
+// Writes x[m][k] (fp32, row-major) into `a` in the form matmul takes for m rows: int8 per row and
+// 32-block, scale = max|x| / 127, q = round(x / scale); or fp16.
 void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a);
 
 // For kernels that produce activations themselves: where element (row, k) of a matrix with kb
 // 32-blocks per row goes, where its block's scale goes, and the quantization rule applied to a run
-// of values sharing one block (amax: the block's max |x|).
+// of values sharing one block (amax: the block's max |x|); and where it goes in fp16 (kh: 16-element
+// runs per row).
 inline int64_t act_index(int64_t row, int64_t k, int64_t kb) { return ((row / 8) * kb + k / 32) * 256 + (row % 8) * 32 + k % 32; }
+inline int64_t act16_index(int64_t row, int64_t k, int64_t kh) { return ((row / 8) * kh + k / 16) * 128 + (row % 8) * 16 + k % 16; }
 inline int64_t act_scale_index(int64_t row, int64_t k, int64_t kb) { return ((row / 8) * kb + k / 32) * 8 + row % 8; }
 template <int N>
 inline float quantize_run(const float (&x)[N], float amax, int8_t* dst) {
@@ -55,13 +67,14 @@ inline float quantize_run(const float (&x)[N], float amax, int8_t* dst) {
   for (int j = 0; j < N; ++j) dst[j] = int8_t(sycl::round(x[j] * id));
   return d;
 }
-// Marks `a` as holding m rows of width k written that way. Rows from m to the padded count keep
-// whatever they held; matmul never stores their results.
+// Marks `a` as holding m rows of width k, in the form for m rows (a.fp16 says which), for a kernel
+// about to write them that way. Rows from m to the padded count keep whatever they held; matmul
+// never stores their results.
 void set_rows(Activations& a, int64_t m, int64_t k);
 
-// out[m][n] = sum over blocks of (a block . w block) * a.scale * w.scale, fp32, row-major.
-// Small m (decode) runs a K-split GEMV schedule, larger m a tiled GEMM. quantize and matmul only
-// enqueue (the queue must be in order); the caller waits.
+// out[m][n] = a . w^T, fp32, row-major. Up to 256 int8 rows run K-split GEMV schedules; fp16
+// activations the shared-memory GEMM (n a multiple of 128). quantize and matmul only enqueue (the
+// queue must be in order); the caller waits.
 void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out);
 
 }  // namespace eklow::xmx

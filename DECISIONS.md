@@ -335,3 +335,19 @@ over 1k / 4k / 16k prompts; decode 22.2 / 20.8 / 19.4 tok/s at 0 / 4k / 16k. At 
 35% of prefill and the weight GEMMs at ~33 TOPS most of the rest. The next attention step is the
 standard one: a work-group stages each K/V block through shared local memory with double buffering,
 so several query tiles share one load and the next block's loads overlap this block's dpas.
+
+## 2026-10-24 — fp16 GEMM
+
+Taking the int8 GEMM apart the same way as attention (a copy with parts switched off): with every
+load removed it still ran at 28-46 TOPS, and 67 with the per-block scaling removed too. Each s8 x s4
+dpas is one Q4_0 block, and its 64 int32 results need converting and scaling by an activation and a
+weight scale, about as much vector work as the dpas is matrix work; the vector side is the limit.
+
+Prefill (more than 32 rows) now multiplies fp16 activations by weights dequantized to fp16 in
+shared local memory: each Q4_0 block's tiles once per work-group of 16 x 4 threads (256 rows x 128
+columns), the dpas accumulating in fp32 over all of K, so the scaling cost is per weight per
+work-group instead of per output per block. Global loads for block b+1 go out before block b's dpas.
+In isolation 48-52 TFLOPS on all four of the 12B's shapes (no loads, no barrier: 95). The products
+are also closer to fp32: 2e-4 relative against the reference, against 1e-2 for int8 activations.
+Gemma's matmul inputs stay well inside fp16 (largest 2,488, on the chat prompt's first FFN; 1,573
+on the 2,616-token prompt). Decode stays on int8, where the weights' bytes are the cost.

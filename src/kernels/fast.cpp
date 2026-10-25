@@ -143,9 +143,11 @@ void residual_norm_quant(sycl::queue& q, const float* o, const float* w_o, const
   const int32_t C = int32_t(cols), kb = C / 32;
   int8_t* aq = nullptr;
   float* as = nullptr;
+  sycl::half* ah = nullptr;
   if (act && w_next) {
     xmx::set_rows(*act, rows, cols);
-    aq = act->q, as = act->s;
+    if (act->fp16) ah = act->h;
+    else aq = act->q, as = act->s;
   }
   q.parallel_for(sycl::nd_range<1>(size_t(rows * cols / 8), size_t(cols / 8)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
     const int32_t r = int32_t(it.get_group(0)), c0 = int32_t(it.get_local_id(0)) * 8;
@@ -175,6 +177,10 @@ void residual_norm_quant(sycl::queue& q, const float* o, const float* w_o, const
       amax = sycl::fmax(amax, sycl::fabs(v[i]));
       if (h_out) h_out[r * C + c0 + i] = v[i];
     }
+    if (ah) {
+      for (int i = 0; i < 8; ++i) ah[xmx::act16_index(r, c0 + i, C / 16)] = sycl::half(v[i]);
+      return;
+    }
     if (!aq) return;
     auto sg = it.get_sub_group();
     amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 1));
@@ -189,6 +195,7 @@ void gelu_quant(sycl::queue& q, const float* gu, int64_t rows, int64_t n, xmx::A
   xmx::set_rows(act, rows, n);
   int8_t* aq = act.q;
   float* as = act.s;
+  sycl::half* ah = act.fp16 ? act.h : nullptr;
   const int32_t N = int32_t(n), kb = N / 32;
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(rows), size_t(n / 8)), sycl::range<2>(1, 64)),
                  [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
@@ -198,6 +205,10 @@ void gelu_quant(sycl::queue& q, const float* gu, int64_t rows, int64_t n, xmx::A
                      const float g = gu[r * 2 * N + c0 + i], u = gu[r * 2 * N + N + c0 + i];
                      v[i] = 0.5f * g * (1.0f + sycl::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g))) * u;
                      amax = sycl::fmax(amax, sycl::fabs(v[i]));
+                   }
+                   if (ah) {
+                     for (int i = 0; i < 8; ++i) ah[xmx::act16_index(r, c0 + i, N / 16)] = sycl::half(v[i]);
+                     return;
                    }
                    auto sg = it.get_sub_group();
                    amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 1));

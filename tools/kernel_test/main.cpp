@@ -4,8 +4,9 @@
 //   eklow-kernel-test --model GGUF [--json FILE]
 //
 // For each weight and row count: the XMX matmul against ref::matmul (fp32; the difference is the
-// int8 activation quantization, the same trade llama.cpp makes), against a CPU emulation of the
-// quantized arithmetic at sampled outputs (should agree to fp32 rounding), and its speed.
+// int8 activation quantization, the same trade llama.cpp makes, or above xmx::kFp16Rows rows the
+// fp16 rounding of activations and scaled weights), against a CPU emulation of that arithmetic at
+// sampled outputs (should agree to fp32 rounding), and its speed.
 #include <sycl/sycl.hpp>
 
 #include <chrono>
@@ -30,17 +31,26 @@ namespace {
 
 float half_to_float(const uint8_t* p) { return float(sycl::bit_cast<sycl::half>(uint16_t(p[0] | p[1] << 8))); }
 
-// The quantized product at (row, col) on the CPU, in double: int8 activations from the same
-// quantization rule, the Q4_0 weights from the file.
-double emulate(const std::vector<float>& x, int64_t k, const gguf::Tensor& w, int64_t row, int64_t col) {
+// The product at (row, col) on the CPU, in double, with the GPU's operands: the Q4_0 weights
+// from the file, and int8 activations from the same quantization rule or, with fp16, the
+// activations and the scaled weights each rounded to fp16 as the fp16 GEMM's are.
+double emulate(const std::vector<float>& x, int64_t k, const gguf::Tensor& w, int64_t row, int64_t col, bool fp16) {
   const uint8_t* wrow = w.data + uint64_t(col) * (w.nbytes / w.ne[1]);
   double total = 0;
   for (int64_t b = 0; b < k / 32; ++b) {
     const float* xs = x.data() + row * k + b * 32;
+    const uint8_t* blk = wrow + b * 18;
+    if (fp16) {
+      const sycl::half d = sycl::bit_cast<sycl::half>(uint16_t(blk[0] | blk[1] << 8));
+      for (int j = 0; j < 32; ++j) {
+        const int qw = (j < 16 ? blk[2 + j] & 15 : blk[2 + j - 16] >> 4) - 8;
+        total += double(float(sycl::half(xs[j]))) * double(float(sycl::half(float(qw)) * d));
+      }
+      continue;
+    }
     float amax = 0;
     for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(xs[j]));
     const float d = amax / 127.0f, id = d != 0 ? 1.0f / d : 0.0f;
-    const uint8_t* blk = wrow + b * 18;
     long dot = 0;
     for (int j = 0; j < 32; ++j) {
       const int qa = int(std::round(xs[j] * id));
@@ -107,7 +117,7 @@ int main(int argc, char** argv) {
         double emul_err = 0;
         for (int s = 0; s < 16; ++s) {
           const int64_t row = int64_t(rng() % uint32_t(m)), col = int64_t(rng() % uint32_t(n));
-          const double e = emulate(x, k, *t, row, col);
+          const double e = emulate(x, k, *t, row, col, m > xmx::kFp16Rows);
           emul_err = std::max(emul_err, std::fabs(double(hx[size_t(row * n + col)]) - e) / std::max(1e-6, std::fabs(e)));
         }
         // Timing: quantize + matmul, 20 calls enqueued back to back and one wait, so launch and
