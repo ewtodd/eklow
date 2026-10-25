@@ -60,7 +60,8 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] reference kernels (`src/kernels/ref.cpp`) and the reference forward (`src/model/gemma4.cpp`,
       `eklow-ref-run`): on a 25-token chat prompt top-1 25/25, mean KL 3.9e-3; on 2,616 tokens top-1
       31/32, mean KL 1.9e-2, the same band as llama.cpp CUDA against CPU (DECISIONS 2026-10-24)
-- [ ] streaming parser for the thinking channel and tool calls
+- [x] streaming output parser (`src/text/output_parser.cpp`): reasoning, content and tool calls
+      recovered exactly from 40,000 random turns rendered by the template (DECISIONS 2026-10-24)
 - [ ] image input (bidirectional attention among an image's tokens on sliding layers): with M3
 
 ## Open

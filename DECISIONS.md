@@ -231,3 +231,20 @@ with position for eklow and for CUDA alike, with no step at position 1024, so th
 long-range RoPE are right; the drift is the quantized model's own sensitivity, which two llama.cpp
 backends show against each other. The reference runs 25 tokens in 12 s and 2,616 in 135 s on the
 A770M; speed is M4's job.
+
+## 2026-10-24 — the output parser reads tokens, not text
+
+Gemma 4 writes `<|channel>thought\n...<channel|>`, then `<|tool_call>call:NAME{ARGS}<tool_call|>`
+calls, then content, ending at `<turn|>`, `<eos>` or `<|tool_response>`. ARGS is the template's
+format_argument with bare keys and strings between `<|"|>` tokens. llama.cpp parses the decoded
+text and has broken on strings holding braces or commas (#21384, #29655); `src/text/output_parser.cpp`
+works on token ids, where `<|"|>` is one special token, so string contents never confuse it. Text is
+released only as whole UTF-8 characters; the template's newline before `<channel|>` is held back
+until the next token shows whether the channel closes. Keys holding `:` or `,` cannot be recovered
+(the template does not escape keys).
+
+`tools/ref/parse_compare.py` renders random assistant turns after a user turn with the verified
+template port, tokenizes them, feeds the generated part to `eklow-parse` one token at a time, and
+compares: 2 x 20,000 turns (reasoning, 1-3 tool calls with nested arguments of every JSON kind,
+content) recovered exactly. Keeping the template's trailing newline in the reasoning shows up as
+974 differences in 2,000.

@@ -43,6 +43,10 @@ class Tokenizer {
   // added tokens are written as their text unless skip_special.
   std::string decode(std::span<const int32_t> ids, bool skip_special = false) const;
 
+  // One token's bytes as decode() would write them, without joining byte tokens: a byte token is
+  // its single byte (possibly part of a UTF-8 character), an added token its text.
+  std::string bytes(int32_t id) const;
+
   size_t size() const { return pieces_.size(); }
   const std::string& piece(int32_t id) const { return pieces_.at(size_t(id)); }
   // -1 when the piece is not in the vocabulary.

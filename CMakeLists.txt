@@ -38,6 +38,7 @@ endfunction()
 # Serving text layer: the tokenizer (and, later, the chat template and output parser). No device code.
 add_library(eklow_text STATIC
   src/text/chat_gemma4.cpp
+  src/text/output_parser.cpp
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
 )
@@ -48,6 +49,9 @@ target_link_libraries(eklow-tok PRIVATE eklow_text)
 
 add_executable(eklow-chat tools/chat/main.cpp)
 target_link_libraries(eklow-chat PRIVATE eklow_text)
+
+add_executable(eklow-parse tools/parse/main.cpp)
+target_link_libraries(eklow-parse PRIVATE eklow_text)
 
 # Device runtime: picking the card. SYCL plus Level Zero.
 add_library(eklow_rt STATIC src/rt/device.cpp)
@@ -81,4 +85,4 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-probe eklow-xmx-bench eklow-ref-run RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run RUNTIME DESTINATION bin)

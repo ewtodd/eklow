@@ -18,6 +18,8 @@ stand and `DECISIONS.md` for the evidence behind each choice.
 - `eklow-ref-run --model GGUF --out DIR --tokens-json FILE`: the reference forward pass, dumped in
   the oracle's format; `eklow-oracle` (`nix build .#oracle`) is llama.cpp's CPU backend, and
   `tools/ref/compare_dumps.py` compares the two layer by layer.
+- `eklow-parse GGUF`: the output parser over generated token ids; `tools/ref/parse_compare.py`
+  round-trips random assistant turns through the template and back.
 - `eklow-gguf FILE [--tensors] [--json]`: what the GGUF loader reads from a file;
   `tools/ref/gguf_compare.py FILE JSON` checks it against the gguf Python package.
 
