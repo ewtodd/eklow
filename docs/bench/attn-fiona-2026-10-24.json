@@ -5,7 +5,7 @@
   "check": [
     {
       "kind": "sliding",
-      "rel_l2": 0.00010136833967565461,
+      "rel_l2": 0.00010263807665075806,
       "max_abs": 0.0004794597625732422,
       "pass": true
     },
@@ -20,50 +20,50 @@
     {
       "kind": "sliding",
       "ctx": 1024,
-      "decode_us": 92.00624000000002,
+      "decode_us": 93.30208000000002,
       "prefill_chunk": 1024,
-      "prefill_ms": 1.6167707999999998,
-      "prefill_tflops": 5.318207874610303
+      "prefill_ms": 1.0861042,
+      "prefill_tflops": 7.916665086093948
     },
     {
       "kind": "sliding",
       "ctx": 4096,
-      "decode_us": 91.92708,
+      "decode_us": 91.21668000000001,
       "prefill_chunk": 1024,
-      "prefill_ms": 2.799271,
-      "prefill_tflops": 6.137265446610922
+      "prefill_ms": 1.6507292,
+      "prefill_tflops": 10.407442470878932
     },
     {
       "kind": "sliding",
       "ctx": 16384,
-      "decode_us": 92.74584000000002,
+      "decode_us": 91.2521,
       "prefill_chunk": 1024,
-      "prefill_ms": 2.7972292000000003,
-      "prefill_tflops": 6.141745261346477
+      "prefill_ms": 1.660375,
+      "prefill_tflops": 10.346981365053075
     },
     {
       "kind": "global",
       "ctx": 1024,
-      "decode_us": 83.51458000000001,
+      "decode_us": 82.65,
       "prefill_chunk": 1024,
-      "prefill_ms": 2.2215834,
-      "prefill_tflops": 7.740716103658318
+      "prefill_ms": 1.9565000000000003,
+      "prefill_tflops": 8.78949470994122
     },
     {
       "kind": "global",
       "ctx": 4096,
-      "decode_us": 147.63750000000002,
+      "decode_us": 155.43124,
       "prefill_chunk": 1024,
-      "prefill_ms": 13.465458400000001,
-      "prefill_tflops": 8.932177273964916
+      "prefill_ms": 11.067270800000001,
+      "prefill_tflops": 10.867707466234585
     },
     {
       "kind": "global",
       "ctx": 16384,
-      "decode_us": 314.39582,
+      "decode_us": 314.78749999999997,
       "prefill_chunk": 1024,
-      "prefill_ms": 73.847646,
-      "prefill_tflops": 7.212047380900942
+      "prefill_ms": 48.5715208,
+      "prefill_tflops": 10.965123453989111
     }
   ],
   "pass": true

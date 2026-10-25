@@ -84,12 +84,15 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] output head in an aligned Q6 layout: 3.4 ms of a decode step (was 69)
 - [x] flash attention on the matrix units with paged dpas-tiled KV (`src/kernels/attention.cpp`,
       `eklow-attn-test`): decode 84-314 us per layer, prefill 6-9 TFLOPS (DECISIONS 2026-10-24)
-- [x] `eklow-engine-bench`: prefill 1,141 / 1,057 / 867 tok/s at 1k / 4k / 16k, decode 22.2 /
-      20.8 / 19.4 tok/s at 0 / 4k / 16k (docs/bench/engine-fiona-2026-10-24.json); `--profile`
-      times each section of the forward pass on the card
+- [x] `eklow-engine-bench`: prefill 1,509 / 1,413 / 1,194 tok/s over 1k / 4k / 16k prompts, 1,287
+      / 962 tok/s at 4k / 16k depth; decode 32.1 / 29.0 / 27.6 tok/s at 0 / 4k / 16k
+      (docs/bench/engine-fiona-2026-10-24.json); `--profile` times each section on the card
 - [x] decode: stacked QKV and gate/up matmuls, fused layer tails (about 16 launches a layer, from
       34): decode 32.2 / 29.1 / 27.6 tok/s at 0 / 4k / 16k
-- [ ] attention: K/V blocks staged through shared local memory, shared by several query tiles
+- [x] attention: prefill work-groups sharing each K/V block through shared local memory: 10.4 /
+      10.9 TFLOPS (sliding / global)
+- [ ] prefill at 16k depth: 962 tok/s of the 1,500 target (`eklow-engine-bench --depth 16384`);
+      needs global attention near 20 TFLOPS and the GEMMs near 60 (DECISIONS 2026-10-24)
 - [x] fp16 GEMM through shared local memory for prefill: 48-52 TFLOPS in isolation; prefill 1,364 /
       1,243 / 993 tok/s at 1k / 4k / 16k (DECISIONS 2026-10-24, "fp16 GEMM")
 - [ ] decode GEMV toward the 399 GB/s the card reads

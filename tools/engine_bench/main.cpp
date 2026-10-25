@@ -2,11 +2,12 @@
 // depend on them).
 //
 //   eklow-engine-bench --model GGUF [--prefill 1024,4096,16384] [--chunk 2048]
-//                      [--decode-ctx 0,4096,16384] [--decode-steps 64] [--slots N]
-//                      [--profile] [--json FILE]
+//                      [--depth 0,4096,16384] [--decode-ctx 0,4096,16384] [--decode-steps 64]
+//                      [--slots N] [--profile] [--json FILE]
 //
 // Prefill: a fresh sequence of N tokens in chunks of --chunk; tokens per second over the whole
-// prompt. Decode: every slot prefilled to CTX tokens, then --decode-steps steps of one token per
+// prompt. Depth (llama-bench's -d): the sequence first filled to D tokens untimed, then two chunks
+// timed; the rate of prefill at that depth. Decode: every slot prefilled to CTX tokens, then --decode-steps steps of one token per
 // slot; tokens per second per sequence. --profile adds the card's time per section of the forward
 // pass, from timestamps of marker kernels between sections.
 #include <algorithm>
@@ -59,7 +60,7 @@ void print_profile(const std::map<std::string, double>& p, json::Writer& w) {
 
 int main(int argc, char** argv) {
   std::string model, json_path;
-  std::vector<int64_t> prefill = {1024, 4096, 16384}, decode_ctx = {0, 4096, 16384};
+  std::vector<int64_t> prefill = {1024, 4096, 16384}, decode_ctx = {0, 4096, 16384}, depth;
   int64_t chunk = 2048, decode_steps = 64;
   int slots = 1;
   bool profile = false;
@@ -68,6 +69,7 @@ int main(int argc, char** argv) {
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
     if (a == "--model") model = next();
     else if (a == "--prefill") prefill = list(next());
+    else if (a == "--depth") depth = list(next());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
     else if (a == "--decode-ctx") decode_ctx = list(next());
     else if (a == "--decode-steps") decode_steps = std::atoll(next().c_str());
@@ -75,7 +77,7 @@ int main(int argc, char** argv) {
     else if (a == "--profile") profile = true;
     else if (a == "--json") json_path = next();
     else {
-      std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--decode-ctx N,...] "
+      std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--depth N,...] [--decode-ctx N,...] "
                            "[--decode-steps N] [--slots N] [--profile] [--json FILE]\n");
       return 2;
     }
@@ -83,6 +85,7 @@ int main(int argc, char** argv) {
   try {
     int64_t longest = 1;
     for (auto n : prefill) longest = std::max(longest, n);
+    for (auto n : depth) longest = std::max(longest, n + 2 * chunk);
     for (auto n : decode_ctx) longest = std::max(longest, n + decode_steps);
     engine::Config ec;
     ec.n_slots = slots;
@@ -107,9 +110,10 @@ int main(int argc, char** argv) {
     };
     std::map<std::string, double> prof;
     auto fill = [&](int slot, int64_t n) {
-      for (int64_t s = 0; s < n; s += chunk) {
-        const int64_t c = std::min(chunk, n - s);
-        eng.step({engine::Chunk{slot, s, tokens(c), s + c == n ? 1 : 0}});
+      const int64_t start = eng.length(slot);
+      for (int64_t s = start; s < start + n; s += chunk) {
+        const int64_t c = std::min(chunk, start + n - s);
+        eng.step({engine::Chunk{slot, s, tokens(c), s + c == start + n ? 1 : 0}});
       }
     };
     fill(0, std::min<int64_t>(chunk, 512));  // warm-up: first launches, scratch allocations
@@ -128,6 +132,22 @@ int main(int argc, char** argv) {
       eng.release(0);
       std::printf("prefill %6lld tokens: %7.2f s, %8.1f tok/s\n", (long long)n, s, double(n) / s);
       w.begin_object().kv("tokens", n).kv("seconds", s).kv("tok_per_s", double(n) / s);
+      if (profile) print_profile(prof, w);
+      w.end_object();
+    }
+    w.end_array().key("depth").begin_array();
+    for (int64_t d : depth) {
+      fill(0, d);
+      prof.clear();
+      eng.set_profile(profile ? &prof : nullptr);
+      auto t0 = std::chrono::steady_clock::now();
+      fill(0, 2 * chunk);
+      const double s = since(t0);
+      eng.set_profile(nullptr);
+      eng.release(0);
+      std::printf("prefill at depth %6lld: %7.2f s for %lld tokens, %8.1f tok/s\n", (long long)d, s, (long long)(2 * chunk),
+                  double(2 * chunk) / s);
+      w.begin_object().kv("depth", d).kv("tokens", 2 * chunk).kv("seconds", s).kv("tok_per_s", double(2 * chunk) / s);
       if (profile) print_profile(prof, w);
       w.end_object();
     }

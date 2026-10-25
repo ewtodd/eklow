@@ -13,9 +13,10 @@ namespace eklow::attn {
 namespace esimd = sycl::ext::intel::esimd;
 namespace xmxd = sycl::ext::intel::esimd::xmx;
 
-// Tiles per prefill work-group: the K/V block staged in shared local memory and the scores
-// exchanged there must fit its 64 KB.
-TileList::TileList(int64_t head_dim) : per_group(head_dim >= 512 ? 4 : 8) {}
+// Tiles per prefill work-group: with 16 loaders, 64 threads, two of which fill an Xe-core's 128
+// thread slots; the K/V block and the scores in shared local memory stay under 64 KB, of which an
+// Xe-core holds two (it allocates power-of-two sizes from 128 KB; measured 2026-10-24).
+TileList::TileList(int64_t head_dim) : per_group(head_dim >= 512 ? 6 : 12) {}
 
 void TileList::add_chunk(int32_t base, int64_t n_tok, int64_t last_pos, int64_t group, int64_t n_head_kv, int64_t window) {
   const int64_t rows = n_tok * group;
@@ -391,7 +392,7 @@ struct FlashGroup {
 template <int D, int G>
 void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* tiles, const Cache& c,
          int64_t n_head, float scale, float* out, Scratch& scratch) {
-  constexpr int P = Flash<D, G>::P, QT = D >= 512 ? 4 : 8;
+  constexpr int P = Flash<D, G>::P, QT = D >= 512 ? 6 : 12;
   const int64_t n_tiles = list.size(), max_keys = list.max_keys;
   if (list.per_group != QT) throw std::runtime_error("attention: tile list grouped for another head size");
   const int32_t H = int32_t(n_head);

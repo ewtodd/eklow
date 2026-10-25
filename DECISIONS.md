@@ -351,3 +351,27 @@ In isolation 48-52 TFLOPS on all four of the 12B's shapes (no loads, no barrier:
 are also closer to fp32: 2e-4 relative against the reference, against 1e-2 for int8 activations.
 Gemma's matmul inputs stay well inside fp16 (largest 2,488, on the chat prompt's first FFN; 1,573
 on the 2,616-token prompt). Decode stays on int8, where the weights' bytes are the cost.
+
+## 2026-10-24 — prefill attention: shared K/V blocks, and where it stands
+
+The target is the rate at 16k depth (DESIGN: ~25 GFLOP a token counting attention at 16k), which
+`eklow-engine-bench --depth` now measures: a sequence filled to the depth untimed, then two chunks
+timed. A 16k prompt from empty averages 8k of depth and flatters the number.
+
+Prefill attention now runs a work-group per group of query tiles of one chunk and K/V head, 12
+tiles (head 256) or 6 (head 512) with 16 loader threads: 64 threads, each 16-key K/V block staged
+once in shared local memory. The sizes come from two measurements: an Xe-core holds 128 thread
+slots, and gives shared local memory out in power-of-two sizes from 128 KB (a 33-64 KB work-group
+lets two fit, 32 KB four), so 64 threads under 64 KB fill a core twice. Loaders and compute
+threads run separate loops with the same barriers (one loop kept both register sets live and
+spilled). 10.4 TFLOPS on sliding layers and 10.9 on global (from 6.1 and 7-9).
+
+Timing the compute threads' phases with rdtsc: Q.K^T about a quarter of a block, P.V a fifth, and
+each of the score exchange's two barriers about a sixth, waiting. The remedies that suggest
+themselves do not fit head 512's shared memory: a double-buffered score exchange (one barrier a
+block) or 32-key blocks would need 80-112 KB. Q kept in registers spilled 3 KB, skipping the output
+rescale when no maximum moved spilled 1.7 KB; both ran slower.
+
+At 16k depth the engine prefills 962 tok/s (2,048 tokens in 2.13 s): global attention 0.88 s at
+~10.6 TFLOPS, the weight GEMMs 0.96 s at ~46.5 TOPS. 1,500 tok/s needs both: global attention near
+20 TFLOPS and the GEMMs near 60.
