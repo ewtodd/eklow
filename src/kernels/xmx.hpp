@@ -32,6 +32,7 @@ void free_weight(sycl::queue& q, Weight& w);
 
 struct Activations {
   int64_t m = 0, m_pad = 0, k = 0;  // m_pad: m rounded up to 32
+  int64_t capacity = 0;              // int8 elements allocated: any m_pad x k up to it fits
   int8_t* q = nullptr;
   float* s = nullptr;
 };

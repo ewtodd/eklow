@@ -85,9 +85,9 @@ Activations alloc_activations(sycl::queue& q, int64_t max_m, int64_t k) {
   if (k % 32) throw std::runtime_error("xmx: activation width not a multiple of 32");
   Activations a;
   a.k = k;
-  a.m_pad = (max_m + 31) / 32 * 32;
-  a.q = sycl::malloc_device<int8_t>(size_t(a.m_pad * k), q);
-  a.s = sycl::malloc_device<float>(size_t(a.m_pad * (k / 32)), q);
+  a.capacity = (max_m + 31) / 32 * 32 * k;
+  a.q = sycl::malloc_device<int8_t>(size_t(a.capacity), q);
+  a.s = sycl::malloc_device<float>(size_t(a.capacity / 32), q);
   if (!a.q || !a.s) throw std::runtime_error("xmx: out of device memory for activations");
   return a;
 }
@@ -101,8 +101,9 @@ void free_activations(sycl::queue& q, Activations& a) {
 
 void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a) {
   const int64_t m_pad = (m + 31) / 32 * 32, kb = a.k / 32, k = a.k;
-  if (m_pad * k > (a.m_pad * a.k)) throw std::runtime_error("xmx: activation buffer too small");
+  if (m_pad * k > a.capacity) throw std::runtime_error("xmx: activation buffer too small");
   a.m = m;
+  a.m_pad = m_pad;
   int8_t* qd = a.q;
   float* sd = a.s;
   q.parallel_for(sycl::range<2>(size_t(m_pad), size_t(kb)), [=](sycl::id<2> id) {
