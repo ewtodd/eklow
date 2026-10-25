@@ -86,9 +86,10 @@ M1 measures the card; these stay estimates until then.
   results set the real targets; the GGUF loader.
 - **M2, correct forward pass on the 12B.** Reference kernels and per-layer comparison against the
   oracle; every Gemma 4 detail above; for image input, bidirectional attention among an image's
-  tokens on the sliding layers; the tokenizer, checked against Hugging Face's; the official Jinja
-  chat template through an embedded interpreter, with golden tests; a streaming parser for the
-  thinking channel and tool calls.
+  tokens on the sliding layers; the tokenizer, checked against Hugging Face's; Google's chat
+  template ported to C++, byte-identical to Hugging Face's rendering and refusing any GGUF that
+  carries another template (DECISIONS 2026-10-24); a streaming parser for the thinking channel and
+  tool calls.
 - **M3, serving.** Continuous batching with chunked prefill; a paged global KV cache plus
   per-sequence sliding-window rings; a prefix cache whose window snapshots spill to host RAM;
   OpenAI chat with tools and streaming, `/v1/embeddings`, image and audio input (the 12B's vision

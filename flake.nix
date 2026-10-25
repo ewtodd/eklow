@@ -70,6 +70,8 @@
             ps.numpy
             ps.gguf
             ps.tokenizers
+            ps.transformers
+            ps.jinja2
           ]))
         ];
         shellHook = ''

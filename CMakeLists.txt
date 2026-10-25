@@ -23,6 +23,7 @@ add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 # Host-only pieces: no device code, no -fsycl.
 add_library(eklow_host STATIC
   src/core/json.cpp
+  src/core/json_value.cpp
   src/model/gguf.cpp
 )
 target_include_directories(eklow_host PUBLIC src)
@@ -36,12 +37,17 @@ endfunction()
 
 # Serving text layer: the tokenizer (and, later, the chat template and output parser). No device code.
 add_library(eklow_text STATIC
+  src/text/chat_gemma4.cpp
+  src/text/pyfmt.cpp
   src/text/tokenizer.cpp
 )
 target_link_libraries(eklow_text PUBLIC eklow_host)
 
 add_executable(eklow-tok tools/tok/main.cpp)
 target_link_libraries(eklow-tok PRIVATE eklow_text)
+
+add_executable(eklow-chat tools/chat/main.cpp)
+target_link_libraries(eklow-chat PRIVATE eklow_text)
 
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
@@ -57,4 +63,4 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-probe eklow-xmx-bench RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-probe eklow-xmx-bench RUNTIME DESTINATION bin)

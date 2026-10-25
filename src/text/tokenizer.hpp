@@ -29,6 +29,16 @@ class Tokenizer {
   static Tokenizer from_gguf(const gguf::File& f);
 
   std::vector<int32_t> encode(std::string_view text, bool parse_special = true) const;
+
+  // A rendered prompt as pieces, special tokens recognized only inside pieces that allow them
+  // (template text; request text does not). BPE still runs over everything between two special
+  // tokens, across piece boundaries, as it does on the joined text, so a prompt without injected
+  // special-token text tokenizes exactly as encode(join) would.
+  struct Piece {
+    std::string_view text;
+    bool special;
+  };
+  std::vector<int32_t> encode(std::span<const Piece> pieces) const;
   // Byte tokens are joined into UTF-8 (invalid sequences become U+FFFD); "▁" becomes a space;
   // added tokens are written as their text unless skip_special.
   std::string decode(std::span<const int32_t> ids, bool skip_special = false) const;

@@ -1,5 +1,6 @@
 // A small streaming JSON writer for tool output (probe records, GGUF dumps). Commas and nesting are
-// tracked; keys and values are written in call order. Doubles that are not finite become null.
+// tracked; keys and values are written in call order. Doubles are written with the shortest digits
+// that round-trip; ones that are not finite become null.
 #pragma once
 
 #include <cstdint>
@@ -29,6 +30,8 @@ class Writer {
   Writer& value(unsigned u) { return value(uint64_t(u)); }
   Writer& value(double d);
   Writer& null();
+  // An already-formatted JSON value (an integer's exact digits).
+  Writer& raw(std::string_view v);
 
   // key + value in one call.
   template <class T>

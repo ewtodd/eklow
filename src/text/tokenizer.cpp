@@ -155,6 +155,17 @@ void Tokenizer::bpe(std::string_view word, std::vector<int32_t>& out) const {
 }
 
 std::vector<int32_t> Tokenizer::encode(std::string_view text, bool parse_special) const {
+  Piece p{text, parse_special};
+  return encode(std::span<const Piece>(&p, 1));
+}
+
+std::vector<int32_t> Tokenizer::encode(std::span<const Piece> pieces) const {
+  std::string text;
+  std::vector<bool> allowed;  // per byte: may a special token match here
+  for (const auto& p : pieces) {
+    text += p.text;
+    allowed.insert(allowed.end(), p.text.size(), p.special);
+  }
   std::vector<int32_t> out;
   std::string norm;
   auto plain = [&](std::string_view s) {
@@ -167,26 +178,26 @@ std::vector<int32_t> Tokenizer::encode(std::string_view text, bool parse_special
     bpe(norm, out);
   };
   size_t start = 0;
-  if (parse_special) {
-    // Every added token starts with '<'.
-    for (size_t i = text.find('<'); i != std::string_view::npos; i = text.find('<', i)) {
-      const std::pair<std::string, int32_t>* hit = nullptr;
+  // Every added token starts with '<'; a match must lie wholly where special tokens are allowed.
+  for (size_t i = text.find('<'); i != std::string::npos; i = text.find('<', i)) {
+    const std::pair<std::string, int32_t>* hit = nullptr;
+    if (allowed[i])
       for (auto& a : added_)
-        if (text.compare(i, a.first.size(), a.first) == 0) {
+        if (text.compare(i, a.first.size(), a.first) == 0 &&
+            std::all_of(allowed.begin() + long(i), allowed.begin() + long(i + a.first.size()), [](bool b) { return b; })) {
           hit = &a;
           break;
         }
-      if (!hit) {
-        ++i;
-        continue;
-      }
-      plain(text.substr(start, i - start));
-      out.push_back(hit->second);
-      i += hit->first.size();
-      start = i;
+    if (!hit) {
+      ++i;
+      continue;
     }
+    plain(std::string_view(text).substr(start, i - start));
+    out.push_back(hit->second);
+    i += hit->first.size();
+    start = i;
   }
-  plain(text.substr(start));
+  plain(std::string_view(text).substr(start));
   return out;
 }
 

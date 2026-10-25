@@ -13,6 +13,8 @@ stand and `DECISIONS.md` for the evidence behind each choice.
   operand type, the Q4_0 inner loops, and VRAM read bandwidth.
 - `eklow-tok GGUF encode|decode|bench`: the tokenizer; `tools/ref/tok_compare.py` checks it against
   Hugging Face's `tokenizers` on Google's `tokenizer.json`.
+- `eklow-chat render [--tokens GGUF]` / `eklow-chat check GGUF`: the Gemma 4 chat template port;
+  `tools/ref/chat_compare.py` checks it against transformers' `apply_chat_template`.
 - `eklow-gguf FILE [--tensors] [--json]`: what the GGUF loader reads from a file;
   `tools/ref/gguf_compare.py FILE JSON` checks it against the gguf Python package.
 

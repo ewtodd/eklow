@@ -50,7 +50,10 @@ nix develop -c python3 tools/ref/compare_dumps.py REF_DIR TEST_DIR
       top-1 96% (DECISIONS 2026-10-24)
 - [x] tokenizer (`src/text/tokenizer.cpp`): identical to Hugging Face's `tokenizers` on 27,607
       strings / 1.34M tokens, encode and decode; 1.5M tokens/s (DECISIONS 2026-10-24)
-- [ ] chat template (the official Jinja), golden tests
+- [x] chat template: Google's Gemma 4 template ported to C++ (`src/text/chat_gemma4.cpp`),
+      identical to transformers' `apply_chat_template` on 20,416 conversations and, tokenized with
+      special tokens only in template text, on 3.82M tokens; request text cannot inject special
+      tokens (DECISIONS 2026-10-24)
 - [ ] reference kernels and the reference forward, compared per layer against the oracle
 
 ## Open

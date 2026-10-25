@@ -161,3 +161,48 @@ wrapped in the chat template, 20,000 random strings over a mixed alphabet, and f
 whole and line by line. 27,607 strings, 1.34M tokens: no difference in encoding or decoding.
 Reversing the tie-break among equal ranks gives 9 differences in 3,142 strings, so the comparison
 catches the rule that matters. Encoding runs at 1.5M tokens/s on one core; loading takes 0.10 s.
+
+## 2026-10-24 — the chat template is ported, not interpreted
+
+The plan was the official Jinja template through an embedded interpreter, most likely llama.cpp's
+own engine (common/jinja, ~6,500 lines, MIT). Its record on Gemma 4 argued against it:
+
+- #21547 (open since April): Gemma 4 requests with tools fail with "NotImplemented: map:
+  filter-mapping not implemented", the `map` filter this template uses.
+- #28249 (open): the engine can mark request text so it cannot become special tokens, but
+  llama.cpp never wired it up; #24382 showed `A<|turn>B` in a user message tokenized as a real
+  turn boundary.
+- #30834 (open): deeply nested JSON in a request overflows the stack in the engine's value layer
+  and kills the server; #29706: nested `range` loops ran 2^N iterations.
+- The engine is from January 2026 (b7756) and still taking fixes in features this template uses
+  (`select`/`selectattr`, #31059, after the pinned revision).
+
+The tool-call bugs reported against Gemma 4 (#21384, #22786, #21660, #29089) were in llama.cpp's
+output parser and grammar, which eklow replaces either way.
+
+eklow serves one model family, as unholy serves one model; unholy ported DeepSeek's Python encoder
+rather than embedding Python. So `src/text/chat_gemma4.cpp` ports Google's template (390 lines,
+"published 2026-07-09"; the GGUF's copy is byte-identical to the Hugging Face repo's) statement by
+statement, with the Jinja2 and Python semantics it depends on: `{{ x }}` is Python's `str()` (float
+repr, list and dict repr for list-typed schemas through `| upper`), `dictsort` is case-insensitive
+and stable, `trim` strips Python's Unicode whitespace, Undefined differs from None (`x['k']` versus
+`x.get('k')`; Undefined iterates as empty and is a "sequence"), tool-response names resolve with
+`None == None`. Case mapping covers Latin, Greek and Cyrillic; JSON numbers keep Python's int/float
+distinction. JSON nesting is capped at 128 levels.
+
+`tools/ref/chat_compare.py` renders with transformers 5.17 `apply_chat_template` (Jinja2 3.1.6)
+and with `eklow-chat`: 264 hand-written combinations of each branch (system/developer, tools,
+tool calls and responses, legacy `tool_responses`, thinking channels, reasoning fields, images,
+continued assistant turns; generation prompt, `enable_thinking`, `preserve_thinking`), 4 inputs
+both must reject, son-of-anton's real requests (the dieted and pre-diet prompts with their full tool
+schemas) and probe transcripts, and 20,000 random conversations with random tool schemas and
+argument values. 20,416 cases: identical text on every one that renders, both reject the 4.
+Making `dictsort` case-sensitive gives 568 differences in 2,268 cases.
+
+The render comes back in parts, template text and request text. Tokenization finds special tokens
+only in template text and runs BPE over everything between them, so it equals Hugging Face's
+tokenization of the joined prompt whenever no request text spells a special token; checked on
+3.82M tokens against an independent reference built on Hugging Face's tokenizer. `A<|turn>B` now
+tokenizes as A, <, |, turn, >, B. A GGUF whose `tokenizer.chat_template` is not this template
+(FNV-1a fingerprint) is refused rather than rendered wrong; a new Google template means a new port
+and a new comparison run.

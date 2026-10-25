@@ -1,5 +1,6 @@
 #include "core/json.hpp"
 
+#include <charconv>
 #include <cmath>
 #include <cstdio>
 
@@ -116,9 +117,16 @@ Writer& Writer::value(double d) {
     out_ += "null";
     return *this;
   }
+  // Shortest digits that read back as the same double.
   char buf[32];
-  std::snprintf(buf, sizeof buf, "%.9g", d);
-  out_ += buf;
+  auto r = std::to_chars(buf, buf + sizeof buf, d);
+  out_.append(buf, r.ptr);
+  return *this;
+}
+
+Writer& Writer::raw(std::string_view v) {
+  before_value();
+  out_ += v;
   return *this;
 }
 
