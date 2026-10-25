@@ -128,3 +128,18 @@ reads ~6.5 GB per token: 399 GB/s caps one stream near 60 tok/s.
 Measurement notes: the first runs used 11-29 ms kernels and came out 25-50% low because the clock
 was still ramping; each kernel now runs once untimed and is timed best of three at ~90 ms. A
 `memset` of 0x01 had also made the fp16 inputs denormal.
+
+## 2026-10-24 — the oracle: llama.cpp's CPU backend, and its noise floor
+
+`eklow-oracle` (tools/ref/oracle) links the llama.cpp fiona serves (the fleet's ea0c4c2c), built
+for AVX2, and runs one CPU forward pass over a prompt with an fp32 KV cache and no flash
+attention, dumping any graph tensor by name prefix plus the logits of every position.
+
+Two llama.cpp backends on the same GGUF set the scale for "correct": on a 25-token Gemma 4 chat
+prompt the CPU and CUDA builds agree on the top-1 token at 24 of 25 positions, mean KL 4.7e-3
+(max 3.9e-2); per-layer outputs drift from 2% relative L2 at layer 0 to 18% at layer 47, with
+cosine never below 0.98. eklow against the oracle should land in that band.
+
+A false alarm on the way: on the raw text "The capital of France is", both backends predict
+digits ("011111111111"). That is the instruction-tuned model off its chat format, not a bug; with
+the chat format both put probability 1.0 on "The". Checks use chat-formatted prompts.
