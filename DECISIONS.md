@@ -493,3 +493,51 @@ Unchanged by it: `eklow-embed`'s vectors identical to the bit on the four inputs
 with llama.cpp's server, 50 ms each on an idle card; the reference forward bit-identical to its
 2026-10-24 dump on the 25-token chat prompt (all 48 layer outputs and the last row of logits);
 `eklow-attn-test` and `eklow-kernel-test` as recorded.
+
+## 2026-10-26 — decode attention: more splits need a cheaper merge
+
+Decode attention reads its cache at 25-107 GB/s of the card's 399, and with the int8 global cache
+the server now uses it set decode at long contexts (~11 tok/s at 259k). The reading was that too
+few threads run: a decode token on a global layer gave 2 tiles x 32 splits x 8 threads = 512
+threads of 4,096, each walking 32 blocks at ~7 us a block. More splits alone made it worse (global8
+at 16k: 470 us with today's cap of 32 splits, 526 with splits of 4 blocks, 780 with 2) and slowed
+short contexts by up to 40%, because the merge's work-items each loop over every split: with 128
+splits the merge was half of the decode time (a timing run with it skipped).
+
+So splits stay as they were up to 4k keys (the sliding layers, 40 of 48, always have ~1k) and are
+at most 8 blocks beyond, and past 32 splits a kernel folds each group of 8 into one partial in the
+same layout before the merge. A single-kernel rewrite of the merge, with the per-split weights
+computed once per row, was slower: 16 work-items looped over 128 splits. eklow-attn-test at 16k keys:
+global8 470 -> 302 us a layer, global 311 -> 306; 1k and 4k unchanged; splits of at most 4 blocks
+gave 366. Engine decode with the int8 cache at 16k 26.8 -> 27.8 tok/s, 24.8 at 64k. The decode
+kernel is now most of those 302 us, at ~111 GB/s: what limits it is how much one thread keeps in
+flight, not how many threads run.
+
+The work was done by Qwen 3.8 27B through son-of-anton one-shot runs, from step-by-step specs with
+acceptance checks (`~/eklow-perf` on fiona holds the benchmark and oracle-check scripts the runs
+used, with a lock so that two never share the card).
+
+## 2026-10-26 — what holds the prefill GEMM: shared-memory load latency
+
+The fp16 GEMM runs at 36-47 TFLOPS of 98.8. Per 32-K block a thread reads 12 x 256 bytes of shared
+local memory for 16 dpas, 192 bytes a dpas, which looked like more than SLM delivers. Measured
+(`eklow-xmx-bench`, 8,192 threads reading 256-byte blocks): SLM ~214 bytes a clock per Xe-core at
+1.5 GHz, L1 ~204, both at once ~173, so bandwidth is not the limit and moving activations to L1
+cannot help (SLM and L1 share a port).
+
+Knockouts, each removing one cost (results wrong on purpose; TFLOPS at 2,048 rows averaged over
+the six shapes `eklow-kernel-test` now runs, from 41.4):
+
+| removed | speed-up |
+|---|---|
+| the inner loop's SLM loads (one A pair and one B reused) | +45% (to 68 on qkv) |
+| the next block's global loads | +28% |
+| the dpas | +18% |
+| the barrier | +15% |
+| the dequantization | +13% |
+
+Without any dpas the kernel reaches only ~48 TFLOPS of loads and stores: the matrix units wait on
+the staging. Each B tile is loaded from SLM right before its dpas, so every one of the 12 loads a
+block is waited on in turn; the global loads compete for the same port. Next: fewer, larger SLM
+loads (both K halves of a tile in one 512-byte load) and the next tile's load issued before the
+current dpas.

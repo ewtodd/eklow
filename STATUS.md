@@ -40,6 +40,13 @@ nix develop path:. -c ./build/eklow-ref-run --model ~/models/gemma-4-12b-it-qat-
 nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 ```
 
+Speed work (2026-10-26): `~/eklow-perf` on fiona (copies in `~/Software/eklow-perf` on
+e-desktop) holds `bench.sh` (a tree's engine bench, profile, kernel test or attention test, under
+`~/eklow-perf/gpu.lock`), `check.sh` (logits against llama.cpp CPU dumps of the 2,616- and
+25-token prompts in `~/eklow-oracle`; baseline 31/32 at mean KL 2.4e-2, 25/25 at 4.2e-3) and the
+`AGENTS.md` the delegated runs read. Each run works in a worktree (`~/Software/eklow-wt/*` on
+e-desktop, `~/eklow-wt-*` on fiona).
+
 ## Milestone 1 (foundation)
 
 - [x] flake + CMake (intel-llvm stdenv, AOT for DG2)
@@ -109,7 +116,8 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] attention: prefill work-groups sharing each K/V block through shared local memory: 10.4 /
       10.9 TFLOPS (sliding / global)
 - [ ] prefill at 16k depth: 962 tok/s of the 1,500 target (`eklow-engine-bench --depth 16384`);
-      needs global attention near 20 TFLOPS and the GEMMs near 60 (DECISIONS 2026-10-24)
+      needs global attention near 20 TFLOPS and the GEMMs near 60 (DECISIONS 2026-10-24); the
+      GEMM waits on its shared-memory loads, not their bandwidth (knockouts, DECISIONS 2026-10-26)
 - [x] fp16 GEMM through shared local memory for prefill: 48-52 TFLOPS in isolation; prefill 1,364 /
       1,243 / 993 tok/s at 1k / 4k / 16k (DECISIONS 2026-10-24, "fp16 GEMM")
 - [ ] decode GEMV toward the 399 GB/s the card reads
@@ -121,6 +129,8 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] re-measured at 3e37ce5 (docs/bench/engine-*-fiona-2026-10-25.json): prefill 1,507 / 1,410 /
       1,193 tok/s, 1,281 / 965 at 4k / 16k depth; decode 31.9 / 29.5 / 28.0 tok/s, two slots 29.5
       / 26.8 / 25.4 per sequence; with int8 KV 31.6 / 26.8 at 0 / 16k
+- [x] decode attention beyond 4k keys: splits of at most 8 blocks and a two-level merge; global8 at
+      16k 470 -> 302 us a layer, int8 decode at 16k 27.8 tok/s, 24.8 at 64k (DECISIONS 2026-10-26)
 
 ## Open
 
