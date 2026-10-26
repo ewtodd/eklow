@@ -487,6 +487,8 @@ struct FlashGroup {
 };
 
 
+constexpr int64_t kPerSplitMax = 8;
+
 template <int D, int G, bool Q8>
 void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* tiles, const Cache& c,
          int64_t n_head, float scale, float* out, Scratch& scratch) {
@@ -513,17 +515,47 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
   }
   // Enough threads to fill the card: when there are few tiles (decode), split each tile's keys.
   // Each block costs a thread several microseconds of load latency, so short splits win, but every
-  // split adds partials to merge: at least 4 blocks a split, and at most 32 splits beyond that
-  // (measured on the A770M, 2026-10-24).
+  // split adds partials to merge. Up to 4k keys the splits are as measured on 2026-10-24 (at least
+  // 4 blocks, at most 32 splits); beyond, at most kPerSplitMax blocks a split, with the two-level
+  // merge below (2026-10-26: global8 decode at 16k keys 470 -> 302 us; kPerSplitMax 4 gave 366).
   const int64_t max_blocks = max_keys / kKeys + 2;
-  const int64_t per_split = std::max<int64_t>(4, max_blocks / 32);
+  const int64_t per_split = std::clamp<int64_t>(max_blocks / 32, 4, kPerSplitMax);
   const int64_t splits = std::clamp<int64_t>((8192 + n_tiles * P - 1) / (n_tiles * P), 1, std::max<int64_t>(1, max_blocks / per_split));
-  const int32_t sp = int32_t(splits);
+  int32_t sp = int32_t(splits);
   float* part = splits > 1 ? grow(q, scratch.part, scratch.part_floats, size_t(n_tiles * splits * part_stride(D))) : nullptr;
   Flash<D, G, Q8> k{qt, tiles, tok.slot, tok.pos, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
                     int32_t(c.n_head_kv), H, sp, out, part};
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(splits), size_t(n_tiles * P)), sycl::range<2>(1, P)), k);
   if (splits == 1) return;
+  // Each work-item of the merge below loops over every split, which at 128 splits was half of
+  // the decode time: past 32 splits, first fold each group of 8 consecutive splits into one
+  // partial in the same layout (the same rescaling as the merge), then merge those.
+  if (splits > 32) {
+    const int32_t sp2 = (sp + 7) / 8;
+    float* part2 = grow(q, scratch.part2, scratch.part2_floats, size_t(n_tiles) * sp2 * part_stride(D));
+    q.parallel_for(sycl::range<3>(size_t(n_tiles) * kRows, D, sp2), [=](sycl::id<3> id) {
+      const int32_t tile = int32_t(id[0]) / kRows, i = int32_t(id[0]) % kRows, d = int32_t(id[1]), g = int32_t(id[2]);
+      const int32_t rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i;
+      if (r >= rows) return;
+      const float* p = part + tile * sp * part_stride(D);
+      float* o2 = part2 + (tile * sp2 + g) * part_stride(D);
+      float mg = kNegBig, lg = 0, o = 0;
+      for (int32_t s = g * 8; s < g * 8 + 8 && s < sp; ++s)
+        if (p[s * part_stride(D) + kRows * D + kRows + i] > 0) mg = sycl::fmax(mg, p[s * part_stride(D) + kRows * D + i]);
+      for (int32_t s = g * 8; s < g * 8 + 8 && s < sp; ++s) {
+        const float* ps = p + s * part_stride(D);
+        const float ls = ps[kRows * D + kRows + i];
+        if (ls == 0) continue;
+        const float w = sycl::exp(ps[kRows * D + i] - mg);
+        lg += ls * w;
+        o += ps[i * D + d] * w;
+      }
+      o2[i * D + d] = o;
+      if (d == 0) o2[kRows * D + i] = mg, o2[kRows * D + kRows + i] = lg;
+    });
+    sp = sp2;
+    part = part2;
+  }
   q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
     const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), d = int32_t(id[2]);
     const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];

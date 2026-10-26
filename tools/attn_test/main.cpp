@@ -232,6 +232,7 @@ int main(int argc, char** argv) {
       for (int32_t* p : {dslot, dpos, dtiles}) sycl::free(p, q);
       if (scratch.q) sycl::free(scratch.q, q);
       if (scratch.part) sycl::free(scratch.part, q);
+      if (scratch.part2) sycl::free(scratch.part2, q);
       cache.free(q);
     }
     w.end_array().key("speed").begin_array();
@@ -291,6 +292,7 @@ int main(int argc, char** argv) {
         for (int32_t* p : {dslot, dpos, dtiles}) sycl::free(p, q);
         if (scratch.q) sycl::free(scratch.q, q);
         if (scratch.part) sycl::free(scratch.part, q);
+        if (scratch.part2) sycl::free(scratch.part2, q);
         cache.free(q);
       }
     w.end_array().kv("pass", ok).end_object();

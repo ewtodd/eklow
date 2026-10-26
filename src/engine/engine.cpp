@@ -203,6 +203,7 @@ Engine::~Engine() {
   xmx::free_activations(q_, act_ffn_);
   if (attn_scratch_.q) sycl::free(attn_scratch_.q, q_);
   if (attn_scratch_.part) sycl::free(attn_scratch_.part, q_);
+  if (attn_scratch_.part2) sycl::free(attn_scratch_.part2, q_);
   for (void* p : owned_) sycl::free(p, q_);
 }
 

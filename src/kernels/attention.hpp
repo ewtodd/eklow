@@ -76,7 +76,8 @@ struct TileList {
 struct Scratch {
   sycl::half* q = nullptr;  // query tiles, fp16
   float* part = nullptr;    // split partials
-  size_t q_halves = 0, part_floats = 0;
+  float* part2 = nullptr;   // partials folded from groups of 8 splits, when the merge runs two levels
+  size_t q_halves = 0, part_floats = 0, part2_floats = 0;
 };
 
 // out[t][h][:] = softmax(Q[t][h] . K^T * scale) V over the keys token t sees: positions up to its
