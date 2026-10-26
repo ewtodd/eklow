@@ -15,6 +15,10 @@
 //      fp16+dequant  nibbles unpacked to fp16 and scaled in registers, then reused by several
 //                    fp16 dpas (one per 8 activation rows).
 // 4. bandwidth: block loads streaming 1 GiB of VRAM.
+// 5. local read: 128 work-groups of 64 threads, each with 32 KB of SLM (four groups per Xe-core),
+//    looping 256-byte block loads 4,096 times through their 32 KB: from SLM, from an L1-resident
+//    32 KB per group, and half of each interleaved. This is the per-dpas traffic the fp16 GEMM
+//    makes (DECISIONS 2026-10-26, "GEMM toward the fp16 peak").
 // Kernels run 100-400 ms, far below xe's 5 s job timeout; each is launched once untimed (the clock
 // ramps up) and then timed three times, keeping the fastest.
 #include <sycl/ext/intel/esimd.hpp>
@@ -337,6 +341,35 @@ double run_bandwidth(sycl::queue& q, uint32_t* buf, size_t bytes, size_t threads
 
 }  // namespace
 
+// Local read of step 5: one work-group's 32 KB of SLM, an L1-resident 32 KB, or half of each
+// interleaved, in 256-byte block loads. The template is a free function: a local template lambda
+// crashes the DPC++ compiler.
+template <int SRC>
+sycl::event launch_local_read(sycl::queue& q, const uint32_t* gbuf, uint32_t* sink) {
+  constexpr int kGroups = 128, kThreads = 64, kSlmBytes = 32 * 1024, kIters = 4096, kBlocks = kSlmBytes / 256;
+  constexpr auto cached = esimd::properties{esimd::cache_hint_L1<esimd::cache_hint::cached>,
+                                            esimd::cache_hint_L2<esimd::cache_hint::cached>};
+  return q.parallel_for(sycl::nd_range<1>(size_t(kGroups) * kThreads, kThreads),
+                        [=](sycl::nd_item<1> it) SYCL_ESIMD_KERNEL {
+                          const int g = int(it.get_global_id(0)) / kThreads, tid = int(it.get_local_id(0));
+                          if constexpr (SRC != 1) esimd::slm_init<kSlmBytes>();
+                          const uint32_t* base = gbuf + size_t(g) * kSlmBytes / 4;
+                          esimd::simd<uint32_t, 64> v = 0;
+                          for (int i = 0; i < kIters; ++i) {
+                            const int blk = (tid + i) % kBlocks;
+                            if constexpr (SRC == 0)
+                              v ^= esimd::slm_block_load<uint32_t, 64>(blk * 256);
+                            else if constexpr (SRC == 1)
+                              v ^= esimd::block_load<uint32_t, 64>(base + blk * 64, cached);
+                            else
+                              v ^= (i & 1) ? esimd::block_load<uint32_t, 64>(base + blk * 64, cached)
+                                           : esimd::slm_block_load<uint32_t, 64>(blk * 256);
+                          }
+                          esimd::block_store<uint32_t, 16>(sink + (size_t(g) * kThreads + tid) * 16,
+                                                           v.template select<16, 1>(0));
+                        });
+}
+
 int main(int argc, char** argv) {
   std::string json_path;
   for (int i = 1; i < argc; ++i) {
@@ -407,6 +440,30 @@ int main(int argc, char** argv) {
     w.kv("read_bandwidth_gbps", gbps);
     sycl::free(buf, q);
     sycl::free(sink, q);
+
+    // Local read: each thread walks its group's 32 KB in 256-byte blocks, wrapping, starting at
+    // tid * 256 (every thread covers all 128 blocks per pass). 8,192 threads x 4,096 loads x 256 B.
+    {
+      constexpr int kGroups = 128, kThreads = 64, kSlmBytes = 32 * 1024, kIters = 4096;
+      constexpr size_t kTotalBytes = size_t(kGroups) * kThreads * kIters * 256;
+      auto* gbuf = sycl::malloc_device<uint32_t>(size_t(kGroups) * kSlmBytes / 4, q);
+      q.memset(gbuf, 1, size_t(kGroups) * kSlmBytes).wait();
+      auto* sink = sycl::malloc_device<uint32_t>(size_t(kGroups) * kThreads * 16, q);
+      w.key("local_read").begin_array();
+      for (auto [src, kind] : {std::pair{0, std::string("slm read")}, std::pair{1, std::string("l1 read")},
+                               std::pair{2, std::string("slm+l1 read")}}) {
+        double secs = 0;
+        if (src == 0) secs = best_seconds([&] { return launch_local_read<0>(q, gbuf, sink); });
+        if (src == 1) secs = best_seconds([&] { return launch_local_read<1>(q, gbuf, sink); });
+        if (src == 2) secs = best_seconds([&] { return launch_local_read<2>(q, gbuf, sink); });
+        const double g = kTotalBytes / secs / 1e9;
+        w.begin_object().kv("kind", kind).kv("gbps", g).kv("bytes_per_clock_per_core", g / 32.0 / 1.5).end_object();
+        std::printf("%-11s %6.0f GB/s  (%.2f B/clk/Xe-core)\n", kind.c_str(), g, g / 32.0 / 1.5);
+      }
+      w.end_array();
+      sycl::free(gbuf, q);
+      sycl::free(sink, q);
+    }
     w.end_object();
     if (!json_path.empty()) {
       std::ofstream(json_path) << w.str() << "\n";
