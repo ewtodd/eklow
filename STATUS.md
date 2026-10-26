@@ -6,6 +6,9 @@ Live state. Design and targets: `DESIGN.md`; history and evidence: `DECISIONS.md
 
 - Source of truth: `github.com/ewtodd/eklow` (working copy `~/Software/eklow` on e-desktop); the
   build/run tree on fiona is `~/eklow` (rsync, no `.git`).
+- Image input in progress on the branch `image-input` (picked up from fiona's `~/eklow-dev`, where
+  it was written): image preparation, the gemma4uv embedder on reference kernels, the oracle
+  through mtmd; not yet checked against the oracle or wired into the engine.
 - Weights: `fiona:~/models/gemma-4-12b-it-qat-q4_0.gguf` (sha256 93567e57..., the file fiona's
   llama.cpp serves from `/var/cache/llama-cache`, which the fiona user cannot read).
 - Toolchain: the fleet's nixpkgs (c3f15ff4): intel-llvm 7.1.1, level-zero 1.32.0,
@@ -77,7 +80,10 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] EmbeddingGemma 2 in the same process, /v1/embeddings on its own port: cosine 0.9996-0.99995
       against the llama.cpp server it replaces (reference kernels, 50-80 ms an input)
 - [x] NixOS module (`nix/module.nix`, models pinned by revision and hash) and fiona's config
-      (/etc/nixos 9c56ee15, build-checked; not deployed)
+      (/etc/nixos 9c56ee15, build-checked; not deployed); 2 x 262,144 with int8 global KV by
+      default, which maitred lists as `eklow/gemma-4-12b` (DECISIONS 2026-10-26)
+- [x] a son-of-anton-sized prompt (10.6k tokens) through `eklow-server`: first token 8.5 s cold,
+      0.2 s with the prefix cached, then 28.3 tok/s (`tools/server/ttft.py`; targets 5 s and 1 s)
 - [ ] son-of-anton's Signal probe scenarios on eklow against llama.cpp
 - [x] grammar-constrained tool calls (`src/serve/tool_grammar.cpp`, `eklow-grammar-test`)
 - [ ] image input (llama.cpp's server on fiona had no projector either)
@@ -103,8 +109,14 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
 - [x] fp16 GEMM through shared local memory for prefill: 48-52 TFLOPS in isolation; prefill 1,364 /
       1,243 / 993 tok/s at 1k / 4k / 16k (DECISIONS 2026-10-24, "fp16 GEMM")
 - [ ] decode GEMV toward the 399 GB/s the card reads
-- [x] int8 global KV (`--kv-int8`): 2 x 262k in ~4.8 GB, within the noise floor
-- [ ] 2 x 262k run end to end
+- [x] int8 global KV (`--kv-int8`): 2 x 262k in ~4.8 GB, within the noise floor; the server's
+      default (`--kv-fp16` for fp16)
+- [x] 2 x 262k end to end: 12.5 GiB on the card with the embedding model; two 259k-token prompts
+      at once prefilled in 36 min (237 tok/s together, from empty), both needles recalled; decode
+      ~11 tok/s per sequence at 259k (DECISIONS 2026-10-26)
+- [x] re-measured at 3e37ce5 (docs/bench/engine-*-fiona-2026-10-25.json): prefill 1,507 / 1,410 /
+      1,193 tok/s, 1,281 / 965 at 4k / 16k depth; decode 31.9 / 29.5 / 28.0 tok/s, two slots 29.5
+      / 26.8 / 25.4 per sequence; with int8 KV 31.6 / 26.8 at 0 / 16k
 
 ## Open
 
@@ -112,3 +124,5 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
    never seen by a running kernel under xe.
 2. Kernels that run long while llama.cpp shares the card have not been tried against xe's job
    timeout.
+3. Embeddings wait behind chat prefill: every /v1/embeddings request during the 2 x 262k prefill
+   timed out (600 s); idle they take 50-100 ms, and maitred gives the embed upstream 120 s.

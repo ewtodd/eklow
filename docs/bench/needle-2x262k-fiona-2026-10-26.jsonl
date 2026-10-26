@@ -1,0 +1,10 @@
+{"event":"start","t":1793036033.7}
+{"event":"embed","ms":100,"dim":768,"t":1793036033.8}
+{"event":"embed","error":"TimeoutError('timed out')","t":1793036753.9}
+{"event":"embed","error":"TimeoutError('timed out')","t":1793037474.0}
+{"event":"embed","error":"TimeoutError('timed out')","t":1793038194.1}
+{"slot":"b","event":"first_token","ttft_s":2171.2,"t":1793038204.9}
+{"slot":"a","event":"first_token","ttft_s":2183.8,"t":1793038217.5}
+{"slot":"b","event":"done","error":null,"ttft_s":2171.2,"total_s":2219.2,"usage":{"prompt_tokens":258916,"completion_tokens":387,"total_tokens":259303,"prompt_tokens_details":{"cached_tokens":0}},"expected":"cobalt-heron-2093","found":true,"first_line":"cobalt-heron-2093","decode_tok_s":8.04,"t":1793038252.9}
+{"slot":"a","event":"done","error":null,"ttft_s":2183.8,"total_s":2221.7,"usage":{"prompt_tokens":259623,"completion_tokens":414,"total_tokens":260037,"prompt_tokens_details":{"cached_tokens":0}},"expected":"plum-anchor-4417","found":true,"first_line":"plum-anchor-4417","decode_tok_s":10.9,"t":1793038255.4}
+{"event":"end","t":1793038255.4}

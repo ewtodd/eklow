@@ -424,3 +424,36 @@ and allowed sets are cached by state (mode, open containers, and the name or wor
 requests. eklow-grammar-test on the vocabulary: 5,000 random well-formed calls accepted token by
 token; 4,997 random walks through the allowed sets closed, and every one parsed into a call of a
 declared tool.
+
+## 2026-10-26 — 2 x 262k by default
+
+`eklow-server` and the NixOS module now give both slots Gemma's full 262,144-token window, with
+the global layers' K/V in int8 (`--kv-fp16` for fp16). fp16 cannot hold it: the global layers alone
+would take 8.6 GB beside the weights. With int8 the card carries 6.48 GiB of weights, 5.75 GiB of
+KV (both slots' global pages and sliding rings) and 0.27 GiB of EmbeddingGemma 2, 12.5 of the 15
+GiB it allocates.
+
+End to end, through the server as the module runs it (`tools/server/needle.py`,
+docs/bench/needle-2x262k-fiona-2026-10-26.jsonl): two prompts of 259,623 and 258,916 tokens
+(son-of-anton's Python in two orders, each with a one-line note giving a passphrase, 2% and 55% of
+the way in), sent at once. Both prefilled together in 36 min (first tokens at 2,172 and 2,184 s:
+237 tok/s for the two, from empty, so about 18 min for one), with no xe job timeout, and each
+answered with its own passphrase and an accurate summary of the code. Decode at 259k is about 11
+tok/s per sequence with both decoding (the first slot's 8.0 includes steps that also carried the
+other's last prefill chunks): each token reads the whole global cache. What int8 costs where fp16
+also fits (`eklow-engine-bench`, docs/bench/engine-int8-fiona-2026-10-25.json): decode 31.6
+against 31.9 tok/s at 0, 26.8 against 28.0 at 16k; prefill at 16k depth 943 against 965.
+
+maitred lists the model as `eklow/gemma-4-12b` with a 262,144 window (the id names the engine,
+as `unholy/` and `radiance/` do). son-of-anton asks for "auto", which takes the strongest serving
+model whose window fits the conversation, so a long conversation can now stay on Gemma: a cold one
+near the full window costs ~18 min of prefill, a cached one only its new tokens. For scale, a
+10.6k-token prompt, the size of son-of-anton's prefix, takes 8.5 s to the first token cold and 0.2
+s with the prefix cached (`tools/server/ttft.py`, 2026-10-25).
+
+The same run shows embeddings starving behind chat: the three /v1/embeddings requests sent during
+the prefill each timed out after 600 s; on an idle card they take 50-100 ms, and maitred gives the
+embed upstream 120 s. The embedding model runs on its own queue, which keeps it out of the
+scheduler's steps but evidently not from waiting on them. Not yet diagnosed; a suspect is
+`EmbedGemma2::embed` allocating and freeing device memory on every call, since a Level Zero free
+can wait for the device to go idle.

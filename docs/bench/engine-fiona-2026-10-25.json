@@ -1,0 +1,56 @@
+{
+  "device": "Intel(R) Arc(TM) A770M Graphics",
+  "chunk": 1024,
+  "slots": 1,
+  "prefill": [
+    {
+      "tokens": 1024,
+      "seconds": 0.679503047,
+      "tok_per_s": 1506.9836765573768
+    },
+    {
+      "tokens": 4096,
+      "seconds": 2.90486417,
+      "tok_per_s": 1410.0487183880957
+    },
+    {
+      "tokens": 16384,
+      "seconds": 13.734866127,
+      "tok_per_s": 1192.8765703651331
+    }
+  ],
+  "depth": [
+    {
+      "depth": 4096,
+      "tokens": 2048,
+      "seconds": 1.598655403,
+      "tok_per_s": 1281.0765823308577
+    },
+    {
+      "depth": 16384,
+      "tokens": 2048,
+      "seconds": 2.121821818,
+      "tok_per_s": 965.2082859296906
+    }
+  ],
+  "decode": [
+    {
+      "ctx": 0,
+      "ms_per_step": 31.326579734375,
+      "enqueue_ms_per_step": 3.2266903749999996,
+      "tok_per_s": 31.921774048722245
+    },
+    {
+      "ctx": 4096,
+      "ms_per_step": 33.9458746875,
+      "enqueue_ms_per_step": 3.2822047968750003,
+      "tok_per_s": 29.45866056496795
+    },
+    {
+      "ctx": 16384,
+      "ms_per_step": 35.731787078125,
+      "enqueue_ms_per_step": 3.166001999999999,
+      "tok_per_s": 27.986285651304577
+    }
+  ]
+}

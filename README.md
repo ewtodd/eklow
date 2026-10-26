@@ -1,8 +1,8 @@
 # eklow
 
 A serving engine for Gemma 4 on one Intel Arc A770M, in C++20 and SYCL on Level Zero.
-Early: milestone 1 (foundation). See `DESIGN.md` for the target, `STATUS.md` for where things
-stand and `DECISIONS.md` for the evidence behind each choice.
+Serving (milestone 3), with speed work under way (milestone 4). See `DESIGN.md` for the target,
+`STATUS.md` for where things stand and `DECISIONS.md` for the evidence behind each choice.
 
 ## Tools
 
