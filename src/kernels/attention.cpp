@@ -99,12 +99,13 @@ constexpr int kElem = Q8 ? 1 : 2;
 // Index arithmetic below is in 32 bits with the query group size a template parameter: DG2 has no
 // integer division, and 64-bit divisions by runtime values were library calls that cost more than
 // a decode step's whole attention.
-template <int D, int G, bool Q8>
+template <int D, int G, bool Q8, int S>
 struct Flash {
-  static constexpr int P = D / kSlice;     // threads per tile
+  static constexpr int P = D / S;          // threads per tile
   static constexpr int RPT = kRows / P;    // rows each thread runs the softmax for
-  static constexpr int DC = kSlice / 16;   // Q.K^T steps per slice
-  static constexpr int DG = kSlice / 8;    // P.V output tiles per slice
+  static constexpr int DC = S / 16;        // Q.K^T steps per slice
+  static constexpr int DG = S / 8;         // P.V output tiles per slice
+  static_assert(kRows % P == 0);
   // Shared local memory: partial scores [P][2 key halves][8 rows][8 keys] fp32, the probability
   // tile [8 rows][16 keys] fp16, the correction per row, and at the end m and l per row.
   static constexpr uint32_t kScores = 0, kProbs = P * 512, kCorr = kProbs + 256, kM = kCorr + 32, kL = kM + 32,
@@ -250,12 +251,12 @@ struct Flash {
       const int32_t r = r0 + i;
       if (r >= rows) break;
       if (splits == 1) {
-        float* dst = out + ((base + r / G) * n_head + kvh * G + r % G) * D + j * kSlice;
+        float* dst = out + ((base + r / G) * n_head + kvh * G + r % G) * D + j * S;
         const float inv = 1.0f / L[i];
 #pragma unroll
         for (int g = 0; g < DG; ++g) esimd::block_store<float, 8>(dst + g * 8, O[g].template select<8, 1>(i * 8) * inv);
       } else {
-        float* dst = part + (tile * splits + s) * part_stride(D) + i * D + j * kSlice;
+        float* dst = part + (tile * splits + s) * part_stride(D) + i * D + j * S;
 #pragma unroll
         for (int g = 0; g < DG; ++g) esimd::block_store<float, 8>(dst + g * 8, O[g].template select<8, 1>(i * 8));
       }
@@ -492,7 +493,10 @@ constexpr int64_t kPerSplitMax = 8;
 template <int D, int G, bool Q8>
 void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* tiles, const Cache& c,
          int64_t n_head, float scale, float* out, Scratch& scratch) {
-  constexpr int P = Flash<D, G, Q8>::P, QT = D >= 512 ? 6 : 12;
+  // The 256-dim decode slices 32 dims per thread: at 64, Flash's P.V output (8 x 64 floats)
+  // spilled 928 B; at 32 it fits the 128-register budget and the tile gets twice the threads.
+  constexpr int S = D == 256 ? 32 : kSlice;
+  constexpr int P = Flash<D, G, Q8, S>::P, QT = D >= 512 ? 6 : 12;
   const int64_t n_tiles = list.size(), max_keys = list.max_keys;
   if (list.per_group != QT) throw std::runtime_error("attention: tile list grouped for another head size");
   const int32_t H = int32_t(n_head);
@@ -523,8 +527,8 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
   const int64_t splits = std::clamp<int64_t>((8192 + n_tiles * P - 1) / (n_tiles * P), 1, std::max<int64_t>(1, max_blocks / per_split));
   int32_t sp = int32_t(splits);
   float* part = splits > 1 ? grow(q, scratch.part, scratch.part_floats, size_t(n_tiles * splits * part_stride(D))) : nullptr;
-  Flash<D, G, Q8> k{qt, tiles, tok.slot, tok.pos, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
-                    int32_t(c.n_head_kv), H, sp, out, part};
+  Flash<D, G, Q8, S> k{qt, tiles, tok.slot, tok.pos, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
+                       int32_t(c.n_head_kv), H, sp, out, part};
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(splits), size_t(n_tiles * P)), sycl::range<2>(1, P)), k);
   if (splits == 1) return;
   // Each work-item of the merge below loops over every split, which at 128 splits was half of
