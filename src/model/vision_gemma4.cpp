@@ -79,10 +79,11 @@ DeviceRows VisionGemma4::encode(const image::Patches& p) {
   q_.parallel_for(sycl::range<2>(size_t(n), size_t(E)), [=](sycl::id<2> id) {
      const int64_t r = int64_t(id[0]), e = int64_t(id[1]);
      xp[r * E + e] = (xp[r * E + e] + pos[(r % cols) * E + e]) + pos[(P + r / cols) * E + e];
-   }).wait();
+   });
   ref::layernorm(q_, xp, norm3_w_, norm3_b_, n, E, 1e-5f, xp);
   ref::rmsnorm(q_, xp, nullptr, n, E, eps_, xp);
   ref::matmul(q_, proj_, xp, n, out.get());
+  q_.wait();  // patches and x are freed on return
   return {out, n, n_out_};
 }
 

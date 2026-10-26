@@ -143,13 +143,13 @@ void layernorm(sycl::queue& q, const float* x, const float* w, const float* b, i
      for (int64_t i = 0; i < cols; ++i) ss += (xr[i] - mean) * (xr[i] - mean);
      const float inv = 1.0f / sycl::sqrt(ss / float(cols) + eps);
      for (int64_t i = 0; i < cols; ++i) out[r * cols + i] = (xr[i] - mean) * inv * w[i] + b[i];
-   }).wait();
+   });
 }
 
 void add_rows(sycl::queue& q, float* x, const float* v, int64_t rows, int64_t cols) {
   q.parallel_for(sycl::range<2>(size_t(rows), size_t(cols)), [=](sycl::id<2> id) {
      x[int64_t(id[0]) * cols + int64_t(id[1])] += v[id[1]];
-   }).wait();
+   });
 }
 
 void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, float* out) {
