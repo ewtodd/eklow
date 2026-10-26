@@ -59,14 +59,15 @@ std::string models_json(const std::string& id, int64_t ctx, int64_t slots) {
 }
 
 // The embedding endpoint: inputs one at a time through the model (each its own sequence,
-// attended both ways), each at most max_tokens long.
+// attended both ways), each at most max_tokens long, with the scheduler held so that no new chat
+// step starts until they are done.
 void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::Tokenizer& tok, std::mutex& mu,
-                      const std::string& alias, int64_t max_tokens) {
+                      serve::Scheduler& sched, const std::string& alias, int64_t max_tokens) {
   http.Get("/health", [](const httplib::Request&, httplib::Response& res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
   http.Get("/v1/models", [alias, max_tokens](const httplib::Request&, httplib::Response& res) {
     res.set_content(models_json(alias, max_tokens, 1), "application/json");
   });
-  http.Post("/v1/embeddings", [&m, &tok, &mu, alias, max_tokens](const httplib::Request& req, httplib::Response& res) {
+  http.Post("/v1/embeddings", [&m, &tok, &mu, &sched, alias, max_tokens](const httplib::Request& req, httplib::Response& res) {
     try {
       json::Value body;
       try {
@@ -113,14 +114,16 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
       }
       json::Writer w(false);
       w.begin_object().kv("object", "list").kv("model", alias).key("data").begin_array();
+      std::vector<std::vector<float>> embs;
       {
         std::lock_guard lk(mu);
-        for (size_t i = 0; i < seqs.size(); ++i) {
-          const std::vector<float> e = m.embed(seqs[i]);
-          w.begin_object().kv("object", "embedding").kv("index", int64_t(i)).key("embedding").begin_array();
-          for (float v : e) w.value(double(v));
-          w.end_array().end_object();
-        }
+        const serve::Scheduler::Hold hold(sched);
+        embs = m.embed(seqs);
+      }
+      for (size_t i = 0; i < embs.size(); ++i) {
+        w.begin_object().kv("object", "embedding").kv("index", int64_t(i)).key("embedding").begin_array();
+        for (float v : embs[i]) w.value(double(v));
+        w.end_array().end_object();
       }
       w.end_array().key("usage").begin_object().kv("prompt_tokens", total).kv("total_tokens", total).end_object().end_object();
       res.set_content(w.str(), "application/json");
@@ -272,7 +275,7 @@ int main(int argc, char** argv) {
       embed_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
       embed_model = std::make_unique<model::EmbedGemma2>(*embed_q, *embed_file);
       embed_http.new_task_queue = [] { return new httplib::ThreadPool(4); };
-      serve_embeddings(embed_http, *embed_model, *embed_tok, embed_mu, embed_alias, 8192);
+      serve_embeddings(embed_http, *embed_model, *embed_tok, embed_mu, sched, embed_alias, 8192);
       std::fprintf(stderr, "eklow-server: %s, %.2f GiB, listening on %s:%d\n", embed_alias.c_str(), embed_model->bytes() / 1073741824.0,
                    host.c_str(), embed_port);
       embed_thread = std::thread([&] {

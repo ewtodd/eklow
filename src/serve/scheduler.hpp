@@ -77,6 +77,21 @@ class Scheduler {
   };
   Stats stats() const;
 
+  // While a Hold lives the engine thread starts no new step (the one under way finishes), so other
+  // work on the card, the embedding model, has it to itself instead of getting a timeslice now and
+  // then behind a long prefill. After each Hold ends the thread takes at least one step, so holds
+  // back to back cannot starve chat.
+  class Hold {
+   public:
+    explicit Hold(Scheduler& s);
+    ~Hold();
+    Hold(const Hold&) = delete;
+    Hold& operator=(const Hold&) = delete;
+
+   private:
+    Scheduler& s_;
+  };
+
  private:
   struct Seq {
     std::shared_ptr<Request> req;
@@ -107,6 +122,11 @@ class Scheduler {
   std::condition_variable cv_;
   std::deque<std::shared_ptr<Request>> waiting_;
   Stats stats_;
+
+  std::mutex hold_mu_;
+  std::condition_variable hold_cv_;
+  int holds_ = 0;
+  uint64_t releases_ = 0;  // Holds ended so far
 };
 
 }  // namespace eklow::serve

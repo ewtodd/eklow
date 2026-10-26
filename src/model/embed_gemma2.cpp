@@ -97,51 +97,90 @@ EmbedGemma2::~EmbedGemma2() {
 }
 
 // Activation buffers for n_tok tokens: x, x2, h, o, q, k, v, att, gate, up, per-layer inputs,
-// per-layer gate, embeddings, and the token ids.
+// per-layer gate, embeddings, and the token ids; then the RoPE tables for positions 0..n_tok-1
+// (cos and sin of the sliding layers, then of the global ones), which serve any shorter input.
 void EmbedGemma2::ensure(int64_t n_tok) {
   if (n_tok <= max_tok_) return;
   q_.wait();
   for (float* p : act_) sycl::free(p, q_);
   act_.clear();
-  int64_t dmax = 0;
-  for (const auto& L : layers_) dmax = std::max(dmax, L.head_dim);
+  int64_t dmax = 0, d_s = 0, d_g = 0;
+  for (const auto& L : layers_) {
+    dmax = std::max(dmax, L.head_dim);
+    (L.sliding ? d_s : d_g) = L.head_dim;
+  }
   const int64_t T = std::max<int64_t>(n_tok, 2 * max_tok_), E = n_embd_;
   for (int64_t n : {T * E, T * E, T * E, T * E, T * n_head_ * dmax, T * n_head_ * dmax, T * n_head_ * dmax, T * n_head_ * dmax,
-                    T * n_ff_, T * n_ff_, T * n_pl_ * n_layer_, T * n_pl_, T * n_out_, T}) {
+                    T * n_ff_, T * n_ff_, T * n_pl_ * n_layer_, T * n_pl_, T * n_out_, T, T * d_s / 2, T * d_s / 2, T * d_g / 2,
+                    T * d_g / 2}) {
     auto* p = sycl::malloc_device<float>(size_t(n), q_);
     if (!p) throw std::runtime_error("embedding model: out of device memory for activations");
     act_.push_back(p);
   }
+  const ref::RopeTables s = ref::rope_tables(T, d_s, rope_base_s_, nullptr), g = ref::rope_tables(T, d_g, rope_base_g_, nullptr);
+  q_.memcpy(act_[14], s.cos.data(), s.cos.size() * sizeof(float));
+  q_.memcpy(act_[15], s.sin.data(), s.sin.size() * sizeof(float));
+  q_.memcpy(act_[16], g.cos.data(), g.cos.size() * sizeof(float));
+  q_.memcpy(act_[17], g.sin.data(), g.sin.size() * sizeof(float)).wait();
   max_tok_ = T;
 }
 
 std::vector<float> EmbedGemma2::embed(const std::vector<int32_t>& tokens) {
+  return std::move(embed(std::vector<std::vector<int32_t>>{tokens})[0]);
+}
+
+// The inputs one after another on the queue, each one's last layer copied to the host, and a single
+// wait at the end: with a long prefill on the card, every wait costs a turn on it (~90 ms at 50k
+// tokens of depth), and a wait per kernel made an input take a minute.
+std::vector<std::vector<float>> EmbedGemma2::embed(const std::vector<std::vector<int32_t>>& seqs) {
+  int64_t longest = 0;
+  for (const auto& s : seqs) {
+    if (s.empty()) throw std::runtime_error("embedding model: empty input");
+    longest = std::max(longest, int64_t(s.size()));
+  }
+  ensure(longest);
+  std::vector<std::vector<float>> rows(seqs.size());
+  try {
+    for (size_t i = 0; i < seqs.size(); ++i) {
+      rows[i].resize(seqs[i].size() * size_t(n_out_));
+      forward(seqs[i], rows[i].data());
+    }
+  } catch (...) {
+    q_.wait();  // copies already queued write into rows
+    throw;
+  }
+  q_.wait();
+  std::vector<std::vector<float>> out;
+  for (size_t i = 0; i < seqs.size(); ++i) {
+    const int64_t T = int64_t(seqs[i].size());
+    std::vector<double> mean(size_t(n_out_), 0.0);
+    for (int64_t t = 0; t < T; ++t)
+      for (int64_t j = 0; j < n_out_; ++j) mean[size_t(j)] += rows[i][size_t(t * n_out_ + j)];
+    double norm = 0;
+    for (auto& v : mean) {
+      v /= double(T);
+      norm += v * v;
+    }
+    norm = std::sqrt(norm);
+    std::vector<float> e(static_cast<size_t>(n_out_));
+    for (int64_t j = 0; j < n_out_; ++j) e[size_t(j)] = float(norm > 0 ? mean[size_t(j)] / norm : 0.0);
+    out.push_back(std::move(e));
+  }
+  return out;
+}
+
+void EmbedGemma2::forward(const std::vector<int32_t>& tokens, float* rows) {
   const int64_t T = int64_t(tokens.size()), E = n_embd_, H = n_head_, L = n_layer_;
-  if (T == 0) throw std::runtime_error("embedding model: empty input");
-  ensure(T);
   float *x = act_[0], *x2 = act_[1], *h = act_[2], *o = act_[3], *qb = act_[4], *kb = act_[5], *vb = act_[6], *att = act_[7];
   float *gate = act_[8], *up = act_[9], *pl = act_[10], *pg = act_[11], *emb = act_[12];
   auto* tok = reinterpret_cast<int32_t*>(act_[13]);
-  q_.memcpy(tok, tokens.data(), tokens.size() * sizeof(int32_t)).wait();
+  const float *cos_s = act_[14], *sin_s = act_[15], *cos_g = act_[16], *sin_g = act_[17];
+  q_.memcpy(tok, tokens.data(), tokens.size() * sizeof(int32_t));
 
   ref::embed(q_, tok_embd_, tok, T, std::sqrt(float(E)), x);
   ref::matmul(q_, pl_proj_, x, T, pl);
   ref::scale(q_, pl, 1.0f / std::sqrt(float(E)), T * n_pl_ * L);
   ref::rmsnorm(q_, pl, pl_norm_, T * L, n_pl_, eps_, pl);
-
-  // RoPE tables per kind of layer, for positions 0..T-1.
-  auto tables = [&](int64_t n_rot, float base) {
-    ref::RopeTables t = ref::rope_tables(T, n_rot, base, nullptr);
-    float* c = sycl::malloc_device<float>(t.cos.size(), q_);
-    float* s = sycl::malloc_device<float>(t.sin.size(), q_);
-    q_.memcpy(c, t.cos.data(), t.cos.size() * sizeof(float));
-    q_.memcpy(s, t.sin.data(), t.sin.size() * sizeof(float)).wait();
-    return std::pair{c, s};
-  };
-  int64_t d_s = 0, d_g = 0;
-  for (const auto& Lr : layers_) (Lr.sliding ? d_s : d_g) = Lr.head_dim;
-  auto [cos_s, sin_s] = tables(d_s, rope_base_s_);
-  auto [cos_g, sin_g] = tables(d_g, rope_base_g_);
 
   for (int64_t l = 0; l < L; ++l) {
     const Layer& Ly = layers_[size_t(l)];
@@ -175,30 +214,16 @@ std::vector<float> EmbedGemma2::embed(const std::vector<int32_t>& tokens) {
     q_.parallel_for(sycl::range<2>(size_t(T), size_t(npl)), [=](sycl::id<2> id) {
        const int64_t t = int64_t(id[0]), i = int64_t(id[1]);
        pg[t * npl + i] *= pl[(t * nl + li) * npl + i];
-     }).wait();
+     });
     ref::matmul(q_, Ly.proj, pg, T, o);
     ref::rmsnorm(q_, o, Ly.post_norm, T, E, eps_, o);
     ref::add(q_, o, x2, T * E, x);
     ref::scale(q_, x, Ly.out_scale, T * E);
   }
-  for (float* p : {cos_s, sin_s, cos_g, sin_g}) sycl::free(p, q_);
 
   ref::rmsnorm(q_, x, output_norm_, T, E, eps_, h);
   ref::matmul(q_, output_, h, T, emb);
-  std::vector<float> all(size_t(T * n_out_));
-  q_.memcpy(all.data(), emb, all.size() * sizeof(float)).wait();
-  std::vector<double> mean(size_t(n_out_), 0.0);
-  for (int64_t t = 0; t < T; ++t)
-    for (int64_t i = 0; i < n_out_; ++i) mean[size_t(i)] += all[size_t(t * n_out_ + i)];
-  double norm = 0;
-  for (auto& v : mean) {
-    v /= double(T);
-    norm += v * v;
-  }
-  norm = std::sqrt(norm);
-  std::vector<float> out(static_cast<size_t>(n_out_));
-  for (int64_t i = 0; i < n_out_; ++i) out[size_t(i)] = float(norm > 0 ? mean[size_t(i)] / norm : 0.0);
-  return out;
+  q_.memcpy(rows, emb, size_t(T * n_out_) * sizeof(float));
 }
 
 }  // namespace eklow::model

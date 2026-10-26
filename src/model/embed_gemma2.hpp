@@ -30,6 +30,8 @@ class EmbedGemma2 {
 
   // The normalized embedding of one sequence of token ids.
   std::vector<float> embed(const std::vector<int32_t>& tokens);
+  // Those of several, computed one after another with a single wait for the card.
+  std::vector<std::vector<float>> embed(const std::vector<std::vector<int32_t>>& seqs);
 
   int64_t dim() const { return n_out_; }
   int64_t max_tokens() const { return max_tok_; }
@@ -45,6 +47,8 @@ class EmbedGemma2 {
   };
   float* buf(size_t floats);
   void ensure(int64_t n_tok);
+  // Enqueues one sequence and the copy of its last layer, [tokens][dim], to `rows` on the host.
+  void forward(const std::vector<int32_t>& tokens, float* rows);
 
   sycl::queue& q_;
   std::vector<void*> owned_;
@@ -54,7 +58,7 @@ class EmbedGemma2 {
   ref::Weight tok_embd_, pl_proj_, output_;
   const float *pl_norm_, *output_norm_;
   std::vector<Layer> layers_;
-  // activations for up to max_tok_ tokens
+  // activations and RoPE tables for up to max_tok_ tokens
   std::vector<float*> act_;
 };
 

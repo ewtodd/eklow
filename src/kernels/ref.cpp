@@ -118,7 +118,7 @@ void embed(sycl::queue& q, const Weight& table, const int32_t* tokens, int64_t n
      const int64_t t = int64_t(id[0]), i = int64_t(id[1]);
      const uint8_t* row = w.data + uint64_t(tokens[t]) * w.row_bytes;
      out[t * w.k + i] = weight_at(w.type, row, i) * scale_by;
-   }).wait();
+   });
 }
 
 void rmsnorm(sycl::queue& q, const float* x, const float* w, int64_t rows, int64_t cols, float eps, float* out) {
@@ -129,7 +129,7 @@ void rmsnorm(sycl::queue& q, const float* x, const float* w, int64_t rows, int64
      for (int64_t i = 0; i < cols; ++i) ss += xr[i] * xr[i];
      const float inv = 1.0f / sycl::sqrt(ss / float(cols) + eps);
      for (int64_t i = 0; i < cols; ++i) out[r * cols + i] = xr[i] * inv * (w ? w[i] : 1.0f);
-   }).wait();
+   });
 }
 
 void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, float* out) {
@@ -154,7 +154,7 @@ void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, flo
          for (int64_t i = 0; i < ww.k; ++i) acc += weight_at(ww.type, row, i) * xm[i];
        }
        out[m * ww.n + n] = acc;
-     }).wait();
+     });
   }
 }
 
@@ -181,7 +181,7 @@ void rope_neox(sycl::queue& q, float* x, int64_t n_tok, int64_t n_head, int64_t 
      const float a = v[i], b = v[i + half];
      v[i] = a * c - b * s;
      v[i + half] = a * s + b * c;
-   }).wait();
+   });
 }
 
 void attention(sycl::queue& q, const float* Q, const float* K, const float* V, int64_t n_tok, int64_t n_head,
@@ -212,8 +212,7 @@ void attention(sycl::queue& q, const float* Q, const float* K, const float* V, i
                        m = mn;
                      }
                      out[(t * n_head + h) * head_dim + d] = acc / l;
-                   })
-        .wait();
+                   });
   }
 }
 
@@ -243,8 +242,7 @@ void attention_bidir(sycl::queue& q, const float* Q, const float* K, const float
                        m = mn;
                      }
                      out[(t * n_head + h) * head_dim + d] = acc / l;
-                   })
-        .wait();
+                   });
   }
 }
 
@@ -253,11 +251,11 @@ void gelu(sycl::queue& q, const float* x, int64_t n, float* out) {
      const float g = x[id[0]];
      const float k0 = 0.7978845608028654f, k1 = 0.044715f;
      out[id[0]] = 0.5f * g * (1.0f + sycl::tanh(k0 * (g + k1 * g * g * g)));
-   }).wait();
+   });
 }
 
 void mul(sycl::queue& q, const float* a, const float* b, int64_t n, float* out) {
-  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = a[id[0]] * b[id[0]]; }).wait();
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = a[id[0]] * b[id[0]]; });
 }
 
 void gelu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out) {
@@ -266,19 +264,19 @@ void gelu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, flo
      // gelu with the tanh approximation, as Gemma's gelu_pytorch_tanh and ggml_gelu
      const float k0 = 0.7978845608028654f, k1 = 0.044715f;
      out[id[0]] = 0.5f * g * (1.0f + sycl::tanh(k0 * (g + k1 * g * g * g))) * up[id[0]];
-   }).wait();
+   });
 }
 
 void add(sycl::queue& q, const float* a, const float* b, int64_t n, float* out) {
-  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = a[id[0]] + b[id[0]]; }).wait();
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = a[id[0]] + b[id[0]]; });
 }
 
 void scale(sycl::queue& q, float* x, float s, int64_t n) {
-  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { x[id[0]] *= s; }).wait();
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { x[id[0]] *= s; });
 }
 
 void softcap(sycl::queue& q, float* x, float cap, int64_t n) {
-  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { x[id[0]] = cap * sycl::tanh(x[id[0]] / cap); }).wait();
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { x[id[0]] = cap * sycl::tanh(x[id[0]] / cap); });
 }
 
 }  // namespace eklow::ref

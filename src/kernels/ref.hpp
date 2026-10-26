@@ -3,6 +3,11 @@
 // oracle (llama.cpp's CPU backend) layer by layer; speed is not their job. Long launches are split
 // so that none comes near xe's 5 s job timeout.
 //
+// The kernels are enqueued and not waited for: every queue here is in-order, so they run in the
+// order called, and a caller waits before it reads results on the host or frees what they use.
+// (A wait per kernel made the embedding model take a minute an input whenever a prefill held the
+// card; DECISIONS 2026-10-26.)
+//
 // Layouts follow ggml: a matrix's rows are contiguous, a weight of shape ne = {K, N} is N rows of K
 // (quantized in blocks along K), activations are [tokens][features].
 #pragma once

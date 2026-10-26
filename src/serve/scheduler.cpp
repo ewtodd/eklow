@@ -95,13 +95,34 @@ bool Scheduler::admit() {
   return stats_.active > 0;
 }
 
+Scheduler::Hold::Hold(Scheduler& s) : s_(s) {
+  std::lock_guard lk(s_.hold_mu_);
+  ++s_.holds_;
+}
+
+Scheduler::Hold::~Hold() {
+  {
+    std::lock_guard lk(s_.hold_mu_);
+    --s_.holds_;
+    ++s_.releases_;
+  }
+  s_.hold_cv_.notify_all();
+}
+
 void Scheduler::run(const std::atomic<bool>& stop) {
+  uint64_t seen = 0;  // releases_ at the last step
   while (!stop.load()) {
     if (!admit()) {
       std::unique_lock lk(mu_);
       cv_.wait_for(lk, std::chrono::milliseconds(100), [&] { return !waiting_.empty() || stop.load(); });
       continue;
     }
+    {
+      std::unique_lock lk(hold_mu_);
+      while (holds_ > 0 && releases_ == seen && !stop.load()) hold_cv_.wait_for(lk, std::chrono::milliseconds(100));
+      seen = releases_;
+    }
+    if (stop.load()) break;
     try {
       step();
     } catch (const std::exception& e) {
