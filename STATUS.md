@@ -14,7 +14,8 @@ Live state. Design and targets: `DESIGN.md`; history and evidence: `DECISIONS.md
 - Toolchain: the fleet's nixpkgs (c3f15ff4): intel-llvm 7.1.1, level-zero 1.32.0,
   intel-compute-runtime 26.31.39395.13.
 - fiona's GPUs: `level_zero:0` A770M (eklow), `level_zero:1` Iris Xe (little-titles on llama.cpp
-  Vulkan). Development sessions stop `llama-server-gemma-4-12b`; embeddings stay up.
+  Vulkan). The `eklow` service holds the A770M; development sessions stop it (`systemctl stop
+  eklow` as the fiona user, which polkit allows) and start it again after.
 
 ## Build / run (on fiona)
 
@@ -78,12 +79,15 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
       card's defaults; scheduler with continuous batching and per-slot prefix reuse; matches what
       son-of-anton sends and reads (a survey of its client, DECISIONS 2026-10-25)
 - [x] EmbeddingGemma 2 in the same process, /v1/embeddings on its own port: cosine 0.9996-0.99995
-      against the llama.cpp server it replaces (reference kernels, 50-80 ms an input)
-- [x] NixOS module (`nix/module.nix`, models pinned by revision and hash) and fiona's config
-      (/etc/nixos 9c56ee15, build-checked; not deployed); 2 x 262,144 with int8 global KV by
-      default, which maitred lists as `eklow/gemma-4-12b` (DECISIONS 2026-10-26)
-- [x] a son-of-anton-sized prompt (10.6k tokens) through `eklow-server`: first token 8.5 s cold,
-      0.2 s with the prefix cached, then 28.3 tok/s (`tools/server/ttft.py`; targets 5 s and 1 s)
+      against the llama.cpp server it replaces (reference kernels, 50 ms an input); beside a long
+      prefill the endpoint holds the scheduler, 0.06-3.8 s an input at 135k tokens of depth
+      (DECISIONS 2026-10-26, "embeddings beside a long prefill")
+- [x] NixOS module (`nix/module.nix`, models pinned by revision and hash) and fiona's config,
+      deployed 2026-10-26: 2 x 262,144 with int8 global KV by default, which maitred lists as
+      `eklow/gemma-4-12b` (DECISIONS 2026-10-26)
+- [x] a son-of-anton-sized prompt (10.6k tokens) through `eklow-server` at 2 x 262k: first token
+      8.7 s cold, 0.2 s with the prefix cached, then 27.4 tok/s (`tools/server/ttft.py`; targets
+      5 s and 1 s)
 - [ ] son-of-anton's Signal probe scenarios on eklow against llama.cpp
 - [x] grammar-constrained tool calls (`src/serve/tool_grammar.cpp`, `eklow-grammar-test`)
 - [ ] image input (llama.cpp's server on fiona had no projector either)
@@ -124,5 +128,3 @@ nix develop -c python3 tools/ref/compare_dumps.py DIR RUN_DIR
    never seen by a running kernel under xe.
 2. Kernels that run long while llama.cpp shares the card have not been tried against xe's job
    timeout.
-3. Embeddings wait behind chat prefill: every /v1/embeddings request during the 2 x 262k prefill
-   timed out (600 s); idle they take 50-100 ms, and maitred gives the embed upstream 120 s.

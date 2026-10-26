@@ -454,6 +454,42 @@ s with the prefix cached (`tools/server/ttft.py`, 2026-10-25).
 The same run shows embeddings starving behind chat: the three /v1/embeddings requests sent during
 the prefill each timed out after 600 s; on an idle card they take 50-100 ms, and maitred gives the
 embed upstream 120 s. The embedding model runs on its own queue, which keeps it out of the
-scheduler's steps but evidently not from waiting on them. Not yet diagnosed; a suspect is
-`EmbedGemma2::embed` allocating and freeing device memory on every call, since a Level Zero free
-can wait for the device to go idle.
+scheduler's steps but evidently not from waiting on them. Why, and the fix: the next entry.
+
+## 2026-10-26 — embeddings beside a long prefill
+
+Timing each phase of `EmbedGemma2::embed` while a 49,836-token prompt prefilled
+(`tools/server/embed_contend.py`, an embedding request every 5 s) cleared the first suspect, the
+per-call device allocations and frees (0.0 ms). The time was all in the kernels: each of the ~650
+in the 24 layers was waited for from the host and took ~90 ms to come back (0.1 ms on an idle
+card), so an input took 60 s and finished only when the prefill did. xe gives each queue 1 ms
+timeslices on the card's one compute engine (`ccs_mode` 1), but taking the engine back from a
+running prefill costs tens of milliseconds, and every host wait paid that again.
+
+On the same prefill (embedding latency during it; chat alone on a 10.6k-token prompt, first token
+and decode, 2 x 262k int8):
+
+| | embedding during the prefill | chat alone |
+|---|---|---|
+| as deployed | 60 s, one in the whole prefill | 8.68 s, 27.3 tok/s |
+| chat queue at low priority | median 60 ms, worst 109 ms | 8.92 s, 24.1 tok/s |
+| embedding queue at high priority | 60 s (ignored, unprivileged) | |
+| no waits per kernel | 0.70 s, 1.45 s; 32 inputs a request 22-36 s | unchanged |
+| no waits, and the scheduler held | 0.69 s, 1.43 s; 32 inputs 2.3 s, 3.1 s | 8.71 s, 27.4 tok/s |
+
+Low priority for chat is the simplest fix for embeddings but costs decode 12%, for reasons not
+looked into, so chat stays at normal priority. Instead the reference kernels no longer wait (every
+queue here is in-order; the callers already waited before reading results or freeing buffers), the
+embedding model builds its RoPE tables once with its activation buffers and runs a request's
+inputs back to back with a single wait, and the endpoint holds the scheduler while it embeds
+(`Scheduler::Hold`): the step under way finishes, no new one starts until the embeddings are done,
+and a step always runs after each hold, so requests back to back cannot starve chat. An embedding
+then waits at most for the step under way: 0.06-3.8 s at 135k tokens of depth, where steps take
+~4 s; at 2 x 262k, with steps near 15 s, it should stay under 20 s (estimated), inside maitred's
+120 s. Chat pays the embeddings' own time on the card, ~50 ms an input: 352 inputs during the 50k
+prefill made it 18 s longer (80.3 against 62.3 s).
+
+Unchanged by it: `eklow-embed`'s vectors identical to the bit on the four inputs of the comparison
+with llama.cpp's server, 50 ms each on an idle card; the reference forward bit-identical to its
+2026-10-24 dump on the 25-token chat prompt (all 48 layer outputs and the last row of logits);
+`eklow-attn-test` and `eklow-kernel-test` as recorded.
