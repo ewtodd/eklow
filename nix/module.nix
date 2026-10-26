@@ -81,8 +81,17 @@ in
 
     contextSize = lib.mkOption {
       type = lib.types.ints.positive;
-      default = 65536;
-      description = "Context of each slot, in tokens.";
+      default = 262144;
+      description = "Context of each slot, in tokens; Gemma 4's full window by default.";
+    };
+
+    kvInt8 = lib.mkOption {
+      type = lib.types.bool;
+      default = true;
+      description = ''
+        Keep the global layers' K/V in int8. Needed for 2 x 262144 (fp16 would not fit beside the
+        weights); fp16 decodes a few percent faster at depth.
+      '';
     };
 
     extraArgs = lib.mkOption {
@@ -128,6 +137,7 @@ in
             (toString cfg.slots)
             "--ctx"
             (toString cfg.contextSize)
+            (if cfg.kvInt8 then "--kv-int8" else "--kv-fp16")
           ]
           ++ lib.optionals (cfg.embedModel != null) [
             "--embed-model"

@@ -1,11 +1,13 @@
 // eklow-server: Gemma 4 on the A770M behind an OpenAI-compatible HTTP API.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
-//                [--batch N] [--chunk N] [--kv-int8]
+//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME]]
 //
-// --ctx is the context of each slot (positions); --batch the tokens of one engine step and --chunk
-// the prefill tokens of one sequence in a step; --kv-int8 keeps the global layers' K/V in int8.
+// --ctx is the context of each slot (positions), Gemma's full 262,144 by default; --batch the
+// tokens of one engine step and --chunk the prefill tokens of one sequence in a step. The global
+// layers' K/V are int8 by default, which is what lets 2 x 262k fit beside the weights; --kv-fp16
+// decodes a little faster at depth but cannot hold 2 x 262k.
 // Endpoints: POST /v1/chat/completions (streamed or whole), GET /v1/models, GET /health; with an
 // embedding model, POST /v1/embeddings, GET /v1/models and GET /health on its own port (the house
 // runs chat and embeddings as separate upstreams).
@@ -135,8 +137,8 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 int main(int argc, char** argv) {
   std::string model_path, alias = "gemma-4-12b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2";
   int port = 8081, slots = 2, embed_port = 8082;
-  int64_t ctx = 65536, batch = 2048, chunk = 1024;
-  bool kv_int8 = false;
+  int64_t ctx = 262144, batch = 2048, chunk = 1024;
+  bool kv_int8 = true;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -152,9 +154,10 @@ int main(int argc, char** argv) {
     else if (a == "--embed-port") embed_port = std::atoi(next().c_str());
     else if (a == "--embed-alias") embed_alias = next();
     else if (a == "--kv-int8") kv_int8 = true;
+    else if (a == "--kv-fp16") kv_int8 = false;
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
-                           "[--batch N] [--chunk N] [--kv-int8] [--embed-model GGUF --embed-port N [--embed-alias NAME]]\n");
+                           "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--embed-model GGUF --embed-port N [--embed-alias NAME]]\n");
       return 2;
     }
   }
