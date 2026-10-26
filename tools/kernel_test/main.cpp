@@ -97,7 +97,7 @@ int main(int argc, char** argv) {
       auto* xd = sycl::malloc_device<float>(size_t(max_m * k), q);
       auto* yr = sycl::malloc_device<float>(size_t(max_m * n), q);
       auto* yx = sycl::malloc_device<float>(size_t(max_m * n), q);
-      for (int64_t m : {1, 5, 8, 16, 32, 64, 256, 2048}) {
+      for (int64_t m : {1, 2, 5, 8, 16, 32, 64, 256, 1024, 2048}) {
         std::vector<float> x(size_t(m * k));
         for (auto& v : x) v = nd(rng);
         // Gemma's hidden states carry a few large channels; give the input some.
@@ -189,7 +189,7 @@ int main(int argc, char** argv) {
       auto* yr = sycl::malloc_device<float>(size_t(max_m * n), q);  // ref of the stacked product
       auto* yref = geglu ? sycl::malloc_device<float>(size_t(max_m * nn), q) : yr;
       auto* yx = sycl::malloc_device<float>(size_t(max_m * nn), q);
-      for (int64_t m : {1, 5, 8, 16, 32, 64, 256, 2048}) {
+      for (int64_t m : {1, 2, 5, 8, 16, 32, 64, 256, 1024, 2048}) {
         std::vector<float> x(size_t(m * k));
         for (auto& v : x) v = nd(rng);
         for (int64_t r = 0; r < m; ++r)
