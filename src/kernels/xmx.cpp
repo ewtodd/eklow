@@ -234,11 +234,15 @@ struct Gemm16Kernel {
         esimd::simd<sycl::half, 128> A[2];
 #pragma unroll
         for (int r = 0; r < 2; ++r) A[r] = esimd::slm_block_load<sycl::half, 128>(cur + kBBuf + ((wi * 2 + r) * 2 + h) * 256);
+        // The next B tile is loaded before the current dpas, so its SLM latency hides behind it.
+        esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(cur + (wj * 4 * 2 + h) * 256);
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
-          const esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4 + c) * 2 + h) * 256);
+          esimd::simd<sycl::half, 128> Bn;
+          if (c + 1 < 4) Bn = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4 + c + 1) * 2 + h) * 256);
 #pragma unroll
           for (int r = 0; r < 2; ++r) acc[r][c] = xmxd::dpas<8, 8, float>(acc[r][c], B, A[r]);
+          B = Bn;
         }
       }
       if (b + 1 < kb) store(nxt);
@@ -272,6 +276,17 @@ struct Gemm16Kernel {
 };
 
 void gemm16(sycl::queue& q, const Activations& a, const Weight& w, float* out, sycl::half* glu = nullptr) {
+  // At 1,024 rows the 256 x 128 tile leaves the narrow matrices (N 3,840) with 4 x 30
+  // work-groups, under two waves of the 64 the card holds at once; the 128 x 128 tile doubles
+  // the groups with the same per-thread work.
+  constexpr int64_t kMinGroups = 256;
+  if ((a.m_pad / 256) * (w.n / 128) < kMinGroups) {
+    constexpr int WM = 8, WN = 4;
+    if (a.m_pad % (16 * WM) || w.n % (32 * WN)) throw std::runtime_error("xmx: fp16 GEMM tile does not divide the problem");
+    Gemm16Kernel<WM, WN> k{a.h, w.tiles, w.scales, out, int32_t(a.k / 32), int32_t(w.n / 8), int32_t(a.m), int32_t(w.n), glu};
+    q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(a.m_pad / 16), size_t(w.n / 32)), sycl::range<2>(WM, WN)), k);
+    return;
+  }
   constexpr int WM = 16, WN = 4;
   if (a.m_pad % (16 * WM) || w.n % (32 * WN)) throw std::runtime_error("xmx: fp16 GEMM tile does not divide the problem");
   Gemm16Kernel<WM, WN> k{a.h, w.tiles, w.scales, out, int32_t(a.k / 32), int32_t(w.n / 8), int32_t(a.m), int32_t(w.n), glu};
