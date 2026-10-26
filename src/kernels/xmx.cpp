@@ -16,32 +16,6 @@ namespace {
 constexpr int kTileBytes = 128;   // weight tile: 32 K x 8 N nibbles
 constexpr int kATileBytes = 256;  // activation tile: 8 rows x 32 K bytes
 
-// Partial sums of the K-split GEMV, reused across calls.
-struct Scratch {
-  sycl::queue* q = nullptr;
-  float* p = nullptr;
-  size_t floats = 0;
-  float* get(sycl::queue& queue, size_t need) {
-    if (need > floats || q != &queue) {
-      if (p) {
-        q->wait();  // kernels still in flight may read the old buffer
-        sycl::free(p, *q);
-      }
-      q = &queue;
-      floats = std::max(need, floats * 2);
-      p = sycl::malloc_device<float>(floats, queue);
-      if (!p) throw std::runtime_error("xmx: out of device memory for GEMV partials");
-    }
-    return p;
-  }
-} scratch;
-
-int pick_local(int64_t n) {
-  for (int l : {8, 4, 2})
-    if (n % l == 0) return l;
-  return 1;
-}
-
 }  // namespace
 
 Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave) {
@@ -293,27 +267,28 @@ void gemm16(sycl::queue& q, const Activations& a, const Weight& w, float* out, s
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(a.m_pad / 16), size_t(w.n / 32)), sycl::range<2>(WM, WN)), k);
 }
 
-// Column-group schedule for 2-32 rows (decode of several sequences): one thread per
-// (K slice, group of up to 32 rows, 8 columns). Each weight tile is read once per row group and
-// applied to all its rows; partial sums over K slices are added afterwards.
-template <int RT>
+// Column-group schedule for 2-32 rows (decode of several sequences): one work-group of T threads
+// per (row group of up to 32 rows, 8-column group), the T threads splitting K and merging their
+// partials in shared local memory, so no partial buffer and no second kernel. Each weight tile is
+// read once per row group and applied to all its rows.
+template <int RT, int T>
 void gemv(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
-  const int64_t kb = a.k / 32, ng = w.n / 8, m = a.m, n = w.n, m_pad = a.m_pad;
+  const int64_t kb = a.k / 32, ng = w.n / 8, m = a.m, n = w.n;
   const int64_t row_groups = (a.m + RT * 8 - 1) / (RT * 8);
-  const int64_t splits = std::clamp<int64_t>(8192 / (ng * row_groups), 1, kb);
-  const int64_t per = (kb + splits - 1) / splits;
-  float* part = scratch.get(q, size_t(splits * m_pad * n));
+  const int64_t per = (kb + T - 1) / T;
   const int8_t* aq = a.q;
   const float* as = a.s;
   const uint8_t* bt = w.tiles;
   const sycl::half* bs = w.scales;
-  q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(splits), size_t(row_groups), size_t(ng)), sycl::range<3>(1, 1, size_t(pick_local(ng)))),
+  q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(ng), size_t(row_groups), size_t(T)), sycl::range<3>(1, 1, size_t(T))),
                  [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
-                   const int64_t s = int64_t(it.get_global_id(0)), rg = int64_t(it.get_global_id(1)), g = int64_t(it.get_global_id(2));
+                   if constexpr (T > 1) esimd::slm_init<T * RT * 256>();
+                   const int64_t rg = int64_t(it.get_global_id(1)), g = int64_t(it.get_global_id(0));
+                   const int t = int(it.get_local_id(2));
                    esimd::simd<float, 64> acc[RT];
 #pragma unroll
                    for (int r = 0; r < RT; ++r) acc[r] = 0;
-                   const int64_t b0 = s * per, b1 = std::min(kb, b0 + per);
+                   const int64_t b0 = int64_t(t) * per, b1 = std::min(kb, b0 + per);
                    for (int64_t b = b0; b < b1; ++b) {
                      const int64_t wt = b * ng + g;
                      esimd::simd<uint8_t, kTileBytes> B = esimd::block_load<uint8_t, kTileBytes>(bt + wt * kTileBytes);
@@ -335,39 +310,61 @@ void gemv(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
                        }
                      }
                    }
-#pragma unroll
-                   for (int r = 0; r < RT; ++r)
-#pragma unroll
-                     for (int i = 0; i < 8; ++i) {
-                       const int64_t row = (rg * RT + r) * 8 + i;
-                       if (row < m)
-                         esimd::block_store<float, 8>(part + (s * m_pad + row) * n + g * 8, acc[r].template select<8, 1>(i * 8));
+                   if constexpr (T > 1) {
+                     #pragma unroll
+                     for (int r = 0; r < RT; ++r) esimd::slm_block_store<float, 64>(t * RT * 256 + r * 256, acc[r]);
+                     esimd::barrier();
+                     // Thread t adds the T partials of the group's rows t, t + T, ... (L in rows).
+                     for (int L = t; L < RT * 8; L += T) {
+                       const int64_t row = rg * RT * 8 + L;
+                       if (row >= m) break;
+                       const int r = L / 8, i = L % 8;
+                       esimd::simd<float, 8> sum = 0;
+                       for (int u = 0; u < T; ++u) sum += esimd::slm_block_load<float, 8>(u * RT * 256 + r * 256 + i * 32);
+                       esimd::block_store<float, 8>(out + row * n + g * 8, sum);
                      }
+                   } else {
+                     // T = 1: the thread owns all of K, so acc[r] is already the group's full partial.
+                     for (int L = 0; L < RT * 8; ++L) {
+                       const int64_t row = rg * RT * 8 + L;
+                       if (row >= m) break;
+                       const int r = L / 8, i = L % 8;
+                       esimd::block_store<float, 8>(out + row * n + g * 8, acc[r].template select<8, 1>(i * 8));
+                     }
+                   }
                  });
-  q.parallel_for(sycl::range<2>(size_t(m), size_t(n)), [=](sycl::id<2> id) {
-     const int64_t row = int64_t(id[0]), col = int64_t(id[1]);
-     float sum = 0;
-     for (int64_t s = 0; s < splits; ++s) sum += part[(s * m_pad + row) * n + col];
-     out[row * n + col] = sum;
-   });
 }
 
-// The one-row GEMV (decode of a single sequence): dpas with repeat count 1 reads only row 0's 32
-// activation bytes per block instead of a whole 8-row tile.
+// The flat grid of the old code ran about 8192 threads per GEMV whatever the shape; with one
+// work-group of T threads per 8-column group a comparable count is kept only if T follows the
+// group count, so matmul() derives it from the matrix's shape: at 4096 the widest matrix
+// (gate|up, 3840 groups) drops to T = 1 and the narrowest (480 groups) rises to 8. One value
+// cannot win for one row and several: 4096 suits the one-row GEMVs (ab.sh decode
+// +2.8/+2.0/+2.2 vs +1.9/+2.0/+2.2 at 8192 and -1.9/-1.7/-1.8 at 16384), but the wide two-row
+// GEMVs want 8192 (gate|up 2 rows: T = 2, 291 GB/s, vs T = 1 at 232). Measured on fiona
+// 2026-10-26.
+constexpr int64_t kThreads1 = 4096;  // one row (gemv1)
+constexpr int64_t kThreadsN = 8192;  // 2-32 rows (gemv<RT, T>)
+
+// The one-row GEMV (decode of a single sequence): K is split over the T threads of one work-group
+// per 8-column group, the partials merged in shared local memory, so no partial buffer and no
+// second kernel. dpas with repeat count 1 reads only row 0's 32 activation bytes per block instead
+// of a whole 8-row tile. For T = 1 the thread owns all of K and stores straight to out.
+template <int T>
 void gemv1(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
   const int64_t kb = a.k / 32, ng = w.n / 8, n = w.n;
-  const int64_t splits = std::clamp<int64_t>(8192 / ng, 1, kb);
-  const int64_t per = (kb + splits - 1) / splits;
-  float* part = scratch.get(q, size_t(splits * n));
+  const int64_t per = (kb + T - 1) / T;
   const int8_t* aq = a.q;
   const float* as = a.s;
   const uint8_t* bt = w.tiles;
   const sycl::half* bs = w.scales;
-  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(splits), size_t(ng)), sycl::range<2>(1, size_t(pick_local(ng)))),
+  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(ng), size_t(T)), sycl::range<2>(1, size_t(T))),
                  [=](sycl::nd_item<2> it) SYCL_ESIMD_KERNEL {
-                   const int64_t s = int64_t(it.get_global_id(0)), g = int64_t(it.get_global_id(1));
+                   if constexpr (T > 1) esimd::slm_init<T * 32>();
+                   const int64_t g = int64_t(it.get_global_id(0));
+                   const int t = int(it.get_local_id(1));
                    esimd::simd<float, 8> acc = 0;
-                   const int64_t b0 = s * per, b1 = std::min(kb, b0 + per);
+                   const int64_t b0 = int64_t(t) * per, b1 = std::min(kb, b0 + per);
                    int64_t b = b0;
                    // Four blocks per step, every load issued before the first dpas, so each
                    // thread keeps several weight reads in flight.
@@ -405,13 +402,42 @@ void gemv1(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
                      esimd::simd<float, 8> cf = ci;
                      acc += cf * (sb * sa);
                    }
-                   esimd::block_store<float, 8>(part + s * n + g * 8, acc);
+                   if constexpr (T > 1) {
+                     esimd::slm_block_store<float, 8>(t * 32, acc);
+                     esimd::barrier();
+                     if (t == 0) {
+                       esimd::simd<float, 8> sum = 0;
+                       for (int i = 0; i < T; ++i) sum += esimd::slm_block_load<float, 8>(i * 32);
+                       esimd::block_store<float, 8>(out + g * 8, sum);
+                     }
+                   } else {
+                     esimd::block_store<float, 8>(out + g * 8, acc);
+                   }
                  });
-  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
-     float sum = 0;
-     for (int64_t s = 0; s < splits; ++s) sum += part[s * n + int64_t(id[0])];
-     out[id[0]] = sum;
-   });
+}
+
+// The dispatcher's switch over T, one template instantiation per T per row count.
+void gemv1_d(int T, sycl::queue& q, const Activations& a, const Weight& w, float* out) {
+  switch (T) {
+    case 1: gemv1<1>(q, a, w, out); break;
+    case 2: gemv1<2>(q, a, w, out); break;
+    case 4: gemv1<4>(q, a, w, out); break;
+    case 8: gemv1<8>(q, a, w, out); break;
+    case 16: gemv1<16>(q, a, w, out); break;
+    default: gemv1<32>(q, a, w, out); break;
+  }
+}
+
+template <int RT>
+void gemv_d(int T, sycl::queue& q, const Activations& a, const Weight& w, float* out) {
+  switch (T) {
+    case 1: gemv<RT, 1>(q, a, w, out); break;
+    case 2: gemv<RT, 2>(q, a, w, out); break;
+    case 4: gemv<RT, 4>(q, a, w, out); break;
+    case 8: gemv<RT, 8>(q, a, w, out); break;
+    case 16: gemv<RT, 16>(q, a, w, out); break;
+    default: gemv<RT, 32>(q, a, w, out); break;
+  }
 }
 
 }  // namespace
@@ -420,12 +446,20 @@ void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
   if (a.k != w.k) throw std::runtime_error("xmx: activation and weight widths differ");
   if (w.n % 32) throw std::runtime_error("xmx: output width not a multiple of 32");
   const int64_t row_tiles = (a.m + 7) / 8;
-  if (a.fp16) gemm16(q, a, w, out);
-  else if (a.m == 1) gemv1(q, a, w, out);
-  else if (row_tiles <= 1) gemv<1>(q, a, w, out);
-  else if (row_tiles <= 2) gemv<2>(q, a, w, out);
-  else if (row_tiles <= 4) gemv<4>(q, a, w, out);
-  else throw std::runtime_error("xmx: int8 activations of more than 32 rows");
+  if (a.fp16) {
+    gemm16(q, a, w, out);
+    return;
+  }
+  if (row_tiles > 4) throw std::runtime_error("xmx: int8 activations of more than 32 rows");
+  // T = the largest power of two <= the row-count's thread target / ng, clamped to [1, 32].
+  const int64_t ng = w.n / 8;
+  const int64_t threads = a.m == 1 ? kThreads1 : kThreadsN;
+  int T = 1;
+  while (T < 32 && 2 * T <= threads / ng) T *= 2;
+  if (a.m == 1) gemv1_d(T, q, a, w, out);
+  else if (row_tiles <= 1) gemv_d<1>(T, q, a, w, out);
+  else if (row_tiles <= 2) gemv_d<2>(T, q, a, w, out);
+  else gemv_d<4>(T, q, a, w, out);
 }
 
 void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activations& out, float* scratch) {
