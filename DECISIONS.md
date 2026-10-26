@@ -541,3 +541,26 @@ the staging. Each B tile is loaded from SLM right before its dpas, so every one 
 block is waited on in turn; the global loads compete for the same port. Next: fewer, larger SLM
 loads (both K halves of a tile in one 512-byte load) and the next tile's load issued before the
 current dpas.
+
+## 2026-10-26 — decode GEMVs in one kernel; the GEMM at the engine's 1,024 rows
+
+Each int8 GEMV was a flat grid of ~8,192 threads, one per (K split, 8-column group), writing
+partial sums, plus a second kernel adding them; for the small matrices (attention output, 8.9 MB,
+~22 us of reading) the two launches and the partials made it ~77 us. Now a work-group of T threads
+per column group splits K and adds the partials in shared local memory. T must follow the shape:
+a fixed T = 8 lifted the narrow matrices (attention output 124 -> 166 GB/s) but took the stacked
+gate|up, 3,840 column groups and ~10 ms of a decode step, from 302 to 245 GB/s, so decode got 2%
+slower overall. With T the largest power of two under target / column groups, one row aiming at
+4,096 threads and 2-32 rows at 8,192 (4,096 left the two-row gate|up at T = 1, 232 GB/s): decode
++3.1 / +2.7 / +2.2% at 0 / 4k / 16k with one slot, +4.4 / +4.1 / +3.3% with two (`ab.sh`, three
+rounds alternating with main).
+
+The GEMM's B tiles are now loaded one column tile ahead (+4% in kernel-test at 2,048 rows, nothing
+measurable in the engine alone), and loading both K halves of a tile at once ran out of registers
+(-51%). The engine prefills one sequence in 1,024-token chunks, which kernel-test did not measure
+until now: there the 256 x 128 work-group tile gives the narrow matrices (N 3,840) 120 groups,
+under two waves of the card's 64; a 128 x 128 tile below 256 groups gives prefill +1.1-1.5% on
+every row of the engine bench (963.8 tok/s at 16k depth). The smaller tile on every shape lost 1-3%:
+the doubled weight traffic costs more than the tail saves. Two lessons from the round: kernel-test
+at 2,048 rows twice predicted gains the engine did not show, so keep rules now use `ab.sh`; and a
+geometric mean over shapes weighs a 9 MB matrix like a 236 MB one.

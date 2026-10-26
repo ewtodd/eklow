@@ -120,7 +120,7 @@ e-desktop, `~/eklow-wt-*` on fiona).
       GEMM waits on its shared-memory loads, not their bandwidth (knockouts, DECISIONS 2026-10-26)
 - [x] fp16 GEMM through shared local memory for prefill: 48-52 TFLOPS in isolation; prefill 1,364 /
       1,243 / 993 tok/s at 1k / 4k / 16k (DECISIONS 2026-10-24, "fp16 GEMM")
-- [ ] decode GEMV toward the 399 GB/s the card reads
+- [ ] decode GEMV toward the 399 GB/s the card reads (now 160-290 GB/s by shape at one row)
 - [x] int8 global KV (`--kv-int8`): 2 x 262k in ~4.8 GB, within the noise floor; the server's
       default (`--kv-fp16` for fp16)
 - [x] 2 x 262k end to end: 12.5 GiB on the card with the embedding model; two 259k-token prompts
@@ -131,6 +131,9 @@ e-desktop, `~/eklow-wt-*` on fiona).
       / 26.8 / 25.4 per sequence; with int8 KV 31.6 / 26.8 at 0 / 16k
 - [x] decode attention beyond 4k keys: splits of at most 8 blocks and a two-level merge; global8 at
       16k 470 -> 302 us a layer, int8 decode at 16k 27.8 tok/s, 24.8 at 64k (DECISIONS 2026-10-26)
+- [x] decode GEMVs in one kernel (K split inside a work-group, threads from the shape): decode
+      +2-3% with one slot, +3-4% with two; GEMM: B tiles loaded early and a 128 x 128 tile for the
+      narrow matrices at 1,024 rows, prefill +1-1.5% (DECISIONS 2026-10-26)
 
 ## Open
 
