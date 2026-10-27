@@ -17,6 +17,11 @@ bool integrated(const sycl::device& d) {
   return props.flags & ZE_DEVICE_PROPERTY_FLAG_INTEGRATED;
 }
 
+std::optional<uint64_t> free_memory(const sycl::device& d) {
+  if (!d.has(sycl::aspect::ext_intel_free_memory)) return std::nullopt;
+  return uint64_t(d.get_info<sycl::ext::intel::info::device::free_memory>());
+}
+
 sycl::device pick_device() {
   std::vector<sycl::device> gpus;
   for (auto& d : sycl::device::get_devices(sycl::info::device_type::gpu))

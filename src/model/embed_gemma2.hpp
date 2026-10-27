@@ -35,6 +35,8 @@ class EmbedGemma2 {
 
   int64_t dim() const { return n_out_; }
   int64_t max_tokens() const { return max_tok_; }
+  // Allocates the activations for inputs of up to n_tok tokens now, so that a request never allocates.
+  void reserve(int64_t n_tok) { ensure(n_tok); }
   uint64_t bytes() const { return bytes_; }
 
  private:

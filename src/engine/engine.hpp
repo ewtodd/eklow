@@ -39,7 +39,8 @@ struct Config {
   // the CPU from the GGUF's mapping (which must outlive the engine). -1: all of them; below the
   // model's count a profile is required.
   std::string expert_profile;
-  int64_t experts_on_card = -1;
+  int64_t experts_on_card = -1;  // -2: as many as fit in the free memory left after the rest, less card_margin_bytes
+  uint64_t card_margin_bytes = 1ull << 30;
   int cpu_threads = 0;  // the cold experts' pool, caller included; 0: 12
 };
 
@@ -81,6 +82,10 @@ class Engine {
   // Experts of each layer on the card (the model's count when all are), and since the engine was
   // made, the (token, slot) pairs the MoE layers routed and how many of them went to the CPU.
   int64_t experts_on_card() const { return n_hot_; }
+  // What the placement saw: the card's free memory before the experts went on (0 when it was not asked)
+  // and the bytes of one expert from every layer.
+  uint64_t free_at_placement() const { return free_at_placement_; }
+  uint64_t expert_set_bytes() const { return expert_set_bytes_; }
   uint64_t pairs() const { return pairs_; }
   uint64_t cold_pairs() const { return cold_pairs_; }
   // Host seconds since the engine was made: waiting for the card's routing, computing cold experts on
@@ -188,6 +193,7 @@ class Engine {
   // with cold experts in hp_sum_ rows, token t's row in hp_map_[t] or -1, copied to the card's cold_sum_ and
   // cold_map_).
   int64_t n_hot_ = 0;
+  uint64_t free_at_placement_ = 0, expert_set_bytes_ = 0;
   std::unique_ptr<cpu::Pool> pool_;
   int32_t* hp_ids_ = nullptr;
   float *hp_w_ = nullptr, *hp_xs_ = nullptr, *hp_y_ = nullptr, *hp_sum_ = nullptr, *hp_as_ = nullptr, *cold_sum_ = nullptr;

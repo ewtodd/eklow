@@ -13,6 +13,7 @@
 
 #include "core/json_value.hpp"
 #include "kernels/fast.hpp"
+#include "rt/device.hpp"
 
 namespace eklow::engine {
 
@@ -265,7 +266,17 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
 void Engine::load_experts() {
   const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NE = cfg_.n_expert;
   const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
-  n_hot_ = c_.experts_on_card >= 0 && c_.experts_on_card < NE ? c_.experts_on_card : NE;
+  expert_set_bytes_ = uint64_t(cfg_.n_layer) * (uint64_t(2 * Fe) * gu_row + uint64_t(E) * dn_row);
+  if (c_.experts_on_card == -2) {
+    // As many as fit: everything else is on the card by now (weights, KV cache, workspace).
+    const auto fm = rt::free_memory(q_.get_device());
+    if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
+    free_at_placement_ = *fm;
+    const uint64_t budget = *fm > c_.card_margin_bytes ? *fm - c_.card_margin_bytes : 0;
+    n_hot_ = int64_t(std::min<uint64_t>(uint64_t(NE), budget / expert_set_bytes_));
+  } else {
+    n_hot_ = c_.experts_on_card >= 0 && c_.experts_on_card < NE ? c_.experts_on_card : NE;
+  }
   // The hot set of each layer: its n_hot most-selected experts by the profile, ties to the lower id.
   std::vector<std::vector<int64_t>> counts;
   if (n_hot_ < NE) {

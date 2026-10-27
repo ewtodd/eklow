@@ -1,13 +1,17 @@
 // eklow-server: Gemma 4 on the A770M behind an OpenAI-compatible HTTP API.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
-//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N]]
+//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME]]
 //
 // --ctx is the context of each slot (positions), Gemma's full 262,144 by default; --batch the
 // tokens of one engine step and --chunk the prefill tokens of one sequence in a step. The global
 // layers' K/V are int8 by default, which is what lets 2 x 262k fit beside the weights; --kv-fp16
 // decodes a little faster at depth but cannot hold 2 x 262k.
+// --expert-profile (the 26B): the experts of each layer that the routing profile says are busiest stay on
+// the card and the rest are computed on the CPU. How many (--experts-on-card) is, by default, as many as fit
+// in the card's free memory after the KV cache, the workspace and the embedding model, less
+// --card-margin-mib (1024) for what the first requests allocate and the driver keeps.
 // Endpoints: POST /v1/chat/completions (streamed or whole), GET /v1/models, GET /health; with an
 // embedding model, POST /v1/embeddings, GET /v1/models and GET /health on its own port (the house
 // runs chat and embeddings as separate upstreams).
@@ -143,7 +147,8 @@ int main(int argc, char** argv) {
   int64_t ctx = 262144, batch = 2048, chunk = 1024;
   bool kv_int8 = true;
   std::string expert_profile;
-  int64_t experts_on_card = -1;
+  int64_t experts_on_card = -2;  // as many as fit, once there is a profile
+  int64_t card_margin_mib = 1024;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -157,6 +162,7 @@ int main(int argc, char** argv) {
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
     else if (a == "--expert-profile") expert_profile = next();
     else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
+    else if (a == "--card-margin-mib") card_margin_mib = std::atoll(next().c_str());
     else if (a == "--embed-model") embed_path = next();
     else if (a == "--embed-port") embed_port = std::atoi(next().c_str());
     else if (a == "--embed-alias") embed_alias = next();
@@ -164,7 +170,7 @@ int main(int argc, char** argv) {
     else if (a == "--kv-fp16") kv_int8 = false;
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
-                           "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N]] [--embed-model GGUF --embed-port N [--embed-alias NAME]]\n");
+                           "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N]] [--embed-model GGUF --embed-port N [--embed-alias NAME]]\n");
       return 2;
     }
   }
@@ -187,12 +193,35 @@ int main(int argc, char** argv) {
     ec.max_logits = slots;
     ec.int8_global_kv = kv_int8;
     ec.expert_profile = expert_profile;
-    ec.experts_on_card = experts_on_card;
+    ec.experts_on_card = expert_profile.empty() ? -1 : experts_on_card;
+    ec.card_margin_bytes = uint64_t(card_margin_mib) << 20;
+    // The embedding model: its own queue on the card, so its work does not wait behind steps. It goes on
+    // first, with room for its longest input, so that the experts' placement sees what it leaves.
+    std::unique_ptr<gguf::File> embed_file;
+    std::unique_ptr<text::Tokenizer> embed_tok;
+    std::unique_ptr<sycl::queue> embed_q;
+    std::unique_ptr<model::EmbedGemma2> embed_model;
+    std::mutex embed_mu;
+    if (!embed_path.empty()) {
+      embed_file = std::make_unique<gguf::File>(gguf::File::open(embed_path));
+      embed_tok = std::make_unique<text::Tokenizer>(text::Tokenizer::from_gguf(*embed_file));
+      embed_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
+      embed_model = std::make_unique<model::EmbedGemma2>(*embed_q, *embed_file);
+      embed_model->reserve(8192);  // the longest input: no allocation at request time
+    }
     engine::Engine eng(q, file, ec);
+    const double GiB = 1073741824.0;
     std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights, %.2f GiB of KV cache (%d slots of %lld), %.1f s\n",
-                 alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / 1073741824.0,
-                 eng.cache_bytes() / 1073741824.0, slots, (long long)ec.max_ctx,
+                 alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / GiB,
+                 eng.cache_bytes() / GiB, slots, (long long)ec.max_ctx,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    if (eng.model().n_expert > 0)
+      std::fprintf(stderr,
+                   "eklow-server: experts on the card: N = %lld of %lld per layer%s (one expert of every layer is %.0f MiB; free card memory before them "
+                   "%.2f GiB, margin %.2f GiB, free after %.2f GiB)\n",
+                   (long long)eng.experts_on_card(), (long long)eng.model().n_expert, eng.experts_on_card() < eng.model().n_expert ? ", the rest on the CPU" : "",
+                   eng.expert_set_bytes() / 1048576.0, eng.free_at_placement() / GiB, double(ec.card_margin_bytes) / GiB,
+                   rt::free_memory(q.get_device()).value_or(0) / GiB);
 
     serve::Scheduler sched(eng, tok, {batch, chunk, ec.max_ctx});
     std::thread engine_thread([&] { sched.run(g_stop); });
@@ -267,19 +296,9 @@ int main(int argc, char** argv) {
           [r](bool) { r->cancel(); });
     });
 
-    // The embedding model: its own queue on the card, so its work does not wait behind steps.
-    std::unique_ptr<gguf::File> embed_file;
-    std::unique_ptr<text::Tokenizer> embed_tok;
-    std::unique_ptr<sycl::queue> embed_q;
-    std::unique_ptr<model::EmbedGemma2> embed_model;
-    std::mutex embed_mu;
     httplib::Server embed_http;
     std::thread embed_thread;
-    if (!embed_path.empty()) {
-      embed_file = std::make_unique<gguf::File>(gguf::File::open(embed_path));
-      embed_tok = std::make_unique<text::Tokenizer>(text::Tokenizer::from_gguf(*embed_file));
-      embed_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
-      embed_model = std::make_unique<model::EmbedGemma2>(*embed_q, *embed_file);
+    if (embed_model) {
       embed_http.new_task_queue = [] { return new httplib::ThreadPool(4); };
       serve_embeddings(embed_http, *embed_model, *embed_tok, embed_mu, sched, embed_alias, 8192);
       std::fprintf(stderr, "eklow-server: %s, %.2f GiB, listening on %s:%d\n", embed_alias.c_str(), embed_model->bytes() / 1073741824.0,
