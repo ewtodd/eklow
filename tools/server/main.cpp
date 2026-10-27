@@ -230,7 +230,8 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
       if (!input) throw serve::ApiError(400, "invalid_request_error", "", "input is required");
       // A string, strings, token ids, arrays of token ids, or arrays of chat-style content parts (text and image_url),
       // which as llama.cpp's server tokenizes a prompt with media markers are BOS, the text before each image, <|image>,
-      // the image's rows, <image|>, the text after, EOS. A top-level array of parts is one input.
+      // the image's rows, <image|>, the text after, EOS (text parts joined with nothing between them, as it does). Also as
+      // its server takes them: an item {"content": [parts]}. A top-level array of parts is one input.
       std::vector<std::vector<int32_t>> seqs;
       std::vector<std::vector<model::ImageRows>> spans;  // per input
       std::vector<serve::EncodedImage> encoded;          // the rows the spans point into
@@ -295,11 +296,13 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
       };
       if (input->is_string()) seqs.push_back(text(input->as_string()));
       else if (input->is_array() && !input->items().empty() && input->items()[0].is_int()) seqs.push_back(ids_of(*input));
-      else if (input->is_array() && !input->items().empty() && input->items()[0].is_object()) seqs.push_back(parts_of(*input));
+      else if (input->is_object() && input->find("content") && input->find("content")->is_array()) seqs.push_back(parts_of(*input->find("content")));
+      else if (input->is_array() && !input->items().empty() && input->items()[0].is_object() && input->items()[0].find("type")) seqs.push_back(parts_of(*input));
       else if (input->is_array())
         for (const auto& v : input->items()) {
           if (v.is_string()) seqs.push_back(text(v.as_string()));
           else if (v.is_array() && !v.items().empty() && v.items()[0].is_object()) seqs.push_back(parts_of(v));
+          else if (v.is_object() && v.find("content") && v.find("content")->is_array()) seqs.push_back(parts_of(*v.find("content")));  // llama.cpp's shape
           else if (v.is_array()) seqs.push_back(ids_of(v));
           else throw serve::ApiError(400, "invalid_request_error", "", "input must hold strings, token ids or content parts");
         }
@@ -401,9 +404,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "eklow-server: --image-tokens must be 70 to 1120\n");
     return 2;
   }
-  if (!mmproj_path.empty() && (chunk < image_tokens || batch < chunk + slots)) {
+  if (!mmproj_path.empty() && (chunk < image_tokens || batch < image_tokens + slots)) {
     // An image's rows go in one chunk (its sliding layers see all of it at once), and a step holds the decode tokens too.
-    std::fprintf(stderr, "eklow-server: --image-tokens %d needs --chunk >= %d and --batch >= chunk + slots\n", image_tokens, image_tokens);
+    std::fprintf(stderr, "eklow-server: --image-tokens %d needs --chunk >= %d and --batch >= %d\n", image_tokens, image_tokens, image_tokens + slots);
     return 2;
   }
   try {
