@@ -1,7 +1,7 @@
 // The card's copy (blitter) engine through Level Zero, for host-to-card copies that run beside
 // kernels. A SYCL queue's memcpy goes to the compute engine and shares it with the kernels in flight
-// (copy and grouped GEMM each took 2x as long when run together, DECISIONS 2026-10-28); a command list
-// on the copy-only queue group runs on its own hardware.
+// (copy and grouped GEMM each took 2x as long when run together, DECISIONS 2026-10-27, M6 stage 3b); a
+// command list on the copy-only queue group runs on its own hardware.
 #pragma once
 
 #include <level_zero/ze_api.h>
