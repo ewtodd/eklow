@@ -63,4 +63,8 @@ void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_exp
 // out[t][:] = sum_i weights[t][i] * y[t * n_used + i][:], summed in the order i = 0..n_used-1.
 void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out);
 
+// out[t][c] = w[c] . x[t] for fp32 w [n][k] (k a multiple of 4) and up to 4 tokens: the 26B's router
+// at decode (ref::matmul's generic path ran one work-item per output).
+void matmul_f32_small(sycl::queue& q, const float* w, int64_t n, int64_t k, const float* x, int64_t n_tok, float* out);
+
 }  // namespace eklow::fast

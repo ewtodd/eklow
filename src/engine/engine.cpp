@@ -437,7 +437,10 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       emit("ffn_mlp" + s, o_, {E, T});
       // Router: r = rmsnorm(x2_) * (ffn_gate_inp.scale / sqrt(E)), then r @ W_router^T.
       fast::rmsnorm(q_, x2_, L.router_in_scale, T, E, cfg_.eps, h_);
-      ref::matmul(q_, L.w_router, h_, T, rlog_);
+      if (T * n_used <= xmx::kFp16Rows)
+        fast::matmul_f32_small(q_, reinterpret_cast<const float*>(L.w_router.data), n_expert, E, h_, T, rlog_);
+      else ref::matmul(q_, L.w_router, h_, T, rlog_);
+      mark("router");
       emit("ffn_moe_logits" + s, rlog_, {n_expert, T});
       if (T * n_used <= xmx::kFp16Rows) {
         // Decode (up to 4 tokens): routing, the grouped expert GEMVs and the weighted sum all on the
