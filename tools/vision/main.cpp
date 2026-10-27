@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
   std::string mmproj, path, out, taps;
   std::vector<std::string> prefixes{"inp", "pos_embd", "layer_out-", "pooled", "std_scaled", "projected"};
   int tokens = 280;
-  bool dump_patches = false;
+  bool dump_patches = false, bf16_act = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -42,8 +42,9 @@ int main(int argc, char** argv) {
         prefixes.push_back(s.substr(b, e - b));
       }
     } else if (a == "--dump-patches") dump_patches = true;
+    else if (a == "--bf16-act") bf16_act = true;
     else {
-      std::fprintf(stderr, "usage: eklow-vision --mmproj GGUF --image FILE [--tokens N] [--out ROWS.f32] [--taps DIR [--tap-prefix P,...]]\n");
+      std::fprintf(stderr, "usage: eklow-vision --mmproj GGUF --image FILE [--tokens N] [--out ROWS.f32] [--bf16-act] [--taps DIR [--tap-prefix P,...]]\n");
       return 2;
     }
   }
@@ -57,6 +58,7 @@ int main(int argc, char** argv) {
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     auto f = gguf::File::open(mmproj);
     model::VisionGemma4V v(q, f);
+    v.set_bf16_activations(bf16_act);
     const image::Spec spec = v.spec(tokens);
     if (!taps.empty())
       v.set_tap([&](std::string_view name, const float* dev, int64_t rows, int64_t dim) {

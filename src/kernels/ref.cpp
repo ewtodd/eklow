@@ -289,6 +289,14 @@ void gelu_quick_mul(sycl::queue& q, const float* gate, const float* up, int64_t 
    });
 }
 
+void round_bf16(sycl::queue& q, const float* x, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+     uint32_t b = sycl::bit_cast<uint32_t>(x[id[0]]);
+     if ((b & 0x7fffffffu) <= 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+     out[id[0]] = sycl::bit_cast<float>(b & 0xffff0000u);
+   });
+}
+
 void clamp(sycl::queue& q, const float* x, float lo, float hi, int64_t n, float* out) {
   q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = sycl::fmin(sycl::fmax(x[id[0]], lo), hi); });
 }

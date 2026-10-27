@@ -71,6 +71,8 @@ void add_rows(sycl::queue& q, float* x, const float* v, int64_t rows, int64_t co
 
 // out = gelu_quick(gate) * up, gelu_quick(x) = x / (1 + exp(-1.702 x)) (ggml_geglu_quick_split)
 void gelu_quick_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out);
+// out = x rounded to bf16 (nearest even) and back: what ggml's CPU backend does to the activations of a BF16 weight
+void round_bf16(sycl::queue& q, const float* x, int64_t n, float* out);
 // out = min(max(x, lo), hi)
 void clamp(sycl::queue& q, const float* x, float lo, float hi, int64_t n, float* out);
 // x[r][:] *= v[:], rows of `cols`.

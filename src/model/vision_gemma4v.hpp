@@ -58,6 +58,8 @@ class VisionGemma4V {
   // layer N), the rows on the card and their shape [rows][dim]; the queue is idle when it runs.
   using Tap = std::function<void(std::string_view name, const float* dev, int64_t rows, int64_t dim)>;
   void set_tap(Tap t) { tap_ = std::move(t); }
+  // Round the activations of BF16 weights to bf16 before each matmul, as ggml's CPU backend does (the oracle).
+  void set_bf16_activations(bool on) { bf16_act_ = on; }
 
  private:
   struct Linear {
@@ -84,6 +86,7 @@ class VisionGemma4V {
   const float *pos_, *std_bias_ = nullptr, *std_scale_ = nullptr;
   std::vector<Layer> layers_;
   Tap tap_;
+  bool bf16_act_ = false;
 };
 
 }  // namespace eklow::model

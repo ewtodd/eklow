@@ -88,7 +88,8 @@ VisionGemma4V::VisionGemma4V(sycl::queue& q, const gguf::File& f) : q_(q) {
 
   const gguf::Tensor& pe = need("v.patch_embd.weight");
   if (find("v.patch_embd.bias")) throw std::runtime_error(f.path() + ": gemma4v has no patch bias");
-  patch_embd_ = matrix(pe);
+  // [16][16][3][n_embd] in the file: n_embd rows of 768, the layout of a patch
+  patch_embd_ = {pe.type, int64_t(pe.ne[0] * pe.ne[1] * pe.ne[2]), int64_t(pe.ne[3]), upload(pe), pe.nbytes / pe.ne[3]};
   n_in_ = patch_embd_.k;
   if (n_in_ != int64_t(3) * patch_ * patch_ || patch_embd_.n != n_embd_) throw std::runtime_error(f.path() + ": unexpected patch embedding shape");
   const gguf::Tensor& pos = need("v.position_embd.weight");
@@ -153,6 +154,10 @@ void VisionGemma4V::mm(const Linear& l, const float* x, int64_t rows, float* out
   const float* in = x;
   if (l.clamp) {
     ref::clamp(q_, x, l.in_min, l.in_max, rows * l.w.k, scratch);
+    in = scratch;
+  }
+  if (bf16_act_ && l.w.type == gguf::Type::BF16) {
+    ref::round_bf16(q_, in, rows * l.w.k, scratch);
     in = scratch;
   }
   ref::matmul(q_, l.w, in, rows, out);
