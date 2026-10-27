@@ -6,6 +6,7 @@
 #include <cmath>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -267,56 +268,57 @@ void Engine::load_experts() {
   const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NE = cfg_.n_expert;
   const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
   expert_set_bytes_ = uint64_t(cfg_.n_layer) * (uint64_t(2 * Fe) * gu_row + uint64_t(E) * dn_row);
-  if (c_.experts_on_card == -2) {
-    // As many as fit: everything else is on the card by now (weights, KV cache, workspace).
-    const auto fm = rt::free_memory(q_.get_device());
-    if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
-    free_at_placement_ = *fm;
-    const uint64_t budget = *fm > c_.card_margin_bytes ? *fm - c_.card_margin_bytes : 0;
-    n_hot_ = int64_t(std::min<uint64_t>(uint64_t(NE), budget / expert_set_bytes_));
-  } else {
-    n_hot_ = c_.experts_on_card >= 0 && c_.experts_on_card < NE ? c_.experts_on_card : NE;
-  }
-  // The hot set of each layer: its n_hot most-selected experts by the profile, ties to the lower id.
-  std::vector<std::vector<int64_t>> counts;
-  if (n_hot_ < NE) {
-    if (c_.expert_profile.empty()) throw std::runtime_error("engine: experts_on_card below the expert count needs an expert profile");
+  const bool fit = c_.experts_on_card == -2;
+  const int64_t want = fit || c_.experts_on_card < 0 || c_.experts_on_card >= NE ? NE : c_.experts_on_card;
+  // Each layer's experts by the profile's counts, busiest first, ties to the lower id.
+  std::vector<std::vector<int>> order(static_cast<size_t>(cfg_.n_layer), std::vector<int>(static_cast<size_t>(NE)));
+  for (auto& o : order)
+    for (int e = 0; e < NE; ++e) o[size_t(e)] = e;
+  if (!c_.expert_profile.empty()) {
     std::ifstream in(c_.expert_profile);
     if (!in) throw std::runtime_error("engine: cannot read " + c_.expert_profile);
     const json::Value doc = json::parse(std::string((std::istreambuf_iterator<char>(in)), {}));
     const json::Value* cs = doc.find("counts");
     if (!cs || !cs->is_array() || int64_t(cs->items().size()) != cfg_.n_layer)
       throw std::runtime_error(c_.expert_profile + ": counts must hold one row per layer");
-    for (const auto& row : cs->items()) {
+    for (int l = 0; l < cfg_.n_layer; ++l) {
+      const json::Value& row = cs->items()[size_t(l)];
       if (!row.is_array() || int64_t(row.items().size()) != NE) throw std::runtime_error(c_.expert_profile + ": counts must hold one entry per expert");
-      counts.emplace_back();
-      for (const auto& v : row.items()) counts.back().push_back(std::atoll(v.int_digits().c_str()));
+      std::vector<int64_t> c;
+      for (const auto& v : row.items()) c.push_back(std::atoll(v.int_digits().c_str()));
+      std::stable_sort(order[size_t(l)].begin(), order[size_t(l)].end(), [&](int a, int b) { return c[size_t(a)] > c[size_t(b)]; });
     }
+  } else if (want < NE) {
+    throw std::runtime_error("engine: experts_on_card below the expert count needs an expert profile");
   }
   const uint64_t stage_bytes = std::max(uint64_t(2 * Fe) * gu_row, uint64_t(E) * dn_row);
   auto* staging = sycl::malloc_device<uint8_t>(stage_bytes, q_);
   if (!staging) throw std::runtime_error("engine: out of device memory for weight staging");
-  for (int l = 0; l < cfg_.n_layer; ++l) {
-    Layer& L = layers_[size_t(l)];
-    L.cold.assign(size_t(NE), 0);
-    if (n_hot_ < NE) {
-      std::vector<int> order(static_cast<size_t>(NE));
-      for (int e = 0; e < NE; ++e) order[size_t(e)] = e;
-      const auto& c = counts[size_t(l)];
-      std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return c[size_t(a)] > c[size_t(b)]; });
-      for (int64_t i = n_hot_; i < NE; ++i) L.cold[size_t(order[size_t(i)])] = 1;
-      L.n_cold = int(NE - n_hot_);
-    }
-    // Repack each hot expert's gate_up (interleaved) and down, staging each into the shared buffer
-    // so the originals are not kept on the card. A cold expert is a table entry with no tiles.
-    L.exp_gate_up.resize(size_t(NE));
-    L.exp_down.resize(size_t(NE));
-    for (int e = 0; e < NE; ++e) {
-      if (L.cold[size_t(e)]) {
-        L.exp_gate_up[size_t(e)] = xmx::Weight{E, 2 * Fe, nullptr, nullptr};
-        L.exp_down[size_t(e)] = xmx::Weight{Fe, E, nullptr, nullptr};
-        continue;
-      }
+  for (Layer& L : layers_) {
+    L.cold.assign(size_t(NE), 1);
+    L.exp_gate_up.assign(size_t(NE), xmx::Weight{E, 2 * Fe, nullptr, nullptr});  // cold: a table entry with no tiles
+    L.exp_down.assign(size_t(NE), xmx::Weight{Fe, E, nullptr, nullptr});
+  }
+  // Experts go on the card one rank at a time, that rank of every layer, so that the layers stay alike.
+  // When fitting them to the card, the free memory is read before each rank and after it: the rank
+  // goes on if the free memory less the margin holds what the last one took (allocations round up, so
+  // that is a few percent above the bytes of the weights).
+  std::optional<uint64_t> fm;
+  if (fit) {
+    fm = rt::free_memory(q_.get_device());
+    if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
+    free_at_placement_ = *fm;
+  }
+  uint64_t rank_bytes = expert_set_bytes_ + expert_set_bytes_ / 8;
+  int64_t rank = 0;
+  for (; rank < want; ++rank) {
+    if (fit && *fm < c_.card_margin_bytes + rank_bytes) break;
+    for (int l = 0; l < cfg_.n_layer; ++l) {
+      Layer& L = layers_[size_t(l)];
+      const int e = order[size_t(l)][size_t(rank)];
+      L.cold[size_t(e)] = 0;
+      // Repack the expert's gate_up (interleaved) and down, staging each into the shared buffer so the
+      // originals are not kept on the card.
       q_.memcpy(staging, L.gu_host + size_t(e) * 2 * Fe * gu_row, size_t(2 * Fe * gu_row)).wait();
       L.exp_gate_up[size_t(e)] = xmx::repack_q4_0(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, staging, gu_row}, true);
       q_.memcpy(staging, L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row)).wait();
@@ -327,6 +329,17 @@ void Engine::load_experts() {
       }
       weight_bytes_ += size_t(2 * Fe * gu_row + E * dn_row);
     }
+    if (fit) {
+      const auto after = rt::free_memory(q_.get_device());
+      if (!after) throw std::runtime_error("engine: the driver stopped reporting free device memory");
+      if (*fm > *after) rank_bytes = *fm - *after;
+      fm = after;
+    }
+  }
+  n_hot_ = rank;
+  if (n_hot_ < NE && c_.expert_profile.empty()) throw std::runtime_error("engine: the experts do not all fit; an expert profile is needed to place some on the CPU");
+  for (Layer& L : layers_) {
+    L.n_cold = int(NE - n_hot_);
     // Device tables of the experts' pointers for the grouped decode kernels.
     {
       // The dense FFN's gate|up as three more entries (its 3 x 1,408 interleaved columns are contiguous tile ranges).
