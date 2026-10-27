@@ -125,16 +125,23 @@ class Engine {
 
   // workspace, sized for max_batch tokens
   float *x_, *x2_, *h_, *qkv_, *qb_, *kb_, *vb_, *att_, *o_, *gu_, *rows_, *logits_;
-  // MoE (26B) workspace: the expert sum, the router logits, and a buffer that holds one expert's
-  // gathered input rows and, after its down matmul, its output rows; plus the per-expert token
-  // indices and weights and the expert activation buffers.
-  float *moe_ = nullptr, *rlog_ = nullptr, *gx_ = nullptr, *dws_ = nullptr;
-  int32_t* dids_ = nullptr;
-  // Decode-path MoE (T * n_used <= kFp16Rows pairs): chosen expert ids and weights, the grouped
-  // gate_up output before GeGLU.
+  // MoE (26B) workspace: the expert sum, the router logits, the chosen expert ids and weights
+  // (per pair), and the expert input rows (gx_: down outputs of up to kFp16Rows pairs at decode).
+  float *moe_ = nullptr, *rlog_ = nullptr, *gx_ = nullptr;
   int32_t* moe_ids_ = nullptr;
-  float *moe_w_ = nullptr, *moe_gu_ = nullptr;
+  float* moe_w_ = nullptr;
+  // Decode (T * n_used <= kFp16Rows pairs): the grouped gate_up output before GeGLU, and the int8
+  // activation buffers.
+  float* moe_gu_ = nullptr;
   xmx::Activations act_exp_, act_exp_ffn_;
+  // Prefill: pairs sorted by expert in row tiles of moe_tile_ rows (fast::moe_group): the tile list,
+  // its scratch, each pair's row; fp16 expert inputs (moe_a_, sharing moe_y_'s memory: they are dead
+  // once the gate_up is done) and gate_up outputs, and the down outputs in fp32.
+  // 64 rows: 32 halves the GEMM's speed, 128 pads too much (DECISIONS 2026-10-26, "the 26B's prefill MoE").
+  int64_t moe_tile_ = 64, moe_max_tiles_ = 0;
+  int32_t *moe_tiles_ = nullptr, *moe_scratch_ = nullptr, *moe_row_ = nullptr;
+  sycl::half *moe_a_ = nullptr, *moe_h_ = nullptr;
+  float* moe_y_ = nullptr;
   int32_t *tok_, *slot_, *pos_, *tiles_sliding_, *tiles_global_;
   int64_t max_tiles_sliding_ = 0, max_tiles_global_ = 0;
   xmx::Activations act_, act_ffn_;  // matmul inputs: of width E or H x D, and of the FFN's width

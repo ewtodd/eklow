@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
-#include <numeric>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -249,23 +248,32 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * Dg));
   act_ffn_ = xmx::alloc_activations(q_, B, F);
   if (cfg_.n_expert > 0) {
-    // An expert's rows are padded to kFp16Rows + 1 (see step()), so its buffers hold at least that.
-    const int64_t Bx = std::max<int64_t>(B, xmx::kFp16Rows + 1);
+    const int64_t NE = cfg_.n_expert, NU = cfg_.n_expert_used, P = B * NU, Fe = cfg_.n_ff_exp;
     moe_ = dev(B * E);
-    rlog_ = dev(B * cfg_.n_expert);
-    gx_ = dev(Bx * E);
-    dids_ = sycl::malloc_device<int32_t>(size_t(B), q_);
-    dws_ = sycl::malloc_device<float>(size_t(B), q_);
-    if (!dids_ || !dws_) throw std::runtime_error("engine: out of device memory");
-    owned_.push_back(dids_);
-    owned_.push_back(dws_);
-    moe_ids_ = sycl::malloc_device<int32_t>(size_t(xmx::kFp16Rows), q_);
-    if (!moe_ids_) throw std::runtime_error("engine: out of device memory");
+    rlog_ = dev(B * NE);
+    gx_ = dev(std::max<int64_t>(P, xmx::kFp16Rows) * E);
+    // Per pair: the chosen expert and weight (decode keeps at most kFp16Rows pairs in them).
+    moe_ids_ = sycl::malloc_device<int32_t>(size_t(P), q_);
+    moe_row_ = sycl::malloc_device<int32_t>(size_t(P), q_);
+    if (!moe_ids_ || !moe_row_) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(moe_ids_);
-    moe_w_ = dev(xmx::kFp16Rows);
-    moe_gu_ = dev(xmx::kFp16Rows * 2 * cfg_.n_ff_exp);
-    act_exp_ = xmx::alloc_activations(q_, Bx, E);
-    act_exp_ffn_ = xmx::alloc_activations(q_, Bx, cfg_.n_ff_exp);
+    owned_.push_back(moe_row_);
+    moe_w_ = dev(P);
+    moe_gu_ = dev(xmx::kFp16Rows * 2 * Fe);
+    act_exp_ = xmx::alloc_activations(q_, xmx::kFp16Rows, E);
+    act_exp_ffn_ = xmx::alloc_activations(q_, xmx::kFp16Rows, Fe);
+    // Prefill: segments padded to row tiles, so at most P / tile + n_expert tiles. The tile and
+    // gate_up outputs are sized for that; the fp32 down outputs (the biggest) take the memory the
+    // fp16 inputs used.
+    moe_max_tiles_ = (P + moe_tile_ - 1) / moe_tile_ + NE;
+    const int64_t rows = moe_max_tiles_ * moe_tile_;
+    moe_y_ = dev(rows * E);
+    moe_a_ = reinterpret_cast<sycl::half*>(moe_y_);
+    moe_h_ = sycl::malloc_device<sycl::half>(size_t(rows * Fe), q_);
+    moe_tiles_ = sycl::malloc_device<int32_t>(size_t(4 + 4 * moe_max_tiles_), q_);
+    moe_scratch_ = sycl::malloc_device<int32_t>(size_t((P / 256 + 2) * NE), q_);
+    if (!moe_h_ || !moe_tiles_ || !moe_scratch_) throw std::runtime_error("engine: out of device memory");
+    for (void* p : {static_cast<void*>(moe_h_), static_cast<void*>(moe_tiles_), static_cast<void*>(moe_scratch_)}) owned_.push_back(p);
   }
 }
 
@@ -437,15 +445,15 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       emit("ffn_mlp" + s, o_, {E, T});
       // Router: r = rmsnorm(x2_) * (ffn_gate_inp.scale / sqrt(E)), then r @ W_router^T.
       fast::rmsnorm(q_, x2_, L.router_in_scale, T, E, cfg_.eps, h_);
-      if (T * n_used <= xmx::kFp16Rows)
-        fast::matmul_f32_small(q_, reinterpret_cast<const float*>(L.w_router.data), n_expert, E, h_, T, rlog_);
-      else ref::matmul(q_, L.w_router, h_, T, rlog_);
+      const float* w_router = reinterpret_cast<const float*>(L.w_router.data);
+      if (T * n_used <= xmx::kFp16Rows) fast::matmul_f32_small(q_, w_router, n_expert, E, h_, T, rlog_);
+      else fast::matmul_f32(q_, w_router, n_expert, E, h_, T, rlog_);
       mark("router");
       emit("ffn_moe_logits" + s, rlog_, {n_expert, T});
-      if (T * n_used <= xmx::kFp16Rows) {
+      const int64_t P = T * n_used;
+      if (P <= xmx::kFp16Rows) {
         // Decode (up to 4 tokens): routing, the grouped expert GEMVs and the weighted sum all on the
         // card, nothing copied to or waited on by the host.
-        const int64_t P = T * n_used;
         fast::moe_route(q_, rlog_, T, n_expert, n_used, L.exp_down_scale_dev, moe_ids_, moe_w_);
         mark("moe_route");
         // Expert input rmsnorm(x2_) * pre_ffw_norm_2, quantized to T int8 rows (h_ is scratch).
@@ -458,72 +466,23 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         fast::moe_combine(q_, gx_, moe_w_, T, n_used, E, moe_);
         mark("moe_sum");
       } else {
-        // Host routing: softmax over the 128 experts, the top n_used, renormalized (floored at 2^-14,
-        // llama.cpp's epsilon), each weight times its expert's down scale. Same as reference_forward.
-        std::vector<std::vector<int32_t>> tok(n_expert);
-        std::vector<std::vector<float>> wt(n_expert);
-        {
-          std::vector<float> host(size_t(T) * n_expert);
-          q_.memcpy(host.data(), rlog_, host.size() * sizeof(float)).wait();
-          for (int64_t t = 0; t < T; ++t) {
-            const float* lg = host.data() + size_t(t) * n_expert;
-            const float mx = *std::max_element(lg, lg + n_expert);
-            std::vector<float> p(n_expert);
-            float sum = 0.0f;
-            for (int e = 0; e < n_expert; ++e) {
-              p[size_t(e)] = std::exp(lg[e] - mx);
-              sum += p[size_t(e)];
-            }
-            for (int e = 0; e < n_expert; ++e) p[size_t(e)] /= sum;
-            std::vector<int> idx(n_expert);
-            std::iota(idx.begin(), idx.end(), 0);
-            std::partial_sort(idx.begin(), idx.begin() + n_used, idx.end(),
-                              [&](int a, int b) { return p[size_t(a)] > p[size_t(b)]; });
-            float wsum = 0.0f;
-            for (int i = 0; i < n_used; ++i) wsum += p[size_t(idx[size_t(i)])];
-            const float denom = std::max(wsum, 6.103515625e-5f);
-            for (int i = 0; i < n_used; ++i) {
-              const int e = idx[size_t(i)];
-              tok[size_t(e)].push_back(int(t));
-              wt[size_t(e)].push_back(p[size_t(e)] / denom * L.exp_down_scale[size_t(e)]);
-            }
-          }
-        }
-        // Expert input: moe_x = rmsnorm(x2_) * pre_ffw_norm_2 (reuses h_).
+        // Prefill: routing, grouping of the pairs by expert into row tiles, the experts' GEMMs over all
+        // their tokens at once and the weighted sum, all on the card.
+        fast::moe_route(q_, rlog_, T, n_expert, n_used, L.exp_down_scale_dev, moe_ids_, moe_w_);
+        mark("moe_route");
+        fast::moe_group(q_, moe_ids_, P, n_expert, moe_tile_, moe_scratch_, moe_tiles_, moe_row_);
+        mark("moe_group");
+        // Expert input rmsnorm(x2_) * pre_ffw_norm_2 (h_ is scratch), each pair's row in sorted order.
         fast::rmsnorm(q_, x2_, L.pre_ffw_norm_2, T, E, cfg_.eps, h_);
-        q_.fill(moe_, 0.0f, size_t(T * E));
-        for (int e = 0; e < n_expert; ++e) {
-          const int64_t n_e = tok[size_t(e)].size();
-          if (!n_e) continue;
-          q_.memcpy(dids_, tok[size_t(e)].data(), size_t(n_e) * 4);
-          q_.memcpy(dws_, wt[size_t(e)].data(), size_t(n_e) * 4).wait();
-          // Gather this expert's tokens' moe_x rows, then its gate_up (704 wide) and down.
-          {
-            float* gx = gx_;
-            const float* h = h_;
-            const int32_t* dids = dids_;
-            q_.parallel_for(sycl::range<1>(size_t(n_e * E)), [=](sycl::id<1> id) {
-              const int i = int(id[0]) / int(E), j = int(id[0]) % int(E);
-              gx[size_t(id[0])] = h[size_t(dids[i]) * E + j];
-            });
-          }
-          // Rows past n_e are stale but finite and their outputs are never read; padding to more than 32
-          // rows keeps the expert matmuls on the fp16 path (int8 activations flip routing downstream).
-          xmx::quantize(q_, gx_, std::max<int64_t>(n_e, xmx::kFp16Rows + 1), act_exp_);
-          xmx::matmul_geglu(q_, act_exp_, L.exp_gate_up[size_t(e)], act_exp_ffn_, gu_);
-          xmx::matmul(q_, act_exp_ffn_, L.exp_down[size_t(e)], gx_);
-          // moe[token] += w * y for this expert's tokens.
-          {
-            float* moe = moe_;
-            const float* gx = gx_;
-            const int32_t* dids = dids_;
-            const float* dws = dws_;
-            q_.parallel_for(sycl::range<1>(size_t(n_e * E)), [=](sycl::id<1> id) {
-              const int i = int(id[0]) / int(E), j = int(id[0]) % int(E);
-              moe[size_t(dids[i]) * E + j] += dws[i] * gx[size_t(id[0])];
-            });
-          }
-        }
+        fast::moe_gather(q_, h_, moe_row_, P, n_used, E, moe_a_);
+        mark("moe_gather");
+        const int64_t max_tiles = (P + moe_tile_ - 1) / moe_tile_ + n_expert;
+        xmx::matmul_geglu_grouped16(q_, moe_a_, L.tab_gate_up, moe_tiles_, max_tiles, moe_tile_, moe_h_);
+        mark("moe_gate_up");
+        xmx::matmul_grouped16(q_, moe_h_, L.tab_down, moe_tiles_, max_tiles, moe_tile_, moe_y_);
+        mark("moe_down");
+        fast::moe_combine(q_, moe_y_, moe_w_, T, n_used, E, moe_, moe_row_);
+        mark("moe_sum");
       }
       fast::rmsnorm(q_, moe_, L.post_ffw_norm_2, T, E, cfg_.eps, moe_);
       mark("moe_post_norm");
