@@ -60,8 +60,31 @@ void matmul_q6(sycl::queue& q, const Q6& w, const float* x, int64_t rows, float*
 // multiple of 32, at most 256; n_used at most 16.
 void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_expert, int64_t n_used, const float* down_scale,
                int32_t* ids, float* weights);
-// out[t][:] = sum_i weights[t][i] * y[t * n_used + i][:], summed in the order i = 0..n_used-1.
-void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out);
+// out[t][:] = sum_i weights[t][i] * y[row(t, i)][:], summed in the order i = 0..n_used-1; row(t, i)
+// is t * n_used + i, or rows[t * n_used + i] when given (the grouped GEMM's sorted order).
+void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out,
+                 const int32_t* rows = nullptr);
+
+// Prefill's grouping of the (token, slot) pairs p = t * n_used + i by expert (ids as moe_route wrote
+// them), a stable counting sort so that results do not depend on scheduling: expert e's pairs, in
+// token order, fill rows from its segment start, and segments start at multiples of `tile` rows.
+//   tiles: [0] = number of row tiles, then from tiles[4] four ints a tile, expert by expert: expert,
+//     first row, rows holding pairs (the rest padding);
+//     at most ceil(P / tile) + n_expert tiles, so the buffer holds 4 + 4 * that.
+//   row_of_pair[p]: the pair's row in the sorted order.
+//   scratch: int32, (ceil(P / 256) + 1) * n_expert.
+// n_expert at most 256. Rows of a segment past its expert's count are padding.
+void moe_group(sycl::queue& q, const int32_t* ids, int64_t n_pairs, int64_t n_expert, int64_t tile, int32_t* scratch, int32_t* tiles,
+               int32_t* row_of_pair);
+// Writes x[p / n_used][:] (fp32, cols a multiple of 16) for each pair p to its sorted row in the
+// fp16 activation layout (xmx::act16_index) at `out`.
+void moe_gather(sycl::queue& q, const float* x, const int32_t* row_of_pair, int64_t n_pairs, int64_t n_used, int64_t cols,
+                sycl::half* out);
+
+// out[t][c] = w[c] . x[t] for fp32 w [n][k] and any number of tokens (n a multiple of 32, at most
+// 256; k a multiple of 4): the 26B's router at prefill, kept in fp32 because routing is sensitive to
+// its precision.
+void matmul_f32(sycl::queue& q, const float* w, int64_t n, int64_t k, const float* x, int64_t n_tok, float* out);
 
 // out[t][c] = w[c] . x[t] for fp32 w [n][k] (k a multiple of 4) and up to 4 tokens: the 26B's router
 // at decode (ref::matmul's generic path ran one work-item per output).

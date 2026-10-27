@@ -18,11 +18,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <numeric>
 #include <random>
 #include <string>
 #include <vector>
 
 #include "core/json.hpp"
+#include "kernels/fast.hpp"
 #include "kernels/ref.hpp"
 #include "kernels/xmx.hpp"
 #include "model/gguf.hpp"
@@ -176,6 +178,163 @@ void grouped_test(sycl::queue& q, const gguf::File& f, json::Writer& w) {
   }
   w.end_array();
 }
+
+// The grouped fp16 GEMMs (prefill's MoE) against xmx::matmul_geglu / xmx::matmul per expert, on the
+// 26B's layer 0 experts, with T random tokens each routed to a random set of 8 experts. Same fp16
+// arithmetic, so the relative L2 should be ~1e-6..1e-4 (a different K order only through the
+// work-group's schedule). Also checks fast::moe_group's order on the host, and times the kernels.
+void grouped16_test(sycl::queue& q, const gguf::File& f, json::Writer& w, int64_t tile) {
+  std::mt19937 rng(11);
+  std::normal_distribution<float> nd(0, 1);
+  const gguf::Tensor* tg = f.tensor("blk.0.ffn_gate_up_exps.weight");
+  const gguf::Tensor* td = f.tensor("blk.0.ffn_down_exps.weight");
+  if (!tg || !td) throw std::runtime_error("no blk.0 expert tensors in the MoE model");
+  const int64_t T = 1024, NU = 8, P = T * NU, NE = int64_t(tg->ne[2]);
+  const int64_t E = int64_t(tg->ne[0]), Fe = int64_t(tg->ne[1]) / 2;
+  std::vector<xmx::Weight> gu, dn;
+  for (const bool gate_up : {true, false}) {
+    const gguf::Tensor* t = gate_up ? tg : td;
+    const int64_t n = int64_t(t->ne[1]), k = int64_t(t->ne[0]);
+    const uint64_t row_bytes = t->nbytes / uint64_t(NE) / uint64_t(n), exp_bytes = row_bytes * uint64_t(n);
+    auto* staging = sycl::malloc_device<uint8_t>(exp_bytes, q);
+    for (int64_t e = 0; e < NE; ++e) {
+      q.memcpy(staging, t->data + uint64_t(e) * exp_bytes, exp_bytes).wait();
+      (gate_up ? gu : dn).push_back(xmx::repack_q4_0(q, ref::Weight{gguf::Type::Q4_0, k, n, staging, row_bytes}, gate_up));
+    }
+    sycl::free(staging, q);
+  }
+  xmx::ExpertTable tab_gu = xmx::make_expert_table(q, gu), tab_dn = xmx::make_expert_table(q, dn);
+
+  // Routing: 8 distinct experts per token.
+  std::vector<int32_t> ids(size_t(P) + 0);
+  std::vector<int32_t> perm(size_t(NE) + 0);
+  for (int64_t t = 0; t < T; ++t) {
+    std::iota(perm.begin(), perm.end(), 0);
+    std::shuffle(perm.begin(), perm.end(), rng);
+    for (int64_t j = 0; j < NU; ++j) ids[size_t(t * NU + j)] = perm[size_t(j)];
+  }
+  std::vector<float> x(size_t(T * E));
+  for (auto& v : x) v = nd(rng);
+  const int64_t max_tiles = (P + tile - 1) / tile + NE, rows = max_tiles * tile;
+  auto* idd = sycl::malloc_device<int32_t>(size_t(P), q);
+  auto* rowp = sycl::malloc_device<int32_t>(size_t(P), q);
+  auto* scr = sycl::malloc_device<int32_t>(size_t((P / 256 + 2) * NE), q);
+  auto* tiles = sycl::malloc_device<int32_t>(size_t(4 + 4 * max_tiles), q);
+  auto* xd = sycl::malloc_device<float>(size_t(T * E), q);
+  auto* a = sycl::malloc_device<sycl::half>(size_t(rows * E), q);
+  auto* h = sycl::malloc_device<sycl::half>(size_t(rows * Fe), q);
+  auto* y = sycl::malloc_device<float>(size_t(rows * E), q);
+  q.memcpy(idd, ids.data(), ids.size() * 4);
+  q.memcpy(xd, x.data(), x.size() * 4).wait();
+  q.memset(a, 0, size_t(rows * E) * 2).wait();
+  fast::moe_group(q, idd, P, NE, tile, scr, tiles, rowp);
+  fast::moe_gather(q, xd, rowp, P, NU, E, a);
+  xmx::matmul_geglu_grouped16(q, a, tab_gu, tiles, max_tiles, tile, h);
+  xmx::matmul_grouped16(q, h, tab_dn, tiles, max_tiles, tile, y);
+  q.wait();
+
+  // Host check of the grouping: rows unique, segments tile-aligned and in expert order, each
+  // expert's pairs in pair order.
+  std::vector<int32_t> hrow(size_t(P) + 0), htiles(size_t(4 + 4 * max_tiles));
+  q.memcpy(hrow.data(), rowp, hrow.size() * 4);
+  q.memcpy(htiles.data(), tiles, htiles.size() * 4).wait();
+  std::vector<std::vector<int64_t>> by_expert(size_t(NE) + 0);
+  for (int64_t p = 0; p < P; ++p) by_expert[size_t(ids[size_t(p)])].push_back(p);
+  bool order_ok = true;
+  int64_t n_tiles = htiles[0], ti = 0;
+  for (int64_t e = 0; e < NE; ++e) {
+    const int64_t cnt = int64_t(by_expert[size_t(e)].size()), nt = (cnt + tile - 1) / tile;
+    int64_t start = -1;
+    for (int64_t j = 0; j < nt; ++j, ++ti) {
+      order_ok &= ti < n_tiles && htiles[size_t(4 + 4 * ti)] == e && htiles[size_t(6 + 4 * ti)] == std::min(tile, cnt - j * tile);
+      if (j == 0) start = htiles[size_t(5 + 4 * ti)];
+      order_ok &= ti < n_tiles && htiles[size_t(5 + 4 * ti)] == start + j * tile;
+    }
+    for (int64_t i = 0; i < cnt; ++i) order_ok &= hrow[size_t(by_expert[size_t(e)][size_t(i)])] == start + i;
+  }
+  order_ok &= ti == n_tiles;
+
+  // Per expert reference: its rows through the dense fp16 path.
+  std::vector<sycl::half> hh(size_t(rows * Fe));
+  std::vector<float> hy(size_t(rows * E));
+  q.memcpy(hh.data(), h, hh.size() * 2);
+  q.memcpy(hy.data(), y, hy.size() * 4).wait();
+  double num_gu = 0, den_gu = 0, num_dn = 0, den_dn = 0;
+  xmx::Activations ain = xmx::alloc_activations(q, 2048, E), ah = xmx::alloc_activations(q, 2048, Fe);
+  auto* xe = sycl::malloc_device<float>(size_t(2048 * E), q);
+  auto* ye = sycl::malloc_device<float>(size_t(2048 * E), q);
+  std::vector<float> hye(size_t(2048 * E));
+  for (int64_t e = 0; e < NE; ++e) {
+    const auto& prs = by_expert[size_t(e)];
+    if (prs.empty()) continue;
+    const int64_t cnt = int64_t(prs.size()), m = std::max<int64_t>(cnt, xmx::kFp16Rows + 1);
+    std::vector<float> xs(size_t(m * E), 0.0f);
+    for (int64_t i = 0; i < cnt; ++i) std::copy_n(x.begin() + (prs[size_t(i)] / NU) * E, E, xs.begin() + i * E);
+    q.memcpy(xe, xs.data(), xs.size() * 4).wait();
+    xmx::quantize(q, xe, m, ain);
+    xmx::matmul_geglu(q, ain, gu[size_t(e)], ah, nullptr);
+    xmx::matmul(q, ah, dn[size_t(e)], ye);
+    std::vector<sycl::half> rh(size_t(ah.m_pad * Fe));
+    q.memcpy(rh.data(), ah.h, rh.size() * 2);
+    q.memcpy(hye.data(), ye, size_t(m * E) * 4).wait();
+    for (int64_t i = 0; i < cnt; ++i) {
+      const int64_t row = hrow[size_t(prs[size_t(i)])];
+      for (int64_t c = 0; c < Fe; ++c) {
+        const double g = double(float(hh[size_t(xmx::act16_index(row, c, Fe / 16))])), r = double(float(rh[size_t(xmx::act16_index(i, c, Fe / 16))]));
+        num_gu += (g - r) * (g - r);
+        den_gu += r * r;
+      }
+      for (int64_t c = 0; c < E; ++c) {
+        const double g = double(hy[size_t(row * E + c)]), r = double(hye[size_t(i * E + c)]);
+        num_dn += (g - r) * (g - r);
+        den_dn += r * r;
+      }
+    }
+  }
+
+  // Speed: the three grouped kernels, best of several runs; TFLOPS on the real pairs and on the
+  // padded rows the tiles hold.
+  int64_t used_rows = htiles[0] * tile;
+  auto time = [&](auto&& fn) {
+    double best = 1e30;
+    for (int rep = 0; rep < 6; ++rep) {
+      auto t0 = std::chrono::steady_clock::now();
+      for (int i = 0; i < 10; ++i) fn();
+      q.wait();
+      const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 10;
+      if (rep) best = std::min(best, dt);
+    }
+    return best;
+  };
+  const double t_gu = time([&] { xmx::matmul_geglu_grouped16(q, a, tab_gu, tiles, max_tiles, tile, h); });
+  const double t_dn = time([&] { xmx::matmul_grouped16(q, h, tab_dn, tiles, max_tiles, tile, y); });
+  const double t_grp = time([&] {
+    fast::moe_group(q, idd, P, NE, tile, scr, tiles, rowp);
+    fast::moe_gather(q, xd, rowp, P, NU, E, a);
+  });
+  const double fl_gu = 2.0 * double(P) * double(E) * double(2 * Fe), fl_dn = 2.0 * double(P) * double(Fe) * double(E);
+  std::printf("grouped fp16 GEMMs, %lld tokens x 8, tile %lld rows: grouping %s, %lld tiles (%lld rows for %lld pairs)\n", (long long)T,
+              (long long)tile, order_ok ? "ok" : "WRONG", (long long)htiles[0], (long long)used_rows, (long long)P);
+  std::printf("%-14s %10s %9s %12s %12s\n", "kernel", "rel L2", "ms", "TFLOPS real", "TFLOPS padded");
+  std::printf("%-14s %10.2e %9.4f %12.1f %12.1f\n", "gate_up+GeGLU", std::sqrt(num_gu / den_gu), t_gu * 1e3, fl_gu / t_gu / 1e12,
+              fl_gu * double(used_rows) / double(P) / t_gu / 1e12);
+  std::printf("%-14s %10.2e %9.4f %12.1f %12.1f\n", "down", std::sqrt(num_dn / den_dn), t_dn * 1e3, fl_dn / t_dn / 1e12,
+              fl_dn * double(used_rows) / double(P) / t_dn / 1e12);
+  std::printf("%-14s %10s %9.4f\n", "group+gather", "", t_grp * 1e3);
+  w.key("grouped16").begin_object().kv("tile", tile).kv("tokens", T).kv("grouping_ok", order_ok).kv("tiles", int64_t(htiles[0]))
+      .kv("rel_gate_up", std::sqrt(num_gu / den_gu)).kv("rel_down", std::sqrt(num_dn / den_dn)).kv("ms_gate_up", t_gu * 1e3)
+      .kv("ms_down", t_dn * 1e3).kv("tflops_gate_up", fl_gu / t_gu / 1e12).kv("tflops_down", fl_dn / t_dn / 1e12).end_object();
+  for (void* p : {static_cast<void*>(idd), static_cast<void*>(rowp), static_cast<void*>(scr), static_cast<void*>(tiles),
+                  static_cast<void*>(xd), static_cast<void*>(a), static_cast<void*>(h), static_cast<void*>(y),
+                  static_cast<void*>(xe), static_cast<void*>(ye)})
+    sycl::free(p, q);
+  xmx::free_activations(q, ain);
+  xmx::free_activations(q, ah);
+  xmx::free_expert_table(q, tab_gu);
+  xmx::free_expert_table(q, tab_dn);
+  for (auto& e : gu) xmx::free_weight(q, e);
+  for (auto& e : dn) xmx::free_weight(q, e);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -197,6 +356,7 @@ int main(int argc, char** argv) {
       json::Writer gw;
       gw.begin_object();
       grouped_test(gq, fm, gw);
+      for (const int64_t tile : {32, 64, 128}) grouped16_test(gq, fm, gw, tile);
       gw.end_object();
       if (!json_path.empty()) std::ofstream(json_path) << gw.str() << "\n";
       return 0;

@@ -112,4 +112,15 @@ void matmul_geglu_grouped(sycl::queue& q, const Activations& a, const ExpertTabl
 void matmul_geglu_grouped_dense(sycl::queue& q, const Activations& a, const Activations& ad, const ExpertTable& w, const int32_t* ids,
                                 int64_t P, int64_t row_div, int64_t rows_d, Activations& out, Activations& out_d, float* scratch);
 
+// Grouped fp16 GEMMs for prefill (the MoE's experts over all their tokens at once). `a` holds the
+// rows sorted by expert in the fp16 activation layout (act16_index, width w.k), in row tiles of
+// `tile_rows` (32, 64 or 128) that each belong to one expert: `tiles` is the list fast::moe_group
+// builds. The grid is sized for max_tiles; groups past the list exit. matmul_grouped16 writes fp32
+// out[row][n]; the GeGLU form (w interleaved gate_up) writes fp16 activations of width n/2 to `out`
+// in the same layout. Rows of a tile past its expert's count hold garbage that nothing reads.
+void matmul_grouped16(sycl::queue& q, const sycl::half* a, const ExpertTable& w, const int32_t* tiles, int64_t max_tiles,
+                      int64_t tile_rows, float* out);
+void matmul_geglu_grouped16(sycl::queue& q, const sycl::half* a, const ExpertTable& w, const int32_t* tiles, int64_t max_tiles,
+                            int64_t tile_rows, sycl::half* out);
+
 }  // namespace eklow::xmx

@@ -268,13 +268,139 @@ void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_exp
   });
 }
 
-void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out) {
+void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out,
+                 const int32_t* rows) {
   const int32_t NU = int32_t(n_used), C = int32_t(cols);
   q.parallel_for(sycl::range<1>(size_t(n_tok * cols)), [=](sycl::id<1> id) {
     const int32_t t = int32_t(id[0]) / C, j = int32_t(id[0]) % C;
     float s = 0;
-    for (int i = 0; i < NU; ++i) s += weights[t * NU + i] * y[size_t(t * NU + i) * C + j];
+    for (int i = 0; i < NU; ++i) s += weights[t * NU + i] * y[size_t(rows ? rows[t * NU + i] : t * NU + i) * C + j];
     out[id[0]] = s;
+  });
+}
+
+void moe_group(sycl::queue& q, const int32_t* ids, int64_t n_pairs, int64_t n_expert, int64_t tile, int32_t* scratch, int32_t* tiles,
+               int32_t* row_of_pair) {
+  constexpr int kWg = 256;
+  if (n_expert > kWg) throw std::runtime_error("fast::moe_group: too many experts");
+  const int32_t P = int32_t(n_pairs), NE = int32_t(n_expert), TM = int32_t(tile);
+  const int32_t nch = (P + kWg - 1) / kWg;
+  int32_t* counts = scratch;           // [nch][NE]: the chunk's pairs per expert, then its offset in the expert's segment
+  int32_t* segs = scratch + nch * NE;  // [NE]: first row of each expert's segment
+  // Per chunk of 256 pairs, a histogram by expert.
+  q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<int32_t, 1> cnt(sycl::range<1>(kWg), h);
+    h.parallel_for(sycl::nd_range<1>(size_t(nch) * kWg, kWg), [=](sycl::nd_item<1> it) {
+      const int32_t c = int32_t(it.get_group(0)), lid = int32_t(it.get_local_id(0));
+      cnt[lid] = 0;
+      sycl::group_barrier(it.get_group());
+      const int32_t p = c * kWg + lid;
+      if (p < P)
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space>(
+            cnt[ids[p]])
+            .fetch_add(1);
+      sycl::group_barrier(it.get_group());
+      if (lid < NE) counts[c * NE + lid] = cnt[lid];
+    });
+  });
+  // One work-group: the chunks' offsets within each expert, then the tile list.
+  q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<int32_t, 1> total(sycl::range<1>(kWg), h), first(sycl::range<1>(kWg + 1), h);
+    h.parallel_for(sycl::nd_range<1>(kWg, kWg), [=](sycl::nd_item<1> it) {
+      const int32_t e = int32_t(it.get_local_id(0));
+      int32_t run = 0;
+      if (e < NE) {
+        for (int32_t c = 0; c < nch; ++c) {
+          const int32_t v = counts[c * NE + e];
+          counts[c * NE + e] = run;
+          run += v;
+        }
+      }
+      total[e] = run;
+      sycl::group_barrier(it.get_group());
+      if (e == 0) {
+        int32_t t = 0;
+        for (int32_t x = 0; x < NE; ++x) {
+          first[x] = t;
+          t += (total[x] + TM - 1) / TM;
+        }
+        first[NE] = t;
+        tiles[0] = t;
+      }
+      sycl::group_barrier(it.get_group());
+      if (e < NE) {
+        segs[e] = first[e] * TM;
+        for (int32_t j = first[e]; j < first[e + 1]; ++j) {
+          tiles[4 + 4 * j] = e;
+          tiles[5 + 4 * j] = j * TM;
+          tiles[6 + 4 * j] = sycl::min(TM, total[e] - (j - first[e]) * TM);
+        }
+      }
+    });
+  });
+  // Per chunk: each pair's rank among the chunk's pairs of its expert.
+  q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<int32_t, 1> sid(sycl::range<1>(kWg), h);
+    h.parallel_for(sycl::nd_range<1>(size_t(nch) * kWg, kWg), [=](sycl::nd_item<1> it) {
+      const int32_t c = int32_t(it.get_group(0)), lid = int32_t(it.get_local_id(0));
+      const int32_t p = c * kWg + lid;
+      sid[lid] = p < P ? ids[p] : -1;
+      sycl::group_barrier(it.get_group());
+      if (p >= P) return;
+      const int32_t e = sid[lid];
+      int32_t rank = 0;
+      for (int32_t k = 0; k < lid; ++k) rank += sid[k] == e;
+      row_of_pair[p] = segs[e] + counts[c * NE + e] + rank;
+    });
+  });
+}
+
+void moe_gather(sycl::queue& q, const float* x, const int32_t* row_of_pair, int64_t n_pairs, int64_t n_used, int64_t cols,
+                sycl::half* out) {
+  if (cols % 16) throw std::runtime_error("fast::moe_gather: width not a multiple of 16");
+  const int32_t NU = int32_t(n_used), C = int32_t(cols), kh = C / 16;
+  q.parallel_for(sycl::range<2>(size_t(n_pairs), size_t(kh)), [=](sycl::id<2> id) {
+    const int32_t p = int32_t(id[0]), j = int32_t(id[1]);
+    const sycl::float4* src = reinterpret_cast<const sycl::float4*>(x + int64_t(p / NU) * C + j * 16);
+    sycl::vec<sycl::half, 4>* dst = reinterpret_cast<sycl::vec<sycl::half, 4>*>(out + xmx::act16_index(row_of_pair[p], int64_t(j) * 16, kh));
+    sycl::float4 v[4];
+    for (int c = 0; c < 4; ++c) v[c] = src[c];
+    for (int c = 0; c < 4; ++c) dst[c] = v[c].convert<sycl::half, sycl::rounding_mode::automatic>();
+  });
+}
+
+void matmul_f32(sycl::queue& q, const float* w, int64_t n, int64_t k, const float* x, int64_t n_tok, float* out) {
+  constexpr int kTok = 4, kChunk = 256;  // tokens per work-group; floats of K per staged chunk
+  if (k % 4 || n > 256 || n % 32) throw std::runtime_error("fast::matmul_f32: unsupported shape");
+  const int32_t K = int32_t(k), N = int32_t(n), M = int32_t(n_tok);
+  const int32_t groups = (M + kTok - 1) / kTok;
+  // One work-group per 4 tokens, one work-item per output column: the tokens' chunk of K is staged in
+  // shared memory and read by all the columns, each item reading its weight row in float4s.
+  q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<float, 1> xs(sycl::range<1>(kTok * kChunk), h);
+    h.parallel_for(sycl::nd_range<1>(size_t(groups) * size_t(N), size_t(N)), [=](sycl::nd_item<1> it) {
+      const int32_t g = int32_t(it.get_group(0)), c = int32_t(it.get_local_id(0));
+      const sycl::float4* wr = reinterpret_cast<const sycl::float4*>(w + int64_t(c) * K);
+      float acc[kTok] = {};
+      for (int32_t k0 = 0; k0 < K; k0 += kChunk) {
+        const int32_t len = sycl::min<int32_t>(kChunk, K - k0);
+        for (int32_t i = c; i < kTok * kChunk; i += N) {
+          const int32_t t = g * kTok + i / kChunk, kk = i % kChunk;
+          xs[i] = t < M && kk < len ? x[int64_t(t) * K + k0 + kk] : 0.0f;
+        }
+        sycl::group_barrier(it.get_group());
+        for (int32_t kk = 0; kk < len; kk += 4) {
+          const sycl::float4 wv = wr[(k0 + kk) / 4];
+          for (int t = 0; t < kTok; ++t) {
+            const sycl::float4 xv = *reinterpret_cast<const sycl::float4*>(&xs[t * kChunk + kk]);
+            acc[t] += wv.x() * xv.x() + wv.y() * xv.y() + wv.z() * xv.z() + wv.w() * xv.w();
+          }
+        }
+        sycl::group_barrier(it.get_group());
+      }
+      for (int t = 0; t < kTok; ++t)
+        if (g * kTok + t < M) out[int64_t(g * kTok + t) * N + c] = acc[t];
+    });
   });
 }
 

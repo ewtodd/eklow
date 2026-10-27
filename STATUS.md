@@ -113,7 +113,10 @@ e-desktop, `~/eklow-wt-*` on fiona).
 - [x] decode in fewer kernels (fused norms and layer tail, the dense gate|up in the grouped GEMV):
       68.2 / 61.9 tok/s at 0 / 4k, 53.9 / 48.3 per sequence with two (DECISIONS 2026-10-26, "the
       26B's decode step in fewer kernels")
-- [ ] grouped expert GEMMs for prefill (now 1,014 tok/s at 1k, the per-expert host loop)
+- [x] grouped expert GEMMs for prefill: 3,130 / 2,821 tok/s at 1k / 4k, 2,525 at 4k depth (from
+      1,014 / 1,003 / 970; DECISIONS 2026-10-26, "the 26B's prefill MoE on the card")
+- [x] through the server: chat and tool calls at 2 x 8k; 2 x 32k does not fit with every expert on
+      the card
 - [ ] experts placed by the routing profile with the rest on the CPU (long contexts); the tool-call
       eval against the 12B
 

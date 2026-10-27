@@ -718,3 +718,43 @@ unchanged. Folding the GeGLU into the grouped GEMV's epilogue gave wrong logits 
 
 The grouped GEMVs read at ~180 GB/s against the card's 399. A profiled step at 0 (18.3 ms with
 marks): gate_up (experts and dense) 3.8 ms, head 2.8, qkv 1.9, wo 1.75, expert down 1.6.
+
+## 2026-10-26 — the 26B's prefill MoE on the card: grouped expert GEMMs
+
+Steps of more than 4 tokens now keep the MoE on the card too:
+- `fast::matmul_f32` computes the router; it stays fp32, since routing is sensitive to it.
+- `fast::moe_route` picks each token's experts.
+- `fast::moe_group` stable-sorts the (token, slot) pairs by expert, pads each expert's segment to
+  the row tile (64 rows), and builds the tile list.
+- `fast::moe_gather` writes the expert inputs in sorted order (fp16).
+- Two grouped fp16 GEMMs run: `Gemm16Kernel` with each work-group's row tile and expert taken from
+  the list and its weights from the `ExpertTable`. One is gate_up with the GeGLU epilogue, the other
+  down into fp32 rows.
+- `fast::moe_combine` sums each token's 8 rows in a fixed order.
+
+The host path and its buffers are gone. Against per-expert `xmx::matmul` the grouped GEMMs are
+bit-identical.
+
+The row tile was measured by prefill at 1k: TM 32 / 64 / 128 / 256 gave 2,450 / 3,126 / 3,044 /
+2,465 tok/s, so 64 is kept. Padding rows are computed at full price, ~46% extra at TM 64. Two forms
+of skipping idle work halved the kernel: an early return for idle work-groups before the K loop,
+and an `if` over idle 8-row subtiles inside it. Idle groups now run zero blocks, and only the
+padding rows' epilogue is skipped. The workspace is ~312 MB at max_batch 2,048; the fp32 down rows
+share memory with the fp16 inputs.
+
+A 1,024-token chunk profiles at ~330 ms. The expert GEMMs are 82 + 45 ms of it (~26 / 21 TFLOPS on
+real rows in the kernel test), attention 44, qkv and wo 57, the router 17 (its weight reads are
+uncoalesced), gather and sum 18.
+
+| 26B, `bench.sh engine26` at main with stage 2d | one slot | two slots |
+|---|---|---|
+| prefill 1k / 4k, tok/s | 3,130 / 2,821 (1,014 / 1,003) | 3,123 / 2,821 |
+| prefill at 4k depth, tok/s | 2,525 (970) | 2,521 |
+| decode at 0 / 4k, tok/s per sequence | 68.1 / 61.4 | 53.9 / 48.2 |
+
+check26 gives 242/256 at mean KL 2.8e-2 (chat 23/25, 6.9e-2); the 12B is unchanged.
+
+Through `eklow-server` the 26B answers and makes tool calls at 2 x 8k (batch 1,024). At 2 x 32k
+the first request fails with UR_RESULT_ERROR_OUT_OF_RESOURCES: 13.43 GiB of weights, 1.48 GiB of
+KV and the workspace exceed the card. Longer contexts need the experts placed by the routing
+profile, with the rest off the card.
