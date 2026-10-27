@@ -57,7 +57,7 @@ add_executable(eklow-parse tools/parse/main.cpp)
 target_link_libraries(eklow-parse PRIVATE eklow_text)
 
 # Device runtime: picking the card. SYCL plus Level Zero.
-add_library(eklow_rt STATIC src/rt/device.cpp)
+add_library(eklow_rt STATIC src/rt/device.cpp src/rt/copy_engine.cpp)
 target_include_directories(eklow_rt PUBLIC src)
 target_link_libraries(eklow_rt PUBLIC PkgConfig::LEVEL_ZERO)
 eklow_sycl(eklow_rt)
@@ -144,6 +144,10 @@ target_link_libraries(eklow-probe PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-probe)
 
 # eklow-xmx-bench: dpas layouts checked against the CPU, XMX throughput, the Q4_0 inner loops and
+add_executable(eklow-copy-bench tools/copy_bench/main.cpp)
+target_link_libraries(eklow-copy-bench PRIVATE eklow_model)
+eklow_sycl(eklow-copy-bench)
+
 # VRAM read bandwidth.
 add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)

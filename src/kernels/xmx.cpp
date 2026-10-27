@@ -21,16 +21,16 @@ inline int64_t tile_at(int64_t b, int64_t g, int64_t kb) { return g * kb + b; }
 
 }  // namespace
 
-Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave) {
+uint64_t weight_tile_bytes(int64_t k, int64_t n) { return uint64_t(n / 8 * (k / 32) * kTileBytes); }
+uint64_t weight_scale_bytes(int64_t k, int64_t n) { return uint64_t(n / 8 * (k / 32) * 8 * sizeof(sycl::half)); }
+
+void repack_q4_0_into(sycl::queue& q, const ref::Weight& raw, bool interleave, const Weight& w) {
   if (raw.type != gguf::Type::Q4_0) throw std::runtime_error("xmx: repack_q4_0 needs a Q4_0 matrix");
   if (raw.k % 32 || raw.n % 8) throw std::runtime_error("xmx: Q4_0 matrix shape not a multiple of 32 x 8");
   if (interleave && raw.n % 16) throw std::runtime_error("xmx: interleaved halves not a multiple of 8 rows");
+  if (w.k != raw.k || w.n != raw.n || !w.tiles || !w.scales) throw std::runtime_error("xmx: repack target does not match the matrix");
   const int64_t half_rows = raw.n / 2;
-  Weight w{raw.k, raw.n, nullptr, nullptr};
   const int64_t kb = raw.k / 32, ng = raw.n / 8;
-  w.tiles = sycl::malloc_device<uint8_t>(size_t(ng * kb * kTileBytes), q);
-  w.scales = sycl::malloc_device<sycl::half>(size_t(ng * kb * 8), q);
-  if (!w.tiles || !w.scales) throw std::runtime_error("xmx: out of device memory repacking weights");
   const uint8_t* src = raw.data;
   const uint64_t row_bytes = raw.row_bytes;
   uint8_t* tiles = w.tiles;
@@ -50,7 +50,16 @@ Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave) {
      }
      uint32_t* dst = reinterpret_cast<uint32_t*>(tiles + tile_at(b, g, kb) * kTileBytes);
      for (int i = 0; i < 32; ++i) dst[i] = words[i];
-   }).wait();
+   });
+}
+
+Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave) {
+  Weight w{raw.k, raw.n, nullptr, nullptr};
+  w.tiles = sycl::malloc_device<uint8_t>(size_t(weight_tile_bytes(raw.k, raw.n)), q);
+  w.scales = sycl::malloc_device<sycl::half>(size_t(weight_scale_bytes(raw.k, raw.n) / sizeof(sycl::half)), q);
+  if (!w.tiles || !w.scales) throw std::runtime_error("xmx: out of device memory repacking weights");
+  repack_q4_0_into(q, raw, interleave, w);
+  q.wait();
   return w;
 }
 

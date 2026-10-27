@@ -92,12 +92,17 @@ void quantize_rows(sycl::queue& q, const float* x, int64_t rows, int64_t cols, i
 // n_expert at most 256. Rows of a segment past its expert's count are padding.
 // cold (n_expert bytes, may be null): pairs of experts flagged 1 are left out of the tile list and get
 // row_of_pair -1 (moe_gather and moe_combine skip them).
+// group_of (n experts of the model, int32, may be null): groups are group_of[expert] instead of the expert, and pairs
+// of experts with a negative group are left out; n_expert is then the number of groups, and row_of_pair keeps
+// what it held for those pairs (a second grouping fills in the rest of an earlier one, as the streamed experts
+// do). The tile list counts rows from 0, row_of_pair from row_base.
 void moe_group(sycl::queue& q, const int32_t* ids, int64_t n_pairs, int64_t n_expert, int64_t tile, int32_t* scratch, int32_t* tiles,
-               int32_t* row_of_pair, const uint8_t* cold = nullptr);
+               int32_t* row_of_pair, const uint8_t* cold = nullptr, const int32_t* group_of = nullptr, int32_t row_base = 0);
 // Writes x[p / n_used][:] (fp32, cols a multiple of 16) for each pair p to its sorted row in the
-// fp16 activation layout (xmx::act16_index) at `out`.
+// fp16 activation layout (xmx::act16_index) at `out`, as row - row_base; pairs with a row below row_base
+// (and cold ones) are skipped, so that the pairs a second grouping added can be gathered alone.
 void moe_gather(sycl::queue& q, const float* x, const int32_t* row_of_pair, int64_t n_pairs, int64_t n_used, int64_t cols,
-                sycl::half* out);
+                sycl::half* out, int32_t row_base = 0);
 
 // out[t][c] = w[c] . x[t] for fp32 w [n][k] and any number of tokens (n a multiple of 32, at most
 // 256; k a multiple of 4): the 26B's router at prefill, kept in fp32 because routing is sensitive to

@@ -4,7 +4,9 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstdio>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <optional>
 #include <sstream>
@@ -267,7 +269,6 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
 void Engine::load_experts() {
   const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NE = cfg_.n_expert;
   const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
-  expert_set_bytes_ = uint64_t(cfg_.n_layer) * (uint64_t(2 * Fe) * gu_row + uint64_t(E) * dn_row);
   const bool fit = c_.experts_on_card == -2;
   const int64_t want = fit || c_.experts_on_card < 0 || c_.experts_on_card >= NE ? NE : c_.experts_on_card;
   // Each layer's experts by the profile's counts, busiest first, ties to the lower id.
@@ -291,55 +292,75 @@ void Engine::load_experts() {
   } else if (want < NE) {
     throw std::runtime_error("engine: experts_on_card below the expert count needs an expert profile");
   }
-  const uint64_t stage_bytes = std::max(uint64_t(2 * Fe) * gu_row, uint64_t(E) * dn_row);
+  // One expert of one layer is gate_up tiles, gate_up scales, down tiles, down scales, back to back (each a
+  // multiple of 128 bytes, so every piece stays aligned): the same bytes as the GGUF's two Q4_0 matrices. A layer's
+  // hot experts share one allocation (a slab), which also saves the rounding four allocations an expert paid
+  // (5% of the experts' bytes, 3a).
+  const uint64_t gu_tb = xmx::weight_tile_bytes(E, 2 * Fe), gu_sb = xmx::weight_scale_bytes(E, 2 * Fe),
+                 dn_tb = xmx::weight_tile_bytes(Fe, E), dn_sb = xmx::weight_scale_bytes(Fe, E);
+  expert_bytes_ = gu_tb + gu_sb + dn_tb + dn_sb;
+  expert_raw_gu_ = uint64_t(2 * Fe) * gu_row;
+  if (expert_bytes_ != expert_raw_gu_ + uint64_t(E) * dn_row) throw std::runtime_error("engine: repacked expert size differs from the GGUF's");
+  expert_set_bytes_ = uint64_t(cfg_.n_layer) * expert_bytes_;
+  auto expert_at = [&](uint8_t* base, xmx::Weight& gu, xmx::Weight& dn) {
+    gu = xmx::Weight{E, 2 * Fe, base, reinterpret_cast<sycl::half*>(base + gu_tb)};
+    dn = xmx::Weight{Fe, E, base + gu_tb + gu_sb, reinterpret_cast<sycl::half*>(base + gu_tb + gu_sb + dn_tb)};
+  };
+
+  // How many experts go on the card. When fitting, the driver's free memory less the margin is spent on the
+  // staging slots (two buffers each, when there are cold experts to stream) and then on whole ranks of experts.
+  std::optional<uint64_t> fm;
+  int64_t n_hot = want;
+  const int64_t slots_wanted = std::min<int64_t>(std::max(c_.stream_slots, 0), 256);
+  if (fit) {
+    fm = rt::free_memory(q_.get_device());
+    if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
+    free_at_placement_ = *fm;
+    const uint64_t budget = *fm > c_.card_margin_bytes ? *fm - c_.card_margin_bytes : 0;
+    if (budget >= uint64_t(want) * expert_set_bytes_) {
+      n_hot = want;
+    } else {
+      const uint64_t slot_bytes = 2 * uint64_t(slots_wanted) * expert_bytes_;
+      n_hot = budget > slot_bytes ? int64_t((budget - slot_bytes) / expert_set_bytes_) : 0;
+    }
+  }
+  n_hot_ = n_hot;
+  if (n_hot_ < NE && c_.expert_profile.empty()) throw std::runtime_error("engine: the experts do not all fit; an expert profile is needed to place some on the CPU");
+
+  const uint64_t stage_bytes = expert_bytes_;
   auto* staging = sycl::malloc_device<uint8_t>(stage_bytes, q_);
   if (!staging) throw std::runtime_error("engine: out of device memory for weight staging");
   for (Layer& L : layers_) {
     L.cold.assign(size_t(NE), 1);
     L.exp_gate_up.assign(size_t(NE), xmx::Weight{E, 2 * Fe, nullptr, nullptr});  // cold: a table entry with no tiles
     L.exp_down.assign(size_t(NE), xmx::Weight{Fe, E, nullptr, nullptr});
+    L.n_cold = int(NE - n_hot_);
   }
   // Experts go on the card one rank at a time, that rank of every layer, so that the layers stay alike.
-  // When fitting them to the card, the free memory is read before each rank and after it: the rank
-  // goes on if the free memory less the margin holds what the last one took (allocations round up, so
-  // that is a few percent above the bytes of the weights).
-  std::optional<uint64_t> fm;
-  if (fit) {
-    fm = rt::free_memory(q_.get_device());
-    if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
-    free_at_placement_ = *fm;
-  }
-  uint64_t rank_bytes = expert_set_bytes_ + expert_set_bytes_ / 8;
-  int64_t rank = 0;
-  for (; rank < want; ++rank) {
-    if (fit && *fm < c_.card_margin_bytes + rank_bytes) break;
+  std::vector<uint8_t*> slab(layers_.size(), nullptr);
+  if (n_hot_ > 0)
+    for (size_t l = 0; l < layers_.size(); ++l) {
+      slab[l] = sycl::malloc_device<uint8_t>(size_t(uint64_t(n_hot_) * expert_bytes_), q_);
+      if (!slab[l]) throw std::runtime_error("engine: out of device memory for the experts");
+      owned_.push_back(slab[l]);
+    }
+  for (int64_t rank = 0; rank < n_hot_; ++rank) {
     for (int l = 0; l < cfg_.n_layer; ++l) {
       Layer& L = layers_[size_t(l)];
       const int e = order[size_t(l)][size_t(rank)];
       L.cold[size_t(e)] = 0;
-      // Repack the expert's gate_up (interleaved) and down, staging each into the shared buffer so the
+      // The expert's two matrices go to the staging buffer and are repacked into its place in the slab, so the
       // originals are not kept on the card.
-      q_.memcpy(staging, L.gu_host + size_t(e) * 2 * Fe * gu_row, size_t(2 * Fe * gu_row)).wait();
-      L.exp_gate_up[size_t(e)] = xmx::repack_q4_0(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, staging, gu_row}, true);
-      q_.memcpy(staging, L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row)).wait();
-      L.exp_down[size_t(e)] = xmx::repack_q4_0(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, staging, dn_row}, false);
-      for (xmx::Weight* w : {&L.exp_gate_up[size_t(e)], &L.exp_down[size_t(e)]}) {
-        owned_.push_back(w->tiles);
-        owned_.push_back(w->scales);
-      }
-      weight_bytes_ += size_t(2 * Fe * gu_row + E * dn_row);
-    }
-    if (fit) {
-      const auto after = rt::free_memory(q_.get_device());
-      if (!after) throw std::runtime_error("engine: the driver stopped reporting free device memory");
-      if (*fm > *after) rank_bytes = *fm - *after;
-      fm = after;
+      q_.memcpy(staging, L.gu_host + size_t(e) * expert_raw_gu_, size_t(expert_raw_gu_));
+      q_.memcpy(staging + expert_raw_gu_, L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row));
+      expert_at(slab[size_t(l)] + uint64_t(rank) * expert_bytes_, L.exp_gate_up[size_t(e)], L.exp_down[size_t(e)]);
+      xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, staging, gu_row}, true, L.exp_gate_up[size_t(e)]);
+      xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, staging + expert_raw_gu_, dn_row}, false, L.exp_down[size_t(e)]);
+      q_.wait();
+      weight_bytes_ += expert_bytes_;
     }
   }
-  n_hot_ = rank;
-  if (n_hot_ < NE && c_.expert_profile.empty()) throw std::runtime_error("engine: the experts do not all fit; an expert profile is needed to place some on the CPU");
   for (Layer& L : layers_) {
-    L.n_cold = int(NE - n_hot_);
     // Device tables of the experts' pointers for the grouped decode kernels.
     {
       // The dense FFN's gate|up as three more entries (its 3 x 1,408 interleaved columns are contiguous tile ranges).
@@ -363,6 +384,40 @@ void Engine::load_experts() {
   sycl::free(staging, q_);
   if (n_hot_ == NE) return;
 
+  // Streaming slots: raw bytes as the copy engine lands them, and the repacked experts the grouped GEMMs read.
+  n_stream_ = int(std::min<int64_t>(slots_wanted, NE - n_hot_));
+  if (n_stream_ > 0) {
+    try {
+      copy_ = std::make_unique<rt::CopyEngine>(q_);
+    } catch (const std::exception& ex) {
+      std::fprintf(stderr, "engine: no streaming of cold experts (%s)\n", ex.what());
+      n_stream_ = 0;
+    }
+  }
+  if (n_stream_ > 0) {
+    const int64_t S = n_stream_, B = c_.max_batch, P = B * cfg_.n_expert_used;
+    stream_raw_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * expert_bytes_), q_);
+    stream_slab_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * expert_bytes_), q_);
+    if (!stream_raw_ || !stream_slab_) throw std::runtime_error("engine: out of device memory for the streaming slots");
+    owned_.push_back(stream_raw_);
+    owned_.push_back(stream_slab_);
+    stream_w_gu_.resize(size_t(S));
+    stream_w_dn_.resize(size_t(S));
+    for (int64_t j = 0; j < S; ++j) expert_at(stream_slab_ + uint64_t(j) * expert_bytes_, stream_w_gu_[size_t(j)], stream_w_dn_[size_t(j)]);
+    stream_gu_ = xmx::make_expert_table(q_, stream_w_gu_);
+    stream_dn_ = xmx::make_expert_table(q_, stream_w_dn_);
+    for (void* p : {static_cast<void*>(stream_gu_.tiles), static_cast<void*>(stream_gu_.scales), static_cast<void*>(stream_dn_.tiles),
+                    static_cast<void*>(stream_dn_.scales)})
+      owned_.push_back(p);
+    stream_map_ = sycl::malloc_device<int32_t>(size_t(NE), q_);
+    stream_tiles_ = sycl::malloc_device<int32_t>(size_t(4 + 4 * ((P + moe_tile_ - 1) / moe_tile_ + S)), q_);
+    stream_scratch_ = sycl::malloc_device<int32_t>(size_t((P / 256 + 2) * S), q_);
+    if (!stream_map_ || !stream_tiles_ || !stream_scratch_) throw std::runtime_error("engine: out of device memory for the streaming slots");
+    for (void* p : {static_cast<void*>(stream_map_), static_cast<void*>(stream_tiles_), static_cast<void*>(stream_scratch_)}) owned_.push_back(p);
+    // The streamed pairs' inputs (fp16, B x H x Dg fp32's worth) go in att_, which holds nothing during the MoE.
+    stream_rows_cap_ = std::min<int64_t>(B * cfg_.n_head * cfg_.head_dim_global * 4 / (E * 2), (P / moe_tile_ + S) * moe_tile_) / moe_tile_ * moe_tile_;
+  }
+
   // The host side: a pool, buffers the card and the host share, and the cold experts' pages
   // touched now (they come out of the page cache the first time, which a request should not wait for).
   const int threads = c_.cpu_threads > 0 ? c_.cpu_threads : 16;
@@ -382,6 +437,7 @@ void Engine::load_experts() {
   host(hp_sum_, B * E);  // as many rows as tokens in the worst case
   host(hp_aq_, E / 32 * 256);
   host(hp_as_, E / 32 * 8);
+  if (n_stream_ > 0) host(hp_smap_, NE);
   cold_map_ = reinterpret_cast<int32_t*>(dev(B));
   // cold_sum_, the quantized inputs and their scales live in workspace that is dead during the MoE
   // (qkv_, qb_, kb_: B x 2,816 fp32, B x 2,816 fp32 and B x 88 fp32 fit them), see step().
@@ -508,15 +564,105 @@ void Engine::cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event route
   if (hot_done.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete) ++cold_.late_layers;
 }
 
-void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event routed, sycl::event hot_done) {
+std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int32_t>& cnt) const {
+  const int64_t NE = cfg_.n_expert;
+  std::vector<int32_t> cand;
+  double rest = 0;
+  for (int e = 0; e < NE; ++e)
+    if (L.cold[size_t(e)] && cnt[size_t(e)] > 0) {
+      rest += cnt[size_t(e)];
+      if (cnt[size_t(e)] >= c_.stream_min_rows) cand.push_back(e);
+    }
+  std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return cnt[size_t(a)] != cnt[size_t(b)] ? cnt[size_t(a)] > cnt[size_t(b)] : a < b; });
+  // The copies and the CPU work run side by side: stream the busiest candidates until the copies would take
+  // longer than the CPU does on what is left, within the slots and the rows the gathered inputs can hold.
+  size_t best_k = 0;
+  double best = rest * c_.stream_cpu_us;
+  int64_t rows = 0;
+  for (size_t k = 1; k <= cand.size() && k <= size_t(n_stream_); ++k) {
+    const int32_t n = cnt[size_t(cand[k - 1])];
+    rest -= n;
+    rows += (n + moe_tile_ - 1) / moe_tile_ * moe_tile_;
+    if (rows > stream_rows_cap_) break;
+    const double cost = std::max(double(k) * c_.stream_copy_us, rest * c_.stream_cpu_us);
+    if (cost < best) {
+      best = cost;
+      best_k = k;
+    }
+  }
+  cand.resize(best_k);
+  return cand;
+}
+
+void Engine::stream_experts(const Layer& L, const std::vector<int32_t>& list, int64_t P, int32_t hot_rows, int64_t s_tiles,
+                            const std::function<void(const char*)>& mark) {
   using Clock = std::chrono::steady_clock;
-  const int64_t E = cfg_.n_embd, NU = cfg_.n_expert_used;
+  const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NU = cfg_.n_expert_used, NE = cfg_.n_expert;
+  const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18, dn_bytes = uint64_t(E) * dn_row;
   const auto t0 = Clock::now();
+  // The copy engine pulls each expert's two matrices out of the GGUF's mapping into its raw slot...
+  for (size_t j = 0; j < list.size(); ++j) {
+    uint8_t* raw = stream_raw_ + uint64_t(j) * expert_bytes_;
+    copy_->copy(raw, L.gu_host + uint64_t(list[j]) * expert_raw_gu_, expert_raw_gu_);
+    copy_->copy(raw + expert_raw_gu_, L.dn_host + uint64_t(list[j]) * dn_bytes, dn_bytes);
+  }
+  copy_->wait(copy_->fence());
+  stream_.copy_s += std::chrono::duration<double>(Clock::now() - t0).count();
+  // ...and the card repacks them into the slots the grouped GEMMs read, groups the pairs that chose them (rows
+  // after the hot experts', so that moe_combine takes both from one row table) and runs their GEMMs.
+  for (size_t j = 0; j < list.size(); ++j) {
+    const uint8_t* raw = stream_raw_ + uint64_t(j) * expert_bytes_;
+    xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, raw, gu_row}, true, stream_w_gu_[j]);
+    xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, raw + expert_raw_gu_, dn_row}, false, stream_w_dn_[j]);
+  }
+  q_.memcpy(stream_map_, hp_smap_, size_t(NE) * 4);
+  mark("stream_copy_repack");
+  fast::moe_group(q_, moe_ids_, P, n_stream_, moe_tile_, stream_scratch_, stream_tiles_, moe_row_, nullptr, stream_map_, hot_rows);
+  sycl::half* a = reinterpret_cast<sycl::half*>(att_);
+  fast::moe_gather(q_, h_, moe_row_, P, NU, E, a, hot_rows);
+  xmx::matmul_geglu_grouped16(q_, a, stream_gu_, stream_tiles_, s_tiles, moe_tile_, moe_h_ + int64_t(hot_rows) * Fe);
+  xmx::matmul_grouped16(q_, moe_h_ + int64_t(hot_rows) * Fe, stream_dn_, stream_tiles_, s_tiles, moe_tile_, moe_y_ + int64_t(hot_rows) * E);
+  mark("stream_gemm");
+}
+
+void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event ids_ready, sycl::event routed, sycl::event hot_done,
+                          const std::function<void(const char*)>& mark) {
+  using Clock = std::chrono::steady_clock;
+  const int64_t E = cfg_.n_embd, NU = cfg_.n_expert_used, NE = cfg_.n_expert;
+  const auto t0 = Clock::now();
+  // The routing comes first: it says which cold experts are worth copying, and the copies should start while the
+  // hot experts' GEMMs (already enqueued) run.
+  ids_ready.wait();
+  std::vector<uint8_t> streamed(size_t(NE), 0);
+  std::future<void> stream_done;
+  uint64_t n_streamed_pairs = 0;
+  std::vector<int32_t> list;
+  if (n_stream_ > 0) {
+    std::vector<int32_t> cnt(size_t(NE), 0);
+    for (int64_t p = 0; p < P; ++p) ++cnt[size_t(hp_ids_[p])];
+    list = choose_stream(L, cnt);
+    if (!list.empty()) {
+      for (int e = 0; e < NE; ++e) hp_smap_[e] = -1;
+      int64_t hot_rows = 0, s_tiles = 0;
+      for (int e = 0; e < NE; ++e)
+        if (!L.cold[size_t(e)]) hot_rows += (cnt[size_t(e)] + moe_tile_ - 1) / moe_tile_ * moe_tile_;
+      for (size_t j = 0; j < list.size(); ++j) {
+        hp_smap_[list[j]] = int32_t(j);
+        streamed[size_t(list[j])] = 1;
+        s_tiles += (cnt[size_t(list[j])] + moe_tile_ - 1) / moe_tile_;
+        n_streamed_pairs += uint64_t(cnt[size_t(list[j])]);
+      }
+      stream_done = std::async(std::launch::async,
+                               [this, &L, &list, P, hot_rows, s_tiles, &mark] { stream_experts(L, list, P, int32_t(hot_rows), s_tiles, mark); });
+    }
+  }
   routed.wait();
   const auto t1 = Clock::now();
-  const std::vector<int32_t> cp = cold_list(L, hp_ids_, P);
+  std::vector<int32_t> cp;
+  for (int64_t p = 0; p < P; ++p)
+    if (L.cold[size_t(hp_ids_[p])] && !streamed[size_t(hp_ids_[p])]) cp.push_back(int32_t(p));
   pairs_ += uint64_t(P);
-  cold_pairs_ += cp.size();
+  cold_pairs_ += cp.size() + n_streamed_pairs;
   std::vector<int32_t> k_of(size_t(P), -1);
   std::vector<char> need(size_t(T), 0);
   for (size_t k = 0; k < cp.size(); ++k) {
@@ -562,9 +708,18 @@ void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event rout
       }
     }
   });
+  const auto t2 = Clock::now();
+  // The streamed experts' kernels were enqueued by the helper; they must be in the queue before the sums that
+  // moe_combine reads alongside them.
+  if (stream_done.valid()) {
+    stream_done.get();
+    ++stream_.layers;
+    stream_.experts += list.size();
+    stream_.pairs += n_streamed_pairs;
+    stream_.wait_s += std::chrono::duration<double>(Clock::now() - t2).count();
+  }
   q_.memcpy(cold_sum_, hp_sum_, size_t(n_need) * size_t(E) * sizeof(float));
   q_.memcpy(cold_map_, hp_map_, size_t(T) * 4);
-  const auto t2 = Clock::now();
   cold_.wait_s += std::chrono::duration<double>(t1 - t0).count();
   cold_.cpu_s += std::chrono::duration<double>(t2 - t1).count();
   ++cold_.layers;
@@ -794,10 +949,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         mark("moe_route");
         // Expert input rmsnorm(x2_) * pre_ffw_norm_2 (h_ is scratch).
         fast::rmsnorm(q_, x2_, L.pre_ffw_norm_2, T, E, cfg_.eps, h_);
-        sycl::event routed;
+        sycl::event routed, ids_ready;
         if (L.n_cold) {
-          // As at decode, the host waits for the routing and the input rows after the hot work is enqueued.
-          q_.memcpy(hp_ids_, moe_ids_, size_t(P) * 4);
+          // As at decode, the host waits for the routing and the input rows after the hot work is enqueued (the ids
+          // first: they say which cold experts to stream).
+          ids_ready = q_.memcpy(hp_ids_, moe_ids_, size_t(P) * 4);
           q_.memcpy(hp_w_, moe_w_, size_t(P) * 4);
           // The expert inputs go as int8 (the form the CPU computes with), a quarter of the bytes.
           fast::quantize_rows(q_, h_, T, E, reinterpret_cast<int8_t*>(qb_), kb_);
@@ -814,7 +970,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         mark("moe_gate_up");
         xmx::matmul_grouped16(q_, moe_h_, L.tab_down, moe_tiles_, max_tiles, moe_tile_, moe_y_);
         mark("moe_down");
-        if (L.n_cold) cold_prefill(L, T, P, routed, q_.single_task([] {}));
+        if (L.n_cold) cold_prefill(L, T, P, ids_ready, routed, q_.single_task([] {}), mark);
         fast::moe_combine(q_, moe_y_, moe_w_, T, n_used, E, moe_, moe_row_, L.n_cold ? cold_sum_ : nullptr, L.n_cold ? cold_map_ : nullptr);
         mark("moe_sum");
       }
