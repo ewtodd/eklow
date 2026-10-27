@@ -49,11 +49,17 @@ struct Cache {
   bool int8() const { return ks != nullptr; }
 };
 
-// Per token of the step: its slot and position.
+// Per token of the step: its slot and position, and optionally the first and last keys (positions) it attends to.
+// Without them a token is causal: back as far as the layer's window (pos - window + 1, or 0) and up to its own
+// position. With them it may see later keys of its own chunk (an image's tokens on the sliding layers, an embedding
+// input in both directions) or fewer earlier ones (another input's); within a chunk neither may decrease from one
+// token to the next.
 struct Tokens {
   const int32_t* slot;
   const int32_t* pos;
   int64_t n;
+  const int32_t* lo = nullptr;
+  const int32_t* hi = nullptr;
 };
 
 // The step's query tiles for one kind of layer, built on the host: per tile the batch index of its
@@ -67,9 +73,13 @@ struct TileList {
   std::vector<int32_t> groups;  // 2 per group
   int64_t per_group;            // tiles per group
   int64_t max_keys = 0;         // bound on any tile's key range
-  // Per chunk: its first token in the batch, tokens, rows per K/V head, first tile, last position.
-  std::vector<int64_t> chunks;  // 5 per chunk
-  void add_chunk(int32_t base, int64_t n_tok, int64_t last_pos, int64_t group, int64_t n_head_kv, int64_t window);
+  // Per chunk: its first token in the batch, tokens, rows per K/V head, first tile, last key and first key any of
+  // its tokens attends to.
+  std::vector<int64_t> chunks;  // 6 per chunk
+  // first_key and last_key: the chunk's key range when its tokens carry their own (Tokens::lo, hi); by default 0
+  // and last_pos.
+  void add_chunk(int32_t base, int64_t n_tok, int64_t last_pos, int64_t group, int64_t n_head_kv, int64_t window, int64_t first_key = 0,
+                 int64_t last_key = -1);
   void clear() { desc.clear(), groups.clear(), chunks.clear(), max_keys = 0; }
   int64_t size() const { return int64_t(desc.size() / 4); }
   int64_t n_groups() const { return int64_t(groups.size() / 2); }

@@ -1044,3 +1044,37 @@ The vectors are the old ones to six places (cosine 1.000000, the least over 98 i
 places N = 50 experts a layer again (46). What holds it now is attention on the reference kernel, a work-group
 reduction per key (long inputs barely moved); the engine's attention kernels with a key range per token, which image
 input needs too, are next.
+
+## 2026-10-27 — a key range per token
+
+Attention's tokens were causal: each saw the keys from its window's start (or 0) to its own position. Two things need
+other ranges. An image's tokens on the 26B's sliding layers see the whole image (llama.cpp runs Gemma 4's vision
+tokens bidirectionally on the sliding layers only), and EmbeddingGemma 2's inputs see themselves both ways (within
+window/2 on its sliding layers), which still ran on `ref::attention_bidir`, a work-group reduction per key, after the
+GEMMs had made the rest of the model fast. `attn::Tokens` now optionally carries each token's first and last key
+(`lo`, `hi`; neither may decrease within a chunk), and `TileList::add_chunk` the chunk's key range. The kernels read
+the last key where they read the position (the host passes `hi` or `pos`), the segment kernel masks keys before `lo`
+as it masks those past `hi`, and a chunk's segments start at its first key. The split kernel (decode) takes the
+ranges as a template parameter: reading `lo` there cost the int8 kernel registers (spill 768 -> 928 bytes) and
+global8 decode 6%; without them it is the old kernel. `eklow-attn-test` runs each kind again (`+img`) with every token
+carrying its range and a quarter of each slot's second chunk an image seeing to its end, those rows against a host
+reference in double: within the kinds' bands (rel L2 1.0e-4 and 3.6e-4 fp16, 8.9e-3 and 9.0e-3 int8, as without).
+
+EmbeddingGemma 2 now runs on these kernels: a pass's inputs back to back in one slot of an fp16 cache (identity page
+table), each input in chunks of up to 2,048 tokens that see their own input, at most 256 inputs a pass (the bounds
+keep the segment buffers and query tiles to ~120 MB with the cache at 8,192 tokens). Its global layers, one K/V head
+of 4 query heads at head 512, get their own instantiation. Through the server with production flags (as in "in
+GEMMs"):
+
+| | before | now |
+|---|---|---|
+| 16 inputs a request (~470 tokens each) | 3,717 tok/s | 23,201 |
+| 1 input a request | 2,335 | 4,374 |
+| ~5,900-token inputs, 4 a request | 610 | 18,416 |
+
+The vectors are main's to six places (cosine 1.000000, the least over 98 inputs). One input a request is now the
+request's own overhead (497 tokens in 0.106 s). The cache and scratch cost the 26B one expert at 2 x 262k: N = 49
+(50). check26 is unchanged (245/256, 2.377e-2; chat 23/25, 6.872e-2), check too (31/32, 1.93e-2; chat 24/25,
+5.24e-3). Alternating `eklow-attn-test` runs against main: decode the same (global8 at 16k 302-306 us against
+305-308), prefill the same but the int8 sliding layers' 1024-token chunk at 16k, 1.71 ms against 1.67-1.68 (the group
+kernel reads `lo` at run time; ~0.15% of a prefill chunk).
