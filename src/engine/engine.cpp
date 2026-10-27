@@ -20,7 +20,6 @@ float* Engine::dev(int64_t n) {
 }
 
 Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), c_(cfg), cfg_(model::Gemma4Config::from_gguf(f)) {
-  if (cfg_.n_expert > 0) throw std::runtime_error("the engine has no MoE kernels yet");
   if (c_.max_ctx % attn::kPage) throw std::runtime_error("engine: max_ctx must be a multiple of the page size");
   const int64_t E = cfg_.n_embd, F = cfg_.n_ff, H = cfg_.n_head;
   auto need = [&](const std::string& name) -> const gguf::Tensor& {
@@ -37,6 +36,13 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     return d;
   };
   auto vec = [&](const std::string& name) { return reinterpret_cast<const float*>(upload(need(name))); };
+  auto vec_host = [&](const std::vector<float>& v) {
+    auto* d = sycl::malloc_device<float>(v.size(), q_);
+    if (!d) throw std::runtime_error("engine: out of device memory");
+    owned_.push_back(d);
+    q_.memcpy(d, v.data(), v.size() * sizeof(float)).wait();
+    return d;
+  };
 
   // Q4_0 matrices go through one staging buffer and are repacked for the matrix units. Matrices
   // that read the same input are stacked into one (their outputs side by side in each row), so a
@@ -119,6 +125,44 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     L.ffn_post_norm = vec(b + "post_ffw_norm.weight");
     const gguf::Tensor* os = f.tensor(b + "layer_output_scale.weight");
     L.out_scale = os ? *reinterpret_cast<const float*>(os->data) : 1.0f;
+    if (cfg_.n_expert > 0) {
+      const int64_t Fe = cfg_.n_ff_exp, n_expert = cfg_.n_expert;
+      const gguf::Tensor& gu_t = need(b + "ffn_gate_up_exps.weight");
+      const gguf::Tensor& dn_t = need(b + "ffn_down_exps.weight");
+      const gguf::Tensor& dn_s = need(b + "ffn_down_exps.scale");
+      L.w_router = ref::Weight{gguf::Type::F32, E, n_expert, upload(need(b + "ffn_gate_inp.weight")), uint64_t(E) * 4};
+      {
+        // The router input is rmsnorm(x) * ffn_gate_inp.scale / sqrt(E); fold the scalar in.
+        const gguf::Tensor& rs = need(b + "ffn_gate_inp.scale");
+        std::vector<float> host;
+        host.resize(size_t(E));
+        const float* src = reinterpret_cast<const float*>(rs.data);
+        const float inv_se = 1.0f / std::sqrt(float(E));
+        for (int64_t i = 0; i < E; ++i) host[size_t(i)] = src[i] * inv_se;
+        L.router_in_scale = vec_host(host);
+      }
+      L.post_ffw_norm_1 = vec(b + "post_ffw_norm_1.weight");
+      L.pre_ffw_norm_2 = vec(b + "pre_ffw_norm_2.weight");
+      L.post_ffw_norm_2 = vec(b + "post_ffw_norm_2.weight");
+      L.exp_down_scale.assign(reinterpret_cast<const float*>(dn_s.data),
+                              reinterpret_cast<const float*>(dn_s.data) + n_expert);
+      // Repack each expert's gate_up (interleaved) and down, staging each into the shared buffer
+      // so the originals are not kept on the card.
+      const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
+      L.exp_gate_up.resize(n_expert);
+      L.exp_down.resize(n_expert);
+      for (int e = 0; e < n_expert; ++e) {
+        q_.memcpy(staging, gu_t.data + size_t(e) * 2 * Fe * gu_row, size_t(2 * Fe * gu_row)).wait();
+        L.exp_gate_up[size_t(e)] = xmx::repack_q4_0(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, staging, gu_row}, true);
+        q_.memcpy(staging, dn_t.data + size_t(e) * E * dn_row, size_t(E * dn_row)).wait();
+        L.exp_down[size_t(e)] = xmx::repack_q4_0(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, staging, dn_row}, false);
+        for (xmx::Weight* w : {&L.exp_gate_up[size_t(e)], &L.exp_down[size_t(e)]}) {
+          owned_.push_back(w->tiles);
+          owned_.push_back(w->scales);
+        }
+        weight_bytes_ += size_t(2 * Fe * gu_row + E * dn_row);
+      }
+    }
     if (cfg_.sliding[size_t(l)]) L.ring_index = n_ring++;
     else L.page_index = n_page++;
     layers_.push_back(L);
@@ -196,12 +240,26 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   }
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * Dg));
   act_ffn_ = xmx::alloc_activations(q_, B, F);
+  if (cfg_.n_expert > 0) {
+    moe_ = dev(B * E);
+    rlog_ = dev(B * cfg_.n_expert);
+    gx_ = dev(B * E);
+    dids_ = sycl::malloc_device<int32_t>(size_t(B), q_);
+    dws_ = sycl::malloc_device<float>(size_t(B), q_);
+    if (!dids_ || !dws_) throw std::runtime_error("engine: out of device memory");
+    owned_.push_back(dids_);
+    owned_.push_back(dws_);
+    act_exp_ = xmx::alloc_activations(q_, B, E);
+    act_exp_ffn_ = xmx::alloc_activations(q_, B, cfg_.n_ff_exp);
+  }
 }
 
 Engine::~Engine() {
   q_.wait();
   xmx::free_activations(q_, act_);
   xmx::free_activations(q_, act_ffn_);
+  if (act_exp_.q) xmx::free_activations(q_, act_exp_);
+  if (act_exp_ffn_.q) xmx::free_activations(q_, act_exp_ffn_);
   if (attn_scratch_.q) sycl::free(attn_scratch_.q, q_);
   if (attn_scratch_.part) sycl::free(attn_scratch_.part, q_);
   if (attn_scratch_.part2) sycl::free(attn_scratch_.part2, q_);
@@ -356,6 +414,92 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     mark("gate_up");
     xmx::matmul(q_, act_ffn_, L.down, o_);
     mark("down");
+    if (cfg_.n_expert > 0) {
+      // The 26B's MoE: the dense part is normed on its own (post_ffw_norm_1), then added to the
+      // routed experts' sum (normed with post_ffw_norm_2).
+      const int64_t Fe = cfg_.n_ff_exp, n_expert = cfg_.n_expert, n_used = cfg_.n_expert_used;
+      fast::rmsnorm(q_, o_, L.post_ffw_norm_1, T, E, cfg_.eps, o_);
+      emit("ffn_mlp" + s, o_, {E, T});
+      // Router: r = rmsnorm(x2_) * (ffn_gate_inp.scale / sqrt(E)), then r @ W_router^T.
+      fast::rmsnorm(q_, x2_, L.router_in_scale, T, E, cfg_.eps, h_);
+      ref::matmul(q_, L.w_router, h_, T, rlog_);
+      emit("ffn_moe_logits" + s, rlog_, {n_expert, T});
+      // Host routing: softmax over the 128 experts, the top n_used, renormalized (floored at 2^-14,
+      // llama.cpp's epsilon), each weight times its expert's down scale. Same as reference_forward.
+      std::vector<std::vector<int32_t>> tok(n_expert);
+      std::vector<std::vector<float>> wt(n_expert);
+      {
+        std::vector<float> host(size_t(T) * n_expert);
+        q_.memcpy(host.data(), rlog_, host.size() * sizeof(float)).wait();
+        for (int64_t t = 0; t < T; ++t) {
+          const float* lg = host.data() + size_t(t) * n_expert;
+          const float mx = *std::max_element(lg, lg + n_expert);
+          std::vector<float> p(n_expert);
+          float sum = 0.0f;
+          for (int e = 0; e < n_expert; ++e) {
+            p[size_t(e)] = std::exp(lg[e] - mx);
+            sum += p[size_t(e)];
+          }
+          for (int e = 0; e < n_expert; ++e) p[size_t(e)] /= sum;
+          std::vector<int> idx(n_expert);
+          std::iota(idx.begin(), idx.end(), 0);
+          std::partial_sort(idx.begin(), idx.begin() + n_used, idx.end(),
+                            [&](int a, int b) { return p[size_t(a)] > p[size_t(b)]; });
+          float wsum = 0.0f;
+          for (int i = 0; i < n_used; ++i) wsum += p[size_t(idx[size_t(i)])];
+          const float denom = std::max(wsum, 6.103515625e-5f);
+          for (int i = 0; i < n_used; ++i) {
+            const int e = idx[size_t(i)];
+            tok[size_t(e)].push_back(int(t));
+            wt[size_t(e)].push_back(p[size_t(e)] / denom * L.exp_down_scale[size_t(e)]);
+          }
+        }
+      }
+      // Expert input: moe_x = rmsnorm(x2_) * pre_ffw_norm_2 (reuses h_).
+      fast::rmsnorm(q_, x2_, L.pre_ffw_norm_2, T, E, cfg_.eps, h_);
+      q_.fill(moe_, 0.0f, size_t(T * E));
+      for (int e = 0; e < n_expert; ++e) {
+        const int64_t n_e = tok[size_t(e)].size();
+        if (!n_e) continue;
+        q_.memcpy(dids_, tok[size_t(e)].data(), size_t(n_e) * 4);
+        q_.memcpy(dws_, wt[size_t(e)].data(), size_t(n_e) * 4).wait();
+        // Gather this expert's tokens' moe_x rows, then its gate_up (704 wide) and down.
+        {
+          float* gx = gx_;
+          const float* h = h_;
+          const int32_t* dids = dids_;
+          q_.parallel_for(sycl::range<1>(size_t(n_e * E)), [=](sycl::id<1> id) {
+            const int i = int(id[0]) / int(E), j = int(id[0]) % int(E);
+            gx[size_t(id[0])] = h[size_t(dids[i]) * E + j];
+          });
+        }
+        // Rows past n_e are stale but finite and their outputs are never read; padding to more than 32
+        // rows keeps the expert matmuls on the fp16 path (int8 activations flip routing downstream).
+        xmx::quantize(q_, gx_, std::max<int64_t>(n_e, xmx::kFp16Rows + 1), act_exp_);
+        xmx::matmul_geglu(q_, act_exp_, L.exp_gate_up[size_t(e)], act_exp_ffn_, gu_);
+        xmx::matmul(q_, act_exp_ffn_, L.exp_down[size_t(e)], gx_);
+        // moe[token] += w * y for this expert's tokens.
+        {
+          float* moe = moe_;
+          const float* gx = gx_;
+          const int32_t* dids = dids_;
+          const float* dws = dws_;
+          q_.parallel_for(sycl::range<1>(size_t(n_e * E)), [=](sycl::id<1> id) {
+            const int i = int(id[0]) / int(E), j = int(id[0]) % int(E);
+            moe[size_t(dids[i]) * E + j] += dws[i] * gx[size_t(id[0])];
+          });
+        }
+      }
+      fast::rmsnorm(q_, moe_, L.post_ffw_norm_2, T, E, cfg_.eps, moe_);
+      emit("ffn_moe" + s, moe_, {E, T});
+      // Combine: o_ = ffn_mlp + moe.
+      {
+        float* o = o_;
+        const float* moe = moe_;
+        q_.parallel_for(sycl::range<1>(size_t(T * E)), [=](sycl::id<1> id) { o[id[0]] += moe[id[0]]; });
+      }
+      emit("ffn_moe_combined" + s, o_, {E, T});
+    }
     const float* next_norm = l + 1 < cfg_.n_layer ? layers_[size_t(l) + 1].attn_norm : nullptr;
     fast::residual_norm_quant(q_, o_, L.ffn_post_norm, x2_, L.out_scale, x_, next_norm, cfg_.eps, T, E, &act_, h_);
     emit("l_out" + s, x_, {E, T});

@@ -19,6 +19,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <set>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -62,11 +63,15 @@ double kl(const float* p, const float* q, int64_t n) {
   return d;
 }
 
+// The 26B's MoE tensor names (each ends in the layer number).
+const std::vector<std::string> moe_prefixes = {"ffn_mlp-", "ffn_moe-", "ffn_moe_combined-", "ffn_moe_logits-"};
+
 }  // namespace
 
 int main(int argc, char** argv) {
   std::string model, out, tokens_json, tokens_arg;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
+  std::set<int64_t> moe_layers;
   int64_t logits_last = 1, chunk = 0, decode_last = 0, max_ctx = 0;
   bool twin = false, kv_int8 = false;
   double twin_tol = 0.05;
@@ -85,13 +90,17 @@ int main(int argc, char** argv) {
     else if (a == "--kv-int8") kv_int8 = true;
     else if (a == "--twin") twin = true;
     else if (a == "--twin-tol") twin_tol = std::atof(next().c_str());
+    else if (a == "--moe-layers")
+      for (auto s : split(next(), ',')) moe_layers.insert(std::atoll(s.c_str()));
     else {
       std::fprintf(stderr, "usage: eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens IDS) "
                            "[--tensors PREFIX,...] [--logits-last N] [--chunk N] [--decode-last N] [--twin] "
-                           "[--twin-tol KL] [--max-ctx N] [--kv-int8]\n");
+                           "[--twin-tol KL] [--max-ctx N] [--kv-int8] [--moe-layers N,...]\n");
       return 2;
     }
   }
+  if (!moe_layers.empty())
+    for (const auto& mp : moe_prefixes) prefixes.push_back(mp);
   try {
     std::vector<int32_t> tokens;
     if (!tokens_json.empty()) {
@@ -139,8 +148,17 @@ int main(int argc, char** argv) {
     std::vector<std::string> order;
     model::DumpSink sink;
     sink.wants = [&](const std::string& name) {
-      for (const auto& p : prefixes)
-        if (name.compare(0, p.size(), p) == 0) return true;
+      for (const auto& p : prefixes) {
+        if (name.compare(0, p.size(), p) != 0) continue;
+        if (moe_layers.empty()) return true;
+        // MoE tensors are only dumped for the requested layers (the long prompt's would be huge);
+        // the layer is the number after the last '-'.
+        bool is_moe = false;
+        for (const auto& mp : moe_prefixes)
+          if (name.compare(0, mp.size(), mp) == 0) is_moe = true;
+        if (!is_moe) return true;
+        return moe_layers.count(std::atoll(name.substr(name.rfind('-') + 1).c_str())) > 0;
+      }
       return false;
     };
     sink.put = [&](const std::string& name, const std::vector<float>& data, const std::vector<int64_t>& ne) {

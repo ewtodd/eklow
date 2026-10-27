@@ -81,6 +81,13 @@ class Engine {
     const float *attn_norm, *q_norm, *k_norm, *attn_post_norm, *ffn_norm, *ffn_post_norm;
     float out_scale;
     int ring_index, page_index;  // index among the sliding / global layers
+    // The 26B's routed experts: per-expert gate_up (interleaved) and down, the F32 router, its
+    // input scale (ffn_gate_inp.scale / sqrt(E)), the expert-path norms, and each expert's down scale.
+    std::vector<xmx::Weight> exp_gate_up, exp_down;
+    ref::Weight w_router;
+    const float *router_in_scale = nullptr, *post_ffw_norm_1 = nullptr, *pre_ffw_norm_2 = nullptr,
+        *post_ffw_norm_2 = nullptr;
+    std::vector<float> exp_down_scale;
   };
   struct Slot {
     int64_t length = 0;
@@ -116,6 +123,12 @@ class Engine {
 
   // workspace, sized for max_batch tokens
   float *x_, *x2_, *h_, *qkv_, *qb_, *kb_, *vb_, *att_, *o_, *gu_, *rows_, *logits_;
+  // MoE (26B) workspace: the expert sum, the router logits, and a buffer that holds one expert's
+  // gathered input rows and, after its down matmul, its output rows; plus the per-expert token
+  // indices and weights and the expert activation buffers.
+  float *moe_ = nullptr, *rlog_ = nullptr, *gx_ = nullptr, *dws_ = nullptr;
+  int32_t* dids_ = nullptr;
+  xmx::Activations act_exp_, act_exp_ffn_;
   int32_t *tok_, *slot_, *pos_, *tiles_sliding_, *tiles_global_;
   int64_t max_tiles_sliding_ = 0, max_tiles_global_ = 0;
   xmx::Activations act_, act_ffn_;  // matmul inputs: of width E or H x D, and of the FFN's width
