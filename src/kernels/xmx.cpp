@@ -443,7 +443,7 @@ void gemv_d(int T, sycl::queue& q, const Activations& a, const Weight& w, float*
   }
 }
 
-constexpr int64_t kThreadsGrouped = 8192;  // work-items of a grouped GEMV; 2048-32768 measured within 10% (cold, 8 pairs)
+constexpr int64_t kThreadsGrouped = 8192;  // work-items of a grouped GEMV; 4096-8192 measured best in the engine (2048-32768 tried)
 
 void geglu_quant(sycl::queue& q, const float* scratch, int64_t m, int64_t n, Activations& out);
 
