@@ -301,4 +301,118 @@ void matmul_f32_small(sycl::queue& q, const float* w, int64_t n, int64_t k, cons
   });
 }
 
+namespace {
+
+// Eight values per work-item to the int8 activations of `rows` rows (the four work-items of a
+// 32-block share its max through sub-group shuffles).
+inline void quant8(sycl::sub_group sg, float (&v)[8], int8_t* aq, float* as, int32_t r, int32_t c0, int32_t kb) {
+  float amax = 0;
+  for (int i = 0; i < 8; ++i) amax = sycl::fmax(amax, sycl::fabs(v[i]));
+  amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 1));
+  amax = sycl::fmax(amax, sycl::permute_group_by_xor(sg, amax, 2));
+  const float d = xmx::quantize_run(v, amax, aq + xmx::act_index(r, c0, kb));
+  if (c0 % 32 == 0) as[xmx::act_scale_index(r, c0, kb)] = d;
+}
+
+}  // namespace
+
+void residual_norm_quant3(sycl::queue& q, const float* o, const float* w_o, const float* x, float* x_out, float eps, int64_t rows,
+                          int64_t cols, xmx::Activations& a1, const float* w1, xmx::Activations& a2, const float* w2,
+                          float* r_out, const float* w3) {
+  if (cols % 128 || cols > 8192) throw std::runtime_error("fast::residual_norm_quant3: unsupported width");
+  const int32_t C = int32_t(cols), kb = C / 32;
+  xmx::set_rows(a1, rows, cols);
+  xmx::set_rows(a2, rows, cols);
+  if (a1.fp16 || a2.fp16) throw std::runtime_error("fast::residual_norm_quant3: int8 rows only");
+  int8_t *q1 = a1.q, *q2 = a2.q;
+  float *s1 = a1.s, *s2 = a2.s;
+  q.parallel_for(sycl::nd_range<1>(size_t(rows * cols / 8), size_t(cols / 8)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+    const int32_t r = int32_t(it.get_group(0)), c0 = int32_t(it.get_local_id(0)) * 8;
+    float v[8], ov[8], ss = 0;
+    for (int i = 0; i < 8; ++i) {
+      v[i] = x[r * C + c0 + i];
+      ov[i] = o[r * C + c0 + i];
+      ss += ov[i] * ov[i];
+    }
+    ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+    float inv = 1.0f / sycl::sqrt(ss / float(C) + eps);
+    ss = 0;
+    for (int i = 0; i < 8; ++i) {
+      v[i] += ov[i] * inv * w_o[c0 + i];
+      x_out[r * C + c0 + i] = v[i];
+      ss += v[i] * v[i];
+    }
+    ss = sycl::reduce_over_group(it.get_group(), ss, sycl::plus<float>());
+    inv = 1.0f / sycl::sqrt(ss / float(C) + eps);
+    float n[8];
+    for (int i = 0; i < 8; ++i) {
+      n[i] = v[i] * inv;
+      r_out[r * C + c0 + i] = n[i] * w3[c0 + i];
+    }
+    auto sg = it.get_sub_group();
+    float t[8];
+    for (int i = 0; i < 8; ++i) t[i] = n[i] * w1[c0 + i];
+    quant8(sg, t, q1, s1, r, c0, kb);
+    for (int i = 0; i < 8; ++i) t[i] = n[i] * w2[c0 + i];
+    quant8(sg, t, q2, s2, r, c0, kb);
+  });
+}
+
+void moe_tail(sycl::queue& q, const float* dense, const float* w_d, const float* y, const float* weights, int64_t n_used,
+              const float* w_m, const float* w_post, const float* x2, float scale, float* x_out, const float* w_next, float eps,
+              int64_t rows, int64_t cols, xmx::Activations* act, float* d_dump, float* m_dump, float* c_dump) {
+  if (cols % 128 || cols > 8192) throw std::runtime_error("fast::moe_tail: unsupported width");
+  const int32_t C = int32_t(cols), kb = C / 32, NU = int32_t(n_used);
+  int8_t* aq = nullptr;
+  float* as = nullptr;
+  if (act && w_next) {
+    xmx::set_rows(*act, rows, cols);
+    if (act->fp16) throw std::runtime_error("fast::moe_tail: int8 rows only");
+    aq = act->q, as = act->s;
+  }
+  q.parallel_for(sycl::nd_range<1>(size_t(rows * cols / 8), size_t(cols / 8)), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(16)]] {
+    const int32_t r = int32_t(it.get_group(0)), c0 = int32_t(it.get_local_id(0)) * 8;
+    auto grp = it.get_group();
+    float d[8], m[8], ssd = 0, ssm = 0;
+    for (int i = 0; i < 8; ++i) {
+      d[i] = dense[r * C + c0 + i];
+      ssd += d[i] * d[i];
+      m[i] = 0;
+    }
+    // The experts' weighted sum, in the order j = 0 .. n_used - 1.
+    for (int j = 0; j < NU; ++j) {
+      const float wj = weights[r * NU + j];
+      const float* yj = y + size_t(r * NU + j) * C + c0;
+      for (int i = 0; i < 8; ++i) m[i] += wj * yj[i];
+    }
+    for (int i = 0; i < 8; ++i) ssm += m[i] * m[i];
+    ssd = sycl::reduce_over_group(grp, ssd, sycl::plus<float>());
+    ssm = sycl::reduce_over_group(grp, ssm, sycl::plus<float>());
+    const float invd = 1.0f / sycl::sqrt(ssd / float(C) + eps), invm = 1.0f / sycl::sqrt(ssm / float(C) + eps);
+    float c[8], ssc = 0;
+    for (int i = 0; i < 8; ++i) {
+      d[i] = d[i] * invd * w_d[c0 + i];
+      m[i] = m[i] * invm * w_m[c0 + i];
+      if (d_dump) d_dump[r * C + c0 + i] = d[i];
+      if (m_dump) m_dump[r * C + c0 + i] = m[i];
+      c[i] = d[i] + m[i];
+      if (c_dump) c_dump[r * C + c0 + i] = c[i];
+      ssc += c[i] * c[i];
+    }
+    ssc = sycl::reduce_over_group(grp, ssc, sycl::plus<float>());
+    const float invc = 1.0f / sycl::sqrt(ssc / float(C) + eps);
+    float v[8], ss = 0;
+    for (int i = 0; i < 8; ++i) {
+      v[i] = (x2[r * C + c0 + i] + c[i] * invc * w_post[c0 + i]) * scale;
+      x_out[r * C + c0 + i] = v[i];
+      ss += v[i] * v[i];
+    }
+    if (!w_next) return;
+    ss = sycl::reduce_over_group(grp, ss, sycl::plus<float>());
+    const float inv = 1.0f / sycl::sqrt(ss / float(C) + eps);
+    for (int i = 0; i < 8; ++i) v[i] *= inv * w_next[c0 + i];
+    quant8(it.get_sub_group(), v, aq, as, r, c0, kb);
+  });
+}
+
 }  // namespace eklow::fast
