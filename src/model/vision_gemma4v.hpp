@@ -1,6 +1,7 @@
 // Gemma 4's vision encoder (llama.cpp's projector "gemma4v": the 26B A4B's mmproj and EmbeddingGemma 2's),
 // following tools/mtmd/models/gemma4v.cpp and clip_graph::build_vit at the oracle's revision on the
-// reference kernels, or (the default) on the matrix units. For an image prepared by image/gemma4_image.hpp (16-pixel patches):
+// reference kernels, or (the default) on the matrix units. For an image prepared by image/gemma4_image.hpp
+// (16-pixel patches):
 //   x = patch_embd . (2 * pixels - 1) + pos_x[column] + pos_y[row]       (no patch bias)
 //   27 (26B) or 16 (EmbeddingGemma 2) layers, each
 //     x += post_norm(attn(rms(x))), x += post_norm(ffn(rms(x)))
@@ -33,7 +34,7 @@ struct DeviceRows {
   int64_t n = 0, dim = 0;
 };
 
-// The fast path (DECISIONS 2026-10-28 "the vision encoder on the matrix units"): every matrix on xmx's fp16 GEMM
+// The fast path (DECISIONS 2026-10-27, "the vision encoder on the matrix units"): every matrix on xmx's fp16 GEMM
 // (BF16/F32 weights as fp16, Q8_0 as Q8_0), attention as two GEMM-shaped kernels per segment of keys
 // (kernels/vision_attn.hpp), the elementwise work in a few fused kernels, and the weights streamed one layer at a
 // time from pinned host memory into two device staging buffers (copy of layer i + 1 beside layer i's compute), so

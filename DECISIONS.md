@@ -1106,3 +1106,32 @@ Layer by layer (26B, tall) the difference grows smoothly from 1e-4 to 1.4e-2, no
 the F32-weight oracle; the 26B's one row at 0.997 is left to the end-to-end check (the model's answers about images).
 The reference kernels are correctness only: 7.5 s for 72 tokens of the 26B, 41 s for 270, EmbeddingGemma 2 148 s for
 1,080 (llama.cpp's CPU: 4-19 s); one work-item per output and a serial attention.
+
+## 2026-10-27 — the vision encoder on the matrix units
+
+The reference encoder took 41 s for a 270-token image of the 26B. Now (`src/model/vision_gemma4v_fast.cpp`, the
+default; `--ref` and the constructor flag keep the reference path) every matrix runs on xmx's fp16 GEMM (BF16 as F16,
+Q8_0 as Q8_0; Q, K, V as one weight, gate and up as one, the FFN padded 4,304 -> 4,352), attention on a new dense
+kernel (`src/kernels/vision_attn.*`: the long-prefill path's two GEMMs per segment of keys, cut for heads of 64 and
+72, the latter padded to 96, several heads a launch, the segment length chosen so a launch has ~128 work-groups), and
+the elementwise work in a few fused kernels (a prep kernel for the per-head norms and 2D RoPE writing the attention's
+tiles; post-norm, residual and the next norm after each GEMM; pooling, std scale and norm together). The weights stay
+in pinned host memory (1.1 GB for the 26B), converted once at load, and each layer is copied into one of two staging
+buffers on the card while the layer before computes; the card holds the encoder only while it encodes (`release()`
+frees it), and `reserve()` / `card_bytes()` let a server count it.
+
+| | tokens | now | reference |
+|---|---|---|---|
+| 26B | 72 / 130 / 253 / 270 | 0.136 / 0.171 / 0.271 / 0.28 s | 7.5 / 13.2 / 34.7 / 41 s |
+| 26B | 1,080 (budget 1,120) | 1.40-1.47 s | > 900 s |
+| EmbeddingGemma 2 | 130 / 270 / 1,080 | 0.047 / 0.082 / 0.51 s | - / 6.8 / 148 s |
+
+Against the F32-weight oracle the rows are closer than the reference path's (26B worst rows 1.4-2.4e-2 rel L2 from
+1.7-7.6e-2, totals 3.3-5.3e-3; EmbeddingGemma 2 totals 1.4-1.9e-3): every mean cosine and total passes the gate.
+Card memory while encoding: the 26B 282 MiB at the 280-token budget, 432 at 1,120 (staging 2 x 40.6, attention operands
+94 and scratch ~82, residual 47, GEMM scratch 80); EmbeddingGemma 2 183 and 264; at rest 8.4 and 1.7 MiB. Where a
+253-token 26B image's 270 ms go: attention 62-73 ms, GEMMs 76 (28-41 TFLOPS), elementwise ~55, and ~70 that is the
+streaming: the copies (1.1 GB at ~12 GB/s) overlap compute in time, but DMA slows the kernels beside it (without the
+copies, as a diagnostic, 195-210 ms; the same with the copies issued up front, 2 or 3 buffers ahead, on the copy engine
+or a second queue). At 1,080 tokens attention is 61% (~14 TFLOPS counting the real 72 dims): its K blocks are 3 dpas
+deep against 16 at head 512, so the epilogue weighs more; that and a resident-weights option are what is left.

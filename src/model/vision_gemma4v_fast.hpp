@@ -1,4 +1,4 @@
-// The fast path's state (vision_gemma4v_fast.cpp); included by vision_gemma4v.cpp only so that its constructor can
+// The fast path's state (vision_gemma4v_fast.cpp); included by vision_gemma4v.cpp only so that its destructor can
 // destroy it.
 #pragma once
 
@@ -22,8 +22,7 @@ struct VisionGemma4V::Fast {
   std::vector<Layer> layers;
   xmx::Weight patch_w, proj_w;
   const float* pos = nullptr;  // host: the position tables in the mapped file
-  static constexpr int kStages = 2;
-  static constexpr int n_stage = kStages;  // staging buffers: layer l goes to l % 2; a third bought nothing
+  static constexpr int kStages = 2;  // staging buffers: layer l goes to l % 2; a third bought nothing
   uint8_t* stage[kStages] = {};
   std::unique_ptr<rt::CopyEngine> copy;
   std::unique_ptr<sycl::queue> copy_q;  // when the card has no copy-only engine
@@ -33,7 +32,7 @@ struct VisionGemma4V::Fast {
   sycl::half *act_main = nullptr, *act_ffn = nullptr, *qt = nullptr, *kt = nullptr, *vt = nullptr;
   vattn::Scratch att;
   int64_t wide_floats = 0;
-  uint64_t held() const { return stage[0] ? uint64_t(n_stage) * blob_bytes : 0; }
+  uint64_t held() const { return stage[0] ? uint64_t(kStages) * blob_bytes : 0; }
 };
 
 }  // namespace eklow::model

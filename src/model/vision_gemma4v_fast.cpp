@@ -205,7 +205,7 @@ uint64_t VisionGemma4V::activation_bytes(int64_t n) const {
 
 uint64_t VisionGemma4V::card_bytes(int tokens) const {
   if (!fast_) return bytes_;
-  return bytes_ + uint64_t(fast_->n_stage) * fast_->blob_bytes + activation_bytes(int64_t(tokens) * merge_ * merge_);
+  return bytes_ + uint64_t(fast_->kStages) * fast_->blob_bytes + activation_bytes(int64_t(tokens) * merge_ * merge_);
 }
 
 void VisionGemma4V::free_activations() {
@@ -233,7 +233,7 @@ void VisionGemma4V::ensure(int64_t n) {
   Fast& F = *fast_;
   if (n <= F.n_cap && F.stage[0]) return;
   free_activations();
-  for (int i = 0; i < F.n_stage; ++i) {
+  for (int i = 0; i < F.kStages; ++i) {
     auto*& s = F.stage[i];
     if (s) continue;
     s = sycl::malloc_device<uint8_t>(F.blob_bytes, q_);
@@ -263,7 +263,7 @@ void VisionGemma4V::ensure(int64_t n) {
   vattn::reserve(q_, F.att, n, F.Dp, H);
   q_.wait();
   F.n_cap = n;
-  held_ = activation_bytes(n) + uint64_t(F.n_stage) * F.blob_bytes;
+  held_ = activation_bytes(n) + uint64_t(F.kStages) * F.blob_bytes;
 }
 
 void VisionGemma4V::reserve(int tokens) {
@@ -304,7 +304,7 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
   // Streaming: layer l's blob goes to staging l % 2; the copy for l + 2 starts once layer l's kernels are done with it.
   std::vector<sycl::event> copied(static_cast<size_t>(n_layer)), done(static_cast<size_t>(n_layer));
   auto start_copy = [&](int64_t l) {
-    uint8_t* dst = F.stage[l % F.n_stage];
+    uint8_t* dst = F.stage[l % F.kStages];
     if (F.copy) {
       F.copy->copy(dst, F.layers[size_t(l)].blob, F.blob_bytes);
       copied[size_t(l)] = F.copy->event(F.copy->fence());
@@ -312,7 +312,7 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
       copied[size_t(l)] = F.copy_q->memcpy(dst, F.layers[size_t(l)].blob, F.blob_bytes);
     }
   };
-  for (int64_t l = 0; l < std::min<int64_t>(F.n_stage, n_layer); ++l) start_copy(l);
+  for (int64_t l = 0; l < std::min<int64_t>(F.kStages, n_layer); ++l) start_copy(l);
 
   // Small per-image device data: the position rows (columns' table rows, then rows'), the RoPE angles.
   const int64_t rot = D / 2, half = rot / 2, maxpos = std::max(cols, rows);
@@ -378,7 +378,7 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
       h.depends_on(copied[size_t(l)]);
       h.single_task([] {});
     });
-    const uint8_t* st = F.stage[l % F.n_stage];
+    const uint8_t* st = F.stage[l % F.kStages];
     auto W = [&](int i, int64_t k, int64_t nn) {
       xmx::Weight w;
       w.k = k, w.n = nn, w.format = F.fmt;
@@ -524,9 +524,9 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
     // Stream: layer l + 1 goes into the staging layer l - 1 used, once the card is done with that layer; layer l is queued,
     // so the card does not idle while the host waits.
     done[size_t(l)] = q_.submit([&](sycl::handler& h) { h.single_task([] {}); });
-    if (l >= 1 && l + F.n_stage - 1 < n_layer) {
+    if (l >= 1 && l + F.kStages - 1 < n_layer) {
       done[size_t(l) - 1].wait();
-      start_copy(l + F.n_stage - 1);
+      start_copy(l + F.kStages - 1);
     }
   }
 
