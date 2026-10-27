@@ -37,6 +37,12 @@ struct Weight {
 // output columns 16i..16i+7 are rows 8i..8i+7 of the first half and 16i+8..16i+15 the same rows of
 // the second, so that one thread of a matmul holds a gate tile and its up tile.
 Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave = false);
+// The bytes of a repacked matrix: the tiles and the fp16 scales (each a multiple of 128).
+uint64_t weight_tile_bytes(int64_t k, int64_t n);
+uint64_t weight_scale_bytes(int64_t k, int64_t n);
+// The same into tiles and scales the caller owns (w.k, w.n set; sizes as above); only enqueues, so `raw` must
+// stay put until the queue has run it. Streamed experts are repacked this way, from a raw staging buffer.
+void repack_q4_0_into(sycl::queue& q, const ref::Weight& raw, bool interleave, const Weight& w);
 void free_weight(sycl::queue& q, Weight& w);
 
 // Rows above which matmul takes fp16 activations.

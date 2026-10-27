@@ -322,7 +322,7 @@ void quantize_rows(sycl::queue& q, const float* x, int64_t rows, int64_t cols, i
 }
 
 void moe_group(sycl::queue& q, const int32_t* ids, int64_t n_pairs, int64_t n_expert, int64_t tile, int32_t* scratch, int32_t* tiles,
-               int32_t* row_of_pair, const uint8_t* cold) {
+               int32_t* row_of_pair, const uint8_t* cold, const int32_t* group_of, int32_t row_base) {
   constexpr int kWg = 256;
   if (n_expert > kWg) throw std::runtime_error("fast::moe_group: too many experts");
   const int32_t P = int32_t(n_pairs), NE = int32_t(n_expert), TM = int32_t(tile);
@@ -337,9 +337,9 @@ void moe_group(sycl::queue& q, const int32_t* ids, int64_t n_pairs, int64_t n_ex
       cnt[lid] = 0;
       sycl::group_barrier(it.get_group());
       const int32_t p = c * kWg + lid;
-      if (p < P && !(cold && cold[ids[p]]))
-        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space>(
-            cnt[ids[p]])
+      const int32_t g = p < P && !(cold && cold[ids[p]]) ? (group_of ? group_of[ids[p]] : ids[p]) : -1;
+      if (g >= 0)
+        sycl::atomic_ref<int32_t, sycl::memory_order::relaxed, sycl::memory_scope::work_group, sycl::access::address_space::local_space>(cnt[g])
             .fetch_add(1);
       sycl::group_barrier(it.get_group());
       if (lid < NE) counts[c * NE + lid] = cnt[lid];
@@ -386,30 +386,31 @@ void moe_group(sycl::queue& q, const int32_t* ids, int64_t n_pairs, int64_t n_ex
     h.parallel_for(sycl::nd_range<1>(size_t(nch) * kWg, kWg), [=](sycl::nd_item<1> it) {
       const int32_t c = int32_t(it.get_group(0)), lid = int32_t(it.get_local_id(0));
       const int32_t p = c * kWg + lid;
-      sid[lid] = p < P && !(cold && cold[ids[p]]) ? ids[p] : -1;
+      sid[lid] = p < P && !(cold && cold[ids[p]]) ? (group_of ? group_of[ids[p]] : ids[p]) : -1;
       sycl::group_barrier(it.get_group());
       if (p >= P) return;
       const int32_t e = sid[lid];
       if (e < 0) {
-        row_of_pair[p] = -1;  // cold: no row
+        if (!group_of) row_of_pair[p] = -1;  // cold: no row
         return;
       }
       int32_t rank = 0;
       for (int32_t k = 0; k < lid; ++k) rank += sid[k] == e;
-      row_of_pair[p] = segs[e] + counts[c * NE + e] + rank;
+      row_of_pair[p] = row_base + segs[e] + counts[c * NE + e] + rank;
     });
   });
 }
 
 void moe_gather(sycl::queue& q, const float* x, const int32_t* row_of_pair, int64_t n_pairs, int64_t n_used, int64_t cols,
-                sycl::half* out) {
+                sycl::half* out, int32_t row_base) {
   if (cols % 16) throw std::runtime_error("fast::moe_gather: width not a multiple of 16");
   const int32_t NU = int32_t(n_used), C = int32_t(cols), kh = C / 16;
   q.parallel_for(sycl::range<2>(size_t(n_pairs), size_t(kh)), [=](sycl::id<2> id) {
     const int32_t p = int32_t(id[0]), j = int32_t(id[1]);
-    if (row_of_pair[p] < 0) return;
+    const int32_t row = row_of_pair[p];
+    if (row < row_base || row < 0) return;
     const sycl::float4* src = reinterpret_cast<const sycl::float4*>(x + int64_t(p / NU) * C + j * 16);
-    sycl::vec<sycl::half, 4>* dst = reinterpret_cast<sycl::vec<sycl::half, 4>*>(out + xmx::act16_index(row_of_pair[p], int64_t(j) * 16, kh));
+    sycl::vec<sycl::half, 4>* dst = reinterpret_cast<sycl::vec<sycl::half, 4>*>(out + xmx::act16_index(row - row_base, int64_t(j) * 16, kh));
     sycl::float4 v[4];
     for (int c = 0; c < 4; ++c) v[c] = src[c];
     for (int c = 0; c < 4; ++c) dst[c] = v[c].convert<sycl::half, sycl::rounding_mode::automatic>();

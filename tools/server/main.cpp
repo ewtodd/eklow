@@ -1,7 +1,7 @@
 // eklow-server: Gemma 4 on the A770M behind an OpenAI-compatible HTTP API.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
-//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N]]
+//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [[--stream-min-rows N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME]]
 //
 // --ctx is the context of each slot (positions), Gemma's full 262,144 by default; --batch the
@@ -149,6 +149,7 @@ int main(int argc, char** argv) {
   std::string expert_profile;
   int64_t experts_on_card = -2;  // as many as fit, once there is a profile
   int64_t card_margin_mib = 1024;
+  int stream_slots = 40, stream_min_rows = 16;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -163,6 +164,8 @@ int main(int argc, char** argv) {
     else if (a == "--expert-profile") expert_profile = next();
     else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
     else if (a == "--card-margin-mib") card_margin_mib = std::atoll(next().c_str());
+    else if (a == "--stream-slots") stream_slots = std::atoi(next().c_str());
+    else if (a == "--stream-min-rows") stream_min_rows = std::atoi(next().c_str());
     else if (a == "--embed-model") embed_path = next();
     else if (a == "--embed-port") embed_port = std::atoi(next().c_str());
     else if (a == "--embed-alias") embed_alias = next();
@@ -195,6 +198,8 @@ int main(int argc, char** argv) {
     ec.expert_profile = expert_profile;
     ec.experts_on_card = expert_profile.empty() ? -1 : experts_on_card;
     ec.card_margin_bytes = uint64_t(card_margin_mib) << 20;
+    ec.stream_slots = stream_slots;
+    ec.stream_min_rows = stream_min_rows;
     // The embedding model: its own queue on the card, so its work does not wait behind steps. It goes on
     // first, with room for its longest input, so that the experts' placement sees what it leaves.
     std::unique_ptr<gguf::File> embed_file;
@@ -222,6 +227,9 @@ int main(int argc, char** argv) {
                    (long long)eng.experts_on_card(), (long long)eng.model().n_expert, eng.experts_on_card() < eng.model().n_expert ? ", the rest on the CPU" : "",
                    eng.expert_set_bytes() / 1048576.0, eng.free_at_placement() / GiB, double(ec.card_margin_bytes) / GiB,
                    rt::free_memory(q.get_device()).value_or(0) / GiB);
+    if (eng.model().n_expert > 0 && eng.stream_slots() > 0)
+      std::fprintf(stderr, "eklow-server: prefill streams busy cold experts to the card: %d slots (%.0f MiB on the card), %.2f GiB of cold experts pinned in host memory\n",
+                   eng.stream_slots(), eng.stream_slot_bytes() / 1048576.0, eng.pinned_bytes() / GiB);
 
     serve::Scheduler sched(eng, tok, {batch, chunk, ec.max_ctx});
     std::thread engine_thread([&] { sched.run(g_stop); });
