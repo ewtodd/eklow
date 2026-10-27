@@ -443,6 +443,85 @@ void gemv_d(int T, sycl::queue& q, const Activations& a, const Weight& w, float*
   }
 }
 
+constexpr int64_t kThreadsGrouped = 8192;  // work-items of a grouped GEMV; 2048-32768 measured within 10% (cold, 8 pairs)
+
+void geglu_quant(sycl::queue& q, const float* scratch, int64_t m, int64_t n, Activations& out);
+
+// The grouped one-row GEMV (decode MoE): gemv1 with the weight picked per pair from the expert
+// tables and the activation row per pair from p / row_div. One work-group of T threads per
+// (8-column group, pair), K split over the threads and merged in shared local memory.
+template <int T>
+void gemv1_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, const int32_t* ids, int64_t P, int row_div,
+                   float* out) {
+  const int64_t kb = a.k / 32, ng = w.n / 8, n = w.n;
+  const int64_t per = (kb + T - 1) / T;
+  const int8_t* aq = a.q;
+  const float* as = a.s;
+  const uint8_t* const* tt = w.tiles;
+  const sycl::half* const* ts = w.scales;
+  q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(ng), size_t(P), size_t(T)), sycl::range<3>(1, 1, size_t(T))),
+                 [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
+                   if constexpr (T > 1) esimd::slm_init<T * 32>();
+                   const int64_t g = int64_t(it.get_global_id(0)), p = int64_t(it.get_global_id(1));
+                   const int t = int(it.get_local_id(2));
+                   const int e = ids[p];
+                   const uint8_t* bt = tt[e];
+                   const sycl::half* bs = ts[e];
+                   const int64_t row = p / row_div;
+                   // Row `row`'s tile b starts at ((row / 8) * kb + b) * 256 + (row % 8) * 32.
+                   const uint8_t* ab = reinterpret_cast<const uint8_t*>(aq) + (row / 8) * kb * kATileBytes + (row % 8) * 32;
+                   const float* sb_ = as + (row / 8) * kb * 8 + row % 8;
+                   esimd::simd<float, 8> acc = 0;
+                   const int64_t b0 = int64_t(t) * per, b1 = std::min(kb, b0 + per);
+                   int64_t b = b0;
+                   for (; b + 4 <= b1; b += 4) {
+                     esimd::simd<uint8_t, 4 * kTileBytes> B4 =
+                         esimd::block_load<uint8_t, 4 * kTileBytes>(bt + tile_at(b, g, kb) * kTileBytes);
+                     esimd::simd<sycl::half, 32> h4 = esimd::block_load<sycl::half, 32>(bs + tile_at(b, g, kb) * 8);
+                     esimd::simd<uint8_t, 32> A[4];
+                     float sa[4];
+#pragma unroll
+                     for (int u = 0; u < 4; ++u) {
+                       A[u] = esimd::block_load<uint8_t, 32>(ab + (b + u) * kATileBytes);
+                       sa[u] = sb_[(b + u) * 8];
+                     }
+#pragma unroll
+                     for (int u = 0; u < 4; ++u) {
+                       const esimd::simd<uint8_t, kTileBytes> B = B4.template select<kTileBytes, 1>(u * kTileBytes);
+                       const esimd::simd<float, 8> sb = h4.template select<8, 1>(u * 8);
+                       esimd::simd<int, 8> ci =
+                           xmxd::dpas<8, 1, int, uint8_t, uint8_t, dpas_argument_type::s4, dpas_argument_type::s8>(B, A[u]);
+                       esimd::simd<float, 8> cf = ci;
+                       acc += cf * (sb * sa[u]);
+                     }
+                   }
+                   // K = 704 is 22 blocks: the tail takes what the four-block steps leave.
+                   for (; b < b1; ++b) {
+                     const int64_t wt = tile_at(b, g, kb);
+                     esimd::simd<uint8_t, kTileBytes> B = esimd::block_load<uint8_t, kTileBytes>(bt + wt * kTileBytes);
+                     esimd::simd<sycl::half, 8> h = esimd::block_load<sycl::half, 8>(bs + wt * 8);
+                     esimd::simd<float, 8> sb = h;
+                     esimd::simd<uint8_t, 32> A = esimd::block_load<uint8_t, 32>(ab + b * kATileBytes);
+                     const float sa = sb_[b * 8];
+                     esimd::simd<int, 8> ci =
+                         xmxd::dpas<8, 1, int, uint8_t, uint8_t, dpas_argument_type::s4, dpas_argument_type::s8>(B, A);
+                     esimd::simd<float, 8> cf = ci;
+                     acc += cf * (sb * sa);
+                   }
+                   if constexpr (T > 1) {
+                     esimd::slm_block_store<float, 8>(t * 32, acc);
+                     esimd::barrier();
+                     if (t == 0) {
+                       esimd::simd<float, 8> sum = 0;
+                       for (int i = 0; i < T; ++i) sum += esimd::slm_block_load<float, 8>(i * 32);
+                       esimd::block_store<float, 8>(out + p * n + g * 8, sum);
+                     }
+                   } else {
+                     esimd::block_store<float, 8>(out + p * n + g * 8, acc);
+                   }
+                 });
+}
+
 }  // namespace
 
 void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
@@ -476,6 +555,13 @@ void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activat
     return gemm16(q, a, w, nullptr, out.h);
   }
   matmul(q, a, w, scratch);
+  geglu_quant(q, scratch, m, n, out);
+}
+
+namespace {
+
+// GeGLU over m rows of interleaved gate|up (fp32, [m][2n]) into int8 `out` (n wide).
+void geglu_quant(sycl::queue& q, const float* scratch, int64_t m, int64_t n, Activations& out) {
   // Eight columns per work-item, gate and up from the interleaved tiles; the four work-items of a
   // 32-block share its max through sub-group shuffles.
   int8_t* aq = out.q;
@@ -498,6 +584,64 @@ void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activat
                    const float d = quantize_run(v, amax, aq + act_index(r, c0, kb));
                    if (c0 % 32 == 0) as[act_scale_index(r, c0, kb)] = d;
                  });
+}
+
+}  // namespace
+
+ExpertTable make_expert_table(sycl::queue& q, const std::vector<Weight>& experts) {
+  if (experts.empty()) throw std::runtime_error("xmx: empty expert table");
+  ExpertTable t;
+  t.k = experts[0].k;
+  t.n = experts[0].n;
+  t.count = int64_t(experts.size());
+  std::vector<const uint8_t*> tiles;
+  std::vector<const sycl::half*> scales;
+  for (const Weight& w : experts) {
+    if (w.k != t.k || w.n != t.n) throw std::runtime_error("xmx: experts of one table differ in shape");
+    tiles.push_back(w.tiles);
+    scales.push_back(w.scales);
+  }
+  t.tiles = sycl::malloc_device<const uint8_t*>(experts.size(), q);
+  t.scales = sycl::malloc_device<const sycl::half*>(experts.size(), q);
+  if (!t.tiles || !t.scales) throw std::runtime_error("xmx: out of device memory for the expert table");
+  q.memcpy(t.tiles, tiles.data(), tiles.size() * sizeof(void*));
+  q.memcpy(t.scales, scales.data(), scales.size() * sizeof(void*)).wait();
+  return t;
+}
+
+void free_expert_table(sycl::queue& q, ExpertTable& t) {
+  if (t.tiles) sycl::free(t.tiles, q);
+  if (t.scales) sycl::free(t.scales, q);
+  t = ExpertTable{};
+}
+
+void matmul_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, const int32_t* ids, int64_t P,
+                    int64_t row_div, float* out) {
+  if (a.k != w.k) throw std::runtime_error("xmx: activation and weight widths differ");
+  if (a.fp16) throw std::runtime_error("xmx: grouped GEMV needs int8 activations");
+  if (w.n % 32) throw std::runtime_error("xmx: output width not a multiple of 32");
+  // Same rule as matmul's one-row case, with the group count including the pairs.
+  const int64_t groups = w.n / 8 * P;
+  int T = 1;
+  while (T < 32 && 2 * T <= kThreadsGrouped / groups) T *= 2;
+  switch (T) {
+    case 1: gemv1_grouped<1>(q, a, w, ids, P, int(row_div), out); break;
+    case 2: gemv1_grouped<2>(q, a, w, ids, P, int(row_div), out); break;
+    case 4: gemv1_grouped<4>(q, a, w, ids, P, int(row_div), out); break;
+    case 8: gemv1_grouped<8>(q, a, w, ids, P, int(row_div), out); break;
+    case 16: gemv1_grouped<16>(q, a, w, ids, P, int(row_div), out); break;
+    default: gemv1_grouped<32>(q, a, w, ids, P, int(row_div), out); break;
+  }
+}
+
+void matmul_geglu_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, const int32_t* ids, int64_t P,
+                          int64_t row_div, Activations& out, float* scratch) {
+  const int64_t n = w.n / 2;
+  if (n % 64) throw std::runtime_error("xmx: GeGLU width not a multiple of 64");
+  if (P > kFp16Rows) throw std::runtime_error("xmx: grouped GeGLU of more than 32 pairs");
+  set_rows(out, P, n);
+  matmul_grouped(q, a, w, ids, P, row_div, scratch);
+  geglu_quant(q, scratch, P, n, out);
 }
 
 }  // namespace eklow::xmx

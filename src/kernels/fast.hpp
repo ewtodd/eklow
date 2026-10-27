@@ -54,4 +54,17 @@ void softcap(sycl::queue& q, float* x, float cap, int64_t n);
 // out[r][v] = x[r] . W[v], r < rows.
 void matmul_q6(sycl::queue& q, const Q6& w, const float* x, int64_t rows, float* out);
 
+// The 26B's router, per token: softmax of logits[t][n_expert], the top n_used, their weights
+// renormalized by the sum (floored at 2^-14) and multiplied by each expert's down scale (on the
+// device). ids[t][n_used] int32 and weights[t][n_used] fp32, by descending probability. n_expert a
+// multiple of 32, at most 256; n_used at most 16.
+void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_expert, int64_t n_used, const float* down_scale,
+               int32_t* ids, float* weights);
+// out[t][:] = sum_i weights[t][i] * y[t * n_used + i][:], summed in the order i = 0..n_used-1.
+void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out);
+
+// out[t][c] = w[c] . x[t] for fp32 w [n][k] (k a multiple of 4) and up to 4 tokens: the 26B's router
+// at decode (ref::matmul's generic path ran one work-item per output).
+void matmul_f32_small(sycl::queue& q, const float* w, int64_t n, int64_t k, const float* x, int64_t n_tok, float* out);
+
 }  // namespace eklow::fast

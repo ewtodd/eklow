@@ -220,4 +220,85 @@ void matmul_q6(sycl::queue& q, const Q6& w, const float* x, int64_t rows, float*
   }
 }
 
+void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_expert, int64_t n_used, const float* down_scale,
+               int32_t* ids, float* weights) {
+  constexpr int kLanes = 32;
+  if (n_expert % kLanes || n_expert / kLanes > 8) throw std::runtime_error("fast::moe_route: unsupported expert count");
+  const int32_t NE = int32_t(n_expert), NU = int32_t(n_used);
+  // One sub-group per token; lane l holds experts l, l + 32, ... so every reduction is a shuffle.
+  // Ties go to the lowest expert id (the host code's partial_sort left them unspecified).
+  q.parallel_for(sycl::nd_range<1>(size_t(n_tok * kLanes), kLanes), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kLanes)]] {
+    const int32_t t = int32_t(it.get_group(0)), l = int32_t(it.get_local_id(0));
+    auto sg = it.get_sub_group();
+    const float* lg = logits + t * NE;
+    float p[8];
+    float mx = -1e30f;
+    for (int i = 0; i < 8; ++i) {
+      p[i] = i * kLanes < NE ? lg[i * kLanes + l] : -1e30f;
+      mx = sycl::fmax(mx, p[i]);
+    }
+    mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
+    float sum = 0;
+    for (int i = 0; i < 8; ++i) {
+      p[i] = i * kLanes < NE ? sycl::exp(p[i] - mx) : 0.0f;
+      sum += p[i];
+    }
+    sum = sycl::reduce_over_group(sg, sum, sycl::plus<float>());
+    for (int i = 0; i < 8; ++i) p[i] /= sum;
+    float wsum = 0, wsel[16];
+    int32_t sel[16];
+    uint32_t taken = 0;  // bit i: this lane's expert i * 32 + l is chosen
+    for (int j = 0; j < NU; ++j) {
+      float best = -1.0f;
+      int32_t bi = 0;
+      for (int i = 0; i < 8; ++i)
+        if (i * kLanes < NE && !(taken >> i & 1) && p[i] > best) best = p[i], bi = i * kLanes + l;
+      const float gbest = sycl::reduce_over_group(sg, best, sycl::maximum<float>());
+      const int32_t gi = sycl::reduce_over_group(sg, best == gbest ? bi : 0x7fffffff, sycl::minimum<int32_t>());
+      if (gi % kLanes == l) taken |= 1u << (gi / kLanes);
+      sel[j] = gi;
+      wsel[j] = gbest;
+      wsum += gbest;
+    }
+    const float denom = sycl::fmax(wsum, 6.103515625e-5f);
+    if (l < NU) {
+      ids[t * NU + l] = sel[l];
+      weights[t * NU + l] = wsel[l] / denom * down_scale[sel[l]];
+    }
+  });
+}
+
+void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out) {
+  const int32_t NU = int32_t(n_used), C = int32_t(cols);
+  q.parallel_for(sycl::range<1>(size_t(n_tok * cols)), [=](sycl::id<1> id) {
+    const int32_t t = int32_t(id[0]) / C, j = int32_t(id[0]) % C;
+    float s = 0;
+    for (int i = 0; i < NU; ++i) s += weights[t * NU + i] * y[size_t(t * NU + i) * C + j];
+    out[id[0]] = s;
+  });
+}
+
+void matmul_f32_small(sycl::queue& q, const float* w, int64_t n, int64_t k, const float* x, int64_t n_tok, float* out) {
+  constexpr int kWg = 64;
+  if (k % 4 || n_tok > 4) throw std::runtime_error("fast::matmul_f32_small: unsupported shape");
+  const int32_t K4 = int32_t(k / 4), M = int32_t(n_tok), N = int32_t(n);
+  // One work-group per output column, its items striding over K in float4s; the row is read once for all tokens.
+  q.parallel_for(sycl::nd_range<1>(size_t(n * kWg), kWg), [=](sycl::nd_item<1> it) {
+    const int32_t c = int32_t(it.get_group(0)), lid = int32_t(it.get_local_id(0));
+    const sycl::float4* wr = reinterpret_cast<const sycl::float4*>(w + int64_t(c) * K4 * 4);
+    float acc[4] = {0, 0, 0, 0};
+    for (int32_t i = lid; i < K4; i += kWg) {
+      const sycl::float4 wv = wr[i];
+      for (int32_t t = 0; t < M; ++t) {
+        const sycl::float4 xv = reinterpret_cast<const sycl::float4*>(x + int64_t(t) * K4 * 4)[i];
+        acc[t] += wv.x() * xv.x() + wv.y() * xv.y() + wv.z() * xv.z() + wv.w() * xv.w();
+      }
+    }
+    for (int32_t t = 0; t < M; ++t) {
+      const float s = sycl::reduce_over_group(it.get_group(), acc[t], sycl::plus<float>());
+      if (lid == 0) out[t * N + c] = s;
+    }
+  });
+}
+
 }  // namespace eklow::fast

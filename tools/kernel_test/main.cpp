@@ -1,7 +1,7 @@
 // eklow-kernel-test: the fast kernels against the reference kernels and an exact CPU emulation,
 // on real Gemma 4 weights.
 //
-//   eklow-kernel-test --model GGUF [--json FILE]
+//   eklow-kernel-test --model GGUF [--moe-model GGUF26B] [--json FILE]
 //
 // For each weight and row count: the XMX matmul against ref::matmul (fp32; the difference is the
 // int8 activation quantization, the same trade llama.cpp makes, or above xmx::kFp16Rows rows the
@@ -11,6 +11,7 @@
 // without the emulation.
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -64,19 +65,142 @@ double emulate(const std::vector<float>& x, int64_t k, const gguf::Tensor& w, in
   return total;
 }
 
+
+// The grouped one-row GEMV against xmx::matmul per pair, on the 26B's layer 0 experts: same
+// arithmetic, so the relative L2 should be ~1e-6 (only the K split over threads differs).
+void grouped_test(sycl::queue& q, const gguf::File& f, json::Writer& w) {
+  std::mt19937 rng(5);
+  std::normal_distribution<float> nd(0, 1);
+  const gguf::Tensor* tg = f.tensor("blk.0.ffn_gate_up_exps.weight");
+  const gguf::Tensor* td = f.tensor("blk.0.ffn_down_exps.weight");
+  if (!tg || !td) throw std::runtime_error("no blk.0 expert tensors in the MoE model");
+  w.key("grouped").begin_array();
+  std::printf("%-18s %5s %9s %10s %9s %9s\n", "weights", "pairs", "distinct", "rel L2", "ms", "GB/s");
+  for (const bool gate_up : {true, false}) {
+    const gguf::Tensor* t = gate_up ? tg : td;
+    const int64_t n_exp = int64_t(t->ne[2]), n = int64_t(t->ne[1]), k = int64_t(t->ne[0]);
+    const uint64_t row_bytes = t->nbytes / uint64_t(n_exp) / uint64_t(n), exp_bytes = row_bytes * uint64_t(n);
+    auto* staging = sycl::malloc_device<uint8_t>(exp_bytes, q);
+    std::vector<xmx::Weight> experts;
+    for (int64_t e = 0; e < n_exp; ++e) {
+      q.memcpy(staging, t->data + uint64_t(e) * exp_bytes, exp_bytes).wait();
+      experts.push_back(xmx::repack_q4_0(q, ref::Weight{gguf::Type::Q4_0, k, n, staging, row_bytes}, gate_up));
+    }
+    sycl::free(staging, q);
+    xmx::ExpertTable table = xmx::make_expert_table(q, experts);
+    for (int64_t P : {8, 16}) {
+      const int64_t row_div = gate_up ? 8 : 1, rows = (P + row_div - 1) / row_div;
+      xmx::Activations act = xmx::alloc_activations(q, 32, k), one = xmx::alloc_activations(q, 32, k);
+      auto* xd = sycl::malloc_device<float>(size_t(rows * k), q);
+      auto* yg = sycl::malloc_device<float>(size_t(P * n), q);
+      auto* yr = sycl::malloc_device<float>(size_t(n), q);
+      auto* idd = sycl::malloc_device<int32_t>(size_t(P), q);
+      auto* idsets = sycl::malloc_device<int32_t>(size_t(32 * P), q);
+      std::vector<float> x(size_t(rows * k) + 0);
+      for (auto& v : x) v = nd(rng);
+      for (int64_t r = 0; r < rows; ++r)
+        for (int64_t c = 0; c < k; c += 487) x[size_t(r * k + c)] *= 30;
+      std::vector<int32_t> ids(size_t(P) + 0);
+      for (auto& id : ids) id = int32_t(rng() % uint32_t(n_exp));
+      q.memcpy(xd, x.data(), x.size() * sizeof(float));
+      q.memcpy(idd, ids.data(), ids.size() * 4).wait();
+      xmx::quantize(q, xd, rows, act);
+      xmx::matmul_grouped(q, act, table, idd, P, row_div, yg);
+      q.wait();
+      std::vector<float> hg(size_t(P * n) + 0), hr(size_t(n) + 0);
+      q.memcpy(hg.data(), yg, hg.size() * 4).wait();
+      double num = 0, den = 0;
+      for (int64_t p = 0; p < P; ++p) {
+        xmx::quantize(q, xd + (p / row_div) * k, 1, one);
+        xmx::matmul(q, one, experts[size_t(ids[size_t(p)])], yr);
+        q.memcpy(hr.data(), yr, hr.size() * 4).wait();
+        for (int64_t i = 0; i < n; ++i) {
+          const double d = double(hg[size_t(p * n + i)]) - hr[size_t(i)];
+          num += d * d;
+          den += double(hr[size_t(i)]) * hr[size_t(i)];
+        }
+      }
+      std::vector<int32_t> all_ids(size_t(32 * P) + 0);
+      int64_t distinct_sum = 0;
+      for (int s = 0; s < 32; ++s) {
+        for (int64_t p = 0; p < P; ++p) all_ids[size_t(s * P + p)] = int32_t(rng() % uint32_t(n_exp));
+        std::vector<int32_t> u(all_ids.begin() + s * P, all_ids.begin() + (s + 1) * P);
+        std::sort(u.begin(), u.end());
+        distinct_sum += std::unique(u.begin(), u.end()) - u.begin();
+      }
+      q.memcpy(idsets, all_ids.data(), all_ids.size() * 4).wait();
+      double best = 1e30;
+      for (int rep = 0; rep < 4; ++rep) {
+        auto t0 = std::chrono::steady_clock::now();
+        // 32 different draws of ids, so the experts come from VRAM and not the 16 MB L2.
+        for (int i = 0; i < 32; ++i) xmx::matmul_grouped(q, act, table, idsets + i * P, P, row_div, yg);
+        q.wait();
+        const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 20;
+        if (rep) best = std::min(best, dt);
+      }
+
+
+      const double distinct = double(distinct_sum) / 32;
+      const double gbps = distinct * double(exp_bytes) / best / 1e9;
+      std::printf("%-18s %5lld %9.1f %10.2e %9.4f %9.0f\n", gate_up ? "blk.0 gate_up exps" : "blk.0 down exps", (long long)P,
+                  distinct, std::sqrt(num / den), best * 1e3, gbps);
+      w.begin_object().kv("weight", gate_up ? "gate_up" : "down").kv("pairs", P).kv("distinct", distinct)
+          .kv("rel_vs_matmul", std::sqrt(num / den)).kv("ms", best * 1e3).kv("gbps", gbps).end_object();
+      if (gate_up) {
+        // With the GeGLU and its int8 quantization after it, as the engine runs it.
+        xmx::Activations glu = xmx::alloc_activations(q, 32, n / 2);
+        auto* scr = sycl::malloc_device<float>(size_t(P * n), q);
+        double gbest = 1e30;
+        for (int rep = 0; rep < 4; ++rep) {
+          auto t0 = std::chrono::steady_clock::now();
+          for (int i = 0; i < 32; ++i) xmx::matmul_geglu_grouped(q, act, table, idsets + i * P, P, row_div, glu, scr);
+          q.wait();
+          const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 32;
+          if (rep) gbest = std::min(gbest, dt);
+        }
+        std::printf("%-18s %5lld %9.1f %10s %9.4f %9.0f\n", "  + GeGLU", (long long)P, distinct, "", gbest * 1e3,
+                    distinct * double(exp_bytes) / gbest / 1e9);
+        sycl::free(scr, q);
+        xmx::free_activations(q, glu);
+      }
+      sycl::free(xd, q);
+      sycl::free(yg, q);
+      sycl::free(yr, q);
+      sycl::free(idd, q);
+      sycl::free(idsets, q);
+      xmx::free_activations(q, act);
+      xmx::free_activations(q, one);
+    }
+    xmx::free_expert_table(q, table);
+    for (auto& e : experts) xmx::free_weight(q, e);
+  }
+  w.end_array();
+}
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, json_path;
+  std::string model, json_path, moe_model;
   for (int i = 1; i < argc; ++i) {
     if (!std::strcmp(argv[i], "--model") && i + 1 < argc) model = argv[++i];
     else if (!std::strcmp(argv[i], "--json") && i + 1 < argc) json_path = argv[++i];
+    else if (!std::strcmp(argv[i], "--moe-model") && i + 1 < argc) moe_model = argv[++i];
     else {
-      std::fprintf(stderr, "usage: eklow-kernel-test --model GGUF [--json FILE]\n");
+      std::fprintf(stderr, "usage: eklow-kernel-test --model GGUF [--moe-model GGUF26B] [--json FILE]\n");
       return 2;
     }
   }
   try {
+    if (model.empty() && !moe_model.empty()) {
+      // Only the grouped MoE GEMV: --moe-model alone.
+      sycl::queue gq(rt::pick_device(), {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
+      auto fm = gguf::File::open(moe_model);
+      json::Writer gw;
+      gw.begin_object();
+      grouped_test(gq, fm, gw);
+      gw.end_object();
+      if (!json_path.empty()) std::ofstream(json_path) << gw.str() << "\n";
+      return 0;
+    }
     auto f = gguf::File::open(model);
     sycl::queue q(rt::pick_device(), {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
     std::mt19937 rng(3);
