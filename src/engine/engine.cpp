@@ -241,16 +241,18 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * Dg));
   act_ffn_ = xmx::alloc_activations(q_, B, F);
   if (cfg_.n_expert > 0) {
+    // An expert's rows are padded to kFp16Rows + 1 (see step()), so its buffers hold at least that.
+    const int64_t Bx = std::max<int64_t>(B, xmx::kFp16Rows + 1);
     moe_ = dev(B * E);
     rlog_ = dev(B * cfg_.n_expert);
-    gx_ = dev(B * E);
+    gx_ = dev(Bx * E);
     dids_ = sycl::malloc_device<int32_t>(size_t(B), q_);
     dws_ = sycl::malloc_device<float>(size_t(B), q_);
     if (!dids_ || !dws_) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(dids_);
     owned_.push_back(dws_);
-    act_exp_ = xmx::alloc_activations(q_, B, E);
-    act_exp_ffn_ = xmx::alloc_activations(q_, B, cfg_.n_ff_exp);
+    act_exp_ = xmx::alloc_activations(q_, Bx, E);
+    act_exp_ffn_ = xmx::alloc_activations(q_, Bx, cfg_.n_ff_exp);
   }
 }
 
