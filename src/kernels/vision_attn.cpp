@@ -3,6 +3,9 @@
 #include <sycl/ext/intel/esimd.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -56,7 +59,7 @@ struct QK {
   sycl::half* p;
   float *mt, *lt;
   const float* mrun;
-  int32_t R, seg0, kend, first;
+  int32_t R, seg0, kend, first, seg;
   int64_t op_stride, p_stride, stat_stride;  // per head of the launch: the Q, K, V tiles, P, the statistics
 
   void operator()(sycl::nd_item<3> it) const SYCL_ESIMD_KERNEL {
@@ -162,7 +165,7 @@ struct QK {
           pt.select<8, 1>(i * 16) = esimd::simd<sycl::half, 8>(acc[r][2 * q2].template select<8, 1>(i * 8));
           pt.select<8, 1>(i * 16 + 8) = esimd::simd<sycl::half, 8>(acc[r][2 * q2 + 1].template select<8, 1>(i * 8));
         }
-        esimd::block_store<sycl::half, 128>(p + ((tm * 32 + wi * 2 + r) * (kSeg / 16) + tn * 8 + wj * 2 + q2) * 128, pt);
+        esimd::block_store<sycl::half, 128>(p + ((tm * 32 + wi * 2 + r) * (seg / 16) + tn * 8 + wj * 2 + q2) * 128, pt);
       }
     }
     esimd::barrier();
@@ -190,7 +193,7 @@ struct PV {
   const sycl::half *p, *vt;
   const float *beta, *alpha;
   float* orun;
-  int32_t R, seg0, kend, nb, first, rows;
+  int32_t R, seg0, kend, nb, first, rows, seg;
   int64_t op_stride, p_stride, stat_stride;  // per head of the launch
 
   void operator()(sycl::nd_item<3> it) const SYCL_ESIMD_KERNEL {
@@ -206,7 +209,7 @@ struct PV {
     // Every thread stages one A piece (row tile tid / 2, keys 16 * (tid % 2) of the block) and threads below 2 * DT
     // one B piece (dimension tile tid / 2, keys 16 * (tid % 2) of the block).
     const int32_t a_tile = tm * 32 + tid / 2;
-    const sycl::half* a_src = p + (a_tile * (kSeg / 16) + tid % 2) * 128;
+    const sycl::half* a_src = p + (a_tile * (seg / 16) + tid % 2) * 128;
     const float* a_beta = beta + a_tile * 8;
     esimd::simd<sycl::half, 128> Araw, Braw;
     esimd::simd<float, 8> Abeta;
@@ -284,27 +287,64 @@ struct PV {
   }
 };
 
-// Heads a launch: the probabilities of a segment take R * kSeg * 2 bytes a head, and one head's P.V has only R / 256
-// work-groups, so heads go together until the P buffer reaches kPBudget or all are in.
-constexpr int64_t kPBudget = int64_t(64) << 20;
+// Heads a launch and keys a segment. The probabilities of a segment take R * seg * 2 bytes a head, and one head's P.V
+// has only R / 256 work-groups of 64 threads, too few to fill the card (4,096 threads) at the largest sizes; so heads go
+// through together, as many as fit kPBudget, and the segment is halved (down to 512 keys) while that brings more work-groups
+// a launch, up to kWgTarget.
+constexpr int64_t kPBudget = int64_t(64) << 20, kWgTarget = 128;
 
-int64_t heads_per_launch(int64_t R, int64_t n_head) { return std::clamp<int64_t>(kPBudget / (R * kSeg * 2), 1, n_head); }
+struct Plan {
+  int64_t G, seg;
+};
+
+Plan plan(int64_t R, int64_t n_head) {
+  Plan best{1, kSeg};
+  int64_t best_wgs = 0;
+  for (int64_t seg = kSeg; seg >= 512; seg /= 2) {
+    const int64_t G = std::clamp<int64_t>(kPBudget / (R * seg * 2), 1, n_head), wgs = G * (R / 256);
+    if (wgs > best_wgs) best = {G, seg}, best_wgs = wgs;
+    if (wgs >= kWgTarget) break;
+  }
+  return best;
+}
+
+// EKLOW_VATTN_PROFILE=1: wait after each kernel kind and print the sums at exit (the kernels then do not overlap).
+struct Prof {
+  bool on = std::getenv("EKLOW_VATTN_PROFILE") != nullptr;
+  double ms[4] = {};
+  std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+  void mark(sycl::queue& q, int kind) {
+    if (!on) return;
+    q.wait();
+    const auto now = std::chrono::steady_clock::now();
+    ms[kind] += std::chrono::duration<double, std::milli>(now - t).count();
+    t = now;
+  }
+  ~Prof() {
+    if (on) std::fprintf(stderr, "vattn: QK %.1f ms, combine %.1f ms, PV %.1f ms, out %.1f ms\n", ms[0], ms[1], ms[2], ms[3]);
+  }
+};
+Prof g_prof;
 
 template <int D>
 void run(sycl::queue& q, const sycl::half* qt, const sycl::half* kt, const sycl::half* vt, int64_t n, int64_t n_head, int64_t d_real,
          Scratch& s, sycl::half* out, int64_t out_k) {
-  const int64_t R64 = rows_padded(n), G = heads_per_launch(R64, n_head);
+  const int64_t R64 = rows_padded(n);
+  const Plan pl = plan(R64, n_head);
+  const int64_t G = pl.G, SEG = pl.seg;
   const int32_t R = int32_t(R64), kend = int32_t(n), rows = kend;
-  const int64_t op_stride = R64 * D, p_stride = R64 * kSeg, stat_stride = int64_t(Stats::floats(R64, D));
+  const int64_t op_stride = R64 * D, p_stride = R64 * SEG, stat_stride = int64_t(Stats::floats(R64, D));
   sycl::half* P = grow(q, s.p, s.p_halves, size_t(G * p_stride));
   const Stats st(grow(q, s.stat, s.stat_floats, size_t(G * stat_stride)), R64);
   for (int64_t h0 = 0; h0 < n_head; h0 += G) {
     const int64_t g = std::min(G, n_head - h0);
     const sycl::half *qh = qt + h0 * op_stride, *kh = kt + h0 * op_stride, *vh = vt + h0 * op_stride;
-    for (int32_t s0 = 0; s0 < kend; s0 += int32_t(kSeg)) {
-      const int32_t kseg = std::min<int32_t>(int32_t(kSeg), kend - s0), nk = (kseg + 127) / 128, nb = (kseg + 31) / 32, first = s0 == 0;
-      QK<D> qk{qh, kh, P, st.mt, st.lt, st.mrun, R, s0, kend, first, op_stride, p_stride, stat_stride};
+    for (int32_t s0 = 0; s0 < kend; s0 += int32_t(SEG)) {
+      const int32_t kseg = std::min<int32_t>(int32_t(SEG), kend - s0), nk = (kseg + 127) / 128, nb = (kseg + 31) / 32, first = s0 == 0;
+      QK<D> qk{qh, kh, P, st.mt, st.lt, st.mrun, R, s0, kend, first, int32_t(SEG), op_stride, p_stride, stat_stride};
+      g_prof.mark(q, 3);
       q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(g), size_t(R / 16), size_t(nk * 4)), sycl::range<3>(1, 16, 4)), qk);
+      g_prof.mark(q, 0);
       q.parallel_for(sycl::range<2>(size_t(g), size_t(R)), [=](sycl::id<2> id) {
         const int64_t off = int64_t(id[0]) * stat_stride;
         const int32_t row = int32_t(id[1]);
@@ -320,8 +360,10 @@ void run(sycl::queue& q, const sycl::half* qt, const sycl::half* kt, const sycl:
         }
         st.mrun[off + row] = mn, st.lrun[off + row] = l, st.alpha[off + row] = a;
       });
-      PV<D> pv{P, vh, st.beta, st.alpha, st.orun, R, s0, kend, nb, first, rows, op_stride, p_stride, stat_stride};
+      g_prof.mark(q, 1);
+      PV<D> pv{P, vh, st.beta, st.alpha, st.orun, R, s0, kend, nb, first, rows, int32_t(SEG), op_stride, p_stride, stat_stride};
       q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(g), size_t(R / 16), 4), sycl::range<3>(1, 16, 4)), pv);
+      g_prof.mark(q, 2);
     }
     // The heads' outputs in the activation tiles of the next GEMM.
     q.parallel_for(sycl::range<3>(size_t(g), size_t(rows), size_t(d_real)), [=](sycl::id<3> id) {
@@ -336,14 +378,16 @@ void run(sycl::queue& q, const sycl::half* qt, const sycl::half* kt, const sycl:
 }  // namespace
 
 uint64_t scratch_bytes(int64_t rows, int64_t D, int64_t n_head) {
-  const int64_t R = rows_padded(rows), G = heads_per_launch(R, n_head);
-  return uint64_t(G) * (uint64_t(R) * kSeg * sizeof(sycl::half) + Stats::floats(R, D) * sizeof(float));
+  const int64_t R = rows_padded(rows);
+  const Plan pl = plan(R, n_head);
+  return uint64_t(pl.G) * (uint64_t(R) * pl.seg * sizeof(sycl::half) + Stats::floats(R, D) * sizeof(float));
 }
 
 void reserve(sycl::queue& q, Scratch& s, int64_t rows, int64_t D, int64_t n_head) {
-  const int64_t R = rows_padded(rows), G = heads_per_launch(R, n_head);
-  grow(q, s.p, s.p_halves, size_t(G * R * kSeg));
-  grow(q, s.stat, s.stat_floats, size_t(G) * Stats::floats(R, D));
+  const int64_t R = rows_padded(rows);
+  const Plan pl = plan(R, n_head);
+  grow(q, s.p, s.p_halves, size_t(pl.G * R * pl.seg));
+  grow(q, s.stat, s.stat_floats, size_t(pl.G) * Stats::floats(R, D));
 }
 
 void release(sycl::queue& q, Scratch& s) {

@@ -22,8 +22,8 @@ struct VisionGemma4V::Fast {
   std::vector<Layer> layers;
   xmx::Weight patch_w, proj_w;
   const float* pos = nullptr;  // host: the position tables in the mapped file
-  static constexpr int kStages = 32;
-  int n_stage = 2;  // staging buffers in use (EKLOW_VISION_STAGES)
+  static constexpr int kStages = 2;
+  static constexpr int n_stage = kStages;  // staging buffers: layer l goes to l % 2; a third bought nothing
   uint8_t* stage[kStages] = {};
   std::unique_ptr<rt::CopyEngine> copy;
   std::unique_ptr<sycl::queue> copy_q;  // when the card has no copy-only engine

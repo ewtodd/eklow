@@ -20,7 +20,7 @@ namespace eklow::model {
 namespace {
 
 constexpr int kSg = 32;
-constexpr int64_t kFfnRows = 2048;  // the FFN runs in chunks of this many rows: its intermediates stay small
+constexpr int64_t kRows = 2048;  // the GEMMs around attention run in chunks of this many rows: their fp32 outputs stay small
 
 int64_t round_up(int64_t x, int64_t m) { return (x + m - 1) / m * m; }
 
@@ -199,8 +199,8 @@ bool VisionGemma4V::load_fast(const gguf::File& f) {
 uint64_t VisionGemma4V::activation_bytes(int64_t n) const {
   const Fast& F = *fast_;
   const int64_t R = vattn::rows_padded(n), E = n_embd_, H = n_head_;
-  const int64_t wide = std::max({R * 3 * E, kFfnRows * (2 * F.Fp + E), R * n_in_});
-  return uint64_t(R * E + wide) * 4 + uint64_t(R * E + kFfnRows * F.Kp) * 2 + uint64_t(3 * H * R * F.Dp) * 2 + vattn::scratch_bytes(n, F.Dp, H);
+  const int64_t wide = std::max({kRows * 3 * E, kRows * (2 * F.Fp + E), R * n_in_});
+  return uint64_t(R * E + wide) * 4 + uint64_t(R * E + kRows * F.Kp) * 2 + uint64_t(3 * H * R * F.Dp) * 2 + vattn::scratch_bytes(n, F.Dp, H);
 }
 
 uint64_t VisionGemma4V::card_bytes(int tokens) const {
@@ -233,11 +233,6 @@ void VisionGemma4V::ensure(int64_t n) {
   Fast& F = *fast_;
   if (n <= F.n_cap && F.stage[0]) return;
   free_activations();
-  if (const char* e = std::getenv("EKLOW_VISION_STAGES")) F.n_stage = std::clamp(std::atoi(e), 2, Fast::kStages);
-  if (std::getenv("EKLOW_VISION_NOCE") && F.copy) {
-    F.copy.reset();
-    F.copy_q = std::make_unique<sycl::queue>(q_.get_context(), q_.get_device(), sycl::property::queue::in_order());
-  }
   for (int i = 0; i < F.n_stage; ++i) {
     auto*& s = F.stage[i];
     if (s) continue;
@@ -245,7 +240,7 @@ void VisionGemma4V::ensure(int64_t n) {
     if (!s) throw std::runtime_error("vision encoder: out of device memory for the weight staging");
   }
   const int64_t R = vattn::rows_padded(n), E = n_embd_, H = n_head_;
-  F.wide_floats = std::max({R * 3 * E, kFfnRows * (2 * F.Fp + E), R * n_in_});
+  F.wide_floats = std::max({kRows * 3 * E, kRows * (2 * F.Fp + E), R * n_in_});
   auto dev = [&](auto*& p, int64_t count) {
     using T = std::remove_reference_t<decltype(*p)>;
     p = sycl::malloc_device<T>(size_t(count), q_);
@@ -257,7 +252,7 @@ void VisionGemma4V::ensure(int64_t n) {
   dev(F.x, R * E);
   dev(F.wide, F.wide_floats);
   dev(F.act_main, R * E);
-  dev(F.act_ffn, kFfnRows * F.Kp);
+  dev(F.act_ffn, kRows * F.Kp);
   dev(F.qt, H * R * F.Dp);
   dev(F.kt, H * R * F.Dp);
   dev(F.vt, H * R * F.Dp);
@@ -283,6 +278,8 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
   const int64_t cols = p.cols, rows = p.rows, n = cols * rows, E = n_embd_, H = n_head_, D = d_head_, Dp = F.Dp, Fp = F.Fp, Kp = F.Kp;
   const int64_t ox = cols / merge_, oy = rows / merge_, n_out = ox * oy, R = vattn::rows_padded(n);
   const int64_t n_layer = int64_t(F.layers.size());
+  // Rows a chunk: equal chunks of at most kRows, a multiple of 256 (the GEMM's row tile).
+  const int64_t chunk = round_up((n + (n + kRows - 1) / kRows - 1) / ((n + kRows - 1) / kRows), 256);
   ensure(n);
   const sycl::context ctx = q_.get_context();
   // EKLOW_VISION_PROFILE=1: wait after each phase and print the sums (the phases then do not overlap).
@@ -307,11 +304,6 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
   // Streaming: layer l's blob goes to staging l % 2; the copy for l + 2 starts once layer l's kernels are done with it.
   std::vector<sycl::event> copied(static_cast<size_t>(n_layer)), done(static_cast<size_t>(n_layer));
   auto start_copy = [&](int64_t l) {
-    static const bool nocopy = std::getenv("EKLOW_VISION_NOCOPY") != nullptr;  // diagnostic: weights stay as they were
-    if (nocopy) {
-      copied[size_t(l)] = q_.submit([&](sycl::handler& h) { h.single_task([] {}); });
-      return;
-    }
     uint8_t* dst = F.stage[l % F.n_stage];
     if (F.copy) {
       F.copy->copy(dst, F.layers[size_t(l)].blob, F.blob_bytes);
@@ -398,49 +390,81 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
     // Attention. The prep kernel: per (patch, head) the q, k, v rows normed, q and k turned by the 2D RoPE, written as
     // dpas tiles (zero padding past the head size is already there).
     mark("wait_copy");
-    gemm(am, n, E, W(0, E, 3 * E), wide);
-    mark("gemm_qkv");
-    {
+    for (int64_t c0 = 0; c0 < n; c0 += chunk) {
+      const int64_t m = std::min(chunk, n - c0);
+      gemm(am + (c0 / 8) * (E / 16) * 128, m, E, W(0, E, 3 * E), wide);
+      mark("gemm_qkv");
+      const int64_t t0 = c0;
       sycl::half *qt = F.qt, *kt = F.kt, *vt = F.vt;
       const float *qn = L.q_norm, *kn = L.k_norm;
       const int64_t E3 = 3 * E;
-      q_.parallel_for(sycl::range<3>(3, size_t(H), size_t(n)), [=](sycl::id<3> id) {
-        const int which = int(id[0]);  // 0 q, 1 k, 2 v: three work-items a (patch, head), the patches fastest
-        const int64_t h = int64_t(id[1]), t = int64_t(id[2]);
-        const float* src = wide + t * E3 + which * E + h * D;
-        float x[80];
+      // q, k: per (head, patch) the row normed (with weight), turned by the 2D RoPE (dims [0, D/2) by the column,
+      // [D/2, D) by the row; NeoX pairs (i, i + D/4) within each half), written as 16-byte runs (q) or dim pairs (k).
+      auto norm_rope = [=](const float* src, const float* w, int64_t t, float* x) {
         float ss = 0;
         for (int64_t d = 0; d < D; ++d) x[d] = src[d], ss += x[d] * x[d];
         const float inv = 1.0f / sycl::sqrt(ss / float(D) + eps);
-        const float* w = which == 0 ? qn : kn;
-        for (int64_t d = 0; d < D; ++d) x[d] = which == 2 ? x[d] * inv : x[d] * inv * w[d];
-        // dims [0, D/2) turn by the column, [D/2, D) by the row; NeoX pairs (i, i + D/4) within each half
-        if (which < 2) {
-          const int64_t col = t % cols, row = t / cols;
-          for (int part = 0; part < 2; ++part) {
-            const int64_t pos = part ? row : col, o = part * rot;
-            for (int64_t i = 0; i < half; ++i) {
-              const float c = cos_t[pos * half + i], s = sin_t[pos * half + i];
-              const float a = x[o + i], b = x[o + i + half];
-              x[o + i] = a * c - b * s, x[o + i + half] = a * s + b * c;
-            }
+        for (int64_t d = 0; d < D; ++d) x[d] = x[d] * inv * w[d];
+        const int64_t col = t % cols, row = t / cols;
+        for (int part = 0; part < 2; ++part) {
+          const int64_t pos = part ? row : col, o = part * rot;
+          for (int64_t i = 0; i < half; ++i) {
+            const float c = cos_t[pos * half + i], s = sin_t[pos * half + i];
+            const float a = x[o + i], b = x[o + i + half];
+            x[o + i] = a * c - b * s, x[o + i + half] = a * s + b * c;
           }
         }
-        sycl::half* dst = (which == 0 ? qt : which == 1 ? kt : vt) + h * R * Dp;
+      };
+      q_.parallel_for(sycl::range<2>(size_t(H), size_t(m)), [=](sycl::id<2> id) {
+        const int64_t h = int64_t(id[0]), t = t0 + int64_t(id[1]);
+        float x[80];
+        norm_rope(wide + (t - t0) * E3 + h * D, qn, t, x);
+        sycl::half* dst = qt + h * R * Dp;
+        for (int64_t d = 0; d < D; d += 8) {
+          sycl::vec<sycl::half, 8> v;
+          for (int j = 0; j < 8; ++j) v[j] = sycl::half(x[d + j]);
+          *reinterpret_cast<sycl::vec<sycl::half, 8>*>(dst + vattn::q_index(t, d, Dp)) = v;
+        }
+      });
+      q_.parallel_for(sycl::range<2>(size_t(H), size_t(m)), [=](sycl::id<2> id) {
+        const int64_t h = int64_t(id[0]), t = t0 + int64_t(id[1]);
+        float x[80];
+        norm_rope(wide + (t - t0) * E3 + E + h * D, kn, t, x);
+        sycl::half* dst = kt + h * R * Dp;
+        for (int64_t d = 0; d < D; d += 2)
+          *reinterpret_cast<sycl::vec<sycl::half, 2>*>(dst + vattn::k_index(t, d, Dp)) = sycl::vec<sycl::half, 2>(sycl::half(x[d]), sycl::half(x[d + 1]));
+      });
+      // v: rms-normed without a weight, two patches a work-item (positions 2j, 2j + 1 are adjacent in the tile).
+      q_.parallel_for(sycl::range<2>(size_t(H), size_t((m + 1) / 2)), [=](sycl::id<2> id) {
+        const int64_t h = int64_t(id[0]), tv = t0 + 2 * int64_t(id[1]);  // c0 is even
+        float x[2][80];
+        for (int e = 0; e < 2; ++e) {
+          const int64_t t = std::min(tv + e, t0 + m - 1);
+          const float* src = wide + (t - t0) * E3 + 2 * E + h * D;
+          float ss = 0;
+          for (int64_t d = 0; d < D; ++d) x[e][d] = src[d], ss += x[e][d] * x[e][d];
+          const float inv = 1.0f / sycl::sqrt(ss / float(D) + eps);
+          for (int64_t d = 0; d < D; ++d) x[e][d] *= inv;
+        }
+        sycl::half* dst = vt + h * R * Dp;
         for (int64_t d = 0; d < D; ++d)
-          dst[which == 0 ? vattn::q_index(t, d, Dp) : which == 1 ? vattn::k_index(t, d, Dp) : vattn::v_index(t, d, Dp)] = sycl::half(x[d]);
+          *reinterpret_cast<sycl::vec<sycl::half, 2>*>(dst + vattn::v_index(tv, d, Dp)) = sycl::vec<sycl::half, 2>(sycl::half(x[0][d]), sycl::half(x[1][d]));
       });
     }
     mark("prep");
     vattn::attend(q_, F.qt, F.kt, F.vt, n, H, Dp, D, F.att, am, E);
     mark("attention");
-    gemm(am, n, E, W(1, E, E), wide);
-    mark("gemm_o");
-    tap("attn_out", int(l), wide, n, E);
-    // x += post_norm(o); the FFN's norm.
-    {
+    for (int64_t c0 = 0; c0 < n; c0 += chunk) {
+      const int64_t m = std::min(chunk, n - c0);
+      sycl::half* a_chunk = am + (c0 / 8) * (E / 16) * 128;
+      gemm(a_chunk, m, E, W(1, E, E), wide);
+      mark("gemm_o");
+      // x += post_norm(o); the FFN's norm.
+      {
       const float *wp = L.attn_post, *w2 = L.ln2;
-      rows_sg(q_, n, [=](int64_t r, sycl::sub_group sg) {
+      float* xc = x + c0 * E;
+      sycl::half* ac = a_chunk;
+      rows_sg(q_, m, [=](int64_t r, sycl::sub_group sg) {
         const int lane = int(sg.get_local_id()[0]);
         float s1 = 0;
         for (int64_t c = lane; c < E; c += kSg) s1 += wide[r * E + c] * wide[r * E + c];
@@ -448,22 +472,18 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
         const float i1 = 1.0f / sycl::sqrt(s1 / float(E) + eps);
         float s2 = 0;
         for (int64_t c = lane; c < E; c += kSg) {
-          const float v = x[r * E + c] + wide[r * E + c] * i1 * wp[c];
-          x[r * E + c] = v;
+          const float v = xc[r * E + c] + wide[r * E + c] * i1 * wp[c];
+          xc[r * E + c] = v;
           s2 += v * v;
         }
         s2 = sycl::reduce_over_group(sg, s2, sycl::plus<float>());
         const float i2 = 1.0f / sycl::sqrt(s2 / float(E) + eps);
-        for (int64_t c = lane; c < E; c += kSg) am[xmx::act16_index(r, c, E / 16)] = sycl::half(x[r * E + c] * i2 * w2[c]);
+        for (int64_t c = lane; c < E; c += kSg) ac[xmx::act16_index(r, c, E / 16)] = sycl::half(xc[r * E + c] * i2 * w2[c]);
       });
-    }
-    mark("post1");
-    // FFN in chunks of rows.
-    for (int64_t c0 = 0; c0 < n; c0 += kFfnRows) {
-      const int64_t m = std::min(kFfnRows, n - c0);
-      sycl::half* a_chunk = am + (c0 / 8) * (E / 16) * 128;
+      }
+      mark("post1");
       float* gu = wide;
-      float* dn = wide + kFfnRows * 2 * Fp;
+      float* dn = wide + kRows * 2 * Fp;
       gemm(a_chunk, m, E, W(2, E, 2 * Fp), gu);
       mark("gemm_gu");
       {

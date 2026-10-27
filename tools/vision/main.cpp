@@ -60,6 +60,7 @@ int main(int argc, char** argv) {
     auto f = gguf::File::open(mmproj);
     model::VisionGemma4V v(q, f, ref);
     v.set_bf16_activations(bf16_act);
+    std::printf("%s path, card bytes at rest: %.1f MiB; reserve(%d) would hold %.1f MiB\n", v.reference() ? "reference" : "fast", double(v.bytes()) / 1048576.0, tokens, double(v.card_bytes(tokens)) / 1048576.0);
     const image::Spec spec = v.spec(tokens);
     if (!taps.empty())
       v.set_tap([&](std::string_view name, const float* dev, int64_t rows, int64_t dim) {
@@ -79,7 +80,7 @@ int main(int argc, char** argv) {
         std::ofstream(taps + "/patches.f32", std::ios::binary)
             .write(reinterpret_cast<const char*>(patches.data.data()), std::streamsize(patches.data.size() * sizeof(float)));
       const auto rows = v.encode(patches);
-      if (pass == 0) std::printf("%s path, card bytes held after the first encode: %.1f MiB (at 1120 tokens: %.1f MiB)\n", v.reference() ? "reference" : "fast", double(v.bytes()) / 1048576.0, double(v.card_bytes(1120)) / 1048576.0);
+      if (pass == 0) std::printf("held after the first encode: %.1f MiB\n", double(v.bytes()) / 1048576.0);
       const auto t2 = std::chrono::steady_clock::now();
       std::printf("%d x %d image, %d x %d patches, %lld tokens x %lld: prepared in %.1f ms, encoded in %.1f ms\n", rgb.width, rgb.height,
                   patches.cols, patches.rows, (long long)rows.n, (long long)rows.dim,
@@ -90,6 +91,8 @@ int main(int argc, char** argv) {
         std::ofstream(out, std::ios::binary).write(reinterpret_cast<const char*>(host.data()), std::streamsize(host.size() * sizeof(float)));
       }
     }
+    v.release();
+    std::printf("held after release(): %.1f MiB\n", double(v.bytes()) / 1048576.0);
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-vision: %s\n", e.what());
