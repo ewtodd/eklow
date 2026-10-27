@@ -1135,3 +1135,29 @@ streaming: the copies (1.1 GB at ~12 GB/s) overlap compute in time, but DMA slow
 copies, as a diagnostic, 195-210 ms; the same with the copies issued up front, 2 or 3 buffers ahead, on the copy engine
 or a second queue). At 1,080 tokens attention is 61% (~14 TFLOPS counting the real 72 dims): its K blocks are 3 dpas
 deep against 16 at head 512, so the epilogue weighs more; that and a resident-weights option are what is left.
+
+## 2026-10-27 — image input through the server
+
+`eklow-server --mmproj GGUF` (chat) and `--embed-mmproj GGUF` (embeddings), `--image-tokens N` (70-1,120, default 280). Chat takes OpenAI
+`image_url` parts with base64 `data:` URLs (JPEG, PNG, GIF, BMP; WebP and http(s) refused with a 400, nothing is fetched); embeddings take an
+input item that is an array of `text` / `image_url` parts or llama.cpp's `{"content": [parts]}`. What llama.cpp does, from its source at the
+oracle's revision and checked by running it (llama-server and the oracle, CPU): the server turns an `image_url` part into a media marker in the
+message's text (text parts joined by newlines, none around a marker), the template runs on that string, and mtmd tokenizes the text before and
+after each marker on its own with `<|image>`, the rows and `<image|>` between, no newlines, BOS (and EOS for embeddings) added. Image rows are
+fed unscaled, the 26B's per-layer inputs do not exist, EmbeddingGemma 2's are made from the rows like from any row. Gemma 4's `non_causal_type`
+is SWA-only: on the sliding layers each image row sees the whole image (and the window back), the global layers stay causal.
+
+eklow: `Chunk::images` (spans of rows in place of lookups; on the sliding layers those tokens' `hi` is the span's last position, through
+`attn::Tokens::lo, hi` when a step holds any), the scheduler never splits an image across chunks and cuts a reused prefix back to an image's
+start, and an image's positions hold ids below zero derived from a hash of its bytes (and budget) and the row, so that prefix reuse tells
+images apart. Each image is encoded on its request's thread with the scheduler held (`Scheduler::Hold`), one at a time per encoder, and
+the host rows of the last six are kept by hash (a conversation resends its images every turn). The encoders' card memory is reserved before the
+experts are placed (26B 282 MiB at 280 rows; EmbeddingGemma 2's projector at 1,120 rows, 264 MiB: `reserve(280)` on it gave NaN embeddings
+for some images, which `reserve(400)`, `reserve(1120)` and no reserve did not). On the 26B at production flags the encoders cost experts a
+layer: N = 44 (49 before), 41 with `--image-tokens 1120`.
+
+Against llama.cpp: token ids and image spans equal for one image, two, and a conversation with an image in an earlier turn; the logits of
+the 26B over the positions after an image, from the oracle's own rows, mean KL 6.3e-2 and top-1 77/90 (one image, within check26's band),
+and a causal image costs 0.25; a two-image prompt reads 0.25 (median 0.02) from either rows, and eklow's own two runs with the two row sets
+differ by the same 0.26: that prompt is chaotic at this size, not a different computation. Embeddings of images against llama-server:
+cosine 0.99966-0.99996, token counts equal; string inputs against main: 1.000000.
