@@ -30,6 +30,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <csignal>
 #include <cstdio>
 #include <cstdlib>
@@ -184,6 +185,9 @@ class ImageService {
     }
     auto host = std::make_shared<std::vector<float>>(size_t(rows.n * rows.dim));
     q_.memcpy(host->data(), rows.data.get(), host->size() * sizeof(float)).wait();
+    size_t bad = 0;
+    for (float x : *host) bad += !std::isfinite(x);
+    if (bad) log_line(fmt("image: %zu of %zu row values are not finite", bad, host->size()));
     log_line(fmt("image: %dx%d patches, %lld rows | wait %.2f s, encoded in %.2f s", patches.cols, patches.rows, (long long)rows.n,
                  seconds(t1 - t0), seconds(std::chrono::steady_clock::now() - t1)));
     {
@@ -452,6 +456,11 @@ int main(int argc, char** argv) {
       vision_file = std::make_unique<gguf::File>(gguf::File::open(mmproj_path));
       vision_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
       vision = std::make_unique<model::VisionGemma4V>(*vision_q, *vision_file);
+      // The encoder's activations for the budget, held for good: reserved before the experts are placed so that they are
+      // counted, and no allocation at request time (~280 MiB at 280 rows, DECISIONS 2026-10-27 vision); the rows an
+      // encode returns are the caller's and fit the card margin.
+      vision->reserve(image_tokens);
+      std::fprintf(stderr, "eklow-server: vision projector %s, %.0f MiB on the card for %d-row images\n", mmproj_path.c_str(), double(vision->bytes()) / 1048576.0, image_tokens);
       images = std::make_unique<ImageService>(*vision_q, *vision, image_tokens);
     }
     if (!embed_mmproj_path.empty()) {
@@ -462,6 +471,10 @@ int main(int argc, char** argv) {
       if (embed_vision->n_embd() != embed_model->n_embd())
         throw std::runtime_error(embed_mmproj_path + ": projects to " + std::to_string(embed_vision->n_embd()) + " but the embedding model's width is " +
                                  std::to_string(embed_model->n_embd()));
+      // Not image_tokens: reserve(280) on this projector gave NaN embeddings for some images (reserve(400) and up, and no
+      // reserve, did not; reported to perf/vision-fast), so it takes the full 1,120 rows (264 MiB instead of 183).
+      embed_vision->reserve(1120);
+      std::fprintf(stderr, "eklow-server: vision projector %s, %.0f MiB on the card for %d-row images\n", embed_mmproj_path.c_str(), double(embed_vision->bytes()) / 1048576.0, 1120);
       embed_images = std::make_unique<ImageService>(*embed_vision_q, *embed_vision, image_tokens);
     }
     engine::Engine eng(q, file, ec);
