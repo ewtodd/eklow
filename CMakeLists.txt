@@ -78,6 +78,8 @@ add_library(eklow_model STATIC
   src/kernels/xmx.cpp
   src/model/embed_gemma2.cpp
   src/model/vision_gemma4v.cpp
+  src/model/vision_gemma4v_fast.cpp
+  src/kernels/vision_attn.cpp
   src/model/gemma4.cpp
 )
 target_link_libraries(eklow_model PUBLIC eklow_host eklow_image eklow_rt)

@@ -45,12 +45,12 @@ struct Config {
   int64_t experts_on_card = -1;  // -2: as many as fit in the free memory left after the rest, less card_margin_bytes
   uint64_t card_margin_bytes = 1ull << 30;
   int cpu_threads = 0;  // the cold experts' pool, caller included; 0: 16 (8, 12, 16, 20 tried: 16 and 20 equal)
-  // Prefill with cold experts (DECISIONS 2026-10-28): the cold experts are held in pinned host memory (one copy, the
-  // CPU computes from it too), and those with at least stream_min_rows pairs in a step are copied to the card by
-  // the copy engine (at most stream_slots of them a layer), repacked there and computed by the grouped GEMMs, while
-  // the CPU takes the other cold pairs. 0 slots: the CPU takes all of them, from the GGUF's mapping (stage 3a).
-  // The costs pick how many candidates to stream: about the point where the copies take as long as the CPU would
-  // on the rest.
+  // Prefill with cold experts (DECISIONS 2026-10-27, "streaming the busy cold experts"): the cold experts are held in
+  // pinned host memory (one copy, the CPU computes from it too), and those with at least stream_min_rows pairs in a
+  // step are copied to the card by the copy engine (at most stream_slots of them a layer), repacked there and computed
+  // by the grouped GEMMs, while the CPU takes the other cold pairs. 0 slots: the CPU takes all of them, from the
+  // GGUF's mapping (stage 3a). The costs pick how many candidates to stream: about the point where the copies take
+  // as long as the CPU would on the rest.
   int stream_slots = 40;
   int stream_min_rows = 16;
   double stream_copy_us = 300;  // one expert from pinned memory to the card (copy-bench: 307 us)
