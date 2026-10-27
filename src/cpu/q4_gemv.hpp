@@ -52,11 +52,12 @@ class Pool {
   Pool(const Pool&) = delete;
   Pool& operator=(const Pool&) = delete;
   int size() const { return int(workers_.size()) + 1; }
+  void set_spin_us(int us) { spin_us_.store(us, std::memory_order_relaxed); }
   void for_each(int64_t n, int64_t grain, const std::function<void(int64_t, int64_t)>& f);
 
  private:
   void run(int id);
-  int spin_us_;
+  std::atomic<int> spin_us_;
   std::vector<std::thread> workers_;
   std::mutex mu_;
   std::condition_variable wake_, done_;

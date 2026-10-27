@@ -41,7 +41,7 @@ struct Config {
   std::string expert_profile;
   int64_t experts_on_card = -1;  // -2: as many as fit in the free memory left after the rest, less card_margin_bytes
   uint64_t card_margin_bytes = 1ull << 30;
-  int cpu_threads = 0;  // the cold experts' pool, caller included; 0: 12
+  int cpu_threads = 0;  // the cold experts' pool, caller included; 0: 16 (8, 12, 16, 20 tried: 16 and 20 equal)
 };
 
 struct Chunk {

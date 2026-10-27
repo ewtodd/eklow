@@ -352,7 +352,7 @@ void Engine::load_experts() {
 
   // The host side: a pool, buffers the card and the host share, and the cold experts' pages
   // touched now (they come out of the page cache the first time, which a request should not wait for).
-  const int threads = c_.cpu_threads > 0 ? c_.cpu_threads : 12;
+  const int threads = c_.cpu_threads > 0 ? c_.cpu_threads : 16;
   pool_ = std::make_unique<cpu::Pool>(threads);
   const int64_t B = std::max<int64_t>(c_.max_batch, xmx::kFp16Rows), P = B * cfg_.n_expert_used;
   auto host = [&](auto*& p, int64_t n) {
@@ -622,6 +622,9 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     ensure_pages(c.slot, c.start_pos + n);
   }
   const int64_t T = int64_t(tok.size()), R = int64_t(logit_rows.size());
+  // Decode calls the pool every few hundred microseconds and wants its workers spinning; prefill's phases
+  // last milliseconds and the spinning only takes the cores from the hot kernels' host thread.
+  if (pool_) pool_->set_spin_us(T * cfg_.n_expert_used <= xmx::kFp16Rows ? 400 : 0);
   if (T == 0) return {};
   const auto t_step = std::chrono::steady_clock::now();
   if (T > c_.max_batch) throw std::runtime_error("engine: step larger than max_batch");

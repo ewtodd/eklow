@@ -147,7 +147,7 @@ void Pool::for_each(int64_t n, int64_t grain, const std::function<void(int64_t, 
   for (int64_t lo; (lo = next_.fetch_add(grain)) < n;) f(lo, std::min(n, lo + grain));
   const auto t0 = SpinClock::now();
   while (pending_.load(std::memory_order_acquire) != 0 &&
-         std::chrono::duration_cast<std::chrono::microseconds>(SpinClock::now() - t0).count() < spin_us_)
+         std::chrono::duration_cast<std::chrono::microseconds>(SpinClock::now() - t0).count() < spin_us_.load(std::memory_order_relaxed))
     _mm_pause();
   if (pending_.load(std::memory_order_acquire) != 0) {
     std::unique_lock lk(mu_);
@@ -160,7 +160,7 @@ void Pool::run(int) {
   for (;;) {
     const auto t0 = SpinClock::now();
     while (gen_.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_relaxed) &&
-           std::chrono::duration_cast<std::chrono::microseconds>(SpinClock::now() - t0).count() < spin_us_)
+           std::chrono::duration_cast<std::chrono::microseconds>(SpinClock::now() - t0).count() < spin_us_.load(std::memory_order_relaxed))
       _mm_pause();
     const std::function<void(int64_t, int64_t)>* job;
     int64_t n, grain;
