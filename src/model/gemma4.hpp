@@ -90,8 +90,11 @@ struct DumpSink {
 };
 
 // The reference forward over one sequence (positions 0..tokens-1); returns logits for the last
-// `logits_rows` positions, [row][vocab].
+// `logits_rows` positions, [row][vocab]. When `routing` is non-null, the selected expert ids are
+// appended to it, layer by layer and, within a layer, token by token, `n_expert_used` ids per
+// token (dense models leave it untouched).
 std::vector<float> reference_forward(sycl::queue& q, const Gemma4Config& c, const Gemma4Weights& w,
-                                     const std::vector<int32_t>& tokens, int64_t logits_rows, const DumpSink* dump);
+                                     const std::vector<int32_t>& tokens, int64_t logits_rows,
+                                     const DumpSink* dump, std::vector<int32_t>* routing = nullptr);
 
 }  // namespace eklow::model

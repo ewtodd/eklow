@@ -2,11 +2,13 @@
 // format so tools/ref/compare_dumps.py can set the two side by side.
 //
 //   eklow-ref-run --model GGUF --out DIR (--tokens-json FILE | --tokens 2,105,...)
-//                 [--tensors PREFIX,...] [--logits-last N]
+//                 [--tensors PREFIX,...] [--logits-last N] [--routing FILE]
 //
 // --tokens-json reads the ids from an oracle's tokens.json, so both runs see the same tokens.
 // --tensors: graph names by prefix (default l_out-,result_norm); --logits-last: only the last N
 // positions' logits (default all).
+// --routing: also record each token's selected expert ids (MoE models) to FILE as raw int32
+// little-endian, layer by layer and token by token, with a FILE.json sidecar.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -41,7 +43,7 @@ double since(std::chrono::steady_clock::time_point t0) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, out, tokens_json, tokens_arg;
+  std::string model, out, tokens_json, tokens_arg, routing_file;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   int64_t logits_last = 0;
   for (int i = 1; i < argc; ++i) {
@@ -53,9 +55,10 @@ int main(int argc, char** argv) {
     else if (a == "--tokens") tokens_arg = next();
     else if (a == "--tensors") prefixes = split(next(), ',');
     else if (a == "--logits-last") logits_last = std::atoll(next().c_str());
+    else if (a == "--routing") routing_file = next();
     else {
       std::fprintf(stderr, "usage: eklow-ref-run --model GGUF --out DIR (--tokens-json FILE | --tokens IDS) "
-                           "[--tensors PREFIX,...] [--logits-last N]\n");
+                           "[--tensors PREFIX,...] [--logits-last N] [--routing FILE]\n");
       return 2;
     }
   }
@@ -99,8 +102,16 @@ int main(int argc, char** argv) {
     };
 
     t0 = std::chrono::steady_clock::now();
-    auto logits = model::reference_forward(q, cfg, w, tokens, logits_last, &sink);
+    std::vector<int32_t> routing;
+    auto logits = model::reference_forward(q, cfg, w, tokens, logits_last, &sink,
+                                           routing_file.empty() ? nullptr : &routing);
     std::printf("reference forward over %zu tokens: %.1f s\n", tokens.size(), since(t0));
+    if (!routing_file.empty()) {
+      std::ofstream(routing_file, std::ios::binary)
+          .write(reinterpret_cast<const char*>(routing.data()), std::streamsize(routing.size() * sizeof(int32_t)));
+      std::ofstream(routing_file + ".json") << "{\"layers\": " << cfg.n_layer << ", \"tokens\": "
+                                            << tokens.size() << ", \"used\": " << cfg.n_expert_used << "}\n";
+    }
     std::ofstream(out + "/logits.f32", std::ios::binary)
         .write(reinterpret_cast<const char*>(logits.data()), std::streamsize(logits.size() * sizeof(float)));
     index.end_array().kv("logits_rows", int64_t(logits.size() / size_t(cfg.n_vocab))).end_object();

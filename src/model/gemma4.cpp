@@ -171,7 +171,8 @@ Gemma4Weights Gemma4Weights::upload(const gguf::File& f, const Gemma4Config& c, 
 }
 
 std::vector<float> reference_forward(sycl::queue& q, const Gemma4Config& c, const Gemma4Weights& w,
-                                     const std::vector<int32_t>& tokens, int64_t logits_rows, const DumpSink* dump) {
+                                     const std::vector<int32_t>& tokens, int64_t logits_rows,
+                                     const DumpSink* dump, std::vector<int32_t>* routing) {
   const int64_t T = int64_t(tokens.size()), E = c.n_embd, F = c.n_ff, H = c.n_head;
   const int64_t D_max = std::max(c.head_dim_global, c.head_dim_sliding);
   int64_t kv_max = 0;
@@ -325,6 +326,8 @@ std::vector<float> reference_forward(sycl::queue& q, const Gemma4Config& c, cons
           std::iota(idx.begin(), idx.end(), 0);
           std::partial_sort(idx.begin(), idx.begin() + c.n_expert_used, idx.end(),
                             [&](int a, int b) { return p[size_t(a)] > p[size_t(b)]; });
+          if (routing)
+            for (int i = 0; i < c.n_expert_used; ++i) routing->push_back(int32_t(idx[size_t(i)]));
           float wsum = 0.0f;
           for (int i = 0; i < c.n_expert_used; ++i) wsum += p[size_t(idx[size_t(i)])];
           const float denom = std::max(wsum, 6.103515625e-5f);
