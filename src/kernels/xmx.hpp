@@ -19,6 +19,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <vector>
 
 #include "kernels/ref.hpp"
 
@@ -84,5 +85,23 @@ void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out);
 // wide) in the form the next matmul takes. On fp16 activations it is the GEMM's epilogue; the
 // int8 path goes through `scratch` (fp32, m x n).
 void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activations& out, float* scratch);
+
+// A layer's experts of one shape, as device tables of their tile and scale pointers (the experts
+// stay separate xmx::Weights; the grouped kernels index the tables by expert id).
+struct ExpertTable {
+  int64_t k = 0, n = 0, count = 0;
+  const uint8_t** tiles = nullptr;
+  const sycl::half** scales = nullptr;
+};
+ExpertTable make_expert_table(sycl::queue& q, const std::vector<Weight>& experts);
+void free_expert_table(sycl::queue& q, ExpertTable& t);
+
+// Grouped one-row GEMVs on int8 activations: for pairs p < P, out[p][:] = W_{ids[p]} * a[p / row_div][:]
+// (ids on the device). out is [P][n], fp32.
+void matmul_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, const int32_t* ids, int64_t P,
+                    int64_t row_div, float* out);
+// The grouped gate_up (interleaved experts) then GeGLU into P-row int8 `out`, through `scratch` [P][n].
+void matmul_geglu_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, const int32_t* ids, int64_t P,
+                          int64_t row_div, Activations& out, float* scratch);
 
 }  // namespace eklow::xmx
