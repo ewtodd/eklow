@@ -232,9 +232,9 @@ void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_exp
     auto sg = it.get_sub_group();
     const float* lg = logits + t * NE;
     float p[8];
-    float mx = -INFINITY;
+    float mx = -1e30f;
     for (int i = 0; i < 8; ++i) {
-      p[i] = i * kLanes < NE ? lg[i * kLanes + l] : -INFINITY;
+      p[i] = i * kLanes < NE ? lg[i * kLanes + l] : -1e30f;
       mx = sycl::fmax(mx, p[i]);
     }
     mx = sycl::reduce_over_group(sg, mx, sycl::maximum<float>());
@@ -254,7 +254,7 @@ void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_exp
       for (int i = 0; i < 8; ++i)
         if (i * kLanes < NE && !(taken >> i & 1) && p[i] > best) best = p[i], bi = i * kLanes + l;
       const float gbest = sycl::reduce_over_group(sg, best, sycl::maximum<float>());
-      const int32_t gi = sycl::reduce_over_group(sg, best == gbest ? bi : INT32_MAX, sycl::minimum<int32_t>());
+      const int32_t gi = sycl::reduce_over_group(sg, best == gbest ? bi : 0x7fffffff, sycl::minimum<int32_t>());
       if (gi % kLanes == l) taken |= 1u << (gi / kLanes);
       sel[j] = gi;
       wsel[j] = gbest;

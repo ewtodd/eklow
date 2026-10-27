@@ -95,18 +95,18 @@ void grouped_test(sycl::queue& q, const gguf::File& f, json::Writer& w) {
       auto* yg = sycl::malloc_device<float>(size_t(P * n), q);
       auto* yr = sycl::malloc_device<float>(size_t(n), q);
       auto* idd = sycl::malloc_device<int32_t>(size_t(P), q);
-      std::vector<float> x(size_t(rows * k));
+      std::vector<float> x(size_t(rows * k) + 0);
       for (auto& v : x) v = nd(rng);
       for (int64_t r = 0; r < rows; ++r)
         for (int64_t c = 0; c < k; c += 487) x[size_t(r * k + c)] *= 30;
-      std::vector<int32_t> ids(size_t(P));
+      std::vector<int32_t> ids(size_t(P) + 0);
       for (auto& id : ids) id = int32_t(rng() % uint32_t(n_exp));
       q.memcpy(xd, x.data(), x.size() * sizeof(float));
       q.memcpy(idd, ids.data(), ids.size() * 4).wait();
       xmx::quantize(q, xd, rows, act);
       xmx::matmul_grouped(q, act, table, idd, P, row_div, yg);
       q.wait();
-      std::vector<float> hg(size_t(P * n)), hr(size_t(n));
+      std::vector<float> hg(size_t(P * n) + 0), hr(size_t(n) + 0);
       q.memcpy(hg.data(), yg, hg.size() * 4).wait();
       double num = 0, den = 0;
       for (int64_t p = 0; p < P; ++p) {
