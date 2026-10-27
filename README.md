@@ -46,15 +46,16 @@ Gemma 4 12B (48 layers, dense) is 7.0 GB and fits the card whole.
 
 Measured on that machine (October 2026), through `eklow-server` with fiona's production flags: the 26B with two
 slots of 262,144 tokens, int8 global KV, 2,048-token prefill chunks, 46 of 128 experts a layer on the card and
-EmbeddingGemma 2 loaded. The method is unholy's (`tools/bench/serve_perf.py`, on unholy's unique Pile documents cut
-to Gemma token depths; `docs/bench/serve-perf-26b-chunk2048-fiona-2026-10-27.txt`, and for GSM8K one at a time
-`docs/bench/serve-perf-26b-fiona-2026-10-27.txt`, at N = 51 and 1,024-token chunks):
+EmbeddingGemma 2 loaded, and the 12B, whole on the card, with the same slots and KV. The method is unholy's
+(`tools/bench/serve_perf.py`, on unholy's unique Pile documents cut to Gemma token depths;
+`docs/bench/serve-perf-26b-chunk2048-fiona-2026-10-27.txt`, `docs/bench/serve-perf-12b-fiona-2026-10-27.txt`, and for
+GSM8K one at a time `docs/bench/serve-perf-26b-fiona-2026-10-27.txt`, at N = 51 and 1,024-token chunks):
 
-| | Gemma 4 26B A4B |
-|---|---|
-| prefill, one request, unique text (time to first token) | 1865 tok/s at 8k, 1794 at 32k, 1177 at 128k, 765 at 252k (338 s) |
-| decode, one stream | 36.6 tok/s at 8k, 34.0 at 32k, 30.5 at 128k, 26.5 at 252k |
-| GSM8K chat (48 requests, thinking on), 1 / 2 at a time | 33.4 / 40.2 tok/s aggregate |
+| | Gemma 4 26B A4B | Gemma 4 12B |
+|---|---|---|
+| prefill, one request, unique text (time to first token) | 1865 tok/s at 8k, 1794 at 32k, 1177 at 128k, 765 at 252k (338 s) | 1420 tok/s at 8k, 1240 at 32k, 749 at 128k, 487 at 252k (530 s) |
+| decode, one stream | 36.6 tok/s at 8k, 34.0 at 32k, 30.5 at 128k, 26.5 at 252k | 29.7 tok/s at 8k, 27.7 at 32k, 22.6 at 128k, 20.1 at 252k |
+| GSM8K chat (48 requests, thinking on), 1 / 2 at a time | 33.4 / 40.2 tok/s aggregate | |
 
 A question on a document already in the prefix cache starts in 0.2-0.7 s. At depth the global layers' attention is
 still what costs (55% of prefill at 128k): it runs in segments of 2,048 keys as two GEMMs at ~31 TFLOPS of the
@@ -69,17 +70,18 @@ chunks) gives prefill 1,914 tok/s at 32k depth (global attention 34% of it) and 
 Embeddings and titles do not wait for it: an embedding takes 60 ms idle and 78 ms during a 32k-token prefill, and
 llama.cpp's title model on the Iris Xe 368 ms idle and 457-471 ms while the 26B prefills or decodes.
 
-Gemma 4 12B, the production model until 2026-10-27, on the same server at 2 x 262k (measured 2026-10-25/26, before
-the last decode work): a 10.6k-token son-of-anton prompt reached its first token in 8.7 s (0.2 s with the prefix
-cached), then decoded 27.4 tok/s; two 259k-token prompts at once prefilled in 36 min, then decoded ~11 tok/s each.
+Gemma 4 12B was the production model until 2026-10-27. The 26B, 4B parameters active a token, is faster than the dense
+12B at every depth; with both slots of the 12B at 259k, two prompts at once prefilled in 36 min and then decoded ~11
+tok/s each (2026-10-26).
 Before eklow, llama.cpp's Vulkan backend on this card gave the 12B ~110-150 tok/s of prefill at 16k depth and ~22
 tok/s of decode, with 2 x 32k contexts.
 
 Production settings: two slots of 262,144 tokens, 2,048-token prefill chunks, the profile from four recordings, a 1 GiB
-card margin; the server prints the placement at startup (5.77 GiB of weights and 6.80 GiB of KV on the card, 46
+card margin; the server prints the placement at startup (5.77 GiB of weights and 6.80 GiB of KV on the card, 49
 experts a layer, 40 streaming slots, 7.7 GiB of cold experts in pinned host memory; ~100 MB of the card goes
-to the long prefill attention's buffers). 1,024-token chunks (`--chunk 1024`) keep 4 more experts a layer and
-prefill ~14% slower (DECISIONS 2026-10-27, "2,048-token prefill chunks by default").
+to the long prefill attention's buffers and ~120 MB to EmbeddingGemma 2's attention). 1,024-token chunks
+(`--chunk 1024`) keep 4 more experts a layer and prefill ~14% slower (DECISIONS 2026-10-27, "2,048-token prefill
+chunks by default").
 
 ## Accuracy
 

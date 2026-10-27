@@ -1,0 +1,38 @@
+# Gemma 4 12B through eklow-server, 2026-10-27, main at cef9ae9: 2 slots of 262,144 tokens, int8 global KV,
+# 2,048-token prefill chunks (the default), EmbeddingGemma 2 loaded; the whole model on the card. eklow.service was
+# stopped; the server ran from the build tree (~/eklow-micro/sp12b.sh: serve-perf.sh's depth part, the 12B's flags).
+# Method as in serve-perf-26b-fiona-2026-10-27.txt (unholy's unique Pile documents cut to Gemma token depths; at each
+# depth one cold request, then four more on the cached prefix; decode is the median of the five).
+
+## startup
+eklow-server: gemma-4-12b on Intel(R) Arc(TM) A770M Graphics, 6.48 GiB of weights, 6.38 GiB of KV cache (2 slots of 262144), 3.1 s
+eklow-server: embeddinggemma-2, 0.27 GiB, listening on 127.0.0.1:18182
+eklow-server: listening on 127.0.0.1:18181
+
+## depth
+request | prompt 8191 (0 cached), completion 256 | ttft 5.77 s, prefill 1420.2 tok/s, decode 29.7 tok/s
+request | prompt 8190 (8177 cached), completion 256 | ttft 0.16 s, prefill 80.7 tok/s, decode 29.7 tok/s
+request | prompt 8193 (8177 cached), completion 256 | ttft 0.16 s, prefill 99.9 tok/s, decode 29.7 tok/s
+request | prompt 8190 (8177 cached), completion 256 | ttft 0.16 s, prefill 80.8 tok/s, decode 29.7 tok/s
+request | prompt 8190 (8177 cached), completion 256 | ttft 0.16 s, prefill 81.2 tok/s, decode 29.7 tok/s
+request | prompt 32795 (0 cached), completion 256 | ttft 26.44 s, prefill 1240.3 tok/s, decode 27.7 tok/s
+request | prompt 32794 (32781 cached), completion 256 | ttft 0.21 s, prefill 62.4 tok/s, decode 27.7 tok/s
+request | prompt 32797 (32781 cached), completion 256 | ttft 0.21 s, prefill 74.8 tok/s, decode 27.7 tok/s
+request | prompt 32794 (32781 cached), completion 256 | ttft 0.21 s, prefill 62.7 tok/s, decode 27.6 tok/s
+request | prompt 32794 (32781 cached), completion 256 | ttft 0.21 s, prefill 62.7 tok/s, decode 27.6 tok/s
+request | prompt 131099 (0 cached), completion 256 | ttft 174.96 s, prefill 749.3 tok/s, decode 23.5 tok/s
+request | prompt 131098 (131085 cached), completion 256 | ttft 0.43 s, prefill 30.4 tok/s, decode 23.2 tok/s
+request | prompt 131101 (131085 cached), completion 256 | ttft 0.43 s, prefill 37.0 tok/s, decode 22.6 tok/s
+request | prompt 131098 (131085 cached), completion 256 | ttft 0.42 s, prefill 30.6 tok/s, decode 21.6 tok/s
+request | prompt 131098 (131085 cached), completion 256 | ttft 0.42 s, prefill 30.6 tok/s, decode 20.4 tok/s
+request | prompt 258075 (0 cached), completion 256 | ttft 530.03 s, prefill 486.9 tok/s, decode 20.3 tok/s
+request | prompt 258074 (258061 cached), completion 256 | ttft 0.72 s, prefill 18.0 tok/s, decode 20.1 tok/s
+request | prompt 258077 (258061 cached), completion 256 | ttft 0.75 s, prefill 21.3 tok/s, decode 19.5 tok/s
+request | prompt 258074 (258061 cached), completion 67 | ttft 0.78 s, prefill 16.7 tok/s, decode 20.5 tok/s
+request | prompt 258074 (258061 cached), completion 256 | ttft 0.74 s, prefill 17.6 tok/s, decode 18.1 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 5
+8k         1420 (5.8 s)        29.7
+32k         1240 (26.4 s)        27.7
+128k          749 (175.0 s)        22.6
+252k          487 (530.0 s)        20.1
