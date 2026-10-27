@@ -11,9 +11,11 @@
 
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
+#include "cpu/q4_gemv.hpp"
 #include "kernels/attention.hpp"
 #include "kernels/fast.hpp"
 #include "kernels/xmx.hpp"
@@ -32,6 +34,14 @@ struct Config {
   // memory, which 2 x 262k needs, at a cost to decode (the conversion adds to what each thread
   // waits on) and within the oracle's noise.
   bool int8_global_kv = false;
+  // The 26B's experts: the `experts_on_card` busiest of each layer by the profile (a JSON of per-layer
+  // selection counts, tools/ref/expert_profile.py) are repacked onto the card; the rest are computed on
+  // the CPU from the GGUF's mapping (which must outlive the engine). -1: all of them; below the
+  // model's count a profile is required.
+  std::string expert_profile;
+  int64_t experts_on_card = -1;  // -2: as many as fit in the free memory left after the rest, less card_margin_bytes
+  uint64_t card_margin_bytes = 1ull << 30;
+  int cpu_threads = 0;  // the cold experts' pool, caller included; 0: 16 (8, 12, 16, 20 tried: 16 and 20 equal)
 };
 
 struct Chunk {
@@ -69,6 +79,23 @@ class Engine {
   const model::Gemma4Config& model() const { return cfg_; }
   int n_slots() const { return c_.n_slots; }
   uint64_t weight_bytes() const { return weight_bytes_; }
+  // Experts of each layer on the card (the model's count when all are), and since the engine was
+  // made, the (token, slot) pairs the MoE layers routed and how many of them went to the CPU.
+  int64_t experts_on_card() const { return n_hot_; }
+  // What the placement saw: the card's free memory before the experts went on (0 when it was not asked)
+  // and the bytes of one expert from every layer.
+  uint64_t free_at_placement() const { return free_at_placement_; }
+  uint64_t expert_set_bytes() const { return expert_set_bytes_; }
+  uint64_t pairs() const { return pairs_; }
+  uint64_t cold_pairs() const { return cold_pairs_; }
+  // Host seconds since the engine was made: waiting for the card's routing, computing cold experts on
+  // the CPU; and of the layers that had cold experts, those whose hot experts were already finished on
+  // the card when the CPU was (the card then waited for the host).
+  struct ColdStats {
+    double wait_s = 0, cpu_s = 0;
+    uint64_t layers = 0, late_layers = 0;
+  };
+  const ColdStats& cold_stats() const { return cold_; }
   uint64_t cache_bytes() const { return cache_bytes_; }
   // Host time the last step took to enqueue its work; when it nears the step's wall time, the
   // card waits on the host.
@@ -90,6 +117,12 @@ class Engine {
     std::vector<float> exp_down_scale;
     xmx::ExpertTable tab_gate_up, tab_down;  // device pointer tables over exp_gate_up / exp_down (decode path)
     const float* exp_down_scale_dev = nullptr;
+    // Cold experts: flags per expert (1: on the host), the same on the device for the grouping kernel,
+    // and the GGUF's rows (gate_up [2 Fe][E], down [E][Fe], ggml Q4_0) of every expert.
+    std::vector<uint8_t> cold;
+    uint8_t* cold_dev = nullptr;
+    int n_cold = 0;
+    const uint8_t *gu_host = nullptr, *dn_host = nullptr;
   };
   struct Slot {
     int64_t length = 0;
@@ -97,6 +130,14 @@ class Engine {
   };
 
   float* dev(int64_t n);
+  void load_experts();
+  // Layer L's cold experts for the pairs cp (ascending pair indices p = t * n_used + i, expert ids[p]):
+  // gate_up, GeGLU and down on the CPU from the int8 input rows x[t]. Output row k (E floats) of y is
+  // the k-th pair's, before its weight.
+  void cold_compute(const Layer& L, const std::vector<int32_t>& cp, const int32_t* ids, const std::vector<cpu::Q8Blocks>& x, float* y);
+  std::vector<int32_t> cold_list(const Layer& L, const int32_t* ids, int64_t P) const;
+  void cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event routed, sycl::event hot_done);
+  void cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event routed, sycl::event hot_done);
   void ensure_pages(int slot, int64_t positions);
 
   sycl::queue& q_;
@@ -146,6 +187,22 @@ class Engine {
   int64_t max_tiles_sliding_ = 0, max_tiles_global_ = 0;
   xmx::Activations act_, act_ffn_;  // matmul inputs: of width E or H x D, and of the FFN's width
   attn::Scratch attn_scratch_;
+  // Cold experts (see Config): the host pool, pinned buffers for the routing and inputs the host
+  // reads (hp_ids_, hp_w_; prefill's int8 expert inputs hp_xq_ with scales hp_xs_; decode's int8 row tile
+  // hp_aq_ hp_as_), for what it writes (hp_y_: decode's output rows; prefill's weighted sums of the tokens
+  // with cold experts in hp_sum_ rows, token t's row in hp_map_[t] or -1, copied to the card's cold_sum_ and
+  // cold_map_).
+  int64_t n_hot_ = 0;
+  uint64_t free_at_placement_ = 0, expert_set_bytes_ = 0;
+  std::unique_ptr<cpu::Pool> pool_;
+  int32_t* hp_ids_ = nullptr;
+  float *hp_w_ = nullptr, *hp_xs_ = nullptr, *hp_y_ = nullptr, *hp_sum_ = nullptr, *hp_as_ = nullptr, *cold_sum_ = nullptr;
+  int8_t *hp_aq_ = nullptr, *hp_xq_ = nullptr;
+  int32_t *hp_map_ = nullptr, *cold_map_ = nullptr;
+  std::vector<float> cold_y_, cold_gu_;
+  std::vector<cpu::Q8Blocks> cold_g_;
+  uint64_t pairs_ = 0, cold_pairs_ = 0;
+  ColdStats cold_;
   std::map<std::string, double>* profile_ = nullptr;
   double enqueue_s_ = 0;
 };

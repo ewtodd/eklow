@@ -88,6 +88,8 @@ void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activat
 
 // A layer's experts of one shape, as device tables of their tile and scale pointers (the experts
 // stay separate xmx::Weights; the grouped kernels index the tables by expert id).
+// An expert with null tiles is cold (it lives in host memory): the grouped GEMVs skip its pairs and
+// leave their output rows as they were.
 struct ExpertTable {
   int64_t k = 0, n = 0, count = 0;
   const uint8_t** tiles = nullptr;

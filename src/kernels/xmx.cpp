@@ -516,6 +516,7 @@ void gemv1_grouped(sycl::queue& q, const Activations& a, const Activations* ad, 
                    const bool dn = p >= pe;
                    const int e = dn ? e_dense + int((p - pe) % 3) : ids[p];
                    const uint8_t* bt = tt[e];
+                   if (!bt) return;  // a cold expert (computed on the host): its work-group has nothing to do
                    const sycl::half* bs = ts[e];
                    const int64_t row = dn ? (p - pe) / 3 : p / row_div;
                    // Row `row`'s tile b starts at ((row / 8) * kb + b) * 256 + (row % 8) * 32.

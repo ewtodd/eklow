@@ -61,9 +61,25 @@ void matmul_q6(sycl::queue& q, const Q6& w, const float* x, int64_t rows, float*
 void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_expert, int64_t n_used, const float* down_scale,
                int32_t* ids, float* weights);
 // out[t][:] = sum_i weights[t][i] * y[row(t, i)][:], summed in the order i = 0..n_used-1; row(t, i)
-// is t * n_used + i, or rows[t * n_used + i] when given (the grouped GEMM's sorted order).
+// is t * n_used + i, or rows[t * n_used + i] when given (the grouped GEMM's sorted order), where a
+// negative row is a pair left out (a cold expert). `extra`, when given, holds the cold experts' share
+// (already weighted, from the host) in rows [extra_row[t]][cols], added to token t's sum unless
+// extra_row[t] is negative.
 void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out,
-                 const int32_t* rows = nullptr);
+                 const int32_t* rows = nullptr, const float* extra = nullptr, const int32_t* extra_row = nullptr);
+// Decode with cold experts: one kernel that copies the routing (ids [n_ids]) and the experts' input
+// row (the first 8-row tile of int8 activations, a_bytes, and its scales, s_n floats) into pinned host
+// memory, so the host needs one event instead of three copies' worth of launches and waits.
+sycl::event host_pack(sycl::queue& q, const int32_t* ids, int64_t n_ids, const int8_t* a, int64_t a_bytes, const float* s, int64_t s_n,
+                      int32_t* h_ids, int8_t* h_a, float* h_s);
+// The cold pairs' output rows from pinned host memory: row k of host_y [n][cols] becomes row pair[k] of y.
+struct PairList {
+  int32_t pair[32];
+};
+void cold_scatter(sycl::queue& q, const float* host_y, const PairList& pairs, int64_t n, int64_t cols, float* y);
+// Row-major int8 for the host: out[r][cols] and one fp32 scale per 32-block, s[r][cols / 32] = max|x| / 127,
+// q = round(x / s), as xmx::quantize_run does it.
+void quantize_rows(sycl::queue& q, const float* x, int64_t rows, int64_t cols, int8_t* out, float* scale);
 
 // Prefill's grouping of the (token, slot) pairs p = t * n_used + i by expert (ids as moe_route wrote
 // them), a stable counting sort so that results do not depend on scheduling: expert e's pairs, in
@@ -74,8 +90,10 @@ void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n
 //   row_of_pair[p]: the pair's row in the sorted order.
 //   scratch: int32, (ceil(P / 256) + 1) * n_expert.
 // n_expert at most 256. Rows of a segment past its expert's count are padding.
+// cold (n_expert bytes, may be null): pairs of experts flagged 1 are left out of the tile list and get
+// row_of_pair -1 (moe_gather and moe_combine skip them).
 void moe_group(sycl::queue& q, const int32_t* ids, int64_t n_pairs, int64_t n_expert, int64_t tile, int32_t* scratch, int32_t* tiles,
-               int32_t* row_of_pair);
+               int32_t* row_of_pair, const uint8_t* cold = nullptr);
 // Writes x[p / n_used][:] (fp32, cols a multiple of 16) for each pair p to its sorted row in the
 // fp16 activation layout (xmx::act16_index) at `out`.
 void moe_gather(sycl::queue& q, const float* x, const int32_t* row_of_pair, int64_t n_pairs, int64_t n_used, int64_t cols,

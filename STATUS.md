@@ -117,8 +117,13 @@ e-desktop, `~/eklow-wt-*` on fiona).
       1,014 / 1,003 / 970; DECISIONS 2026-10-26, "the 26B's prefill MoE on the card")
 - [x] through the server: chat and tool calls at 2 x 8k; 2 x 32k does not fit with every expert on
       the card
-- [ ] experts placed by the routing profile with the rest on the CPU (long contexts); the tool-call
-      eval against the 12B
+- [x] experts placed by the routing profile with the rest on the CPU: N is picked from the card's free
+      memory (51 of 128 per layer at 2 x 262k, 84 at 2 x 128k), chat, tool calls and embeddings through
+      the server at 2 x 262k, two needle requests of 88k and 167k tokens found; real-text engine26 at
+      N = 112 / 96 / 64: decode 63 / 61 / 53 tok/s, prefill 2,420 / 1,445 / 612 tok/s (DECISIONS
+      2026-10-27, "the 26B with cold experts on the CPU")
+- [ ] the tool-call eval against the 12B; cold prefill past N = 64 is CPU-bound (streaming busy cold
+      experts to the card would fix it)
 
 ## Milestone 4 (speed), started early
 

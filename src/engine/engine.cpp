@@ -1,13 +1,20 @@
 #include "engine/engine.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
+#include <fstream>
+#include <iterator>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 
+#include "core/json_value.hpp"
 #include "kernels/fast.hpp"
+#include "rt/device.hpp"
 
 namespace eklow::engine {
 
@@ -56,7 +63,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
       staging_bytes = std::max(staging_bytes, sum);
     }
   for (const auto& t : f.tensors())
-    if (t.type == gguf::Type::Q4_0) staging_bytes = std::max(staging_bytes, t.nbytes);
+    if (t.type == gguf::Type::Q4_0 && t.name.find("_exps") == std::string::npos) staging_bytes = std::max(staging_bytes, t.nbytes);
   auto* staging = sycl::malloc_device<uint8_t>(staging_bytes, q_);
   if (!staging) throw std::runtime_error("engine: out of device memory for weight staging");
   auto matrix = [&](const std::vector<const gguf::Tensor*>& parts, bool interleave = false) {
@@ -125,7 +132,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     const gguf::Tensor* os = f.tensor(b + "layer_output_scale.weight");
     L.out_scale = os ? *reinterpret_cast<const float*>(os->data) : 1.0f;
     if (cfg_.n_expert > 0) {
-      const int64_t Fe = cfg_.n_ff_exp, n_expert = cfg_.n_expert;
+      const int64_t n_expert = cfg_.n_expert;
       const gguf::Tensor& gu_t = need(b + "ffn_gate_up_exps.weight");
       const gguf::Tensor& dn_t = need(b + "ffn_down_exps.weight");
       const gguf::Tensor& dn_s = need(b + "ffn_down_exps.scale");
@@ -145,37 +152,9 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
       L.post_ffw_norm_2 = vec(b + "post_ffw_norm_2.weight");
       L.exp_down_scale.assign(reinterpret_cast<const float*>(dn_s.data),
                               reinterpret_cast<const float*>(dn_s.data) + n_expert);
-      // Repack each expert's gate_up (interleaved) and down, staging each into the shared buffer
-      // so the originals are not kept on the card.
-      const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
-      L.exp_gate_up.resize(n_expert);
-      L.exp_down.resize(n_expert);
-      for (int e = 0; e < n_expert; ++e) {
-        q_.memcpy(staging, gu_t.data + size_t(e) * 2 * Fe * gu_row, size_t(2 * Fe * gu_row)).wait();
-        L.exp_gate_up[size_t(e)] = xmx::repack_q4_0(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, staging, gu_row}, true);
-        q_.memcpy(staging, dn_t.data + size_t(e) * E * dn_row, size_t(E * dn_row)).wait();
-        L.exp_down[size_t(e)] = xmx::repack_q4_0(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, staging, dn_row}, false);
-        for (xmx::Weight* w : {&L.exp_gate_up[size_t(e)], &L.exp_down[size_t(e)]}) {
-          owned_.push_back(w->tiles);
-          owned_.push_back(w->scales);
-        }
-        weight_bytes_ += size_t(2 * Fe * gu_row + E * dn_row);
-      }
-      // Device tables of the experts' pointers for the grouped decode kernels, and the down scales.
-      {
-        // The dense FFN's gate|up as three more entries (its 3 x 1,408 interleaved columns are contiguous tile ranges).
-        std::vector<xmx::Weight> with_dense = L.exp_gate_up;
-        const int64_t third = L.gate_up.n / 3 / 8 * (L.gate_up.k / 32);  // tiles per third
-        for (int j = 0; j < 3; ++j)
-          with_dense.push_back(xmx::Weight{L.gate_up.k, L.gate_up.n / 3, L.gate_up.tiles + j * third * 128, L.gate_up.scales + j * third * 8});
-        L.tab_gate_up = xmx::make_expert_table(q_, with_dense);
-      }
-      L.tab_down = xmx::make_expert_table(q_, L.exp_down);
-      owned_.push_back(L.tab_gate_up.tiles);
-      owned_.push_back(L.tab_gate_up.scales);
-      owned_.push_back(L.tab_down.tiles);
-      owned_.push_back(L.tab_down.scales);
       L.exp_down_scale_dev = vec_host(L.exp_down_scale);
+      L.gu_host = gu_t.data;
+      L.dn_host = dn_t.data;
     }
     if (cfg_.sliding[size_t(l)]) L.ring_index = n_ring++;
     else L.page_index = n_page++;
@@ -282,7 +261,316 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     if (!moe_h_ || !moe_tiles_ || !moe_scratch_) throw std::runtime_error("engine: out of device memory");
     for (void* p : {static_cast<void*>(moe_h_), static_cast<void*>(moe_tiles_), static_cast<void*>(moe_scratch_)}) owned_.push_back(p);
   }
+  if (cfg_.n_expert > 0) load_experts();
 }
+
+void Engine::load_experts() {
+  const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NE = cfg_.n_expert;
+  const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
+  expert_set_bytes_ = uint64_t(cfg_.n_layer) * (uint64_t(2 * Fe) * gu_row + uint64_t(E) * dn_row);
+  const bool fit = c_.experts_on_card == -2;
+  const int64_t want = fit || c_.experts_on_card < 0 || c_.experts_on_card >= NE ? NE : c_.experts_on_card;
+  // Each layer's experts by the profile's counts, busiest first, ties to the lower id.
+  std::vector<std::vector<int>> order(static_cast<size_t>(cfg_.n_layer), std::vector<int>(static_cast<size_t>(NE)));
+  for (auto& o : order)
+    for (int e = 0; e < NE; ++e) o[size_t(e)] = e;
+  if (!c_.expert_profile.empty()) {
+    std::ifstream in(c_.expert_profile);
+    if (!in) throw std::runtime_error("engine: cannot read " + c_.expert_profile);
+    const json::Value doc = json::parse(std::string((std::istreambuf_iterator<char>(in)), {}));
+    const json::Value* cs = doc.find("counts");
+    if (!cs || !cs->is_array() || int64_t(cs->items().size()) != cfg_.n_layer)
+      throw std::runtime_error(c_.expert_profile + ": counts must hold one row per layer");
+    for (int l = 0; l < cfg_.n_layer; ++l) {
+      const json::Value& row = cs->items()[size_t(l)];
+      if (!row.is_array() || int64_t(row.items().size()) != NE) throw std::runtime_error(c_.expert_profile + ": counts must hold one entry per expert");
+      std::vector<int64_t> c;
+      for (const auto& v : row.items()) c.push_back(std::atoll(v.int_digits().c_str()));
+      std::stable_sort(order[size_t(l)].begin(), order[size_t(l)].end(), [&](int a, int b) { return c[size_t(a)] > c[size_t(b)]; });
+    }
+  } else if (want < NE) {
+    throw std::runtime_error("engine: experts_on_card below the expert count needs an expert profile");
+  }
+  const uint64_t stage_bytes = std::max(uint64_t(2 * Fe) * gu_row, uint64_t(E) * dn_row);
+  auto* staging = sycl::malloc_device<uint8_t>(stage_bytes, q_);
+  if (!staging) throw std::runtime_error("engine: out of device memory for weight staging");
+  for (Layer& L : layers_) {
+    L.cold.assign(size_t(NE), 1);
+    L.exp_gate_up.assign(size_t(NE), xmx::Weight{E, 2 * Fe, nullptr, nullptr});  // cold: a table entry with no tiles
+    L.exp_down.assign(size_t(NE), xmx::Weight{Fe, E, nullptr, nullptr});
+  }
+  // Experts go on the card one rank at a time, that rank of every layer, so that the layers stay alike.
+  // When fitting them to the card, the free memory is read before each rank and after it: the rank
+  // goes on if the free memory less the margin holds what the last one took (allocations round up, so
+  // that is a few percent above the bytes of the weights).
+  std::optional<uint64_t> fm;
+  if (fit) {
+    fm = rt::free_memory(q_.get_device());
+    if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
+    free_at_placement_ = *fm;
+  }
+  uint64_t rank_bytes = expert_set_bytes_ + expert_set_bytes_ / 8;
+  int64_t rank = 0;
+  for (; rank < want; ++rank) {
+    if (fit && *fm < c_.card_margin_bytes + rank_bytes) break;
+    for (int l = 0; l < cfg_.n_layer; ++l) {
+      Layer& L = layers_[size_t(l)];
+      const int e = order[size_t(l)][size_t(rank)];
+      L.cold[size_t(e)] = 0;
+      // Repack the expert's gate_up (interleaved) and down, staging each into the shared buffer so the
+      // originals are not kept on the card.
+      q_.memcpy(staging, L.gu_host + size_t(e) * 2 * Fe * gu_row, size_t(2 * Fe * gu_row)).wait();
+      L.exp_gate_up[size_t(e)] = xmx::repack_q4_0(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, staging, gu_row}, true);
+      q_.memcpy(staging, L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row)).wait();
+      L.exp_down[size_t(e)] = xmx::repack_q4_0(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, staging, dn_row}, false);
+      for (xmx::Weight* w : {&L.exp_gate_up[size_t(e)], &L.exp_down[size_t(e)]}) {
+        owned_.push_back(w->tiles);
+        owned_.push_back(w->scales);
+      }
+      weight_bytes_ += size_t(2 * Fe * gu_row + E * dn_row);
+    }
+    if (fit) {
+      const auto after = rt::free_memory(q_.get_device());
+      if (!after) throw std::runtime_error("engine: the driver stopped reporting free device memory");
+      if (*fm > *after) rank_bytes = *fm - *after;
+      fm = after;
+    }
+  }
+  n_hot_ = rank;
+  if (n_hot_ < NE && c_.expert_profile.empty()) throw std::runtime_error("engine: the experts do not all fit; an expert profile is needed to place some on the CPU");
+  for (Layer& L : layers_) {
+    L.n_cold = int(NE - n_hot_);
+    // Device tables of the experts' pointers for the grouped decode kernels.
+    {
+      // The dense FFN's gate|up as three more entries (its 3 x 1,408 interleaved columns are contiguous tile ranges).
+      std::vector<xmx::Weight> with_dense = L.exp_gate_up;
+      const int64_t third = L.gate_up.n / 3 / 8 * (L.gate_up.k / 32);  // tiles per third
+      for (int j = 0; j < 3; ++j)
+        with_dense.push_back(xmx::Weight{L.gate_up.k, L.gate_up.n / 3, L.gate_up.tiles + j * third * 128, L.gate_up.scales + j * third * 8});
+      L.tab_gate_up = xmx::make_expert_table(q_, with_dense);
+    }
+    L.tab_down = xmx::make_expert_table(q_, L.exp_down);
+    for (void* p : {static_cast<void*>(L.tab_gate_up.tiles), static_cast<void*>(L.tab_gate_up.scales), static_cast<void*>(L.tab_down.tiles),
+                    static_cast<void*>(L.tab_down.scales)})
+      owned_.push_back(p);
+    if (L.n_cold) {
+      L.cold_dev = sycl::malloc_device<uint8_t>(size_t(NE), q_);
+      if (!L.cold_dev) throw std::runtime_error("engine: out of device memory");
+      owned_.push_back(L.cold_dev);
+      q_.memcpy(L.cold_dev, L.cold.data(), size_t(NE)).wait();
+    }
+  }
+  sycl::free(staging, q_);
+  if (n_hot_ == NE) return;
+
+  // The host side: a pool, buffers the card and the host share, and the cold experts' pages
+  // touched now (they come out of the page cache the first time, which a request should not wait for).
+  const int threads = c_.cpu_threads > 0 ? c_.cpu_threads : 16;
+  pool_ = std::make_unique<cpu::Pool>(threads);
+  const int64_t B = std::max<int64_t>(c_.max_batch, xmx::kFp16Rows), P = B * cfg_.n_expert_used;
+  auto host = [&](auto*& p, int64_t n) {
+    p = sycl::malloc_host<std::remove_reference_t<decltype(*p)>>(size_t(n), q_);
+    if (!p) throw std::runtime_error("engine: out of pinned host memory");
+    owned_.push_back(p);
+  };
+  host(hp_ids_, P);
+  host(hp_w_, P);
+  host(hp_xq_, B * E);
+  host(hp_xs_, B * E / 32);
+  host(hp_map_, B);
+  host(hp_y_, xmx::kFp16Rows * E);
+  host(hp_sum_, B * E);  // as many rows as tokens in the worst case
+  host(hp_aq_, E / 32 * 256);
+  host(hp_as_, E / 32 * 8);
+  cold_map_ = reinterpret_cast<int32_t*>(dev(B));
+  // cold_sum_, the quantized inputs and their scales live in workspace that is dead during the MoE
+  // (qkv_, qb_, kb_: B x 2,816 fp32, B x 2,816 fp32 and B x 88 fp32 fit them), see step().
+  cold_sum_ = qkv_;
+  std::vector<std::pair<const uint8_t*, size_t>> spans;
+  for (const Layer& L : layers_)
+    for (int e = 0; e < NE; ++e)
+      if (L.cold[size_t(e)]) {
+        spans.push_back({L.gu_host + size_t(e) * 2 * Fe * gu_row, size_t(2 * Fe * gu_row)});
+        spans.push_back({L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row)});
+      }
+  std::atomic<uint64_t> sink{0};
+  pool_->for_each(int64_t(spans.size()), 8, [&](int64_t lo, int64_t hi) {
+    uint64_t s = 0;
+    for (int64_t i = lo; i < hi; ++i)
+      for (size_t o = 0; o < spans[size_t(i)].second; o += 4096) s += spans[size_t(i)].first[o];
+    sink += s;
+  });
+}
+
+std::vector<int32_t> Engine::cold_list(const Layer& L, const int32_t* ids, int64_t P) const {
+  std::vector<int32_t> cp;
+  for (int64_t p = 0; p < P; ++p)
+    if (L.cold[size_t(ids[p])]) cp.push_back(int32_t(p));
+  return cp;
+}
+
+void Engine::cold_compute(const Layer& L, const std::vector<int32_t>& cp, const int32_t* ids, const std::vector<cpu::Q8Blocks>& x, float* y) {
+  const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NE = cfg_.n_expert, NU = cfg_.n_expert_used;
+  const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
+  const int64_t nc = int64_t(cp.size());
+  if (!nc) return;
+  // The pairs grouped by expert (pair order within an expert): each expert's weights are read once for all its rows.
+  struct Seg {
+    int e;
+    std::vector<const cpu::Q8Blocks*> xs;
+    std::vector<float*> ys;
+  };
+  std::vector<std::vector<int32_t>> by_expert(static_cast<size_t>(NE));
+  for (int64_t k = 0; k < nc; ++k) by_expert[size_t(ids[cp[size_t(k)]])].push_back(int32_t(k));
+  cold_gu_.resize(size_t(nc * 2 * Fe));
+  if (int64_t(cold_g_.size()) < nc) cold_g_.resize(size_t(nc));
+  std::vector<Seg> gu_segs, dn_segs;
+  for (int e = 0; e < NE; ++e) {
+    if (by_expert[size_t(e)].empty()) continue;
+    Seg a{e, {}, {}};
+    for (int32_t k : by_expert[size_t(e)]) {
+      a.xs.push_back(&x[size_t(cp[size_t(k)] / NU)]);
+      a.ys.push_back(cold_gu_.data() + int64_t(k) * 2 * Fe);
+    }
+    gu_segs.push_back(std::move(a));
+    Seg b{e, {}, {}};
+    for (int32_t k : by_expert[size_t(e)]) {
+      b.xs.push_back(&cold_g_[size_t(k)]);
+      b.ys.push_back(y + int64_t(k) * E);
+    }
+    dn_segs.push_back(std::move(b));
+  }
+  // Tasks are row ranges of one expert's matrix.
+  auto run = [&](const std::vector<Seg>& segs, const uint8_t* base, uint64_t expert_bytes, int64_t k, int64_t n, int64_t step) {
+    const int64_t per = (n + step - 1) / step;
+    pool_->for_each(int64_t(segs.size()) * per, 1, [&](int64_t lo, int64_t hi) {
+      for (int64_t t = lo; t < hi; ++t) {
+        const Seg& s = segs[size_t(t / per)];
+        const int64_t r0 = (t % per) * step, r1 = std::min(n, r0 + step);
+        cpu::gemv_q4_multi(base + uint64_t(s.e) * expert_bytes, k, r0, r1, s.xs.data(), int(s.xs.size()), s.ys.data());
+      }
+    });
+  };
+  run(gu_segs, L.gu_host, uint64_t(2 * Fe) * gu_row, E, 2 * Fe, 32);
+  // GeGLU (the tanh form, as ref::gelu_mul) and the int8 quantization of its output, per pair.
+  pool_->for_each(nc, 4, [&](int64_t lo, int64_t hi) {
+    std::vector<float> g(static_cast<size_t>(Fe));
+    for (int64_t k = lo; k < hi; ++k) {
+      const float* gu = cold_gu_.data() + k * 2 * Fe;
+      for (int64_t j = 0; j < Fe; ++j) {
+        const float a = gu[j];
+        g[size_t(j)] = 0.5f * a * (1.0f + std::tanh(0.7978845608028654f * (a + 0.044715f * a * a * a))) * gu[Fe + j];
+      }
+      cold_g_[size_t(k)] = cpu::quantize(g.data(), Fe);
+    }
+  });
+  run(dn_segs, L.dn_host, uint64_t(E) * dn_row, Fe, E, 64);
+}
+
+void Engine::cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event routed, sycl::event hot_done) {
+  using Clock = std::chrono::steady_clock;
+  const int64_t E = cfg_.n_embd, NU = cfg_.n_expert_used, kb = E / 32;
+  const auto t0 = Clock::now();
+  routed.wait();
+  const auto t1 = Clock::now();
+  const std::vector<int32_t> cp = cold_list(L, hp_ids_, P);
+  pairs_ += uint64_t(P);
+  cold_pairs_ += cp.size();
+  if (!cp.empty()) {
+    // The expert inputs are the card's own int8 rows (the first 8-row tile of act_exp_).
+    std::vector<cpu::Q8Blocks> x(static_cast<size_t>(T));
+    for (int64_t t = 0; t < T; ++t) {
+      cpu::Q8Blocks& r = x[size_t(t)];
+      r.q.resize(size_t(E));
+      r.s.resize(size_t(kb));
+      r.sum.resize(size_t(kb));
+      for (int64_t b = 0; b < kb; ++b) {
+        int32_t sum = 0;
+        for (int i = 0; i < 32; ++i) {
+          const int8_t v = hp_aq_[b * 256 + t * 32 + i];
+          r.q[size_t(b * 32 + i)] = v;
+          sum += v;
+        }
+        r.s[size_t(b)] = hp_as_[b * 8 + t];
+        r.sum[size_t(b)] = sum;
+      }
+    }
+    cold_compute(L, cp, hp_ids_, x, hp_y_);
+    fast::PairList pl{};
+    for (size_t k = 0; k < cp.size(); ++k) pl.pair[k] = cp[k];
+    fast::cold_scatter(q_, hp_y_, pl, int64_t(cp.size()), E, gx_);
+  }
+  (void)NU;
+  const auto t2 = Clock::now();
+  cold_.wait_s += std::chrono::duration<double>(t1 - t0).count();
+  cold_.cpu_s += std::chrono::duration<double>(t2 - t1).count();
+  ++cold_.layers;
+  if (hot_done.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete) ++cold_.late_layers;
+}
+
+void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event routed, sycl::event hot_done) {
+  using Clock = std::chrono::steady_clock;
+  const int64_t E = cfg_.n_embd, NU = cfg_.n_expert_used;
+  const auto t0 = Clock::now();
+  routed.wait();
+  const auto t1 = Clock::now();
+  const std::vector<int32_t> cp = cold_list(L, hp_ids_, P);
+  pairs_ += uint64_t(P);
+  cold_pairs_ += cp.size();
+  std::vector<int32_t> k_of(size_t(P), -1);
+  std::vector<char> need(size_t(T), 0);
+  for (size_t k = 0; k < cp.size(); ++k) {
+    k_of[size_t(cp[k])] = int32_t(k);
+    need[size_t(cp[k] / NU)] = 1;
+  }
+  const int64_t kb = E / 32;
+  std::vector<cpu::Q8Blocks> x(static_cast<size_t>(T));
+  int32_t n_need = 0;
+  for (int64_t t = 0; t < T; ++t) hp_map_[t] = need[size_t(t)] ? n_need++ : -1;
+  pool_->for_each(T, 8, [&](int64_t lo, int64_t hi) {
+    for (int64_t t = lo; t < hi; ++t) {
+      if (!need[size_t(t)]) continue;
+      cpu::Q8Blocks& r = x[size_t(t)];
+      r.q.assign(hp_xq_ + t * E, hp_xq_ + (t + 1) * E);
+      r.s.assign(hp_xs_ + t * kb, hp_xs_ + (t + 1) * kb);
+      r.sum.resize(size_t(kb));
+      for (int64_t b = 0; b < kb; ++b) {
+        int32_t sum = 0;
+        for (int i = 0; i < 32; ++i) sum += r.q[size_t(b * 32 + i)];
+        r.sum[size_t(b)] = sum;
+      }
+    }
+  });
+  cold_y_.resize(cp.size() * size_t(E));
+  cold_compute(L, cp, hp_ids_, x, cold_y_.data());
+  // Each token's cold share, weighted and summed in slot order (zero for the others).
+  pool_->for_each(T, 16, [&](int64_t lo, int64_t hi) {
+    for (int64_t t = lo; t < hi; ++t) {
+      if (!need[size_t(t)]) continue;
+      float* out = hp_sum_ + int64_t(hp_map_[t]) * E;
+      bool first = true;
+      for (int64_t i = 0; i < NU; ++i) {
+        const int32_t k = k_of[size_t(t * NU + i)];
+        if (k < 0) continue;
+        const float w = hp_w_[t * NU + i];
+        const float* yk = cold_y_.data() + int64_t(k) * E;
+        if (first)
+          for (int64_t j = 0; j < E; ++j) out[j] = w * yk[j];
+        else
+          for (int64_t j = 0; j < E; ++j) out[j] += w * yk[j];
+        first = false;
+      }
+    }
+  });
+  q_.memcpy(cold_sum_, hp_sum_, size_t(n_need) * size_t(E) * sizeof(float));
+  q_.memcpy(cold_map_, hp_map_, size_t(T) * 4);
+  const auto t2 = Clock::now();
+  cold_.wait_s += std::chrono::duration<double>(t1 - t0).count();
+  cold_.cpu_s += std::chrono::duration<double>(t2 - t1).count();
+  ++cold_.layers;
+  if (hot_done.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete) ++cold_.late_layers;
+}
+
 
 Engine::~Engine() {
   q_.wait();
@@ -347,6 +635,9 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     ensure_pages(c.slot, c.start_pos + n);
   }
   const int64_t T = int64_t(tok.size()), R = int64_t(logit_rows.size());
+  // Decode calls the pool every few hundred microseconds and wants its workers spinning; prefill's phases
+  // last milliseconds and the spinning only takes the cores from the hot kernels' host thread.
+  if (pool_) pool_->set_spin_us(T * cfg_.n_expert_used <= xmx::kFp16Rows ? 400 : 0);
   if (T == 0) return {};
   const auto t_step = std::chrono::steady_clock::now();
   if (T > c_.max_batch) throw std::runtime_error("engine: step larger than max_batch");
@@ -471,6 +762,13 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         // card, nothing copied to or waited on by the host.
         fast::moe_route(q_, rlog_, T, n_expert, n_used, L.exp_down_scale_dev, moe_ids_, moe_w_);
         mark("moe_route");
+        // Cold experts: the routing and the experts' int8 input row come to pinned host memory, and the host
+        // waits for them only after the hot experts' kernels are enqueued, so the card works meanwhile.
+        sycl::event routed;
+        if (L.n_cold) {
+          const int64_t kb = E / 32;
+          routed = fast::host_pack(q_, moe_ids_, P, act_exp_.q, kb * 256, act_exp_.s, kb * 8, hp_ids_, hp_aq_, hp_as_);
+        }
         // The dense FFN's gate|up rides along as three more experts; its down follows.
         xmx::matmul_geglu_grouped_dense(q_, act_exp_, act_, L.tab_gate_up, moe_ids_, P, n_used, T, act_exp_ffn_, act_ffn_, moe_gu_);
         mark("moe_gate_up");
@@ -478,6 +776,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         mark("down");
         xmx::matmul_grouped(q_, act_exp_ffn_, L.tab_down, moe_ids_, P, 1, gx_);
         mark("moe_down");
+        if (L.n_cold) cold_decode(L, T, P, routed, q_.single_task([] {}));
         // The layer's tail in one kernel; with a dump sink its intermediates are kept for it.
         const bool d1 = dump && dump->wants("ffn_mlp" + s), d2 = dump && dump->wants("ffn_moe" + s),
                    d3 = dump && dump->wants("ffn_moe_combined" + s);
@@ -493,10 +792,21 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         // their tokens at once and the weighted sum, all on the card.
         fast::moe_route(q_, rlog_, T, n_expert, n_used, L.exp_down_scale_dev, moe_ids_, moe_w_);
         mark("moe_route");
-        fast::moe_group(q_, moe_ids_, P, n_expert, moe_tile_, moe_scratch_, moe_tiles_, moe_row_);
-        mark("moe_group");
-        // Expert input rmsnorm(x2_) * pre_ffw_norm_2 (h_ is scratch), each pair's row in sorted order.
+        // Expert input rmsnorm(x2_) * pre_ffw_norm_2 (h_ is scratch).
         fast::rmsnorm(q_, x2_, L.pre_ffw_norm_2, T, E, cfg_.eps, h_);
+        sycl::event routed;
+        if (L.n_cold) {
+          // As at decode, the host waits for the routing and the input rows after the hot work is enqueued.
+          q_.memcpy(hp_ids_, moe_ids_, size_t(P) * 4);
+          q_.memcpy(hp_w_, moe_w_, size_t(P) * 4);
+          // The expert inputs go as int8 (the form the CPU computes with), a quarter of the bytes.
+          fast::quantize_rows(q_, h_, T, E, reinterpret_cast<int8_t*>(qb_), kb_);
+          q_.memcpy(hp_xq_, qb_, size_t(T * E));
+          routed = q_.memcpy(hp_xs_, kb_, size_t(T) * size_t(E / 32) * sizeof(float));
+        }
+        fast::moe_group(q_, moe_ids_, P, n_expert, moe_tile_, moe_scratch_, moe_tiles_, moe_row_, L.cold_dev);
+        mark("moe_group");
+        // Each pair's row in sorted order.
         fast::moe_gather(q_, h_, moe_row_, P, n_used, E, moe_a_);
         mark("moe_gather");
         const int64_t max_tiles = (P + moe_tile_ - 1) / moe_tile_ + n_expert;
@@ -504,7 +814,8 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         mark("moe_gate_up");
         xmx::matmul_grouped16(q_, moe_h_, L.tab_down, moe_tiles_, max_tiles, moe_tile_, moe_y_);
         mark("moe_down");
-        fast::moe_combine(q_, moe_y_, moe_w_, T, n_used, E, moe_, moe_row_);
+        if (L.n_cold) cold_prefill(L, T, P, routed, q_.single_task([] {}));
+        fast::moe_combine(q_, moe_y_, moe_w_, T, n_used, E, moe_, moe_row_, L.n_cold ? cold_sum_ : nullptr, L.n_cold ? cold_map_ : nullptr);
         mark("moe_sum");
       }
       if (!fused) fast::rmsnorm(q_, moe_, L.post_ffw_norm_2, T, E, cfg_.eps, moe_);

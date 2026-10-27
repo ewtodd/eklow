@@ -1,6 +1,7 @@
 #include "cpu/q4_gemv.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <immintrin.h>
@@ -111,7 +112,7 @@ void gemv_q4(const uint8_t* rows, int64_t k, int64_t n, const Q8Blocks& x, float
   for (auto& w : th) w.join();
 }
 
-Pool::Pool(int threads) {
+Pool::Pool(int threads, int spin_us) : spin_us_(spin_us) {
   for (int i = 1; i < std::max(threads, 1); ++i) workers_.emplace_back([this, i] { run(i); });
 }
 
@@ -124,39 +125,59 @@ Pool::~Pool() {
   for (auto& w : workers_) w.join();
 }
 
+namespace {
+using SpinClock = std::chrono::steady_clock;
+}
+
 void Pool::for_each(int64_t n, int64_t grain, const std::function<void(int64_t, int64_t)>& f) {
+  if (n <= grain || workers_.empty()) {
+    if (n > 0) f(0, n);
+    return;
+  }
   {
     std::lock_guard lk(mu_);
     job_ = &f;
     n_ = n;
     grain_ = grain;
     next_.store(0, std::memory_order_relaxed);
-    pending_ = int(workers_.size());
-    ++gen_;
+    pending_.store(int(workers_.size()), std::memory_order_relaxed);
+    gen_.fetch_add(1, std::memory_order_release);
   }
   wake_.notify_all();
   for (int64_t lo; (lo = next_.fetch_add(grain)) < n;) f(lo, std::min(n, lo + grain));
-  std::unique_lock lk(mu_);
-  done_.wait(lk, [this] { return pending_ == 0; });
+  const auto t0 = SpinClock::now();
+  while (pending_.load(std::memory_order_acquire) != 0 &&
+         std::chrono::duration_cast<std::chrono::microseconds>(SpinClock::now() - t0).count() < spin_us_.load(std::memory_order_relaxed))
+    _mm_pause();
+  if (pending_.load(std::memory_order_acquire) != 0) {
+    std::unique_lock lk(mu_);
+    done_.wait(lk, [this] { return pending_.load(std::memory_order_acquire) == 0; });
+  }
 }
 
 void Pool::run(int) {
   uint64_t seen = 0;
   for (;;) {
+    const auto t0 = SpinClock::now();
+    while (gen_.load(std::memory_order_acquire) == seen && !stop_.load(std::memory_order_relaxed) &&
+           std::chrono::duration_cast<std::chrono::microseconds>(SpinClock::now() - t0).count() < spin_us_.load(std::memory_order_relaxed))
+      _mm_pause();
     const std::function<void(int64_t, int64_t)>* job;
     int64_t n, grain;
     {
       std::unique_lock lk(mu_);
-      wake_.wait(lk, [&] { return stop_ || gen_ != seen; });
+      wake_.wait(lk, [&] { return stop_.load() || gen_.load() != seen; });
       if (stop_) return;
-      seen = gen_;
+      seen = gen_.load();
       job = job_;
       n = n_;
       grain = grain_;
     }
     for (int64_t lo; (lo = next_.fetch_add(grain)) < n;) (*job)(lo, std::min(n, lo + grain));
-    std::lock_guard lk(mu_);
-    if (--pending_ == 0) done_.notify_one();
+    if (pending_.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+      std::lock_guard lk(mu_);
+      done_.notify_one();
+    }
   }
 }
 
@@ -164,6 +185,53 @@ void gemv_q4(const uint8_t* rows, int64_t k, int64_t n, const Q8Blocks& x, float
   if (k % 32) throw std::invalid_argument("gemv_q4: k is not a multiple of 32");
   const int64_t nblk = k / 32;
   pool.for_each(n, 16, [=, &x](int64_t lo, int64_t hi) { rows_range(rows, nblk, x, y, lo, hi); });
+}
+
+// R inputs against one row. The weight block is unpacked once for all of them; per input the
+// -8 * sum(q) of the unsigned nibbles is the dpbusd accumulator's start value (-sum in each of the
+// 8 lanes), so a block costs one dpbusd, a conversion, a multiply by the input block's scale and a
+// fused multiply-add of the weight block's scale into a vector accumulator.
+template <int R>
+inline void row_dot_multi(const uint8_t* row, int64_t nblk, const int8_t* const* qp, const float* const* sp, const int32_t* const* sump,
+                          float* out) {
+  __m256 acc[R];
+  for (int r = 0; r < R; ++r) acc[r] = _mm256_setzero_ps();
+  for (int64_t b = 0; b < nblk; ++b) {
+    const uint8_t* p = row + b * kBlockBytes;
+    const __m256i nib = load_nibbles(p + 2);
+    const __m256 dv = _mm256_set1_ps(f16(p));
+    for (int r = 0; r < R; ++r) {
+      const __m256i dp = _mm256_dpbusd_avx_epi32(_mm256_set1_epi32(-sump[r][b]), nib,
+                                                 _mm256_loadu_si256(reinterpret_cast<const __m256i*>(qp[r] + b * 32)));
+      acc[r] = _mm256_fmadd_ps(_mm256_mul_ps(_mm256_cvtepi32_ps(dp), _mm256_set1_ps(sp[r][b])), dv, acc[r]);
+    }
+  }
+  for (int r = 0; r < R; ++r) {
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc[r]), _mm256_extractf128_ps(acc[r], 1));
+    h = _mm_hadd_ps(h, h);
+    h = _mm_hadd_ps(h, h);
+    out[r] = _mm_cvtss_f32(h);
+  }
+}
+
+void gemv_q4_multi(const uint8_t* rows, int64_t k, int64_t lo, int64_t hi, const Q8Blocks* const* x, int nx, float* const* y) {
+  const int64_t nblk = k / 32, row_bytes = nblk * kBlockBytes;
+  // Groups of four inputs outermost: their int8 rows (4 x 2.8 KB) stay in L1 while the task's weight
+  // rows (L2 after the first group) go by.
+  int j = 0;
+  for (; j + 4 <= nx; j += 4) {
+    const int8_t* qp[4];
+    const float* sp[4];
+    const int32_t* sump[4];
+    for (int i = 0; i < 4; ++i) qp[i] = x[j + i]->q.data(), sp[i] = x[j + i]->s.data(), sump[i] = x[j + i]->sum.data();
+    float o[4];
+    for (int64_t r = lo; r < hi; ++r) {
+      row_dot_multi<4>(rows + r * row_bytes, nblk, qp, sp, sump, o);
+      for (int i = 0; i < 4; ++i) y[j + i][r] = o[i];
+    }
+  }
+  for (; j < nx; ++j)
+    for (int64_t r = lo; r < hi; ++r) y[j][r] = row_dot(rows + r * row_bytes, nblk, *x[j]);
 }
 
 }  // namespace eklow::cpu

@@ -173,6 +173,32 @@ int main(int argc, char** argv) {
       }
     }
 
+    // gemv_q4_multi (prefill's cold experts: many inputs against one expert) against gemv_q4, expert 17's
+    // gate_up with 1, 3, 4 and 37 inputs (the last: groups of four and a remainder), then its speed.
+    {
+      const int64_t n = 2 * Fe;
+      const uint8_t* w = gu + 17 * n * gu_row;
+      for (int nx : {1, 3, 4, 37}) {
+        std::vector<cpu::Q8Blocks> xs(static_cast<size_t>(nx));
+        std::vector<const cpu::Q8Blocks*> xp;
+        std::vector<std::vector<float>> ym(size_t(nx), std::vector<float>(static_cast<size_t>(n))), y1(size_t(nx), std::vector<float>(static_cast<size_t>(n)));
+        std::vector<float*> yp;
+        for (int j = 0; j < nx; ++j) {
+          std::vector<float> v(static_cast<size_t>(E));
+          for (auto& e : v) e = noise(rng);
+          xs[size_t(j)] = cpu::quantize(v.data(), E);
+          cpu::gemv_q4(w, E, n, xs[size_t(j)], y1[size_t(j)].data(), 1);
+        }
+        for (int j = 0; j < nx; ++j) xp.push_back(&xs[size_t(j)]), yp.push_back(ym[size_t(j)].data());
+        cpu::gemv_q4_multi(w, E, 0, n, xp.data(), nx, yp.data());
+        double worst = 0;
+        for (int j = 0; j < nx; ++j) worst = std::max(worst, double(rel_l2(ym[size_t(j)].data(), y1[size_t(j)].data(), n)));
+        const double us = best_of([&] { cpu::gemv_q4_multi(w, E, 0, n, xp.data(), nx, yp.data()); }, 2, 10);
+        std::printf("multi gate_up, %2d inputs: worst rel L2 vs gemv_q4 %.2e, %.1f us on one thread (%.2f us per input)\n", nx, worst, us, us / nx);
+      }
+      std::printf("\n");
+    }
+
     // Speed: one expert's gate_up + GeGLU + quantize + down.
     const int64_t Fe2 = 2 * Fe;
     std::vector<float> xin(size_t(E), 0.0f), gu_out(size_t(Fe2), 0.0f), g_out(size_t(Fe), 0.0f),
