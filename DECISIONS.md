@@ -899,3 +899,19 @@ Left to try: a group of 12 query tiles (112 threads, partial scores exchanged in
 work-group a core, sharing the barriers and loads over twice the rows). It builds within 64 KB,
 but its first run hung (2026-10-27). Beyond it, the likely remaining lever is a deeper restructure
 that splits the 512 dimensions so each thread holds fewer than 64 accumulator registers.
+
+## 2026-10-27 — production on the 26B, and the card is the service's
+
+fiona's eklow.service serves the 26B at 2 x 262k from 09:03. N = 51 of 128 experts a layer are on the card, with
+40 streaming slots and 7.2 GiB pinned, as the startup line reports. Through it, by unholy's method
+(`tools/bench/serve_perf.py`; `docs/bench/serve-perf-26b-fiona-2026-10-27.txt`):
+- prefill 1,578 / 1,257 / 493 / 352 tok/s at 8k / 32k / 128k / 252k (734 s to the first token at 252k);
+- decode 37.6 / 34.9 / 30.9 / 26.7 tok/s;
+- GSM8K 33.4 / 41.9 tok/s aggregate, one and two at a time.
+
+Embeddings (60-78 ms) and llama.cpp's titles on the Iris Xe (368 ms idle, ~460 ms busy) run beside it.
+
+A second eklow-server started beside the live one died at startup on pinned memory, but took card memory first.
+The live service then answered every request with UR_RESULT_ERROR_OUT_OF_RESOURCES until a restart, 14 minutes later.
+Once a running server has hit an out-of-resources launch, it stays broken. `bench.sh` and `tools/bench/serve-perf.sh`
+now refuse to run while the service is active.
