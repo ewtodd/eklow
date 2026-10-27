@@ -311,8 +311,7 @@ void Engine::load_experts() {
   // streaming slots (when there are cold experts to stream) and then on whole ranks of experts.
   std::optional<uint64_t> fm;
   int64_t n_hot = want;
-  const int64_t reach = std::max(c_.stream_reach, 0);
-  const int64_t slots_wanted = std::min<int64_t>({std::max(c_.stream_slots, 0), reach, 256});
+  const int64_t slots_wanted = std::min<int64_t>(std::max(c_.stream_slots, 0), 256);
   if (fit) {
     fm = rt::free_memory(q_.get_device());
     if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
@@ -321,7 +320,7 @@ void Engine::load_experts() {
     if (budget >= uint64_t(want) * expert_set_bytes_) {
       n_hot = want;
     } else {
-      const uint64_t slot_bytes = uint64_t(slots_wanted) * expert_bytes_;
+      const uint64_t slot_bytes = 2 * uint64_t(slots_wanted) * expert_bytes_;
       n_hot = budget > slot_bytes ? int64_t((budget - slot_bytes) / expert_set_bytes_) : 0;
     }
   }
@@ -382,10 +381,8 @@ void Engine::load_experts() {
       q_.memcpy(L.cold_dev, L.cold.data(), size_t(NE)).wait();
     }
   }
-  // The warm tier: the next `reach` experts of every layer (in the profile's order) repacked for the grouped GEMMs, in
-  // pinned host memory, so that the copy engine can move one to a streaming slot as it is, at the link's speed and
-  // without the CPU (from the GGUF's mapping the driver stages the bytes through the CPU, which then also competes
-  // with the cold experts' GEMVs for memory: 530 us an expert against 300).
+  // Streaming slots on the card: a raw one (the bytes as the copy engine lands them) and a repacked one (what the
+  // grouped GEMMs read) each.
   n_stream_ = int(std::min<int64_t>(slots_wanted, NE - n_hot_));
   if (n_hot_ < NE && n_stream_ > 0) {
     try {
@@ -395,39 +392,15 @@ void Engine::load_experts() {
       n_stream_ = 0;
     }
   }
-  if (n_stream_ > 0) {
-    const int64_t K = std::min<int64_t>(reach, NE - n_hot_);
-    auto* tmp = sycl::malloc_device<uint8_t>(size_t(expert_bytes_), q_);
-    if (!tmp) throw std::runtime_error("engine: out of device memory for weight staging");
-    xmx::Weight tgu, tdn;
-    expert_at(tmp, tgu, tdn);
-    for (size_t l = 0; l < layers_.size(); ++l) {
-      Layer& L = layers_[l];
-      auto* blk = sycl::malloc_host<uint8_t>(size_t(uint64_t(K) * expert_bytes_), q_);
-      if (!blk) throw std::runtime_error("engine: out of pinned host memory for the warm experts");
-      owned_.push_back(blk);
-      L.warm.assign(size_t(NE), nullptr);
-      for (int64_t r = 0; r < K; ++r) {
-        const int e = order[l][size_t(n_hot_ + r)];
-        uint8_t* dst = blk + uint64_t(r) * expert_bytes_;
-        q_.memcpy(staging, L.gu_host + size_t(e) * expert_raw_gu_, size_t(expert_raw_gu_));
-        q_.memcpy(staging + expert_raw_gu_, L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row));
-        xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, staging, gu_row}, true, tgu);
-        xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, staging + expert_raw_gu_, dn_row}, false, tdn);
-        q_.memcpy(dst, tmp, size_t(expert_bytes_)).wait();
-        L.warm[size_t(e)] = dst;
-      }
-      warm_bytes_ += uint64_t(K) * expert_bytes_;
-    }
-    sycl::free(tmp, q_);
-  }
   sycl::free(staging, q_);
   if (n_hot_ == NE) return;
 
   if (n_stream_ > 0) {
     const int64_t S = n_stream_, B = c_.max_batch, P = B * cfg_.n_expert_used;
+    stream_raw_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * expert_bytes_), q_);
     stream_slab_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * expert_bytes_), q_);
-    if (!stream_slab_) throw std::runtime_error("engine: out of device memory for the streaming slots");
+    if (!stream_raw_ || !stream_slab_) throw std::runtime_error("engine: out of device memory for the streaming slots");
+    owned_.push_back(stream_raw_);
     owned_.push_back(stream_slab_);
     stream_w_gu_.resize(size_t(S));
     stream_w_dn_.resize(size_t(S));
@@ -470,22 +443,54 @@ void Engine::load_experts() {
   // cold_sum_, the quantized inputs and their scales live in workspace that is dead during the MoE
   // (qkv_, qb_, kb_: B x 2,816 fp32, B x 2,816 fp32 and B x 88 fp32 fit them), see step().
   cold_sum_ = qkv_;
-  std::vector<std::pair<const uint8_t*, size_t>> spans;
-  for (const Layer& L : layers_)
+  // Where the CPU reads the cold experts from. With streaming they are copied (once, in parallel) into pinned host
+  // memory, from which the copy engine moves them to the card without the CPU's help (from the GGUF's mapping the
+  // driver stages the bytes through the CPU, 530 us an expert while the cold GEMVs run, against 300). The copy also
+  // brings the pages in, which a request should not wait for.
+  for (Layer& L : layers_) {
+    L.cold_gu.assign(size_t(NE), nullptr);
+    L.cold_dn.assign(size_t(NE), nullptr);
+    std::vector<int> cold;
     for (int e = 0; e < NE; ++e)
-      if (L.cold[size_t(e)]) {
-        spans.push_back({L.gu_host + size_t(e) * 2 * Fe * gu_row, size_t(2 * Fe * gu_row)});
-        spans.push_back({L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row)});
-      }
-  std::atomic<uint64_t> sink{0};
-  pool_->for_each(int64_t(spans.size()), 8, [&](int64_t lo, int64_t hi) {
-    uint64_t s = 0;
-    for (int64_t i = lo; i < hi; ++i)
-      for (size_t o = 0; o < spans[size_t(i)].second; o += 4096) s += spans[size_t(i)].first[o];
-    sink += s;
-  });
+      if (L.cold[size_t(e)]) cold.push_back(e);
+    uint8_t* blk = nullptr;
+    if (n_stream_ > 0) blk = sycl::malloc_host<uint8_t>(size_t(uint64_t(cold.size()) * expert_bytes_), q_);
+    if (n_stream_ > 0 && !blk) throw std::runtime_error("engine: out of pinned host memory for the cold experts");
+    if (blk) {
+      owned_.push_back(blk);
+      pinned_bytes_ += uint64_t(cold.size()) * expert_bytes_;
+    }
+    for (size_t j = 0; j < cold.size(); ++j) {
+      const size_t e = size_t(cold[j]);
+      L.cold_gu[e] = blk ? blk + j * expert_bytes_ : L.gu_host + e * expert_raw_gu_;
+      L.cold_dn[e] = blk ? blk + j * expert_bytes_ + expert_raw_gu_ : L.dn_host + e * E * dn_row;
+    }
+    if (blk) {
+      pool_->for_each(int64_t(cold.size()), 1, [&](int64_t lo, int64_t hi) {
+        for (int64_t j = lo; j < hi; ++j) {
+          std::memcpy(blk + j * expert_bytes_, L.gu_host + size_t(cold[size_t(j)]) * expert_raw_gu_, expert_raw_gu_);
+          std::memcpy(blk + j * expert_bytes_ + expert_raw_gu_, L.dn_host + size_t(cold[size_t(j)]) * E * dn_row, size_t(E * dn_row));
+        }
+      });
+    }
+  }
+  if (n_stream_ == 0) {
+    std::vector<std::pair<const uint8_t*, size_t>> spans;
+    for (const Layer& L : layers_)
+      for (int e = 0; e < NE; ++e)
+        if (L.cold[size_t(e)]) {
+          spans.push_back({L.gu_host + size_t(e) * 2 * Fe * gu_row, size_t(2 * Fe * gu_row)});
+          spans.push_back({L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row)});
+        }
+    std::atomic<uint64_t> sink{0};
+    pool_->for_each(int64_t(spans.size()), 8, [&](int64_t lo, int64_t hi) {
+      uint64_t s = 0;
+      for (int64_t i = lo; i < hi; ++i)
+        for (size_t o = 0; o < spans[size_t(i)].second; o += 4096) s += spans[size_t(i)].first[o];
+      sink += s;
+    });
+  }
 }
-
 std::vector<int32_t> Engine::cold_list(const Layer& L, const int32_t* ids, int64_t P) const {
   std::vector<int32_t> cp;
   for (int64_t p = 0; p < P; ++p)
@@ -495,7 +500,6 @@ std::vector<int32_t> Engine::cold_list(const Layer& L, const int32_t* ids, int64
 
 void Engine::cold_compute(const Layer& L, const std::vector<int32_t>& cp, const int32_t* ids, const std::vector<cpu::Q8Blocks>& x, float* y) {
   const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NE = cfg_.n_expert, NU = cfg_.n_expert_used;
-  const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
   const int64_t nc = int64_t(cp.size());
   if (!nc) return;
   // The pairs grouped by expert (pair order within an expert): each expert's weights are read once for all its rows.
@@ -525,17 +529,17 @@ void Engine::cold_compute(const Layer& L, const std::vector<int32_t>& cp, const 
     dn_segs.push_back(std::move(b));
   }
   // Tasks are row ranges of one expert's matrix.
-  auto run = [&](const std::vector<Seg>& segs, const uint8_t* base, uint64_t expert_bytes, int64_t k, int64_t n, int64_t step) {
+  auto run = [&](const std::vector<Seg>& segs, const std::vector<const uint8_t*>& expert, int64_t k, int64_t n, int64_t step) {
     const int64_t per = (n + step - 1) / step;
     pool_->for_each(int64_t(segs.size()) * per, 1, [&](int64_t lo, int64_t hi) {
       for (int64_t t = lo; t < hi; ++t) {
         const Seg& s = segs[size_t(t / per)];
         const int64_t r0 = (t % per) * step, r1 = std::min(n, r0 + step);
-        cpu::gemv_q4_multi(base + uint64_t(s.e) * expert_bytes, k, r0, r1, s.xs.data(), int(s.xs.size()), s.ys.data());
+        cpu::gemv_q4_multi(expert[size_t(s.e)], k, r0, r1, s.xs.data(), int(s.xs.size()), s.ys.data());
       }
     });
   };
-  run(gu_segs, L.gu_host, uint64_t(2 * Fe) * gu_row, E, 2 * Fe, 32);
+  run(gu_segs, L.cold_gu, E, 2 * Fe, 32);
   // GeGLU (the tanh form, as ref::gelu_mul) and the int8 quantization of its output, per pair.
   pool_->for_each(nc, 4, [&](int64_t lo, int64_t hi) {
     std::vector<float> g(static_cast<size_t>(Fe));
@@ -548,7 +552,7 @@ void Engine::cold_compute(const Layer& L, const std::vector<int32_t>& cp, const 
       cold_g_[size_t(k)] = cpu::quantize(g.data(), Fe);
     }
   });
-  run(dn_segs, L.dn_host, uint64_t(E) * dn_row, Fe, E, 64);
+  run(dn_segs, L.cold_dn, Fe, E, 64);
 }
 
 void Engine::cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event routed, sycl::event hot_done) {
@@ -599,7 +603,7 @@ std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int
   for (int e = 0; e < NE; ++e)
     if (L.cold[size_t(e)] && cnt[size_t(e)] > 0) {
       rest += cnt[size_t(e)];
-      if (cnt[size_t(e)] >= c_.stream_min_rows && L.warm[size_t(e)]) cand.push_back(e);
+      if (cnt[size_t(e)] >= c_.stream_min_rows) cand.push_back(e);
     }
   std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return cnt[size_t(a)] != cnt[size_t(b)] ? cnt[size_t(a)] > cnt[size_t(b)] : a < b; });
   // The copies and the CPU work run side by side: stream the busiest candidates until the copies would take
@@ -625,16 +629,23 @@ std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int
 void Engine::stream_experts(const Layer& L, const std::vector<int32_t>& list, int64_t P, int32_t hot_rows, int64_t s_tiles,
                             const std::function<void(const char*)>& mark) {
   const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NU = cfg_.n_expert_used, NE = cfg_.n_expert;
-  // The copy engine moves each expert's repacked bytes from pinned memory into its slot; the host does not wait:
-  // the queue does, on the copies' fence, before the grouping and the GEMMs, which come after the hot experts'.
-  for (size_t j = 0; j < list.size(); ++j) copy_->copy(stream_slab_ + uint64_t(j) * expert_bytes_, L.warm[size_t(list[j])], expert_bytes_);
+  const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
+  // The copy engine moves each expert's bytes (gate_up then down, as the GGUF has them) from pinned memory into its
+  // raw slot; the host does not wait: the queue does, on the copies' fence, before the repacking, the grouping and
+  // the GEMMs, which come after the hot experts'.
+  for (size_t j = 0; j < list.size(); ++j) copy_->copy(stream_raw_ + uint64_t(j) * expert_bytes_, L.cold_gu[size_t(list[j])], expert_bytes_);
   const sycl::event copied = copy_->event(copy_->fence());
   q_.submit([&](sycl::handler& h) {
     h.depends_on(copied);
     h.single_task([] {});
   });
+  for (size_t j = 0; j < list.size(); ++j) {
+    const uint8_t* raw = stream_raw_ + uint64_t(j) * expert_bytes_;
+    xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, raw, gu_row}, true, stream_w_gu_[j]);
+    xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, raw + expert_raw_gu_, dn_row}, false, stream_w_dn_[j]);
+  }
   q_.memcpy(stream_map_, hp_smap_, size_t(NE) * 4);
-  mark("stream_copy");
+  mark("stream_copy_repack");
   // The pairs that chose them get rows after the hot experts' (so that moe_combine takes both from one row table).
   fast::moe_group(q_, moe_ids_, P, n_stream_, moe_tile_, stream_scratch_, stream_tiles_, moe_row_, nullptr, stream_map_, hot_rows);
   sycl::half* a = reinterpret_cast<sycl::half*>(att_);

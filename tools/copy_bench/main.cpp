@@ -79,6 +79,19 @@ int main(int argc, char** argv) {
     sx::prepare_for_device_copy(const_cast<uint8_t*>(gu->data), gu->nbytes, q);
     sx::prepare_for_device_copy(const_cast<uint8_t*>(dn->data), dn->nbytes, q);
     run("mapping, prepare_for_device_copy", gu->data, dn->data, q);
+    {
+      rt::CopyEngine ce2(q);
+      for (int rep = 0; rep < 3; ++rep) {
+        const double t0 = now();
+        for (int i = 0; i < n; ++i) {
+          ce2.copy(card + size_t(i) * ex_b, gu->data + size_t(i * 3) * gu_b, gu_b);
+          ce2.copy(card + size_t(i) * ex_b + gu_b, dn->data + size_t(i * 3) * dn_b, dn_b);
+        }
+        const double t1 = now();
+        ce2.wait(ce2.fence());
+        std::printf("copy engine from the registered mapping: %d experts, issue %.0f us, done %.2f ms (%.0f us each)\n", n, (t1 - t0) * 1e6, (now() - t0) * 1e3, (now() - t0) / n * 1e6);
+      }
+    }
     sx::release_from_device_copy(const_cast<uint8_t*>(gu->data), q);
     sx::release_from_device_copy(const_cast<uint8_t*>(dn->data), q);
   } catch (const std::exception& e) {
@@ -175,6 +188,26 @@ int main(int argc, char** argv) {
     }
     std::printf("%s: %d experts alone %.2f ms; with GEMMs: copies done at %.2f ms, GEMM %.2f ms each (alone %.2f)\n", what, n, c0 * 1e3,
                 best_c * 1e3, best_g * 1e3, g0 * 1e3);
+  }
+  {
+    // The card-side repack of one expert (raw bytes on the card to the tile layout), 32 experts back to back.
+    xmx::Weight wgu{E, 2 * Fe, nullptr, nullptr}, wdn{Fe, E, nullptr, nullptr};
+    wgu.tiles = sycl::malloc_device<uint8_t>(xmx::weight_tile_bytes(E, 2 * Fe), q);
+    wgu.scales = sycl::malloc_device<sycl::half>(xmx::weight_scale_bytes(E, 2 * Fe) / 2, q);
+    wdn.tiles = sycl::malloc_device<uint8_t>(xmx::weight_tile_bytes(Fe, E), q);
+    wdn.scales = sycl::malloc_device<sycl::half>(xmx::weight_scale_bytes(Fe, E) / 2, q);
+    auto rep = [&] {
+      for (int i = 0; i < n; ++i) {
+        xmx::repack_q4_0_into(q, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, card + size_t(i) * ex_b, uint64_t(E / 32 * 18)}, true, wgu);
+        xmx::repack_q4_0_into(q, ref::Weight{gguf::Type::Q4_0, Fe, E, card + size_t(i) * ex_b + gu_b, uint64_t(Fe / 32 * 18)}, false, wdn);
+      }
+    };
+    rep();
+    q.wait();
+    const double t0 = now();
+    rep();
+    q.wait();
+    std::printf("card repack of an expert: %.1f us\n", (now() - t0) / n * 1e6);
   }
   // A plain VRAM-bound kernel for comparison: sum of 512 MB.
   auto* big = sycl::malloc_device<float>(size_t(128) << 20, q);

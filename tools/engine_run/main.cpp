@@ -77,7 +77,7 @@ int main(int argc, char** argv) {
   std::string expert_profile;
   int64_t experts_on_card = -1;
   int cpu_threads = 0;
-  int stream_slots = 32, stream_reach = 48, stream_min_rows = 16;
+  int stream_slots = 32, stream_min_rows = 16;
   double stream_copy_us = 300, stream_cpu_us = 22;
   double twin_tol = 0.05;
   for (int i = 1; i < argc; ++i) {
@@ -97,7 +97,6 @@ int main(int argc, char** argv) {
     else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
     else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
     else if (a == "--stream-slots") stream_slots = std::atoi(next().c_str());
-    else if (a == "--stream-reach") stream_reach = std::atoi(next().c_str());
     else if (a == "--stream-min-rows") stream_min_rows = std::atoi(next().c_str());
     else if (a == "--stream-copy-us") stream_copy_us = std::atof(next().c_str());
     else if (a == "--stream-cpu-us") stream_cpu_us = std::atof(next().c_str());
@@ -108,7 +107,7 @@ int main(int argc, char** argv) {
     else {
       std::fprintf(stderr, "usage: eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens IDS) "
                            "[--tensors PREFIX,...] [--logits-last N] [--chunk N] [--decode-last N] [--twin] "
-                           "[--twin-tol KL] [--max-ctx N] [--kv-int8] [--moe-layers N,...] [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [--stream-reach N] [--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US]\n");
+                           "[--twin-tol KL] [--max-ctx N] [--kv-int8] [--moe-layers N,...] [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [[--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US]\n");
       return 2;
     }
   }
@@ -150,7 +149,6 @@ int main(int argc, char** argv) {
     ec.experts_on_card = experts_on_card;
     ec.cpu_threads = cpu_threads;
     ec.stream_slots = stream_slots;
-    ec.stream_reach = stream_reach;
     ec.stream_min_rows = stream_min_rows;
     ec.stream_copy_us = stream_copy_us;
     ec.stream_cpu_us = stream_cpu_us;
@@ -230,8 +228,8 @@ int main(int argc, char** argv) {
       std::printf("cold experts: %.2f s waiting on the card's routing, %.2f s computing on the CPU over %llu layers (%llu with the card finished first)\n",
                   cs.wait_s, cs.cpu_s, (unsigned long long)cs.layers, (unsigned long long)cs.late_layers);
       const auto& ss = eng.stream_stats();
-      std::printf("streamed: %d slots, %.2f GiB of warm experts in pinned memory; %llu experts in %llu layers carried %llu of %llu cold pairs (%.1f%%; the CPU took the rest)\n",
-                  eng.stream_slots(), double(eng.warm_bytes()) / 1073741824.0, (unsigned long long)ss.experts, (unsigned long long)ss.layers, (unsigned long long)ss.pairs,
+      std::printf("streamed: %d slots, %.2f GiB of cold experts in pinned memory; %llu experts in %llu layers carried %llu of %llu cold pairs (%.1f%%; the CPU took the rest)\n",
+                  eng.stream_slots(), double(eng.pinned_bytes()) / 1073741824.0, (unsigned long long)ss.experts, (unsigned long long)ss.layers, (unsigned long long)ss.pairs,
                   (unsigned long long)eng.cold_pairs(), eng.cold_pairs() ? 100.0 * double(ss.pairs) / double(eng.cold_pairs()) : 0.0);
     }
 

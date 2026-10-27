@@ -44,14 +44,13 @@ struct Config {
   int64_t experts_on_card = -1;  // -2: as many as fit in the free memory left after the rest, less card_margin_bytes
   uint64_t card_margin_bytes = 1ull << 30;
   int cpu_threads = 0;  // the cold experts' pool, caller included; 0: 16 (8, 12, 16, 20 tried: 16 and 20 equal)
-  // Prefill with cold experts (DECISIONS 2026-10-28): the next `stream_reach` experts of every layer in the profile's
-  // order after the card's are also kept repacked in pinned host memory, and those with at least stream_min_rows
-  // pairs in a step are copied to the card by the copy engine (at most stream_slots of them a layer) and computed
-  // there by the grouped GEMMs, while the CPU takes the other cold pairs. 0 slots or reach: the CPU takes all of
-  // them (stage 3a). The costs pick how many candidates to stream: about the point where the copies take as long
-  // as the CPU would on the rest. Pinned memory is reach x 30 layers x 3.2 MiB.
+  // Prefill with cold experts (DECISIONS 2026-10-28): the cold experts are held in pinned host memory (one copy, the
+  // CPU computes from it too), and those with at least stream_min_rows pairs in a step are copied to the card by
+  // the copy engine (at most stream_slots of them a layer), repacked there and computed by the grouped GEMMs, while
+  // the CPU takes the other cold pairs. 0 slots: the CPU takes all of them, from the GGUF's mapping (stage 3a).
+  // The costs pick how many candidates to stream: about the point where the copies take as long as the CPU would
+  // on the rest.
   int stream_slots = 32;
-  int stream_reach = 48;
   int stream_min_rows = 16;
   double stream_copy_us = 300;  // one expert from pinned memory to the card (copy-bench: 307 us)
   double stream_cpu_us = 22;    // one cold pair on the CPU, 16 threads
@@ -116,8 +115,8 @@ class Engine {
   };
   const StreamStats& stream_stats() const { return stream_; }
   int stream_slots() const { return n_stream_; }
-  uint64_t stream_slot_bytes() const { return uint64_t(n_stream_) * expert_bytes_; }
-  uint64_t warm_bytes() const { return warm_bytes_; }
+  uint64_t stream_slot_bytes() const { return 2 * uint64_t(n_stream_) * expert_bytes_; }
+  uint64_t pinned_bytes() const { return pinned_bytes_; }
   uint64_t cache_bytes() const { return cache_bytes_; }
   // Host time the last step took to enqueue its work; when it nears the step's wall time, the
   // card waits on the host.
@@ -144,7 +143,9 @@ class Engine {
     std::vector<uint8_t> cold;
     uint8_t* cold_dev = nullptr;
     int n_cold = 0;
-    std::vector<const uint8_t*> warm;  // per expert: its repacked bytes in pinned host memory (the stream_reach after the card's), or null
+    // Where the CPU reads each cold expert (gate_up then down, GGUF layout): the GGUF's mapping or, with streaming,
+    // pinned host memory the copy engine reads too.
+    std::vector<const uint8_t*> cold_gu, cold_dn;
     const uint8_t *gu_host = nullptr, *dn_host = nullptr;
   };
   struct Slot {
@@ -223,12 +224,12 @@ class Engine {
   // with cold experts in hp_sum_ rows, token t's row in hp_map_[t] or -1, copied to the card's cold_sum_ and
   // cold_map_).
   int64_t n_hot_ = 0;
-  // Streaming: S slots on the card (repacked experts, filled by the copy engine), their tables for the grouped
+  // Streaming: S slots on the card (raw bytes as the copy engine lands them, then the repacked experts), their tables for the grouped
   // GEMMs, the experts-to-slots map for the grouping (device, and pinned for the host to fill), the second tile
   // list and grouping scratch; the pairs' inputs are gathered into att_ (dead during the MoE).
   int n_stream_ = 0;
-  uint64_t expert_bytes_ = 0, expert_raw_gu_ = 0, warm_bytes_ = 0;
-  uint8_t* stream_slab_ = nullptr;
+  uint64_t expert_bytes_ = 0, expert_raw_gu_ = 0, pinned_bytes_ = 0;
+  uint8_t *stream_raw_ = nullptr, *stream_slab_ = nullptr;
   std::vector<xmx::Weight> stream_w_gu_, stream_w_dn_;
   xmx::ExpertTable stream_gu_, stream_dn_;
   int32_t *stream_map_ = nullptr, *hp_smap_ = nullptr, *stream_tiles_ = nullptr, *stream_scratch_ = nullptr;
