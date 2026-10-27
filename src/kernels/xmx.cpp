@@ -35,22 +35,37 @@ void repack_q4_0_into(sycl::queue& q, const ref::Weight& raw, bool interleave, c
   const uint64_t row_bytes = raw.row_bytes;
   uint8_t* tiles = w.tiles;
   sycl::half* scales = w.scales;
+  // One work-item per tile: the eight columns' blocks in, one 128-byte tile and its eight scales out.
   q.parallel_for(sycl::range<2>(size_t(ng), size_t(kb)), [=](sycl::id<2> id) {
-     const int64_t g = int64_t(id[0]), b = int64_t(id[1]);
-     uint32_t words[32] = {};
-     for (int n = 0; n < 8; ++n) {
-       const int64_t row = interleave ? (g % 2) * half_rows + (g / 2) * 8 + n : g * 8 + n;
-       const uint8_t* blk = src + uint64_t(row) * row_bytes + uint64_t(b) * 18;
-       scales[tile_at(b, g, kb) * 8 + n] = sycl::bit_cast<sycl::half>(uint16_t(blk[0] | blk[1] << 8));
-       for (int k = 0; k < 32; ++k) {
-         const uint32_t q4 = (k < 16 ? blk[2 + k] & 15 : blk[2 + k - 16] >> 4) ^ 8;
-         const int idx = ((k / 8) * 8 + n) * 8 + k % 8;  // nibble index in the tile
-         words[idx / 8] |= q4 << (4 * (idx % 8));
-       }
-     }
-     uint32_t* dst = reinterpret_cast<uint32_t*>(tiles + tile_at(b, g, kb) * kTileBytes);
-     for (int i = 0; i < 32; ++i) dst[i] = words[i];
-   });
+    const int64_t g = int64_t(id[0]), b = int64_t(id[1]);
+    uint32_t words[32] = {};
+    uint16_t sc[8];
+    for (int n = 0; n < 8; ++n) {
+      const int64_t row = interleave ? (g % 2) * half_rows + (g / 2) * 8 + n : g * 8 + n;
+      const uint8_t* blk = src + uint64_t(row) * row_bytes + uint64_t(b) * 18;
+      sc[n] = uint16_t(blk[0] | blk[1] << 8);
+      // Tile word (k / 8) * 8 + n holds the eight nibbles k = 8 kg .. 8 kg + 7 of column n, low nibble first: kg 0 and 1
+      // are the low nibbles of the block's bytes 0..7 and 8..15, kg 2 and 3 their high nibbles; the s4 form flips bit 3.
+      uint64_t lo8, hi8;
+      __builtin_memcpy(&lo8, blk + 2, 8);
+      __builtin_memcpy(&hi8, blk + 10, 8);
+      auto low_nibbles = [](uint64_t x) {
+        x &= 0x0F0F0F0F0F0F0F0FULL;
+        x = (x | (x >> 4)) & 0x00FF00FF00FF00FFULL;
+        x = (x | (x >> 8)) & 0x0000FFFF0000FFFFULL;
+        return uint32_t((x | (x >> 16)) & 0xFFFFFFFFULL) ^ 0x88888888u;
+      };
+      words[n] = low_nibbles(lo8);
+      words[8 + n] = low_nibbles(hi8);
+      words[16 + n] = low_nibbles(lo8 >> 4);
+      words[24 + n] = low_nibbles(hi8 >> 4);
+    }
+    // Whole 16-byte stores: a tile is 128 bytes and its eight scales 16.
+    auto* dst = reinterpret_cast<sycl::uint4*>(tiles + tile_at(b, g, kb) * kTileBytes);
+    for (int i = 0; i < 8; ++i) dst[i] = sycl::uint4(words[4 * i], words[4 * i + 1], words[4 * i + 2], words[4 * i + 3]);
+    auto* sdst = reinterpret_cast<sycl::uint4*>(scales + tile_at(b, g, kb) * 8);
+    *sdst = sycl::uint4(sc[0] | uint32_t(sc[1]) << 16, sc[2] | uint32_t(sc[3]) << 16, sc[4] | uint32_t(sc[5]) << 16, sc[6] | uint32_t(sc[7]) << 16);
+  });
 }
 
 Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave) {
