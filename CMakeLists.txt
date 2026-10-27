@@ -137,6 +137,11 @@ target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
 target_link_libraries(eklow-server PRIVATE eklow_serve Threads::Threads)
 eklow_sycl(eklow-server)
 
+# The prompt of a chat request (images as rows counted, not encoded), for checking against llama.cpp's without the card.
+add_executable(eklow-prompt tools/prompt/main.cpp)
+target_link_libraries(eklow-prompt PRIVATE eklow_serve)
+eklow_sycl(eklow-prompt)
+
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
@@ -169,6 +174,6 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-grammar-test eklow-cpu-gemv-test RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-cpu-gemv-test RUNTIME DESTINATION bin)
 # The 26B's routing profile, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/gemma-4-26b-a4b-experts.json DESTINATION share/eklow)
