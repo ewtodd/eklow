@@ -108,8 +108,12 @@ e-desktop, `~/eklow-wt-*` on fiona).
       host, one expert at a time): against the fp32 reference 249/256 top-1, mean KL 1.7e-2 on the
       long prompt's last 256 positions, where llama.cpp CPU is 220/256, 7.5e-2 (DECISIONS
       2026-10-26, "the 26B in the engine"); prefill 1,540 tok/s at 1k, decode 18.9 tok/s
-- [ ] MoE kernels (routing on the card, grouped expert GEMVs and GEMMs), then experts placed by the
-      profile with the rest on the CPU; the tool-call eval against the 12B
+- [x] decode MoE on the card (routing kernel, grouped expert GEMVs): 50.5 / 46.4 tok/s at 0 / 4k,
+      41.4 / 38.1 per sequence with two (DECISIONS 2026-10-26, "the 26B's decode MoE on the card")
+- [ ] grouped expert GEMMs for prefill (now 1,014 tok/s at 1k, the per-expert host loop); decode
+      fusion (a layer is ~25 launches; the grouped gate_up runs at half its kernel-test GB/s)
+- [ ] experts placed by the routing profile with the rest on the CPU (long contexts); the tool-call
+      eval against the 12B
 
 ## Milestone 4 (speed), started early
 

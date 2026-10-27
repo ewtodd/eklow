@@ -654,3 +654,37 @@ The 26B is judged from here by `check26.sh` (in the fiona harness): the engine a
 `eklow-ref-run`'s dumps on those 256 positions, inside llama.cpp CPU's own distance (>= 220/256,
 mean KL <= 7.5e-2; chat >= 22/25, <= 8e-2). The 12B keeps its check against llama.cpp: without
 routing the same int8 difference stays small (long 31/32, 1.3e-2).
+
+## 2026-10-26 — the 26B's decode MoE on the card
+
+For steps of at most 4 tokens (T x 8 pairs <= 32) the MoE no longer touches the host:
+- `fast::matmul_f32_small` computes the router logits. `ref::matmul`'s generic F32 path, one
+  work-item per output, had taken 58% of a decode step.
+- `fast::moe_route` does softmax, top 8, renormalization and the down scales, one sub-group per
+  token; ties go to the lowest expert id.
+- The expert input is normed and quantized to int8.
+- `xmx::matmul_geglu_grouped` and `xmx::matmul_grouped` run the gate_up and down GEMVs over all
+  pairs at once. They are gemv1 with each pair's weight looked up in per-layer device tables of
+  the experts' tile and scale pointers (the experts stay separate allocations), and the pair's
+  activation row at p / row_div.
+- `fast::moe_combine` takes the weighted sum in a fixed order.
+
+Prefill keeps the per-expert host path.
+
+Decode measured with `bench.sh engine26`, against the host path in the same runs:
+
+| | at 0 | at 4k |
+|---|---|---|
+| one slot, tok/s (host path) | 50.5 (11.5) | 46.4 (11.3) |
+| two slots, tok/s per sequence | 41.4 | 38.1 |
+
+The 18.9 tok/s quoted above came from different bench settings. With int8 experts at decode,
+check26 gives 245/256 at mean KL 2.6e-2, inside the band.
+
+A profiled decode step at 0 takes 23.9 ms; the marks cost ~20%. The MoE takes about half of it.
+The biggest section is the grouped gate_up + GeGLU, at 5.8 ms over the 30 layers: ~190 us a layer,
+or ~94 GB/s. The kernel test, with cold experts, gives 75-95 us (~185 GB/s), and the grouped down
+runs in the engine as fast as in its test (~50 us). The gap is unexplained. A layer is now ~25
+launches, of which the small MoE kernels take ~3 ms of the step.
+
+Prefill: 1,014 tok/s at 1k and 973 at 4k depth, the per-expert loop with a host wait per expert.
