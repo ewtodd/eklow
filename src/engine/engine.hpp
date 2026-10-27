@@ -44,14 +44,17 @@ struct Config {
   int64_t experts_on_card = -1;  // -2: as many as fit in the free memory left after the rest, less card_margin_bytes
   uint64_t card_margin_bytes = 1ull << 30;
   int cpu_threads = 0;  // the cold experts' pool, caller included; 0: 16 (8, 12, 16, 20 tried: 16 and 20 equal)
-  // Prefill with cold experts: the busiest ones (at least stream_min_rows pairs in the step) are copied to the card
-  // over PCIe by the copy engine and computed there by the grouped GEMMs, up to stream_slots of them a layer; the
-  // CPU takes the rest. 0 slots: the CPU takes all of them (stage 3a). The costs below pick how many of the
-  // candidates to stream (about the point where the copies take as long as the CPU would on the rest).
+  // Prefill with cold experts (DECISIONS 2026-10-28): the next `stream_reach` experts of every layer in the profile's
+  // order after the card's are also kept repacked in pinned host memory, and those with at least stream_min_rows
+  // pairs in a step are copied to the card by the copy engine (at most stream_slots of them a layer) and computed
+  // there by the grouped GEMMs, while the CPU takes the other cold pairs. 0 slots or reach: the CPU takes all of
+  // them (stage 3a). The costs pick how many candidates to stream: about the point where the copies take as long
+  // as the CPU would on the rest. Pinned memory is reach x 30 layers x 3.2 MiB.
   int stream_slots = 32;
+  int stream_reach = 48;
   int stream_min_rows = 16;
-  double stream_copy_us = 360;  // one expert, pageable mapping to the card (copy-bench: 360 us, 307 pinned)
-  double stream_cpu_us = 20;    // one cold pair on the CPU, 16 threads
+  double stream_copy_us = 300;  // one expert from pinned memory to the card (copy-bench: 307 us)
+  double stream_cpu_us = 22;    // one cold pair on the CPU, 16 threads
 };
 
 struct Chunk {
@@ -107,15 +110,14 @@ class Engine {
   };
   const ColdStats& cold_stats() const { return cold_; }
   // Streaming (Config::stream_slots), since the engine was made: cold experts copied to the card for prefill and the
-  // pairs they took off the CPU; host seconds the copies took (in the helper thread, beside the CPU work) and the
-  // seconds the host then waited for them after the CPU was done; layers in which anything was streamed.
+  // pairs they took off the CPU; layers in which anything was streamed.
   struct StreamStats {
     uint64_t experts = 0, pairs = 0, layers = 0;
-    double copy_s = 0, wait_s = 0;
   };
   const StreamStats& stream_stats() const { return stream_; }
   int stream_slots() const { return n_stream_; }
-  uint64_t stream_slot_bytes() const { return 2 * uint64_t(n_stream_) * expert_bytes_; }
+  uint64_t stream_slot_bytes() const { return uint64_t(n_stream_) * expert_bytes_; }
+  uint64_t warm_bytes() const { return warm_bytes_; }
   uint64_t cache_bytes() const { return cache_bytes_; }
   // Host time the last step took to enqueue its work; when it nears the step's wall time, the
   // card waits on the host.
@@ -142,6 +144,7 @@ class Engine {
     std::vector<uint8_t> cold;
     uint8_t* cold_dev = nullptr;
     int n_cold = 0;
+    std::vector<const uint8_t*> warm;  // per expert: its repacked bytes in pinned host memory (the stream_reach after the card's), or null
     const uint8_t *gu_host = nullptr, *dn_host = nullptr;
   };
   struct Slot {
@@ -161,8 +164,8 @@ class Engine {
                     const std::function<void(const char*)>& mark);
   // The experts to stream for a layer of this step, busiest first, from the pairs per expert (cnt).
   std::vector<int32_t> choose_stream(const Layer& L, const std::vector<int32_t>& cnt) const;
-  // Copies the experts into the staging slots, repacks them, groups their pairs and runs their GEMMs, after the
-  // hot experts (a helper thread runs this while the host computes the rest on the CPU).
+  // Starts the copies of the listed experts into the slots and enqueues, behind the hot experts and the copies, the
+  // grouping of their pairs and their GEMMs.
   void stream_experts(const Layer& L, const std::vector<int32_t>& list, int64_t P, int32_t hot_rows, int64_t s_tiles,
                       const std::function<void(const char*)>& mark);
   void ensure_pages(int slot, int64_t positions);
@@ -220,12 +223,12 @@ class Engine {
   // with cold experts in hp_sum_ rows, token t's row in hp_map_[t] or -1, copied to the card's cold_sum_ and
   // cold_map_).
   int64_t n_hot_ = 0;
-  // Streaming: S staging slots on the card (raw bytes as copied, then repacked), their tables for the grouped
-  // GEMMs, the experts-to-slots map for the grouping (device, and pinned for the host to fill), the second
-  // tile list and grouping scratch; the pairs' inputs are gathered into att_ (dead during the MoE).
+  // Streaming: S slots on the card (repacked experts, filled by the copy engine), their tables for the grouped
+  // GEMMs, the experts-to-slots map for the grouping (device, and pinned for the host to fill), the second tile
+  // list and grouping scratch; the pairs' inputs are gathered into att_ (dead during the MoE).
   int n_stream_ = 0;
-  uint64_t expert_bytes_ = 0, expert_raw_gu_ = 0;
-  uint8_t *stream_raw_ = nullptr, *stream_slab_ = nullptr;
+  uint64_t expert_bytes_ = 0, expert_raw_gu_ = 0, warm_bytes_ = 0;
+  uint8_t* stream_slab_ = nullptr;
   std::vector<xmx::Weight> stream_w_gu_, stream_w_dn_;
   xmx::ExpertTable stream_gu_, stream_dn_;
   int32_t *stream_map_ = nullptr, *hp_smap_ = nullptr, *stream_tiles_ = nullptr, *stream_scratch_ = nullptr;

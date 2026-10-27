@@ -4,7 +4,7 @@
 //   eklow-engine-bench --model GGUF [--prefill 1024,4096,16384] [--chunk 2048]
 //                      [--depth 0,4096,16384] [--decode-ctx 0,4096,16384] [--decode-steps 64]
 //                      [--slots N] [--profile] [--kv-int8] [--json FILE] [--tokens-json FILE]
-//                      [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US]
+//                      [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [--stream-reach N] [--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US]
 //
 // --tokens-json: draw the prompts from a real text's token ids (cycled from a random offset) instead of
 // random ids. It matters for the 26B with cold experts: random tokens route almost uniformly, where
@@ -76,8 +76,8 @@ int main(int argc, char** argv) {
   std::string expert_profile;
   int64_t experts_on_card = -1;
   int cpu_threads = 0;
-  int stream_slots = 32, stream_min_rows = 16;
-  double stream_copy_us = 360, stream_cpu_us = 20;
+  int stream_slots = 32, stream_reach = 48, stream_min_rows = 16;
+  double stream_copy_us = 300, stream_cpu_us = 22;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -96,6 +96,7 @@ int main(int argc, char** argv) {
     else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
     else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
     else if (a == "--stream-slots") stream_slots = std::atoi(next().c_str());
+    else if (a == "--stream-reach") stream_reach = std::atoi(next().c_str());
     else if (a == "--stream-min-rows") stream_min_rows = std::atoi(next().c_str());
     else if (a == "--stream-copy-us") stream_copy_us = std::atof(next().c_str());
     else if (a == "--stream-cpu-us") stream_cpu_us = std::atof(next().c_str());
@@ -120,6 +121,7 @@ int main(int argc, char** argv) {
     ec.experts_on_card = experts_on_card;
     ec.cpu_threads = cpu_threads;
     ec.stream_slots = stream_slots;
+    ec.stream_reach = stream_reach;
     ec.stream_min_rows = stream_min_rows;
     ec.stream_copy_us = stream_copy_us;
     ec.stream_cpu_us = stream_cpu_us;
@@ -182,10 +184,9 @@ int main(int argc, char** argv) {
                     cs.wait_s - cs0.wait_s, cs.cpu_s - cs0.cpu_s, 100.0 * double(eng.cold_pairs() - cp0) / double(std::max<uint64_t>(1, eng.pairs() - pr0)),
                     (unsigned long long)(cs.late_layers - cs0.late_layers), (unsigned long long)(cs.layers - cs0.layers));
         const auto ss = eng.stream_stats();
-        std::printf("    streamed: %llu experts in %llu layers carried %.1f%% of the cold pairs; copies %.2f s (beside the CPU), then waited %.2f s\n",
+        std::printf("    streamed: %llu experts in %llu layers carried %.1f%% of the cold pairs (the CPU took the rest)\n",
                     (unsigned long long)(ss.experts - ss0.experts), (unsigned long long)(ss.layers - ss0.layers),
-                    100.0 * double(ss.pairs - ss0.pairs) / double(std::max<uint64_t>(1, eng.cold_pairs() - cp0)), ss.copy_s - ss0.copy_s,
-                    ss.wait_s - ss0.wait_s);
+                    100.0 * double(ss.pairs - ss0.pairs) / double(std::max<uint64_t>(1, eng.cold_pairs() - cp0)));
       }
       w.begin_object().kv("tokens", n).kv("seconds", s).kv("tok_per_s", double(n) / s);
       if (profile) print_profile(prof, w);

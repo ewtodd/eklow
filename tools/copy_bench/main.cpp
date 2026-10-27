@@ -321,6 +321,26 @@ int main(int argc, char** argv) {
       std::printf("copy engine, %s: 4x%d experts alone %.2f ms (%.1f us each); with GEMMs: copies done by %.2f ms, GEMM %.2f ms each (alone %.2f)\n",
                   what, n, c0 * 1e3, c0 / n * 1e6, best_c * 1e3, best_g * 1e3, g0 * 1e3);
     }
+    {
+      // The fence as a dependency of the queue: a kernel after it must not start before the copies are done.
+      for (int rep = 0; rep < 3; ++rep) {
+        const double t0 = now();
+        for (int i = 0; i < n; ++i) {
+          ce.copy(card + size_t(i) * ex_b, pg + size_t(i) * gu_b, gu_b);
+          ce.copy(card + size_t(i) * ex_b + gu_b, pd + size_t(i) * dn_b, dn_b);
+        }
+        sycl::event ev = ce.event(ce.fence());
+        const double t1 = now();
+        q.submit([&](sycl::handler& h) {
+          h.depends_on(ev);
+          h.single_task([] {});
+        });
+        const double t2 = now();
+        q.wait();
+        std::printf("fence as a queue dependency: %d experts issued in %.0f us, submit %.0f us, kernel done at %.2f ms\n", n, (t1 - t0) * 1e6, (t2 - t1) * 1e6,
+                    (now() - t0) * 1e3);
+      }
+    }
   } catch (const std::exception& e) {
     std::printf("copy engine: %s\n", e.what());
   }

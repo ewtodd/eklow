@@ -308,10 +308,11 @@ void Engine::load_experts() {
   };
 
   // How many experts go on the card. When fitting, the driver's free memory less the margin is spent on the
-  // staging slots (two buffers each, when there are cold experts to stream) and then on whole ranks of experts.
+  // streaming slots (when there are cold experts to stream) and then on whole ranks of experts.
   std::optional<uint64_t> fm;
   int64_t n_hot = want;
-  const int64_t slots_wanted = std::min<int64_t>(std::max(c_.stream_slots, 0), 256);
+  const int64_t reach = std::max(c_.stream_reach, 0);
+  const int64_t slots_wanted = std::min<int64_t>({std::max(c_.stream_slots, 0), reach, 256});
   if (fit) {
     fm = rt::free_memory(q_.get_device());
     if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
@@ -320,7 +321,7 @@ void Engine::load_experts() {
     if (budget >= uint64_t(want) * expert_set_bytes_) {
       n_hot = want;
     } else {
-      const uint64_t slot_bytes = 2 * uint64_t(slots_wanted) * expert_bytes_;
+      const uint64_t slot_bytes = uint64_t(slots_wanted) * expert_bytes_;
       n_hot = budget > slot_bytes ? int64_t((budget - slot_bytes) / expert_set_bytes_) : 0;
     }
   }
@@ -381,12 +382,12 @@ void Engine::load_experts() {
       q_.memcpy(L.cold_dev, L.cold.data(), size_t(NE)).wait();
     }
   }
-  sycl::free(staging, q_);
-  if (n_hot_ == NE) return;
-
-  // Streaming slots: raw bytes as the copy engine lands them, and the repacked experts the grouped GEMMs read.
+  // The warm tier: the next `reach` experts of every layer (in the profile's order) repacked for the grouped GEMMs, in
+  // pinned host memory, so that the copy engine can move one to a streaming slot as it is, at the link's speed and
+  // without the CPU (from the GGUF's mapping the driver stages the bytes through the CPU, which then also competes
+  // with the cold experts' GEMVs for memory: 530 us an expert against 300).
   n_stream_ = int(std::min<int64_t>(slots_wanted, NE - n_hot_));
-  if (n_stream_ > 0) {
+  if (n_hot_ < NE && n_stream_ > 0) {
     try {
       copy_ = std::make_unique<rt::CopyEngine>(q_);
     } catch (const std::exception& ex) {
@@ -395,11 +396,38 @@ void Engine::load_experts() {
     }
   }
   if (n_stream_ > 0) {
+    const int64_t K = std::min<int64_t>(reach, NE - n_hot_);
+    auto* tmp = sycl::malloc_device<uint8_t>(size_t(expert_bytes_), q_);
+    if (!tmp) throw std::runtime_error("engine: out of device memory for weight staging");
+    xmx::Weight tgu, tdn;
+    expert_at(tmp, tgu, tdn);
+    for (size_t l = 0; l < layers_.size(); ++l) {
+      Layer& L = layers_[l];
+      auto* blk = sycl::malloc_host<uint8_t>(size_t(uint64_t(K) * expert_bytes_), q_);
+      if (!blk) throw std::runtime_error("engine: out of pinned host memory for the warm experts");
+      owned_.push_back(blk);
+      L.warm.assign(size_t(NE), nullptr);
+      for (int64_t r = 0; r < K; ++r) {
+        const int e = order[l][size_t(n_hot_ + r)];
+        uint8_t* dst = blk + uint64_t(r) * expert_bytes_;
+        q_.memcpy(staging, L.gu_host + size_t(e) * expert_raw_gu_, size_t(expert_raw_gu_));
+        q_.memcpy(staging + expert_raw_gu_, L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row));
+        xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, staging, gu_row}, true, tgu);
+        xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, staging + expert_raw_gu_, dn_row}, false, tdn);
+        q_.memcpy(dst, tmp, size_t(expert_bytes_)).wait();
+        L.warm[size_t(e)] = dst;
+      }
+      warm_bytes_ += uint64_t(K) * expert_bytes_;
+    }
+    sycl::free(tmp, q_);
+  }
+  sycl::free(staging, q_);
+  if (n_hot_ == NE) return;
+
+  if (n_stream_ > 0) {
     const int64_t S = n_stream_, B = c_.max_batch, P = B * cfg_.n_expert_used;
-    stream_raw_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * expert_bytes_), q_);
     stream_slab_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * expert_bytes_), q_);
-    if (!stream_raw_ || !stream_slab_) throw std::runtime_error("engine: out of device memory for the streaming slots");
-    owned_.push_back(stream_raw_);
+    if (!stream_slab_) throw std::runtime_error("engine: out of device memory for the streaming slots");
     owned_.push_back(stream_slab_);
     stream_w_gu_.resize(size_t(S));
     stream_w_dn_.resize(size_t(S));
@@ -571,7 +599,7 @@ std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int
   for (int e = 0; e < NE; ++e)
     if (L.cold[size_t(e)] && cnt[size_t(e)] > 0) {
       rest += cnt[size_t(e)];
-      if (cnt[size_t(e)] >= c_.stream_min_rows) cand.push_back(e);
+      if (cnt[size_t(e)] >= c_.stream_min_rows && L.warm[size_t(e)]) cand.push_back(e);
     }
   std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return cnt[size_t(a)] != cnt[size_t(b)] ? cnt[size_t(a)] > cnt[size_t(b)] : a < b; });
   // The copies and the CPU work run side by side: stream the busiest candidates until the copies would take
@@ -596,27 +624,18 @@ std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int
 
 void Engine::stream_experts(const Layer& L, const std::vector<int32_t>& list, int64_t P, int32_t hot_rows, int64_t s_tiles,
                             const std::function<void(const char*)>& mark) {
-  using Clock = std::chrono::steady_clock;
   const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NU = cfg_.n_expert_used, NE = cfg_.n_expert;
-  const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18, dn_bytes = uint64_t(E) * dn_row;
-  const auto t0 = Clock::now();
-  // The copy engine pulls each expert's two matrices out of the GGUF's mapping into its raw slot...
-  for (size_t j = 0; j < list.size(); ++j) {
-    uint8_t* raw = stream_raw_ + uint64_t(j) * expert_bytes_;
-    copy_->copy(raw, L.gu_host + uint64_t(list[j]) * expert_raw_gu_, expert_raw_gu_);
-    copy_->copy(raw + expert_raw_gu_, L.dn_host + uint64_t(list[j]) * dn_bytes, dn_bytes);
-  }
-  copy_->wait(copy_->fence());
-  stream_.copy_s += std::chrono::duration<double>(Clock::now() - t0).count();
-  // ...and the card repacks them into the slots the grouped GEMMs read, groups the pairs that chose them (rows
-  // after the hot experts', so that moe_combine takes both from one row table) and runs their GEMMs.
-  for (size_t j = 0; j < list.size(); ++j) {
-    const uint8_t* raw = stream_raw_ + uint64_t(j) * expert_bytes_;
-    xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, raw, gu_row}, true, stream_w_gu_[j]);
-    xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, raw + expert_raw_gu_, dn_row}, false, stream_w_dn_[j]);
-  }
+  // The copy engine moves each expert's repacked bytes from pinned memory into its slot; the host does not wait:
+  // the queue does, on the copies' fence, before the grouping and the GEMMs, which come after the hot experts'.
+  for (size_t j = 0; j < list.size(); ++j) copy_->copy(stream_slab_ + uint64_t(j) * expert_bytes_, L.warm[size_t(list[j])], expert_bytes_);
+  const sycl::event copied = copy_->event(copy_->fence());
+  q_.submit([&](sycl::handler& h) {
+    h.depends_on(copied);
+    h.single_task([] {});
+  });
   q_.memcpy(stream_map_, hp_smap_, size_t(NE) * 4);
-  mark("stream_copy_repack");
+  mark("stream_copy");
+  // The pairs that chose them get rows after the hot experts' (so that moe_combine takes both from one row table).
   fast::moe_group(q_, moe_ids_, P, n_stream_, moe_tile_, stream_scratch_, stream_tiles_, moe_row_, nullptr, stream_map_, hot_rows);
   sycl::half* a = reinterpret_cast<sycl::half*>(att_);
   fast::moe_gather(q_, h_, moe_row_, P, NU, E, a, hot_rows);
@@ -634,7 +653,7 @@ void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event ids_
   // hot experts' GEMMs (already enqueued) run.
   ids_ready.wait();
   std::vector<uint8_t> streamed(size_t(NE), 0);
-  std::future<void> stream_done;
+  bool streamed_any = false;
   uint64_t n_streamed_pairs = 0;
   std::vector<int32_t> list;
   if (n_stream_ > 0) {
@@ -652,8 +671,8 @@ void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event ids_
         s_tiles += (cnt[size_t(list[j])] + moe_tile_ - 1) / moe_tile_;
         n_streamed_pairs += uint64_t(cnt[size_t(list[j])]);
       }
-      stream_done = std::async(std::launch::async,
-                               [this, &L, &list, P, hot_rows, s_tiles, &mark] { stream_experts(L, list, P, int32_t(hot_rows), s_tiles, mark); });
+      stream_experts(L, list, P, int32_t(hot_rows), s_tiles, mark);
+      streamed_any = true;
     }
   }
   routed.wait();
@@ -709,14 +728,10 @@ void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event ids_
     }
   });
   const auto t2 = Clock::now();
-  // The streamed experts' kernels were enqueued by the helper; they must be in the queue before the sums that
-  // moe_combine reads alongside them.
-  if (stream_done.valid()) {
-    stream_done.get();
+  if (streamed_any) {
     ++stream_.layers;
     stream_.experts += list.size();
     stream_.pairs += n_streamed_pairs;
-    stream_.wait_s += std::chrono::duration<double>(Clock::now() - t2).count();
   }
   q_.memcpy(cold_sum_, hp_sum_, size_t(n_need) * size_t(E) * sizeof(float));
   q_.memcpy(cold_map_, hp_map_, size_t(T) * 4);

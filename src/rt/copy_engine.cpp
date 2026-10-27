@@ -13,7 +13,7 @@ void check(ze_result_t r, const char* what) {
 }
 }  // namespace
 
-CopyEngine::CopyEngine(const sycl::queue& q) {
+CopyEngine::CopyEngine(const sycl::queue& q) : sctx_(q.get_context()) {
   ctx_ = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
   ze_device_handle_t dev = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
   uint32_t n = 0;
@@ -67,5 +67,9 @@ int CopyEngine::fence() {
 bool CopyEngine::done(int id) const { return zeEventQueryStatus(ev_[id]) == ZE_RESULT_SUCCESS; }
 
 void CopyEngine::wait(int id) { check(zeEventHostSynchronize(ev_[id], UINT64_MAX), "wait"); }
+
+sycl::event CopyEngine::event(int id) const {
+  return sycl::make_event<sycl::backend::ext_oneapi_level_zero>({ev_[id], sycl::ext::oneapi::level_zero::ownership::keep}, sctx_);
+}
 
 }  // namespace eklow::rt

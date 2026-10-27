@@ -28,10 +28,14 @@ class CopyEngine {
   bool done(int fence_id) const;
   // Blocks until the fence has passed.
   void wait(int fence_id);
+  // The fence as a SYCL event, for depends_on: the queue then waits for the copies on the card, not on the host. The
+  // fence slots are reused round robin, so an event is good for the next kEvents - 1 fences.
+  sycl::event event(int fence_id) const;
 
  private:
   static constexpr int kEvents = 64;
   ze_context_handle_t ctx_ = nullptr;
+  sycl::context sctx_;
   ze_command_list_handle_t list_ = nullptr;
   ze_event_pool_handle_t pool_ = nullptr;
   ze_event_handle_t ev_[kEvents] = {};
