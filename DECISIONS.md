@@ -989,3 +989,32 @@ What is left at depth: global attention is still 55% of prefill at 128k. P.V (~2
 out one at a time (the beta scaling, the V dequantization, the V loads, the running output's read) gives back at
 most 5% each, so no one of them holds it. Beyond it: 2,048-token chunks (open), and the sliding layers' prefill
 attention (FlashGroup, ~10 TFLOPS, 4-6% of prefill).
+
+## 2026-10-27 — 2,048-token prefill chunks by default
+
+eklow-server's `--chunk` default is now 2,048 (from 1,024); the NixOS module does not set it. A chunk is the prefill
+tokens of one sequence in a step, and the step stays at most 2,048 tokens (`--batch`), decodes first, so a sequence
+prefilling beside another's decode takes 2,047.
+
+Cost: the sliding layers' rings hold the window and one chunk, ~0.4 GB more at two slots of 262k. The segmented
+global attention now runs a chunk's K/V heads one after the other on one set of buffers, so they stay ~100 MB
+rather than doubling (at 2,048-token chunks one head's rows fill the card; per head is +1.6% against both heads at
+once there, -3.8% at 1,024-token chunks, engine A/B at 32k depth). The server at 2 x 262k places N = 46 experts a
+layer (50 with 1,024-token chunks).
+
+Gain: twice the rows per expert GEMM, and half the steps (and PCIe streaming) per token. Through the server with
+production flags (`docs/bench/serve-perf-26b-chunk2048-fiona-2026-10-27.txt`), prefill as time to first token on
+unique text, against today's 1,024-token run:
+
+| depth | 1,024 (N = 50) | 2,048 (N = 46) |
+|---|---|---|
+| 8k | 1,631 tok/s (5.0 s) | 1,865 (4.4 s) |
+| 32k | 1,529 (21.5 s) | 1,794 (18.3 s) |
+| 128k | 1,040 (126 s) | 1,177 (111 s) |
+| 252k | 703 (367 s) | 765 (338 s) |
+
+Alternated on one card state at 32k: 1,741 / 1,758 against 1,535 / 1,534 tok/s (+14%), decode 32.6 against 33.0.
+GSM8K two at a time 40.2 tok/s aggregate (41.8-41.9 at N = 50-51), the CPU's larger share of two streams' cold
+experts. A long prefill step now takes about twice as long, so another slot's decode waits longer between tokens
+while a prompt prefills. check26 with 2,048-token chunks is identical to 1,024 (245/256, 2.38e-2; chat 23/25,
+6.87e-2): every kernel computes each row on its own.

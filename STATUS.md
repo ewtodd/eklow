@@ -11,10 +11,11 @@ Live state, written as a handoff (2026-10-27). Design and targets: `DESIGN.md`; 
   N = 51 of 128 experts a layer on the card (free card memory 6.08 GiB before them, 1.06 after, margin 1 GiB), 40
   streaming slots (255 MiB), 7.20 GiB of cold experts in pinned host memory. EmbeddingGemma 2 (0.27 GiB) in the same
   process on :8082; chat on :8081.
-- **Not yet deployed: segmented global prefill attention** (main, merged from `perf/attn-wide` 2026-10-27): the
-  global layers' long prefill as two GEMMs per 2,048-key segment, 2x prefill at 128k-252k through the server
-  (below). Deploying it is the owner's (update the eklow input in `/etc/nixos`'s flake.lock, rebuild). The server then
-  places N = 50 of 128 experts a layer: the attention's ~100 MB is now reserved before the experts are placed.
+- **Not yet deployed, in main** (2026-10-27): the global layers' long prefill attention as two GEMMs per 2,048-key
+  segment (merged from `perf/attn-wide`), and 2,048-token prefill chunks by default (`perf/chunk2048`); together
+  2.2-2.3x prefill at 128k-252k through the server (below). Deploying them is the owner's (update the eklow input in
+  `/etc/nixos`'s flake.lock, rebuild; the module sets no `--chunk`). The server then places N = 46 of 128 experts a
+  layer: the rings hold one more chunk (~0.4 GB) and the attention's ~100 MB is reserved before the experts.
 - **`/etc/nixos`** (the owner deploys; agents only commit, as son-of-anton-bot, no co-author trailers):
   `ac7f4993` (the eklow module serves the 26B: model by URL and sha256, alias `gemma-4-26b-a4b`, the profile in
   `extraArgs`; maitred's `gemma` upstream entry renamed to `eklow/gemma-4-26b-a4b`) and `f7391db6` (opencode gets an
@@ -46,10 +47,11 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
 | 128k | 493 (266 s) | 30.9 |
 | 252k | 352 (734 s) | 26.7 |
 
-- Main, not yet deployed (the same method from the build tree, production flags;
-  `docs/bench/serve-perf-26b-segments-fiona-2026-10-27.txt`): prefill 1,631 (5.0 s) / 1,529 (21.5 s) / 1,040 (126 s) /
-  703 (367 s) tok/s at 8k / 32k / 128k / 252k; decode and GSM8K unchanged (main and the branch alternated on one card
-  state decode alike; that run's own decode came ~10% low after hours of load on the card).
+- Main, not yet deployed (the same method from the build tree, production flags, 2,048-token chunks, N = 46;
+  `docs/bench/serve-perf-26b-chunk2048-fiona-2026-10-27.txt`): prefill 1,865 (4.4 s) / 1,794 (18.3 s) / 1,177 (111 s) /
+  765 (338 s) tok/s at 8k / 32k / 128k / 252k; decode 36.6 / 34.0 / 30.5 / 26.5; GSM8K two at a time 40.2 tok/s
+  aggregate (-4%: the CPU's larger share of cold experts). With the segments alone at 1,024-token chunks (N = 50):
+  1,631 / 1,529 / 1,040 / 703 (`docs/bench/serve-perf-26b-segments-fiona-2026-10-27.txt`).
 - Cached document: the next question starts in 0.2-0.7 s.
 - GSM8K: 33.4 tok/s aggregate one at a time (34.0 per stream), 41.9 two at a time (21.4 per stream). Two streams add
   only 25%: at N = 51 the CPU computes both streams' cold experts (not separated further).
@@ -105,9 +107,8 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
   tasks and reports go to `old-reports/` (all excluded from git by `.git/info/exclude`). The orchestrator reviews the
   diff, re-runs the gates, merges into main and keeps DECISIONS / STATUS. Local Qwen workers on son-of-anton were
   dropped so the rack stays quiet.
-- Worktrees now: `gemm` (m6/prefill), `moe` (m6/stream) and `attn-wide` (perf/attn-wide) are merged and clean.
-  `attn` (perf/attn-global) still holds the old flash-kernel knock-out experiment uncommitted; it is superseded (its
-  `eklow-attn-test` flags are in main) and can be removed.
+- Worktrees now: `gemm` (m6/prefill), `moe` (m6/stream), `attn-wide` (perf/attn-wide) and `chunk` (perf/chunk2048)
+  are merged and clean; `attn` (the old flash-kernel knock-outs) was removed 2026-10-27.
 
 ## Milestone 1 (foundation)
 
@@ -240,8 +241,8 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
    segments gave +5% for 64 MB more. The sliding layers' prefill attention (FlashGroup, ~10 TFLOPS) is 4-6% of prefill.
 2. **The tool-call eval, 26B against the 12B** (the owner's). The owner's prior is that the 26B is better; nothing
    here measures model quality, only fidelity to each model.
-3. **Prefill chunks of 2,048 tokens** for the 26B: +30% prefill at N = 51 (2,196 against 1,682 tok/s on a 4k
-   prompt) for ~0.4 GB more sliding-ring memory (about 4 fewer experts a layer). Not decided.
+3. **Prefill chunks of 2,048 tokens**: done (main, the server's default; DECISIONS 2026-10-27): +14% prefill at 32k
+   through the server for N = 46 against 50, decode -1%, GSM8K two at a time -4%.
 4. **A routing profile from real traffic**: today's comes from four recordings (eklow's notes, two Python sources,
    a chat prompt). An export of live routing counts would let it follow what son-of-anton actually sends.
 5. **Decode**: the grouped expert GEMVs read at ~180 GB/s of 399; with two streams at N = 51 the CPU's cold pairs
