@@ -8,7 +8,12 @@
 //     that have no Wv, h Wk), unweighted
 //     a = attention(q, k, v; scale 1, causal, window 1024 on sliding layers) Wo
 //     x = rmsnorm(a) * attn_post_norm + x
-//     f = (gelu_tanh(rmsnorm(x) * ffn_norm Wgate) * (... Wup)) Wdown
+//     dense: f = (gelu_tanh(rmsnorm(x) * ffn_norm Wgate) * (... Wup)) Wdown
+//     MoE (26B A4B, every layer also routes): the dense f goes through post_ffw_norm_1 ("ffn_mlp");
+//       r = rmsnorm(x) * (1/sqrt(n_embd)) * gate_inp.scale, logits = r W_router, p = softmax over
+//       the 128 experts, the top 8 get w_i = p_i / max(sum, 2^-14), and
+//       moe = sum_i w_i * scale_i * Wdown_i(gelu_tanh(Wgate_i(m)) * (Wup_i(m))) with
+//       m = rmsnorm(x) * pre_ffw_norm_2, then through post_ffw_norm_2 ("ffn_moe"); f = ffn_mlp + moe
 //     x = (rmsnorm(f) * ffn_post_norm + x) * layer_output_scale
 //   logits = softcap_30(rmsnorm(x) * output_norm . token_embd^T)
 // Sliding layers rope all 256 dims at base 10000; global layers all 512 at base 1e6, each frequency
@@ -32,6 +37,7 @@ struct Gemma4Config {
   std::vector<int> n_head_kv;
   int head_dim_sliding, head_dim_global;
   float rope_base_sliding, rope_base_global, eps, softcap;
+  int n_expert = 0, n_expert_used = 0, n_ff_exp = 0;  // 0 for the dense 12B
 
   // Throws when the file is not a dense Gemma 4 this code knows how to run.
   static Gemma4Config from_gguf(const gguf::File& f);
@@ -44,6 +50,16 @@ class Gemma4Weights {
     ref::Weight wq, wk, wv, wo, gate, up, down;  // wv.data is null on global layers
     const float *attn_norm, *q_norm, *k_norm, *attn_post_norm, *ffn_norm, *ffn_post_norm;
     float out_scale;
+    // MoE layers only (n_expert > 0): the router, the routed experts as stored, and the norms the
+    // MoE graph adds around the dense FFN.
+    ref::Weight w_router;  // F32, k n_embd, n n_expert
+    const float *router_scale = nullptr;  // F32 [n_embd], on the router input
+    std::vector<float> router_scale_host;  // host copy, for the folded router-in scale
+    const uint8_t *exp_gate_up = nullptr;  // Q4_0, n_expert x 2*n_ff_exp rows of n_embd
+    const uint8_t *exp_down = nullptr;  // Q4_0, n_expert x n_embd rows of n_ff_exp
+    const float *exp_down_scale = nullptr;  // F32 [n_expert], one multiplier per expert
+    std::vector<float> exp_down_scale_host;  // host copy, for the routing
+    const float *post_ffw_norm_1 = nullptr, *pre_ffw_norm_2 = nullptr, *post_ffw_norm_2 = nullptr;
   };
 
   // Copies every tensor to device memory as stored.

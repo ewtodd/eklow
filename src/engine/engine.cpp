@@ -20,6 +20,7 @@ float* Engine::dev(int64_t n) {
 }
 
 Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), c_(cfg), cfg_(model::Gemma4Config::from_gguf(f)) {
+  if (cfg_.n_expert > 0) throw std::runtime_error("the engine has no MoE kernels yet");
   if (c_.max_ctx % attn::kPage) throw std::runtime_error("engine: max_ctx must be a multiple of the page size");
   const int64_t E = cfg_.n_embd, F = cfg_.n_ff, H = cfg_.n_head;
   auto need = [&](const std::string& name) -> const gguf::Tensor& {

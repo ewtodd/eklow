@@ -1,7 +1,9 @@
 #include "model/gemma4.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <numeric>
 #include <stdexcept>
 
 namespace eklow::model {
@@ -41,7 +43,13 @@ Gemma4Config Gemma4Config::from_gguf(const gguf::File& f) {
 
   if (auto* v = f.find(p + "embedding_length_per_layer_input"); v && v->as_int() != 0) unsupported(f, "per-layer embeddings (E2B/E4B)");
   if (auto* v = f.find(p + "attention.shared_kv_layers"); v && v->as_int() != 0) unsupported(f, "shared KV layers");
-  if (f.find(p + "expert_count")) unsupported(f, "mixture of experts (26B A4B)");
+  if (f.find(p + "expert_count")) {
+    c.n_expert = int(get_int(f, p + "expert_count"));
+    c.n_expert_used = int(get_int(f, p + "expert_used_count"));
+    c.n_ff_exp = int(get_int(f, p + "expert_feed_forward_length"));
+    if (c.n_expert <= 0 || c.n_expert_used <= 0 || c.n_ff_exp <= 0)
+      unsupported(f, "expert metadata");
+  }
   if (get_int(f, p + "attention.value_length") != c.head_dim_global ||
       get_int(f, p + "attention.value_length_swa") != c.head_dim_sliding)
     unsupported(f, "value heads differ from key heads");
@@ -119,6 +127,44 @@ Gemma4Weights Gemma4Weights::upload(const gguf::File& f, const Gemma4Config& c, 
     L.ffn_post_norm = vec(b + "post_ffw_norm.weight", c.n_embd);
     const gguf::Tensor* os = f.tensor(b + "layer_output_scale.weight");
     L.out_scale = os ? *reinterpret_cast<const float*>(os->data) : 1.0f;
+    if (c.n_expert > 0) {
+      L.w_router = matrix(b + "ffn_gate_inp.weight", c.n_embd, c.n_expert);
+      {
+        const gguf::Tensor& t = need(b + "ffn_gate_inp.scale");
+        const float* src = reinterpret_cast<const float*>(t.data);
+        L.router_scale_host.assign(src, src + c.n_embd);
+        L.router_scale = reinterpret_cast<const float*>(put(t));
+      }
+      L.post_ffw_norm_1 = vec(b + "post_ffw_norm_1.weight", c.n_embd);
+      L.pre_ffw_norm_2 = vec(b + "pre_ffw_norm_2.weight", c.n_embd);
+      L.post_ffw_norm_2 = vec(b + "post_ffw_norm_2.weight", c.n_embd);
+      // The routed experts as stored: expert e is rows [e*2*n_ff_exp, (e+1)*2*n_ff_exp) of a
+      // n_embd-wide gate_up matrix and rows [e*n_embd, (e+1)*n_embd) of a n_ff_exp-wide down
+      // matrix; Q4_0 rows are k/32*18 bytes.
+      {
+        const gguf::Tensor& t = need(b + "ffn_gate_up_exps.weight");
+        if (t.type != gguf::Type::Q4_0 || t.ne.size() != 3 || int64_t(t.ne[0]) != c.n_embd ||
+            int64_t(t.ne[1]) != 2 * int64_t(c.n_ff_exp) || int64_t(t.ne[2]) != c.n_expert)
+          throw std::runtime_error(f.path() + ": " + t.name + " has an unexpected shape");
+        L.exp_gate_up = put(t);
+      }
+      {
+        const gguf::Tensor& t = need(b + "ffn_down_exps.weight");
+        if (t.type != gguf::Type::Q4_0 || t.ne.size() != 3 || int64_t(t.ne[0]) != c.n_ff_exp ||
+            int64_t(t.ne[1]) != c.n_embd || int64_t(t.ne[2]) != c.n_expert)
+          throw std::runtime_error(f.path() + ": " + t.name + " has an unexpected shape");
+        L.exp_down = put(t);
+      }
+      {
+        const gguf::Tensor& t = need(b + "ffn_down_exps.scale");
+        if (t.type != gguf::Type::F32 || int64_t(t.elements()) != c.n_expert)
+          throw std::runtime_error(f.path() + ": " + t.name + " is not an F32 vector of " +
+                                   std::to_string(c.n_expert));
+        const float* src = reinterpret_cast<const float*>(t.data);
+        L.exp_down_scale_host.assign(src, src + c.n_expert);
+        L.exp_down_scale = reinterpret_cast<const float*>(put(t));
+      }
+    }
     w.layers.push_back(L);
   }
   return w;
@@ -212,16 +258,133 @@ std::vector<float> reference_forward(sycl::queue& q, const Gemma4Config& c, cons
     emit("attn_out" + s, x2, {E, T});
 
     ref::rmsnorm(q, x2, L.ffn_norm, T, E, c.eps, h);
-    emit("ffn_norm" + s, h, {E, T});
+    emit(c.n_expert ? "ffn_norm_1" + s : "ffn_norm" + s, h, {E, T});
     ref::matmul(q, L.gate, h, T, gate);
     ref::matmul(q, L.up, h, T, up);
     ref::gelu_mul(q, gate, up, T * F, gate);
     emit("ffn_geglu" + s, gate, {F, T});
     ref::matmul(q, L.down, gate, T, o);
     emit("ffn_out" + s, o, {E, T});
-    ref::rmsnorm(q, o, L.ffn_post_norm, T, E, c.eps, o);
-    emit("ffn_post_norm" + s, o, {E, T});
-    ref::add(q, o, x2, T * E, x);
+    if (c.n_expert == 0) {
+      ref::rmsnorm(q, o, L.ffn_post_norm, T, E, c.eps, o);
+      emit("ffn_post_norm" + s, o, {E, T});
+      ref::add(q, o, x2, T * E, x);
+      ref::scale(q, x, L.out_scale, T * E);
+      emit("l_out" + s, x, {E, T});
+      continue;
+    }
+    // MoE (26B A4B): the dense part above is "ffn_mlp"; the routed part is added to it. The
+    // routing is on the host; per expert the tokens are gathered, computed, and scattered back.
+    ref::rmsnorm(q, o, L.post_ffw_norm_1, T, E, c.eps, o);
+    emit("ffn_mlp" + s, o, {E, T});
+    {
+      std::vector<void*> mown;
+      Free free_moe{q, mown};
+      auto mall = [&](int64_t n) {
+        float* p = sycl::malloc_device<float>(size_t(n), q);
+        if (!p) throw std::runtime_error("out of device memory for MoE activations");
+        mown.push_back(p);
+        return p;
+      };
+      const int64_t Fe = c.n_ff_exp;
+      float* moe_x = mall(T * E);
+      ref::rmsnorm(q, x2, L.pre_ffw_norm_2, T, E, c.eps, moe_x);
+      emit("ffn_norm_2" + s, moe_x, {E, T});
+      // Router input: rmsnorm with no weight, scaled by 1/sqrt(n_embd) and the learned scale. The
+      // scalar is folded into the weight vector; a final-ulp difference is far below the tolerance.
+      float* rscale = mall(E);
+      {
+        std::vector<float> host = std::vector<float>(size_t(E));
+        const float inv = 1.0f / std::sqrt(float(E));
+        for (int64_t i = 0; i < E; ++i) host[size_t(i)] = L.router_scale_host[size_t(i)] * inv;
+        q.memcpy(rscale, host.data(), host.size() * sizeof(float)).wait();
+      }
+      float* r = mall(T * E);
+      ref::rmsnorm(q, x2, rscale, T, E, c.eps, r);
+      float* rlog = mall(int64_t(T) * c.n_expert);
+      ref::matmul(q, L.w_router, r, T, rlog);
+      emit("ffn_moe_logits" + s, rlog, {int64_t(c.n_expert), T});
+      // Softmax over the 128 experts, top 8, weights renormalized by their sum (floored at 2^-14,
+      // llama.cpp's renorm epsilon), each expert's contribution pre-scaled by its down scale.
+      std::vector<std::vector<int>> tok(c.n_expert);
+      std::vector<std::vector<float>> wt(c.n_expert);
+      {
+        std::vector<float> host(size_t(T) * c.n_expert);
+        q.memcpy(host.data(), rlog, host.size() * sizeof(float)).wait();
+        for (int64_t t = 0; t < T; ++t) {
+          const float* lg = host.data() + size_t(t) * c.n_expert;
+          const float mx = *std::max_element(lg, lg + c.n_expert);
+          std::vector<float> p(c.n_expert);
+          float sum = 0.0f;
+          for (int e = 0; e < c.n_expert; ++e) {
+            p[size_t(e)] = std::exp(lg[e] - mx);
+            sum += p[size_t(e)];
+          }
+          for (int e = 0; e < c.n_expert; ++e) p[size_t(e)] /= sum;
+          std::vector<int> idx(c.n_expert);
+          std::iota(idx.begin(), idx.end(), 0);
+          std::partial_sort(idx.begin(), idx.begin() + c.n_expert_used, idx.end(),
+                            [&](int a, int b) { return p[size_t(a)] > p[size_t(b)]; });
+          float wsum = 0.0f;
+          for (int i = 0; i < c.n_expert_used; ++i) wsum += p[size_t(idx[size_t(i)])];
+          const float denom = std::max(wsum, 6.103515625e-5f);
+          for (int i = 0; i < c.n_expert_used; ++i) {
+            const int e = idx[size_t(i)];
+            tok[size_t(e)].push_back(int(t));
+            wt[size_t(e)].push_back(p[size_t(e)] / denom * L.exp_down_scale_host[size_t(e)]);
+          }
+        }
+      }
+      float* moe = mall(T * E);
+      q.fill(moe, 0.0f, size_t(T * E)).wait();
+      // Per-expert buffers; a group never exceeds T tokens.
+      float* gx = mall(T * E), *gu = mall(T * 2 * Fe), *gb = mall(T * Fe), *ub = mall(T * Fe),
+            *y = mall(T * E);
+      int32_t* dids = reinterpret_cast<int32_t*>(mall(T));
+      float* dws = mall(T);
+      const int64_t gu_row = int64_t(E) / 32 * 18, down_row = Fe / 32 * 18;
+      for (int e = 0; e < c.n_expert; ++e) {
+        const int64_t n_e = tok[size_t(e)].size();
+        if (!n_e) continue;
+        q.memcpy(dids, tok[size_t(e)].data(), size_t(n_e) * sizeof(int32_t));
+        q.memcpy(dws, wt[size_t(e)].data(), size_t(n_e) * sizeof(float)).wait();
+        // Gather this expert's tokens' moe_x rows into a contiguous buffer.
+        q.parallel_for(sycl::range<1>(size_t(n_e * E)), [=](sycl::id<1> id) {
+          const int i = int(id[0]) / int(E), j = int(id[0]) % int(E);
+          gx[size_t(id[0])] = moe_x[size_t(dids[i]) * E + j];
+        });
+        ref::matmul(
+            q,
+            ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, L.exp_gate_up + size_t(e) * 2 * Fe * gu_row,
+                        size_t(gu_row)},
+            gx, n_e, gu);
+        // The gate is the first n_ff_exp of each 2*n_ff_exp row, the up the second half.
+        q.parallel_for(sycl::range<1>(size_t(n_e * Fe)), [=](sycl::id<1> id) {
+          const int i = int(id[0]) / int(Fe), j = int(id[0]) % int(Fe);
+          const int64_t row = int64_t(i) * 2 * Fe;
+          gb[size_t(id[0])] = gu[row + j];
+          ub[size_t(id[0])] = gu[row + Fe + j];
+        });
+        ref::gelu_mul(q, gb, ub, n_e * Fe, gb);
+        ref::matmul(q,
+                    ref::Weight{gguf::Type::Q4_0, Fe, E, L.exp_down + size_t(e) * E * down_row,
+                                size_t(down_row)},
+                    gb, n_e, y);
+        // moe[token] += w * y for this expert's tokens.
+        q.parallel_for(sycl::range<1>(size_t(n_e * E)), [=](sycl::id<1> id) {
+          const int i = int(id[0]) / int(E), j = int(id[0]) % int(E);
+          moe[size_t(dids[i]) * E + j] += dws[i] * y[size_t(id[0])];
+        });
+      }
+      ref::rmsnorm(q, moe, L.post_ffw_norm_2, T, E, c.eps, moe);
+      emit("ffn_moe" + s, moe, {E, T});
+      ref::add(q, o, moe, T * E, h);  // h is free now
+      emit("ffn_moe_combined" + s, h, {E, T});
+      q.wait();  // the reference kernels do not wait, and this block's buffers are freed here
+    }
+    ref::rmsnorm(q, h, L.ffn_post_norm, T, E, c.eps, h);
+    emit("ffn_post_norm" + s, h, {E, T});
+    ref::add(q, h, x2, T * E, x);
     ref::scale(q, x, L.out_scale, T * E);
     emit("l_out" + s, x, {E, T});
   }
