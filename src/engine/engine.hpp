@@ -137,7 +137,7 @@ class Engine {
   // Prefill: pairs sorted by expert in row tiles of moe_tile_ rows (fast::moe_group): the tile list,
   // its scratch, each pair's row; fp16 expert inputs (moe_a_, sharing moe_y_'s memory: they are dead
   // once the gate_up is done) and gate_up outputs, and the down outputs in fp32.
-  // 64 rows: 32 halves the GEMM's speed, 128 pads too much (DECISIONS 2026-10-26, "the 26B's prefill MoE").
+  // Row tile of the grouped GEMMs: prefill at 1k, 1,910 / 2,228 / 1,969 tok/s for 32 / 64 / 128 rows.
   int64_t moe_tile_ = 64, moe_max_tiles_ = 0;
   int32_t *moe_tiles_ = nullptr, *moe_scratch_ = nullptr, *moe_row_ = nullptr;
   sycl::half *moe_a_ = nullptr, *moe_h_ = nullptr;
