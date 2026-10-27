@@ -564,3 +564,54 @@ every row of the engine bench (963.8 tok/s at 16k depth). The smaller tile on ev
 the doubled weight traffic costs more than the tail saves. Two lessons from the round: kernel-test
 at 2,048 rows twice predicted gains the engine did not show, so keep rules now use `ab.sh`; and a
 geometric mean over shapes weighs a 9 MB matrix like a 236 MB one.
+
+## 2026-10-26 — decode: weight tiles column-group major, and what did not help
+
+The one-row GEMV's knockouts (`eklow-kernel-test`, six shapes) put its time in the arithmetic chain
+(dpas, int-to-float, scale, add: +29% without it) and in the non-weight loads (+15%). Splitting the
+accumulator four ways gave decode +0.7-1.1% and a gather of four blocks' scales was mixed (this
+ESIMD's `gather<uint32_t, 16, 4>` returns its 4-dword groups transposed), so neither was kept. The
+knockout that mattered read four tiles in one 512-byte load: +68% on average (partly cache overlap
+between neighbouring threads), because the K-block-major layout put a thread's consecutive tiles
+ng * 128 bytes apart, every one a separate message. With the tiles column-group major ([N/8][K/32],
+through one `tile_at(b, g, kb)` for the repack, the GEMM and both GEMVs), the layout alone gave
+decode +3.0 / +3.7 / +2.8% at 0 / 4k / 16k and the 512-byte loads another +5.8 / +6.0 / +5.7%;
+prefill unchanged. The same four-tile load in the 2-32-row GEMV gave two-slot decode +1-2%, not kept.
+
+Also tried and not kept: a compact one-row activation form (one 128-byte and one 16-byte load per
+four blocks): kernel-test faster, engine decode 3-4% slower. Several columns per sub-group for the
+Q6 output head (3.4 ms a decode step at ~237 GB/s): register spills, +1.5% and +63% slower. A
+32-dimension slice for the global layers' decode attention removed its 768-byte int8 spill and was
+21-26% faster at 1-4k keys but 4-6% slower at 16k with the int8 cache, where it matters. For the
+sliding layers (head 256) the same slice removed a 928-byte spill: 83 -> 69 us a layer (fp16), 114 ->
+75 (int8), engine decode +0.6-2.1% (kept).
+
+Decode at 4k context now spends ~27 of ~33 ms in GEMVs (gate|up 11, down 5.6, qkv 3.6, head 3.4,
+attention output 3.1), so they remain the lever; the card's launch gaps are ~1.15 us x ~650 kernels,
+~0.75 ms.
+
+## 2026-10-26 — Gemma 4 26B A4B: the reference, its noise, its routing
+
+`model::reference_forward` runs the 26B (30 layers; 25 sliding with 8 K/V heads, 5 global with 2;
+every layer a dense GeGLU of 2,112 plus 128 experts of 704, 8 used) as llama.cpp's gemma4 graph
+does: dense path normed by ffn_norm / post_ffw_norm_1; experts on rmsnorm(attn_out) *
+pre_ffw_norm_2; router on rmsnorm(attn_out) / sqrt(n_embd) * ffn_gate_inp.scale, softmax over 128,
+top 8 renormalized (floor 2^-14), each expert's output times ffn_down_exps.scale; the sum normed by
+post_ffw_norm. Against llama.cpp's CPU backend: chat 23/25, mean KL 3.7e-2; 2,616 tokens 31/32,
+2.5e-2. That is inside the 26B's own noise, which is ~8x the 12B's: llama.cpp CUDA (a 4090, the
+oracle built against llama.cpp's cuda package) against CPU gives 25/25 at 3.6e-2 and 31/32 at
+1.9e-2, final-norm rel L2 11.8% (eklow 12.2%), presumably near-tied routes going to different
+experts. The 26B's band: long top-1 >= 30/32 and mean KL <= 3.5e-2, chat <= 5e-2.
+
+Routing (`eklow-ref-run --routing`, `tools/ref/routing_stats.py`, ~15k tokens of eklow's notes, two
+Python sources and a chat prompt) is skewed per layer: each layer's busiest 64 of 128 experts take
+89% of its selections (76-94% by layer, 85-89% held out), 96 take 98% (97-98% held out), 112 take
+99.6%. With weights at 13.4 GiB the card holds every expert only at short contexts; at 2 x 128k about
+76% fit, so ~2-3% of expert work would go elsewhere, at 2 x 262k (~52%) 11-15%.
+
+For that rest, `eklow::cpu::gemv_q4` (AVX-VNNI on fiona's i7-12700H, a persistent pool) computes one
+expert's gate_up + GeGLU + down in ~100 us from DRAM (~33 GB/s, flat from ~6 threads) or ~60 us
+cached, against ~290 us to copy it over PCIe.
+
+The worker on these tasks moved from Qwen 3.8 27B to Sonnet subagents in the evening, to let the
+rack's R9700s rest.

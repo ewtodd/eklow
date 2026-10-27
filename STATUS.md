@@ -99,6 +99,14 @@ e-desktop, `~/eklow-wt-*` on fiona).
 - [x] grammar-constrained tool calls (`src/serve/tool_grammar.cpp`, `eklow-grammar-test`)
 - [ ] image input (llama.cpp's server on fiona had no projector either)
 
+## Milestone 6 (Gemma 4 26B A4B), started 2026-10-26
+
+- [x] the reference forward with the MoE layers, inside the 26B's noise band (8x the 12B's)
+- [x] a routing profile: each layer's busiest 96 of 128 experts take ~98% of its selections
+- [x] Q4_0 expert GEMVs on the CPU (AVX-VNNI): ~100 us an expert from DRAM
+- [ ] the engine runs it (all experts on the card, short contexts), then MoE kernels, then experts
+      placed by the profile with the rest on the CPU; the tool-call eval against the 12B
+
 ## Milestone 4 (speed), started early
 
 - [x] XMX matmul for Q4_0 (`src/kernels/xmx.cpp`): weights repacked to dpas tiles at load,
@@ -134,6 +142,8 @@ e-desktop, `~/eklow-wt-*` on fiona).
 - [x] decode GEMVs in one kernel (K split inside a work-group, threads from the shape): decode
       +2-3% with one slot, +3-4% with two; GEMM: B tiles loaded early and a 128 x 128 tile for the
       narrow matrices at 1,024 rows, prefill +1-1.5% (DECISIONS 2026-10-26)
+- [x] weight tiles column-group major, four tiles a load in the one-row GEMV: decode +9%; sliding
+      decode attention in 32-dimension slices: +0.6-2.1% (DECISIONS 2026-10-26)
 
 ## Open
 
