@@ -14,10 +14,12 @@ Live state, written as a handoff (2026-10-27). Design and targets: `DESIGN.md`; 
 - **Not yet deployed, in main** (2026-10-27): the global layers' long prefill attention as two GEMMs per 2,048-key
   segment (merged from `perf/attn-wide`), and 2,048-token prefill chunks by default (`perf/chunk2048`); together
   2.2-2.3x prefill at 128k-252k through the server (below). Deploying them is the owner's (update the eklow input in
-  `/etc/nixos`'s flake.lock, rebuild; the module sets no `--chunk`). The server then places N = 46 of 128 experts a
+  `/etc/nixos`'s flake.lock, rebuild; the module sets no `--chunk`). The server then places N = 49 of 128 experts a
   layer: the rings hold one more chunk (~0.4 GB) and the attention's ~100 MB is reserved before the experts.
   Also in main: the server's log in unholy's form (a line per request, embedding request and rejection, and the
-  engine's every 10 s while there is traffic; README "Running").
+  engine's every 10 s while there is traffic; README "Running"); EmbeddingGemma 2 in batched GEMMs and on the
+  engine's attention kernels (DECISIONS 2026-10-27, "EmbeddingGemma 2 in GEMMs", "a key range per token"): 883 ->
+  23,201 tok/s at 16 inputs a request; its attention cache and scratch (~120 MB) cost the 26B one expert, N = 49.
 - **`/etc/nixos`** (the owner deploys; agents only commit, as son-of-anton-bot, no co-author trailers):
   `ac7f4993` (the eklow module serves the 26B: model by URL and sha256, alias `gemma-4-26b-a4b`, the profile in
   `extraArgs`; maitred's `gemma` upstream entry renamed to `eklow/gemma-4-26b-a4b`) and `f7391db6` (opencode gets an
@@ -79,8 +81,9 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
   `~/eklow-base-383` and `~/eklow-base-75a` are old baselines, safe to delete.
 - Weights on fiona (`~/models`): gemma-4-26b-a4b-it-qat-q4_0.gguf (sha256 3eca3b8f..., Hugging Face
   google/gemma-4-26B-A4B-it-qat-q4_0-gguf at d1c082be, the file `gemma-4-26B_q4_0-it.gguf`), gemma-4-12b-it-qat-q4_0.gguf
-  (93567e57...), embeddinggemma-2-Q8_0.gguf, and the 12B's mmproj; e-desktop has the 26B too. The 26B's mmproj
-  (gemma4v, 1.19 GB) is not downloaded. The service's copies come from the Nix store (fetchurl in the module).
+  (93567e57...), embeddinggemma-2-Q8_0.gguf, the 12B's mmproj, the 26B's (gemma-4-26b-a4b-it-mmproj.gguf, gemma4v,
+  BF16, a359953a...) and EmbeddingGemma 2's (mmproj-embeddinggemma-2-Q8_0.gguf, c4a8a526...); e-desktop has the 26B
+  too. The service's copies come from the Nix store (fetchurl in the module).
 - Toolchain: the fleet's nixpkgs (c3f15ff4): intel-llvm 7.1.1, level-zero 1.32.0, intel-compute-runtime 26.31.
 - fiona: A770M on PCIe 4.0 x8 (~11 GB/s; `level_zero:0`), Iris Xe (`level_zero:1`, titles), i7-12700H (AVX-VNNI),
   32 GB DDR4.

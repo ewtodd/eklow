@@ -9,9 +9,9 @@
 // Each input is one sequence: BOS, its tokens, EOS.
 //
 // A request's inputs go through together, in passes of up to max_tokens tokens: the weights' matrices run as
-// fp16 GEMMs on the matrix units (xmx, the Q8_0 and F16 forms) over every row of the pass, attention runs input by
-// input, and each input is averaged on the card. One input at a time on the reference kernels gave ~900 tok/s
-// (DECISIONS 2026-10-27, "EmbeddingGemma 2 in GEMMs").
+// fp16 GEMMs on the matrix units (xmx, the Q8_0 and F16 forms) over every row of the pass, attention on the engine's
+// kernels with each input attending to itself only, and each input is averaged on the card. One input at a time on
+// the reference kernels gave ~900 tok/s (DECISIONS 2026-10-27, "EmbeddingGemma 2 in GEMMs").
 #pragma once
 
 #include <sycl/sycl.hpp>
@@ -20,6 +20,7 @@
 #include <string>
 #include <vector>
 
+#include "kernels/attention.hpp"
 #include "kernels/ref.hpp"
 #include "kernels/xmx.hpp"
 #include "model/gguf.hpp"
@@ -74,6 +75,13 @@ class EmbedGemma2 {
   // activations and RoPE tables for passes of up to max_tok_ tokens
   std::vector<float*> act_;
   xmx::Activations a_, a0_;  // fp16 inputs of the GEMMs; a0_ holds the scaled embeddings for the per-layer inputs
+  // Attention runs on the engine's kernels (kernels/attention.hpp) over an fp16 cache of one slot holding the pass's
+  // inputs back to back: each input is a chunk whose tokens see their own input only (Tokens::lo, hi), both ways,
+  // the sliding layers within window/2. One cache serves both kinds of layer, sized for the wider head.
+  void *kc_ = nullptr, *vc_ = nullptr;
+  int32_t* table_ = nullptr;
+  int64_t pages_ = 0;
+  attn::Scratch scratch_;
 };
 
 }  // namespace eklow::model

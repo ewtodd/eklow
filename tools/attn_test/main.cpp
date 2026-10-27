@@ -7,7 +7,9 @@
 // prefill chunks of --chunk and then --decode single tokens; every output row is compared with the
 // reference over the whole sequence, for Gemma 4's sliding (head 256, 8 K/V heads, ring, window
 // 1024) and global (head 512, one K/V head, page table) layers, with fp16 caches and int8 ones
-// (sliding8, global8). Speed: the cache filled to each
+// (sliding8, global8). Each kind runs twice, the second time (+img) with every token carrying its key range
+// (Tokens::lo, hi) and a span of each slot's second chunk, an image, seeing up to the span's end, its rows checked
+// against a host reference. Speed: the cache filled to each
 // --time-ctx, one decode token and one 1024-token prefill chunk ending there, timed on the card.
 // --heads sets the query heads (16, the 12B's; 8 with --only global or global8 gives the 26B's global
 // group of 8 query heads per K/V head), --only runs one kind, --no-check skips the correctness pass.
@@ -107,13 +109,16 @@ struct TestCache {
 // One step: chunk [a, b) of every slot's sequence. Q/K/V of slot s are rows of qs[s], ks[s], vs[s].
 struct Step {
   explicit Step(int64_t head_dim) : tiles(head_dim) {}
-  std::vector<int32_t> slot, pos;
+  std::vector<int32_t> slot, pos, lo, hi;  // lo, hi only with spans
   attn::TileList tiles;
   std::vector<float> Q, K, V;
 };
 
+// With spans (per slot [s0, s1)), every token carries its key range: back as far as the window, and up to s1 - 1
+// inside its slot's span.
 Step make_step(const std::vector<std::pair<int64_t, int64_t>>& ranges, const std::vector<std::vector<float>>& qs,
-               const std::vector<std::vector<float>>& ks, const std::vector<std::vector<float>>& vs, const Kind& k) {
+               const std::vector<std::vector<float>>& ks, const std::vector<std::vector<float>>& vs, const Kind& k,
+               const std::vector<std::pair<int64_t, int64_t>>* spans = nullptr) {
   Step st(k.head_dim);
   const int64_t D = k.head_dim, Hkv = k.n_head_kv;
   for (size_t s = 0; s < ranges.size(); ++s) {
@@ -122,13 +127,42 @@ Step make_step(const std::vector<std::pair<int64_t, int64_t>>& ranges, const std
     for (int64_t t = a; t < b; ++t) {
       st.slot.push_back(int32_t(s));
       st.pos.push_back(int32_t(t));
+      if (!spans) continue;
+      const auto [s0, s1] = (*spans)[s];
+      st.lo.push_back(int32_t(k.window > 0 ? std::max<int64_t>(0, t - k.window + 1) : 0));
+      st.hi.push_back(int32_t(t >= s0 && t < s1 ? s1 - 1 : t));
     }
     st.Q.insert(st.Q.end(), qs[s].begin() + a * kHeads * D, qs[s].begin() + b * kHeads * D);
     st.K.insert(st.K.end(), ks[s].begin() + a * Hkv * D, ks[s].begin() + b * Hkv * D);
     st.V.insert(st.V.end(), vs[s].begin() + a * Hkv * D, vs[s].begin() + b * Hkv * D);
-    st.tiles.add_chunk(base, b - a, b - 1, kHeads / Hkv, Hkv, k.window);
+    if (spans) st.tiles.add_chunk(base, b - a, b - 1, kHeads / Hkv, Hkv, k.window, st.lo[size_t(base)], st.hi.back());
+    else st.tiles.add_chunk(base, b - a, b - 1, kHeads / Hkv, Hkv, k.window);
   }
   return st;
+}
+
+// Token t's output (every head) over keys [lo, hi] of one slot's Q/K/V, in double.
+std::vector<double> host_attention(const std::vector<float>& Q, const std::vector<float>& K, const std::vector<float>& V, int64_t t,
+                                   int64_t lo, int64_t hi, int64_t Hkv, int64_t D, float scale) {
+  std::vector<double> out(size_t(kHeads * D), 0.0), p(size_t(hi - lo + 1));
+  for (int64_t h = 0; h < kHeads; ++h) {
+    const int64_t g = h / (kHeads / Hkv);
+    const float* q = Q.data() + (t * kHeads + h) * D;
+    double m = -1e300, l = 0;
+    for (int64_t j = lo; j <= hi; ++j) {
+      const float* kv = K.data() + (j * Hkv + g) * D;
+      double s = 0;
+      for (int64_t d = 0; d < D; ++d) s += double(q[d]) * kv[d];
+      p[size_t(j - lo)] = s * scale;
+      m = std::max(m, s * scale);
+    }
+    for (auto& x : p) l += (x = std::exp(x - m));
+    for (int64_t j = lo; j <= hi; ++j) {
+      const float* vv = V.data() + (j * Hkv + g) * D;
+      for (int64_t d = 0; d < D; ++d) out[size_t(h * D + d)] += p[size_t(j - lo)] / l * vv[d];
+    }
+  }
+  return out;
 }
 
 // GPU time of `f`'s work, from empty marker kernels before and after it.
@@ -172,8 +206,10 @@ int main(int argc, char** argv) {
     w.begin_object().kv("device", q.get_device().get_info<sycl::info::device::name>()).kv("len", len).kv("chunk", chunk);
     w.key("check").begin_array();
     bool ok = true;
-    for (const Kind& k : kKinds) {
+    for (const Kind& k : kKinds)
+    for (int ranged = 0; ranged < 2; ++ranged) {
       if (no_check || (!only.empty() && only != k.name)) continue;
+      if (ranged && len - decode < 2 * chunk) continue;
       const int64_t D = k.head_dim, Hkv = k.n_head_kv;
       const float scale = 2.0f / std::sqrt(float(D));
       constexpr int kSlots = 2;
@@ -199,13 +235,17 @@ int main(int argc, char** argv) {
       float *dq = sycl::malloc_device<float>(size_t(max_tok * kHeads * D), q), *dk = sycl::malloc_device<float>(size_t(max_tok * Hkv * D), q),
             *dv = sycl::malloc_device<float>(size_t(max_tok * Hkv * D), q), *dout = sycl::malloc_device<float>(size_t(max_tok * kHeads * D), q);
       int32_t *dslot = sycl::malloc_device<int32_t>(size_t(max_tok), q), *dpos = sycl::malloc_device<int32_t>(size_t(max_tok), q);
+      int32_t *dlo = sycl::malloc_device<int32_t>(size_t(max_tok), q), *dhi = sycl::malloc_device<int32_t>(size_t(max_tok), q);
       int32_t* dtiles = sycl::malloc_device<int32_t>(size_t(6 * Hkv * (max_tok * kHeads / Hkv / 8 + kSlots)), q);
       double err2 = 0, ref2 = 0, max_abs = 0;
       std::vector<std::pair<int64_t, int64_t>> sched;
       for (int64_t a = 0; a < len - decode; a += chunk) sched.push_back({a, std::min(len - decode, a + chunk)});
       for (int64_t a = len - decode; a < len; ++a) sched.push_back({a, a + 1});
+      // Each slot's image: a quarter of the second chunk, at different places in the two slots.
+      std::vector<std::pair<int64_t, int64_t>> spans;
+      for (int64_t s = 0; s < kSlots; ++s) spans.push_back({chunk + chunk / 8 + s * chunk / 16, chunk + chunk / 8 + s * chunk / 16 + chunk / 4});
       for (auto [a, b] : sched) {
-        Step st = make_step({{a, b}, {a, b}}, qs, ks, vs, k);
+        Step st = make_step({{a, b}, {a, b}}, qs, ks, vs, k, ranged ? &spans : nullptr);
         const int64_t T = int64_t(st.pos.size());
         q.memcpy(dq, st.Q.data(), st.Q.size() * 4);
         q.memcpy(dk, st.K.data(), st.K.size() * 4);
@@ -214,17 +254,26 @@ int main(int argc, char** argv) {
         q.memcpy(dpos, st.pos.data(), size_t(T) * 4);
         const std::vector<int32_t> packed = st.tiles.packed();
         q.memcpy(dtiles, packed.data(), packed.size() * 4);
-        const attn::Tokens tok{dslot, dpos, T};
+        if (ranged) {
+          q.memcpy(dlo, st.lo.data(), size_t(T) * 4);
+          q.memcpy(dhi, st.hi.data(), size_t(T) * 4);
+        }
+        const attn::Tokens tok = ranged ? attn::Tokens{dslot, dpos, T, dlo, dhi} : attn::Tokens{dslot, dpos, T};
         attn::write(q, dk, dv, tok, cache.c);
         attn::attend(q, dq, tok, st.tiles, dtiles, cache.c, kHeads, scale, dout, scratch);
         std::vector<float> got(size_t(T * kHeads * D));
         q.memcpy(got.data(), dout, got.size() * 4).wait();
         for (int64_t i = 0; i < T; ++i) {
-          const float* r = ref[size_t(st.slot[size_t(i)])].data() + st.pos[size_t(i)] * kHeads * D;
+          const size_t s = size_t(st.slot[size_t(i)]);
+          const int64_t t = st.pos[size_t(i)];
+          const float* r = ref[s].data() + t * kHeads * D;
+          std::vector<double> img;
+          if (ranged && st.hi[size_t(i)] != t) img = host_attention(qs[s], ks[s], vs[s], t, st.lo[size_t(i)], st.hi[size_t(i)], Hkv, D, scale);
           for (int64_t e = 0; e < kHeads * D; ++e) {
-            const double d = double(got[size_t(i * kHeads * D + e)]) - r[e];
+            const double want = img.empty() ? double(r[e]) : img[size_t(e)];
+            const double d = double(got[size_t(i * kHeads * D + e)]) - want;
             err2 += d * d;
-            ref2 += double(r[e]) * r[e];
+            ref2 += want * want;
             max_abs = std::max(max_abs, std::abs(d));
           }
         }
@@ -233,13 +282,14 @@ int main(int argc, char** argv) {
       // fp16 probabilities and fp32 accumulation: a few 1e-4 relative; int8 K/V a few 1e-3.
       const bool pass = rel < (k.int8 ? 2e-2 : 2e-3);
       ok = ok && pass;
-      std::printf("%-8s %zu steps, 2 slots: rel L2 %.3g, max abs %.3g %s\n", k.name, sched.size(), rel, max_abs, pass ? "ok" : "FAIL");
-      w.begin_object().kv("kind", k.name).kv("rel_l2", rel).kv("max_abs", max_abs).kv("pass", pass).end_object();
+      const std::string name = std::string(k.name) + (ranged ? "+img" : "");
+      std::printf("%-12s %zu steps, 2 slots: rel L2 %.3g, max abs %.3g %s\n", name.c_str(), sched.size(), rel, max_abs, pass ? "ok" : "FAIL");
+      w.begin_object().kv("kind", name).kv("rel_l2", rel).kv("max_abs", max_abs).kv("pass", pass).end_object();
       for (float* p : {dq, dk, dv, dout}) sycl::free(p, q);
-      for (int32_t* p : {dslot, dpos, dtiles}) sycl::free(p, q);
-      if (scratch.q) sycl::free(scratch.q, q);
-      if (scratch.part) sycl::free(scratch.part, q);
-      if (scratch.part2) sycl::free(scratch.part2, q);
+      for (int32_t* p : {dslot, dpos, dlo, dhi, dtiles}) sycl::free(p, q);
+      for (void* p : {static_cast<void*>(scratch.q), static_cast<void*>(scratch.part), static_cast<void*>(scratch.part2),
+                      static_cast<void*>(scratch.p), static_cast<void*>(scratch.stat)})
+        if (p) sycl::free(p, q);
       cache.free(q);
     }
     w.end_array().key("speed").begin_array();

@@ -11,6 +11,10 @@ namespace {
 int64_t get_int(const gguf::File& f, const std::string& k) { return f.at(k).as_int(); }
 float get_float(const gguf::File& f, const std::string& k) { return float(f.at(k).as_float()); }
 
+// Attention takes an input in chunks of up to kAttnChunk tokens, and a pass at most kPassInputs inputs: they bound
+// its scratch (the global layers' segment buffers grow with a chunk's rows, the query tiles with the chunks).
+constexpr int64_t kAttnChunk = 2048, kPassInputs = 256;
+
 }  // namespace
 
 float* EmbedGemma2::buf(size_t floats) {
@@ -117,11 +121,15 @@ EmbedGemma2::~EmbedGemma2() {
   for (float* p : act_) sycl::free(p, q_);
   xmx::free_activations(q_, a_);
   xmx::free_activations(q_, a0_);
+  for (void* p : {kc_, vc_, static_cast<void*>(table_), static_cast<void*>(scratch_.q), static_cast<void*>(scratch_.part),
+                  static_cast<void*>(scratch_.part2), static_cast<void*>(scratch_.p), static_cast<void*>(scratch_.stat)})
+    if (p) sycl::free(p, q_);
 }
 
 // Activation buffers for passes of n_tok tokens: x, x2, h, o, q, k, v, att, gate, up, the per-layer gate and input,
 // the last layer, the token ids and positions, the inputs' means; the RoPE tables for positions 0..n_tok-1 (cos and
-// sin of the sliding layers, then of the global ones); and the GEMMs' fp16 inputs.
+// sin of the sliding layers, then of the global ones); the attention's slots, cache positions and key ranges (sliding,
+// global) and tile lists; the GEMMs' fp16 inputs; the attention's cache, page table and scratch.
 void EmbedGemma2::ensure(int64_t n_tok) {
   if (n_tok <= max_tok_) return;
   q_.wait();
@@ -129,16 +137,21 @@ void EmbedGemma2::ensure(int64_t n_tok) {
   act_.clear();
   xmx::free_activations(q_, a_);
   xmx::free_activations(q_, a0_);
-  int64_t dmax = 0, d_s = 0, d_g = 0, hkv = 0;
+  for (void* p : {kc_, vc_, static_cast<void*>(table_)})
+    if (p) sycl::free(p, q_);
+  int64_t dmax = 0, d_s = 0, d_g = 0, hkv = 0, hkv_s = 1, hkv_g = 1;
   for (const auto& L : layers_) {
     dmax = std::max(dmax, L.head_dim);
     hkv = std::max(hkv, L.n_head_kv);
-    (L.sliding ? d_s : d_g) = L.head_dim;
+    (L.sliding ? d_s : d_g) = L.head_dim, (L.sliding ? hkv_s : hkv_g) = L.n_head_kv;
   }
   const int64_t T = n_tok, E = n_embd_;
+  // A pass's query tiles on either kind of layer: per chunk and K/V head ceil(rows / 8), rows = tokens x the query
+  // heads per K/V head; each tile takes 4 ints of the list and at most 2 of its groups.
+  const int64_t max_tiles = (T * n_head_ + 7) / 8 + hkv * (kPassInputs + T / kAttnChunk);
   for (int64_t n : {T * E, T * E, T * E, T * E, T * n_head_ * dmax, T * hkv * dmax, T * hkv * dmax, T * n_head_ * dmax, T * n_ff_,
                     T * n_ff_, T * n_pl_, T * n_pl_, T * n_out_, T, T, T * n_out_, T * d_s / 2, T * d_s / 2, T * d_g / 2,
-                    T * d_g / 2}) {
+                    T * d_g / 2, T, T, T, T, T, T, 6 * max_tiles, 6 * max_tiles}) {
     auto* p = sycl::malloc_device<float>(size_t(n), q_);
     if (!p) throw std::runtime_error("embedding model: out of device memory for activations");
     act_.push_back(p);
@@ -150,6 +163,19 @@ void EmbedGemma2::ensure(int64_t n_tok) {
   q_.memcpy(act_[19], g.sin.data(), g.sin.size() * sizeof(float)).wait();
   a_ = xmx::alloc_activations(q_, T, std::max({E, n_ff_, n_head_ * dmax, n_pl_}));
   a0_ = xmx::alloc_activations(q_, T, E);
+  // One slot of pages_ pages in order (the page table is the identity), [page][K/V head][256][dmax] fp16 each.
+  pages_ = (T + attn::kPage - 1) / attn::kPage;
+  const size_t cache = size_t(pages_ * hkv * attn::kPage * dmax);
+  kc_ = sycl::malloc_device<sycl::half>(cache, q_);
+  vc_ = sycl::malloc_device<sycl::half>(cache, q_);
+  table_ = sycl::malloc_device<int32_t>(size_t(pages_), q_);
+  if (!kc_ || !vc_ || !table_) throw std::runtime_error("embedding model: out of device memory for the attention cache");
+  std::vector<int32_t> identity(static_cast<size_t>(pages_));
+  for (int64_t i = 0; i < pages_; ++i) identity[size_t(i)] = int32_t(i);
+  q_.memcpy(table_, identity.data(), identity.size() * sizeof(int32_t)).wait();
+  const int64_t chunk = std::min(T, kAttnChunk);
+  attn::reserve(q_, scratch_, max_tiles, chunk * (n_head_ / hkv_s), hkv_s, d_s);
+  attn::reserve(q_, scratch_, max_tiles, chunk * (n_head_ / hkv_g), hkv_g, d_g);
   max_tok_ = T;
 }
 
@@ -173,7 +199,8 @@ std::vector<std::vector<float>> EmbedGemma2::embed(const std::vector<std::vector
     for (size_t i0 = 0; i0 < seqs.size();) {
       size_t i1 = i0;
       int64_t tokens = 0;
-      while (i1 < seqs.size() && tokens + int64_t(seqs[i1].size()) <= max_tok_) tokens += int64_t(seqs[i1++].size());
+      while (i1 < seqs.size() && i1 - i0 < size_t(kPassInputs) && tokens + int64_t(seqs[i1].size()) <= max_tok_)
+        tokens += int64_t(seqs[i1++].size());
       forward(seqs, i0, i1, means.data() + i0 * size_t(n_out_), keep);
       i0 = i1;
     }
@@ -214,6 +241,45 @@ void EmbedGemma2::forward(const std::vector<std::vector<int32_t>>& seqs, size_t 
   q_.memcpy(tpos, pos.data(), pos.size() * sizeof(int32_t));
   keep.push_back(std::move(tokens));
   keep.push_back(std::move(pos));
+
+  // Attention: the pass's inputs back to back in one slot (cache position = row), each input in chunks whose tokens
+  // see their own input, within window/2 on the sliding layers. Every Hkv and head size is the same within a kind.
+  int64_t hkv_s = 0, hkv_g = 0, d_s = 0, d_g = 0;
+  for (const auto& Ly : layers_) (Ly.sliding ? hkv_s : hkv_g) = Ly.n_head_kv, (Ly.sliding ? d_s : d_g) = Ly.head_dim;
+  const int64_t hw = window_ / 2;
+  const size_t nt = static_cast<size_t>(T);
+  std::vector<int32_t> slot(nt, 0), cpos(nt), lo_s(nt), hi_s(nt), lo_g(nt), hi_g(nt);
+  attn::TileList tl_s(d_s), tl_g(d_g);
+  for (int64_t s = 0; s < n_seq; ++s) {
+    const int64_t a = start[size_t(s)], b = start[size_t(s) + 1];
+    for (int64_t t = a; t < b; ++t) {
+      cpos[size_t(t)] = int32_t(t);
+      lo_s[size_t(t)] = int32_t(std::max(a, t - hw)), hi_s[size_t(t)] = int32_t(std::min(b - 1, t + hw));
+      lo_g[size_t(t)] = int32_t(a), hi_g[size_t(t)] = int32_t(b - 1);
+    }
+    for (int64_t c0 = a; c0 < b; c0 += kAttnChunk) {
+      const int64_t n = std::min(kAttnChunk, b - c0);
+      if (hkv_s) tl_s.add_chunk(int32_t(c0), n, c0 + n - 1, H / hkv_s, hkv_s, 0, std::max(a, c0 - hw), std::min(b - 1, c0 + n - 1 + hw));
+      if (hkv_g) tl_g.add_chunk(int32_t(c0), n, c0 + n - 1, H / hkv_g, hkv_g, 0, a, b - 1);
+    }
+  }
+  auto* d_slot = reinterpret_cast<int32_t*>(act_[20]);
+  auto* d_cpos = reinterpret_cast<int32_t*>(act_[21]);
+  auto* d_lo_s = reinterpret_cast<int32_t*>(act_[22]);
+  auto* d_hi_s = reinterpret_cast<int32_t*>(act_[23]);
+  auto* d_lo_g = reinterpret_cast<int32_t*>(act_[24]);
+  auto* d_hi_g = reinterpret_cast<int32_t*>(act_[25]);
+  auto* d_tl_s = reinterpret_cast<int32_t*>(act_[26]);
+  auto* d_tl_g = reinterpret_cast<int32_t*>(act_[27]);
+  for (auto [dst, v] : {std::pair{d_slot, &slot}, {d_cpos, &cpos}, {d_lo_s, &lo_s}, {d_hi_s, &hi_s}, {d_lo_g, &lo_g}, {d_hi_g, &hi_g}}) {
+    q_.memcpy(dst, v->data(), v->size() * sizeof(int32_t));
+    keep.push_back(std::move(*v));
+  }
+  keep.push_back(tl_s.packed());
+  q_.memcpy(d_tl_s, keep.back().data(), keep.back().size() * sizeof(int32_t));
+  keep.push_back(tl_g.packed());
+  q_.memcpy(d_tl_g, keep.back().data(), keep.back().size() * sizeof(int32_t));
+  const attn::Tokens tk_s{d_slot, d_cpos, T, d_lo_s, d_hi_s}, tk_g{d_slot, d_cpos, T, d_lo_g, d_hi_g};
   // Rows of the GEMMs: xmx::quantize writes them in the fp16 form at width k.
   auto gemm_in = [&](xmx::Activations& a, const float* v, int64_t k) {
     a.k = k;
@@ -247,11 +313,9 @@ void EmbedGemma2::forward(const std::vector<std::vector<int32_t>>& seqs, size_t 
     ref::rmsnorm(q_, vb, nullptr, T * Hkv, D, eps_, vb);
     rope(qb, H, D, Ly.sliding ? cos_s : cos_g, Ly.sliding ? sin_s : sin_g);
     rope(kb, Hkv, D, Ly.sliding ? cos_s : cos_g, Ly.sliding ? sin_s : sin_g);
-    for (int64_t s = 0; s < n_seq; ++s) {
-      const int64_t t0 = start[size_t(s)], n = start[size_t(s) + 1] - t0;
-      ref::attention_bidir(q_, qb + t0 * H * D, kb + t0 * Hkv * D, vb + t0 * Hkv * D, n, H, Hkv, D, Ly.sliding ? window_ / 2 : 0,
-                           1.0f, att + t0 * H * D);
-    }
+    const attn::Cache cache{kc_, vc_, table_, pages_, 0, Hkv, D};
+    attn::write(q_, kb, vb, Ly.sliding ? tk_s : tk_g, cache);
+    attn::attend(q_, qb, Ly.sliding ? tk_s : tk_g, Ly.sliding ? tl_s : tl_g, Ly.sliding ? d_tl_s : d_tl_g, cache, H, 1.0f, att, scratch_);
     gemm_in(a_, att, H * D);
     xmx::matmul(q_, a_, Ly.wo, o);
     ref::rmsnorm(q_, o, Ly.attn_post_norm, T, E, eps_, o);
