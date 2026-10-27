@@ -95,6 +95,7 @@ void grouped_test(sycl::queue& q, const gguf::File& f, json::Writer& w) {
       auto* yg = sycl::malloc_device<float>(size_t(P * n), q);
       auto* yr = sycl::malloc_device<float>(size_t(n), q);
       auto* idd = sycl::malloc_device<int32_t>(size_t(P), q);
+      auto* idsets = sycl::malloc_device<int32_t>(size_t(32 * P), q);
       std::vector<float> x(size_t(rows * k) + 0);
       for (auto& v : x) v = nd(rng);
       for (int64_t r = 0; r < rows; ++r)
@@ -119,26 +120,54 @@ void grouped_test(sycl::queue& q, const gguf::File& f, json::Writer& w) {
           den += double(hr[size_t(i)]) * hr[size_t(i)];
         }
       }
+      std::vector<int32_t> all_ids(size_t(32 * P) + 0);
+      int64_t distinct_sum = 0;
+      for (int s = 0; s < 32; ++s) {
+        for (int64_t p = 0; p < P; ++p) all_ids[size_t(s * P + p)] = int32_t(rng() % uint32_t(n_exp));
+        std::vector<int32_t> u(all_ids.begin() + s * P, all_ids.begin() + (s + 1) * P);
+        std::sort(u.begin(), u.end());
+        distinct_sum += std::unique(u.begin(), u.end()) - u.begin();
+      }
+      q.memcpy(idsets, all_ids.data(), all_ids.size() * 4).wait();
       double best = 1e30;
       for (int rep = 0; rep < 4; ++rep) {
         auto t0 = std::chrono::steady_clock::now();
-        for (int i = 0; i < 20; ++i) xmx::matmul_grouped(q, act, table, idd, P, row_div, yg);
+        // 32 different draws of ids, so the experts come from VRAM and not the 16 MB L2.
+        for (int i = 0; i < 32; ++i) xmx::matmul_grouped(q, act, table, idsets + i * P, P, row_div, yg);
         q.wait();
         const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 20;
         if (rep) best = std::min(best, dt);
       }
-      std::vector<int32_t> uniq = ids;
-      std::sort(uniq.begin(), uniq.end());
-      const int64_t distinct = std::unique(uniq.begin(), uniq.end()) - uniq.begin();
-      const double gbps = double(distinct) * double(exp_bytes) / best / 1e9;
-      std::printf("%-18s %5lld %9lld %10.2e %9.4f %9.0f\n", gate_up ? "blk.0 gate_up exps" : "blk.0 down exps", (long long)P,
-                  (long long)distinct, std::sqrt(num / den), best * 1e3, gbps);
+
+
+      const double distinct = double(distinct_sum) / 32;
+      const double gbps = distinct * double(exp_bytes) / best / 1e9;
+      std::printf("%-18s %5lld %9.1f %10.2e %9.4f %9.0f\n", gate_up ? "blk.0 gate_up exps" : "blk.0 down exps", (long long)P,
+                  distinct, std::sqrt(num / den), best * 1e3, gbps);
       w.begin_object().kv("weight", gate_up ? "gate_up" : "down").kv("pairs", P).kv("distinct", distinct)
           .kv("rel_vs_matmul", std::sqrt(num / den)).kv("ms", best * 1e3).kv("gbps", gbps).end_object();
+      if (gate_up) {
+        // With the GeGLU and its int8 quantization after it, as the engine runs it.
+        xmx::Activations glu = xmx::alloc_activations(q, 32, n / 2);
+        auto* scr = sycl::malloc_device<float>(size_t(P * n), q);
+        double gbest = 1e30;
+        for (int rep = 0; rep < 4; ++rep) {
+          auto t0 = std::chrono::steady_clock::now();
+          for (int i = 0; i < 32; ++i) xmx::matmul_geglu_grouped(q, act, table, idsets + i * P, P, row_div, glu, scr);
+          q.wait();
+          const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / 32;
+          if (rep) gbest = std::min(gbest, dt);
+        }
+        std::printf("%-18s %5lld %9.1f %10s %9.4f %9.0f\n", "  + GeGLU", (long long)P, distinct, "", gbest * 1e3,
+                    distinct * double(exp_bytes) / gbest / 1e9);
+        sycl::free(scr, q);
+        xmx::free_activations(q, glu);
+      }
       sycl::free(xd, q);
       sycl::free(yg, q);
       sycl::free(yr, q);
       sycl::free(idd, q);
+      sycl::free(idsets, q);
       xmx::free_activations(q, act);
       xmx::free_activations(q, one);
     }
