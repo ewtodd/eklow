@@ -226,6 +226,7 @@ void grouped16_test(sycl::queue& q, const gguf::File& f, json::Writer& w, int64_
   auto* y = sycl::malloc_device<float>(size_t(rows * E), q);
   q.memcpy(idd, ids.data(), ids.size() * 4);
   q.memcpy(xd, x.data(), x.size() * 4).wait();
+  q.memset(a, 0, size_t(rows * E) * 2).wait();
   fast::moe_group(q, idd, P, NE, tile, scr, tiles, rowp);
   fast::moe_gather(q, xd, rowp, P, NU, E, a);
   xmx::matmul_geglu_grouped16(q, a, tab_gu, tiles, max_tiles, tile, h);
