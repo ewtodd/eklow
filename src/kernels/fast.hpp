@@ -67,4 +67,18 @@ void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n
 // at decode (ref::matmul's generic path ran one work-item per output).
 void matmul_f32_small(sycl::queue& q, const float* w, int64_t n, int64_t k, const float* x, int64_t n_tok, float* out);
 
+// The 26B's decode step, fused (T * n_used <= 32 rows):
+// after attention, x_out = x + rmsnorm(o) * w_o (the attention output; x_out may be x's other buffer), then
+// n = rmsnorm(x_out) is written three ways: * w1 into int8 a1 (the dense FFN's input), * w2 into int8 a2
+// (the experts' input) and * w3 into fp32 r_out (the router's input).
+void residual_norm_quant3(sycl::queue& q, const float* o, const float* w_o, const float* x, float* x_out, float eps, int64_t rows,
+                          int64_t cols, xmx::Activations& a1, const float* w1, xmx::Activations& a2, const float* w2,
+                          float* r_out, const float* w3);
+// The layer's tail in one kernel per row: d = rmsnorm(dense) * w_d; m = rmsnorm(sum_j weights[j] y[j]) * w_m;
+// c = d + m; x_out = (x2 + rmsnorm(c) * w_post) * scale; and with w_next the next layer's attn_norm of x_out
+// into int8 act. d_dump, m_dump, c_dump (each may be null) receive d, m, c for the dump sink.
+void moe_tail(sycl::queue& q, const float* dense, const float* w_d, const float* y, const float* weights, int64_t n_used,
+              const float* w_m, const float* w_post, const float* x2, float scale, float* x_out, const float* w_next, float eps,
+              int64_t rows, int64_t cols, xmx::Activations* act, float* d_dump, float* m_dump, float* c_dump);
+
 }  // namespace eklow::fast

@@ -163,7 +163,14 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
         weight_bytes_ += size_t(2 * Fe * gu_row + E * dn_row);
       }
       // Device tables of the experts' pointers for the grouped decode kernels, and the down scales.
-      L.tab_gate_up = xmx::make_expert_table(q_, L.exp_gate_up);
+      {
+        // The dense FFN's gate|up as three more entries (its 3 x 1,408 interleaved columns are contiguous tile ranges).
+        std::vector<xmx::Weight> with_dense = L.exp_gate_up;
+        const int64_t third = L.gate_up.n / 3 / 8 * (L.gate_up.k / 32);  // tiles per third
+        for (int j = 0; j < 3; ++j)
+          with_dense.push_back(xmx::Weight{L.gate_up.k, L.gate_up.n / 3, L.gate_up.tiles + j * third * 128, L.gate_up.scales + j * third * 8});
+        L.tab_gate_up = xmx::make_expert_table(q_, with_dense);
+      }
       L.tab_down = xmx::make_expert_table(q_, L.exp_down);
       owned_.push_back(L.tab_gate_up.tiles);
       owned_.push_back(L.tab_gate_up.scales);
@@ -263,7 +270,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     if (!moe_ids_) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(moe_ids_);
     moe_w_ = dev(xmx::kFp16Rows);
-    moe_gu_ = dev(xmx::kFp16Rows * 2 * cfg_.n_ff_exp);
+    moe_gu_ = dev((xmx::kFp16Rows + 12) * 2 * cfg_.n_ff_exp);  // up to 32 expert pairs and 3 dense per row of 4
     act_exp_ = xmx::alloc_activations(q_, Bx, E);
     act_exp_ffn_ = xmx::alloc_activations(q_, Bx, cfg_.n_ff_exp);
   }
@@ -391,6 +398,8 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     const Layer& L = layers_[size_t(l)];
     const std::string s = "-" + std::to_string(l);
     const bool sliding = cfg_.sliding[size_t(l)];
+    // The 26B at decode: fused norms and tail kernels, everything on the card.
+    const bool fused = cfg_.n_expert > 0 && T * cfg_.n_expert_used <= xmx::kFp16Rows;
     const int64_t D = cfg_.head_dim(l), Hkv = cfg_.n_head_kv[size_t(l)];
     const float* inv = sliding ? inv_freq_sliding_ : inv_freq_global_;
     emit("attn_norm" + s, h_, {E, T});
@@ -421,22 +430,28 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     xmx::quantize(q_, att_, T, act_);
     xmx::matmul(q_, act_, L.wo, o_);
     mark("wo");
-    fast::residual_norm_quant(q_, o_, L.attn_post_norm, x_, 1.0f, x2_, L.ffn_norm, cfg_.eps, T, E, &act_, h_);
+    if (fused)
+      fast::residual_norm_quant3(q_, o_, L.attn_post_norm, x_, x2_, cfg_.eps, T, E, act_, L.ffn_norm, act_exp_, L.pre_ffw_norm_2, h_,
+                                 L.router_in_scale);
+    else
+      fast::residual_norm_quant(q_, o_, L.attn_post_norm, x_, 1.0f, x2_, L.ffn_norm, cfg_.eps, T, E, &act_, h_);
     emit("attn_out" + s, x2_, {E, T});
     mark("post_attn");
 
-    xmx::matmul_geglu(q_, act_, L.gate_up, act_ffn_, gu_);
-    mark("gate_up");
-    xmx::matmul(q_, act_ffn_, L.down, o_);
-    mark("down");
+    if (!fused) {
+      xmx::matmul_geglu(q_, act_, L.gate_up, act_ffn_, gu_);
+      mark("gate_up");
+      xmx::matmul(q_, act_ffn_, L.down, o_);
+      mark("down");
+    }
     if (cfg_.n_expert > 0) {
       // The 26B's MoE: the dense part is normed on its own (post_ffw_norm_1), then added to the
       // routed experts' sum (normed with post_ffw_norm_2).
       const int64_t Fe = cfg_.n_ff_exp, n_expert = cfg_.n_expert, n_used = cfg_.n_expert_used;
-      fast::rmsnorm(q_, o_, L.post_ffw_norm_1, T, E, cfg_.eps, o_);
-      emit("ffn_mlp" + s, o_, {E, T});
+      if (!fused) fast::rmsnorm(q_, o_, L.post_ffw_norm_1, T, E, cfg_.eps, o_);
+      if (!fused) emit("ffn_mlp" + s, o_, {E, T});
       // Router: r = rmsnorm(x2_) * (ffn_gate_inp.scale / sqrt(E)), then r @ W_router^T.
-      fast::rmsnorm(q_, x2_, L.router_in_scale, T, E, cfg_.eps, h_);
+      if (!fused) fast::rmsnorm(q_, x2_, L.router_in_scale, T, E, cfg_.eps, h_);
       if (T * n_used <= xmx::kFp16Rows)
         fast::matmul_f32_small(q_, reinterpret_cast<const float*>(L.w_router.data), n_expert, E, h_, T, rlog_);
       else ref::matmul(q_, L.w_router, h_, T, rlog_);
@@ -448,15 +463,23 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         const int64_t P = T * n_used;
         fast::moe_route(q_, rlog_, T, n_expert, n_used, L.exp_down_scale_dev, moe_ids_, moe_w_);
         mark("moe_route");
-        // Expert input rmsnorm(x2_) * pre_ffw_norm_2, quantized to T int8 rows (h_ is scratch).
-        fast::residual_norm_quant(q_, nullptr, nullptr, x2_, 1.0f, nullptr, L.pre_ffw_norm_2, cfg_.eps, T, E, &act_exp_, h_);
-        mark("moe_norm");
-        xmx::matmul_geglu_grouped(q_, act_exp_, L.tab_gate_up, moe_ids_, P, n_used, act_exp_ffn_, moe_gu_);
+        // The dense FFN's gate|up rides along as three more experts; its down follows.
+        xmx::matmul_geglu_grouped_dense(q_, act_exp_, act_, L.tab_gate_up, moe_ids_, P, n_used, T, act_exp_ffn_, act_ffn_, moe_gu_);
         mark("moe_gate_up");
+        xmx::matmul(q_, act_ffn_, L.down, o_);
+        mark("down");
         xmx::matmul_grouped(q_, act_exp_ffn_, L.tab_down, moe_ids_, P, 1, gx_);
         mark("moe_down");
-        fast::moe_combine(q_, gx_, moe_w_, T, n_used, E, moe_);
-        mark("moe_sum");
+        // The layer's tail in one kernel; with a dump sink its intermediates are kept for it.
+        const bool d1 = dump && dump->wants("ffn_mlp" + s), d2 = dump && dump->wants("ffn_moe" + s),
+                   d3 = dump && dump->wants("ffn_moe_combined" + s);
+        const float* next_norm = l + 1 < cfg_.n_layer ? layers_[size_t(l) + 1].attn_norm : nullptr;
+        fast::moe_tail(q_, o_, L.post_ffw_norm_1, gx_, moe_w_, n_used, L.post_ffw_norm_2, L.ffn_post_norm, x2_, L.out_scale, x_,
+                       next_norm, cfg_.eps, T, E, &act_, d1 ? h_ : nullptr, d2 ? moe_ : nullptr, d3 ? o_ : nullptr);
+        if (d1) emit("ffn_mlp" + s, h_, {E, T});
+        // The next layer's dump of attn_norm reads h_, which the unfused kernel wrote.
+        if (next_norm && dump && dump->wants("attn_norm-" + std::to_string(l + 1))) fast::rmsnorm(q_, x_, next_norm, T, E, cfg_.eps, h_);
+        mark("moe_tail");
       } else {
         // Host routing: softmax over the 128 experts, the top n_used, renormalized (floored at 2^-14,
         // llama.cpp's epsilon), each weight times its expert's down scale. Same as reference_forward.
@@ -525,11 +548,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
           }
         }
       }
-      fast::rmsnorm(q_, moe_, L.post_ffw_norm_2, T, E, cfg_.eps, moe_);
+      if (!fused) fast::rmsnorm(q_, moe_, L.post_ffw_norm_2, T, E, cfg_.eps, moe_);
       mark("moe_post_norm");
       emit("ffn_moe" + s, moe_, {E, T});
       // Combine: o_ = ffn_mlp + moe.
-      {
+      if (!fused) {
         float* o = o_;
         const float* moe = moe_;
         q_.parallel_for(sycl::range<1>(size_t(T * E)), [=](sycl::id<1> id) { o[id[0]] += moe[id[0]]; });
@@ -538,7 +561,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       mark("moe_add");
     }
     const float* next_norm = l + 1 < cfg_.n_layer ? layers_[size_t(l) + 1].attn_norm : nullptr;
-    fast::residual_norm_quant(q_, o_, L.ffn_post_norm, x2_, L.out_scale, x_, next_norm, cfg_.eps, T, E, &act_, h_);
+    if (!fused) fast::residual_norm_quant(q_, o_, L.ffn_post_norm, x2_, L.out_scale, x_, next_norm, cfg_.eps, T, E, &act_, h_);
     emit("l_out" + s, x_, {E, T});
     mark("post_ffn");
   }

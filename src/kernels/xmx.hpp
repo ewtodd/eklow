@@ -104,4 +104,12 @@ void matmul_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, 
 void matmul_geglu_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, const int32_t* ids, int64_t P,
                           int64_t row_div, Activations& out, float* scratch);
 
+// Decode MoE with the dense FFN's gate|up as three more "experts": the table's last three entries are
+// the dense gate|up's thirds (3 x n columns, each a contiguous range of tiles). Pairs 0..P-1 are the
+// experts' (activation row p / row_div of `a`), then 3 per dense row t of `ad` (t < rows_d). One grouped
+// GEMV, one GeGLU launch: the experts into `out` (P rows), the dense row t into `out_d` (3n wide).
+// scratch holds (P + 3 rows_d) rows of the third's width.
+void matmul_geglu_grouped_dense(sycl::queue& q, const Activations& a, const Activations& ad, const ExpertTable& w, const int32_t* ids,
+                                int64_t P, int64_t row_div, int64_t rows_d, Activations& out, Activations& out_d, float* scratch);
+
 }  // namespace eklow::xmx
