@@ -464,7 +464,9 @@ void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
 
 void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activations& out, float* scratch) {
   const int64_t m = a.m, n = w.n / 2;
-  if (n % 512) throw std::runtime_error("xmx: GeGLU width not a multiple of 512");
+  // A work-group of 8 work-items covers 64 output columns; the shuffles below only combine the 4
+  // of a 32-block, so any width a multiple of 64 works (the 26B's experts are 704 wide).
+  if (n % 64) throw std::runtime_error("xmx: GeGLU width not a multiple of 64");
   set_rows(out, m, n);
   if (a.fp16) {
     if (!out.fp16) throw std::runtime_error("xmx: GeGLU input and output forms differ");
@@ -477,8 +479,8 @@ void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activat
   float* as = out.s;
   const int32_t N = int32_t(n), kb = N / 32;
   const float* gu = scratch;
-  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(m), size_t(n / 8)), sycl::range<2>(1, 64)),
-                 [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(16)]] {
+  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(m), size_t(n / 8)), sycl::range<2>(1, 8)),
+                 [=](sycl::nd_item<2> it) [[sycl::reqd_sub_group_size(8)]] {
                    const int32_t r = int32_t(it.get_global_id(0)), c0 = int32_t(it.get_global_id(1)) * 8;
                    const float* src = gu + r * 2 * N + c0 * 2;
                    float v[8], amax = 0;

@@ -593,6 +593,10 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
   } else if (c.head_dim == 512 && group == 16) {
     if (c.int8()) run<512, 16, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
     else run<512, 16, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+  } else if (c.head_dim == 512 && group == 8) {
+    // The 26B's global layers: 2 K/V heads, 8 query heads each.
+    if (c.int8()) run<512, 8, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+    else run<512, 8, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   }
   else throw std::runtime_error("attention: no kernel for head_dim " + std::to_string(c.head_dim) + ", group " + std::to_string(group));
 }
