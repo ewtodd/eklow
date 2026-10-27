@@ -74,6 +74,9 @@ int main(int argc, char** argv) {
   std::set<int64_t> moe_layers;
   int64_t logits_last = 1, chunk = 0, decode_last = 0, max_ctx = 0;
   bool twin = false, kv_int8 = false;
+  std::string expert_profile;
+  int64_t experts_on_card = -1;
+  int cpu_threads = 0;
   double twin_tol = 0.05;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -88,6 +91,9 @@ int main(int argc, char** argv) {
     else if (a == "--decode-last") decode_last = std::atoll(next().c_str());
     else if (a == "--max-ctx") max_ctx = std::atoll(next().c_str());
     else if (a == "--kv-int8") kv_int8 = true;
+    else if (a == "--expert-profile") expert_profile = next();
+    else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
+    else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
     else if (a == "--twin") twin = true;
     else if (a == "--twin-tol") twin_tol = std::atof(next().c_str());
     else if (a == "--moe-layers")
@@ -95,7 +101,7 @@ int main(int argc, char** argv) {
     else {
       std::fprintf(stderr, "usage: eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens IDS) "
                            "[--tensors PREFIX,...] [--logits-last N] [--chunk N] [--decode-last N] [--twin] "
-                           "[--twin-tol KL] [--max-ctx N] [--kv-int8] [--moe-layers N,...]\n");
+                           "[--twin-tol KL] [--max-ctx N] [--kv-int8] [--moe-layers N,...] [--expert-profile JSON --experts-on-card N] [--cpu-threads N]\n");
       return 2;
     }
   }
@@ -133,6 +139,9 @@ int main(int argc, char** argv) {
     ec.max_batch = twin ? 2 * widest : widest;
     ec.max_chunk = widest;
     ec.int8_global_kv = kv_int8;
+    ec.expert_profile = expert_profile;
+    ec.experts_on_card = experts_on_card;
+    ec.cpu_threads = cpu_threads;
     ec.max_logits = twin ? 2 * std::min(widest, logits_last) : std::min(widest, logits_last);
 
     auto t0 = std::chrono::steady_clock::now();
@@ -200,6 +209,10 @@ int main(int argc, char** argv) {
       if (twin && i > 0) twin_logits.insert(twin_logits.end(), l.begin() + std::ptrdiff_t(off), l.end());
     }
     std::printf("%zu steps over %lld tokens: %.2f s (first step %.2f s)\n", steps.size(), (long long)n, since(t0), first_step);
+    if (eng.experts_on_card() < eng.model().n_expert)
+      std::printf("experts on the card: %lld of %lld per layer; %.2f%% of %llu routed pairs went to the CPU\n", (long long)eng.experts_on_card(),
+                  (long long)eng.model().n_expert, eng.pairs() ? 100.0 * double(eng.cold_pairs()) / double(eng.pairs()) : 0.0,
+                  (unsigned long long)eng.pairs());
 
     if (twin) {
       if (twin_logits.size() != logits.size()) throw std::runtime_error("twin produced a different number of logits");

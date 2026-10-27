@@ -1,7 +1,7 @@
 // eklow-server: Gemma 4 on the A770M behind an OpenAI-compatible HTTP API.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
-//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16]
+//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME]]
 //
 // --ctx is the context of each slot (positions), Gemma's full 262,144 by default; --batch the
@@ -142,6 +142,8 @@ int main(int argc, char** argv) {
   int port = 8081, slots = 2, embed_port = 8082;
   int64_t ctx = 262144, batch = 2048, chunk = 1024;
   bool kv_int8 = true;
+  std::string expert_profile;
+  int64_t experts_on_card = -1;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -153,6 +155,8 @@ int main(int argc, char** argv) {
     else if (a == "--ctx") ctx = std::atoll(next().c_str());
     else if (a == "--batch") batch = std::atoll(next().c_str());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
+    else if (a == "--expert-profile") expert_profile = next();
+    else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
     else if (a == "--embed-model") embed_path = next();
     else if (a == "--embed-port") embed_port = std::atoi(next().c_str());
     else if (a == "--embed-alias") embed_alias = next();
@@ -160,7 +164,7 @@ int main(int argc, char** argv) {
     else if (a == "--kv-fp16") kv_int8 = false;
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
-                           "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--embed-model GGUF --embed-port N [--embed-alias NAME]]\n");
+                           "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N]] [--embed-model GGUF --embed-port N [--embed-alias NAME]]\n");
       return 2;
     }
   }
@@ -182,6 +186,8 @@ int main(int argc, char** argv) {
     ec.max_chunk = chunk;
     ec.max_logits = slots;
     ec.int8_global_kv = kv_int8;
+    ec.expert_profile = expert_profile;
+    ec.experts_on_card = experts_on_card;
     engine::Engine eng(q, file, ec);
     std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights, %.2f GiB of KV cache (%d slots of %lld), %.1f s\n",
                  alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / 1073741824.0,

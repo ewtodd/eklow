@@ -64,6 +64,9 @@ int main(int argc, char** argv) {
   int64_t chunk = 2048, decode_steps = 64;
   int slots = 1;
   bool profile = false, kv_int8 = false;
+  std::string expert_profile;
+  int64_t experts_on_card = -1;
+  int cpu_threads = 0;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -77,9 +80,12 @@ int main(int argc, char** argv) {
     else if (a == "--profile") profile = true;
     else if (a == "--json") json_path = next();
     else if (a == "--kv-int8") kv_int8 = true;
+    else if (a == "--expert-profile") expert_profile = next();
+    else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
+    else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--depth N,...] [--decode-ctx N,...] "
-                           "[--decode-steps N] [--slots N] [--profile] [--kv-int8] [--json FILE]\n");
+                           "[--decode-steps N] [--slots N] [--profile] [--kv-int8] [--json FILE] [--expert-profile JSON --experts-on-card N] [--cpu-threads N]\n");
       return 2;
     }
   }
@@ -94,6 +100,9 @@ int main(int argc, char** argv) {
     ec.max_batch = std::max<int64_t>(chunk, slots);
     ec.max_chunk = chunk;
     ec.int8_global_kv = kv_int8;
+    ec.expert_profile = expert_profile;
+    ec.experts_on_card = experts_on_card;
+    ec.cpu_threads = cpu_threads;
     ec.max_logits = slots;
 
     auto f = gguf::File::open(model);
@@ -103,6 +112,8 @@ int main(int argc, char** argv) {
     std::printf("%s: %.2f GiB of weights, %.2f GiB of KV cache (%d slots of %lld)\n",
                 q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / 1073741824.0,
                 eng.cache_bytes() / 1073741824.0, slots, (long long)ec.max_ctx);
+    const bool cold = eng.experts_on_card() < eng.model().n_expert;
+    if (cold) std::printf("experts on the card: %lld of %lld per layer, the rest on the CPU\n", (long long)eng.experts_on_card(), (long long)eng.model().n_expert);
     std::mt19937 rng(7);
     std::uniform_int_distribution<int32_t> id(256, 200000);
     auto tokens = [&](int64_t n) {
@@ -160,6 +171,8 @@ int main(int argc, char** argv) {
       prof.clear();
       eng.set_profile(profile ? &prof : nullptr);
       double enqueue = 0;
+      const auto cs0 = eng.cold_stats();
+      const uint64_t pr0 = eng.pairs(), cp0 = eng.cold_pairs();
       auto t0 = std::chrono::steady_clock::now();
       for (int64_t i = 0; i < decode_steps; ++i) {
         std::vector<engine::Chunk> step;
@@ -172,6 +185,15 @@ int main(int argc, char** argv) {
       for (int sl = 0; sl < slots; ++sl) eng.release(sl);
       std::printf("decode at %6lld: %7.2f ms/step (%.2f ms enqueueing), %6.1f tok/s per sequence\n", (long long)ctx,
                   1e3 * s / double(decode_steps), 1e3 * enqueue / double(decode_steps), double(decode_steps) / s);
+      if (cold) {
+        const auto cs = eng.cold_stats();
+        const double n = double(decode_steps);
+        std::printf("    cold experts per step: %.2f ms waiting on the card's routing, %.2f ms computing on the CPU, %.1f%% of pairs on the CPU; "
+                    "%.1f of %.1f cold layers had the card finished before the CPU\n",
+                    1e3 * (cs.wait_s - cs0.wait_s) / n, 1e3 * (cs.cpu_s - cs0.cpu_s) / n,
+                    100.0 * double(eng.cold_pairs() - cp0) / double(std::max<uint64_t>(1, eng.pairs() - pr0)),
+                    double(cs.late_layers - cs0.late_layers) / n, double(cs.layers - cs0.layers) / n);
+      }
       w.begin_object().kv("ctx", ctx).kv("ms_per_step", 1e3 * s / double(decode_steps)).kv("enqueue_ms_per_step", 1e3 * enqueue / double(decode_steps));
       w.kv("tok_per_s", double(decode_steps) / s);
       if (profile) print_profile(prof, w);

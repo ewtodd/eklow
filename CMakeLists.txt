@@ -92,7 +92,7 @@ eklow_sycl(eklow-ref-run)
 
 # The serving forward pass: KV cache, batched steps over several sequences.
 add_library(eklow_engine STATIC src/engine/engine.cpp)
-target_link_libraries(eklow_engine PUBLIC eklow_model)
+target_link_libraries(eklow_engine PUBLIC eklow_model eklow_cpu)
 eklow_sycl(eklow_engine)
 
 add_executable(eklow-engine-run tools/engine_run/main.cpp)

@@ -160,6 +160,45 @@ void Pool::run(int) {
   }
 }
 
+// Four inputs against one row: the weight block is unpacked once and dotted with each input.
+template <int R>
+inline void row_dot_multi(const uint8_t* row, int64_t nblk, const Q8Blocks* const* x, float* out) {
+  __m256 acc[R];
+  float corr[R];
+  for (int r = 0; r < R; ++r) acc[r] = _mm256_setzero_ps(), corr[r] = 0.0f;
+  for (int64_t b = 0; b < nblk; ++b) {
+    const uint8_t* p = row + b * kBlockBytes;
+    const __m256i nib = load_nibbles(p + 2);
+    const float d = f16(p);
+    for (int r = 0; r < R; ++r) {
+      const float ds = d * x[r]->s[size_t(b)];
+      const __m256i dp = _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), nib, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[r]->q.data() + b * 32)));
+      acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dp), _mm256_set1_ps(ds), acc[r]);
+      corr[r] += float(8 * x[r]->sum[size_t(b)]) * ds;
+    }
+  }
+  for (int r = 0; r < R; ++r) {
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(acc[r]), _mm256_extractf128_ps(acc[r], 1));
+    h = _mm_hadd_ps(h, h);
+    h = _mm_hadd_ps(h, h);
+    out[r] = _mm_cvtss_f32(h) - corr[r];
+  }
+}
+
+void gemv_q4_multi(const uint8_t* rows, int64_t k, int64_t lo, int64_t hi, const Q8Blocks* const* x, int nx, float* const* y) {
+  const int64_t nblk = k / 32, row_bytes = nblk * kBlockBytes;
+  for (int64_t r = lo; r < hi; ++r) {
+    const uint8_t* row = rows + r * row_bytes;
+    int j = 0;
+    float o[4];
+    for (; j + 4 <= nx; j += 4) {
+      row_dot_multi<4>(row, nblk, x + j, o);
+      for (int i = 0; i < 4; ++i) y[j + i][r] = o[i];
+    }
+    for (; j < nx; ++j) y[j][r] = row_dot(row, nblk, *x[j]);
+  }
+}
+
 void gemv_q4(const uint8_t* rows, int64_t k, int64_t n, const Q8Blocks& x, float* y, Pool& pool) {
   if (k % 32) throw std::invalid_argument("gemv_q4: k is not a multiple of 32");
   const int64_t nblk = k / 32;

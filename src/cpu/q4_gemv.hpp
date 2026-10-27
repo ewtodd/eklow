@@ -66,4 +66,10 @@ class Pool {
 
 void gemv_q4(const uint8_t* rows, int64_t k, int64_t n, const Q8Blocks& x, float* y, Pool& pool);
 
+// Rows [lo, hi) of the matrix against nx inputs at once: y[j][r] = dot(x[j], rows[r]). Each weight
+// row is loaded and unpacked once for all the inputs (in groups of four), which is what a prefill
+// chunk's tokens sharing one cold expert need: its weights come out of RAM once, not once a token.
+// `rows` points at row 0 of the matrix.
+void gemv_q4_multi(const uint8_t* rows, int64_t k, int64_t lo, int64_t hi, const Q8Blocks* const* x, int nx, float* const* y);
+
 }  // namespace eklow::cpu
