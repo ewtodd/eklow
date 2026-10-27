@@ -1,7 +1,7 @@
 // eklow-attn-test: the cache attention (kernels/attention.hpp) against ref::attention on random
 // Q/K/V, driven as the engine drives it, and its speed at decode and prefill shapes.
 //
-//   eklow-attn-test [--len N] [--chunk N] [--decode N] [--time-ctx N,...] [--json FILE]
+//   eklow-attn-test [--len N] [--chunk N] [--decode N] [--time-ctx N,...] [--json FILE] [--heads N] [--only KIND] [--no-check]
 //
 // Correctness: two slots hold different random sequences of --len tokens, fed in the same steps as
 // prefill chunks of --chunk and then --decode single tokens; every output row is compared with the
@@ -9,6 +9,8 @@
 // 1024) and global (head 512, one K/V head, page table) layers, with fp16 caches and int8 ones
 // (sliding8, global8). Speed: the cache filled to each
 // --time-ctx, one decode token and one 1024-token prefill chunk ending there, timed on the card.
+// --heads sets the query heads (16, the 12B's; 8 with --only global or global8 gives the 26B's global
+// group of 8 query heads per K/V head), --only runs one kind, --no-check skips the correctness pass.
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -30,7 +32,7 @@ using namespace eklow;
 
 namespace {
 
-constexpr int64_t kHeads = 16;
+int64_t kHeads = 16;  // --heads 8 for the 26B global layers (group 8)
 
 struct Kind {
   const char* name;
@@ -145,7 +147,8 @@ double gpu_seconds(sycl::queue& q, F&& f) {
 int main(int argc, char** argv) {
   int64_t len = 3000, chunk = 512, decode = 40;
   std::vector<int64_t> time_ctx = {4096, 16384};
-  std::string json_path;
+  std::string json_path, only;
+  bool no_check = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -154,8 +157,11 @@ int main(int argc, char** argv) {
     else if (a == "--decode") decode = std::atoll(next().c_str());
     else if (a == "--time-ctx") time_ctx = list(next());
     else if (a == "--json") json_path = next();
+    else if (a == "--heads") kHeads = std::atoll(next().c_str());
+    else if (a == "--only") only = next();
+    else if (a == "--no-check") no_check = true;
     else {
-      std::fprintf(stderr, "usage: eklow-attn-test [--len N] [--chunk N] [--decode N] [--time-ctx N,...] [--json FILE]\n");
+      std::fprintf(stderr, "usage: eklow-attn-test [--len N] [--chunk N] [--decode N] [--time-ctx N,...] [--json FILE] [--heads N] [--only KIND] [--no-check]\n");
       return 2;
     }
   }
@@ -167,6 +173,7 @@ int main(int argc, char** argv) {
     w.key("check").begin_array();
     bool ok = true;
     for (const Kind& k : kKinds) {
+      if (no_check || (!only.empty() && only != k.name)) continue;
       const int64_t D = k.head_dim, Hkv = k.n_head_kv;
       const float scale = 2.0f / std::sqrt(float(D));
       constexpr int kSlots = 2;
@@ -239,6 +246,7 @@ int main(int argc, char** argv) {
 
     for (const Kind& k : kKinds)
       for (int64_t ctx : time_ctx) {
+        if (!only.empty() && only != k.name) continue;
         const int64_t D = k.head_dim, Hkv = k.n_head_kv, pf = std::min<int64_t>(1024, ctx);
         TestCache cache(q, k, 1, ctx + 1, pf);
         attn::Scratch scratch;

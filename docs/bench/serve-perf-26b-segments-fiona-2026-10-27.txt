@@ -1,0 +1,49 @@
+# Gemma 4 26B A4B through eklow-server with production flags, 2026-10-27, with the global layers' prefill attention in
+# key segments as two GEMMs (branch perf/attn-wide; DECISIONS 2026-10-27, "global prefill attention as two GEMMs"):
+# 2 slots of 262,144 tokens, int8 global KV, 1,024-token prefill chunks, EmbeddingGemma 2 loaded,
+# --expert-profile data/gemma-4-26b-a4b-experts.json (N = 50 of 128 experts a layer on the card: the attention's
+# buffers are now reserved before the experts are placed; 40 streaming slots). eklow.service was stopped; the server
+# ran from the build tree under tools/bench/serve-perf.sh. Method as in serve-perf-26b-fiona-2026-10-27.txt.
+# Decode here is ~9-12% below that file's at every depth; it is not the change: alternated on the same card state,
+# the server at 8k decoded 35.6 / 35.3 tok/s from this tree and 35.6 from main (prefill 1,657 / 1,653 against 1,575),
+# eklow-engine-bench decode is the same on both (46.2 / 41.5 tok/s at 0 / 8k), and N = 50 against 51 moves it < 1%.
+# This run came after hours of benchmarks on the card; the earlier file's was the deployed Nix build.
+
+## startup
+eklow-server: gemma-4-26b-a4b on Intel(R) Arc(TM) A770M Graphics, 6.14 GiB of weights, 6.41 GiB of KV cache (2 slots of 262144), 4.0 s
+eklow-server: experts on the card: N = 50 of 128 per layer, the rest on the CPU (one expert of every layer is 96 MiB; free card memory before them 5.96 GiB, margin 1.00 GiB, free after 1.02 GiB)
+eklow-server: prefill streams busy cold experts to the card: 40 slots (255 MiB on the card), 7.29 GiB of cold experts pinned in host memory
+eklow-server: embeddinggemma-2, 0.27 GiB, listening on 127.0.0.1:18182
+eklow-server: listening on 127.0.0.1:18181
+
+## depth
+request | prompt 8191 (0 cached), completion 256 | ttft 5.02 s, prefill 1630.8 tok/s, decode 32.8 tok/s
+request | prompt 8190 (8177 cached), completion 256 | ttft 0.22 s, prefill 57.9 tok/s, decode 33.3 tok/s
+request | prompt 8193 (8177 cached), completion 256 | ttft 0.24 s, prefill 65.9 tok/s, decode 32.6 tok/s
+request | prompt 8190 (8177 cached), completion 256 | ttft 0.23 s, prefill 56.8 tok/s, decode 33.0 tok/s
+request | prompt 8190 (8177 cached), completion 256 | ttft 0.23 s, prefill 57.6 tok/s, decode 32.9 tok/s
+request | prompt 32795 (0 cached), completion 256 | ttft 21.45 s, prefill 1528.8 tok/s, decode 31.0 tok/s
+request | prompt 32794 (32781 cached), completion 256 | ttft 0.27 s, prefill 47.5 tok/s, decode 31.2 tok/s
+request | prompt 32797 (32781 cached), completion 256 | ttft 0.29 s, prefill 55.6 tok/s, decode 29.7 tok/s
+request | prompt 32794 (32781 cached), completion 256 | ttft 0.28 s, prefill 47.2 tok/s, decode 30.7 tok/s
+request | prompt 32794 (32781 cached), completion 256 | ttft 0.27 s, prefill 47.5 tok/s, decode 30.9 tok/s
+request | prompt 131099 (0 cached), completion 256 | ttft 126.05 s, prefill 1040.1 tok/s, decode 28.4 tok/s
+request | prompt 131098 (131085 cached), completion 256 | ttft 0.47 s, prefill 27.6 tok/s, decode 28.2 tok/s
+request | prompt 131101 (131085 cached), completion 256 | ttft 0.48 s, prefill 33.3 tok/s, decode 28.6 tok/s
+request | prompt 131098 (131085 cached), completion 256 | ttft 0.45 s, prefill 28.7 tok/s, decode 28.1 tok/s
+request | prompt 131098 (131085 cached), completion 256 | ttft 0.45 s, prefill 29.0 tok/s, decode 27.9 tok/s
+request | prompt 258075 (0 cached), completion 256 | ttft 367.02 s, prefill 703.2 tok/s, decode 24.4 tok/s
+request | prompt 258074 (258061 cached), completion 256 | ttft 0.75 s, prefill 17.3 tok/s, decode 24.5 tok/s
+request | prompt 258077 (258061 cached), completion 256 | ttft 0.77 s, prefill 20.7 tok/s, decode 24.6 tok/s
+request | prompt 258074 (258061 cached), completion 256 | ttft 0.74 s, prefill 17.6 tok/s, decode 24.8 tok/s
+request | prompt 258074 (258061 cached), completion 256 | ttft 0.74 s, prefill 17.6 tok/s, decode 25.0 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 5
+8k         1631 (5.0 s)        32.9
+32k         1529 (21.5 s)        30.9
+128k         1040 (126.1 s)        28.2
+252k          703 (367.0 s)        24.6
+
+## concurrency
+gsm, 48 requests, 1 at a time: 45760 completion tokens in 1379.2 s, 33.2 tok/s aggregate, decode per stream median 33.8 tok/s
+gsm, 48 requests, 2 at a time: 46858 completion tokens in 1122.0 s, 41.8 tok/s aggregate, decode per stream median 21.4 tok/s

@@ -11,6 +11,10 @@ Live state, written as a handoff (2026-10-27). Design and targets: `DESIGN.md`; 
   N = 51 of 128 experts a layer on the card (free card memory 6.08 GiB before them, 1.06 after, margin 1 GiB), 40
   streaming slots (255 MiB), 7.20 GiB of cold experts in pinned host memory. EmbeddingGemma 2 (0.27 GiB) in the same
   process on :8082; chat on :8081.
+- **Not yet deployed: segmented global prefill attention** (main, merged from `perf/attn-wide` 2026-10-27): the
+  global layers' long prefill as two GEMMs per 2,048-key segment, 2x prefill at 128k-252k through the server
+  (below). Deploying it is the owner's (update the eklow input in `/etc/nixos`'s flake.lock, rebuild). The server then
+  places N = 50 of 128 experts a layer: the attention's ~100 MB is now reserved before the experts are placed.
 - **`/etc/nixos`** (the owner deploys; agents only commit, as son-of-anton-bot, no co-author trailers):
   `ac7f4993` (the eklow module serves the 26B: model by URL and sha256, alias `gemma-4-26b-a4b`, the profile in
   `extraArgs`; maitred's `gemma` upstream entry renamed to `eklow/gemma-4-26b-a4b`) and `f7391db6` (opencode gets an
@@ -42,16 +46,20 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
 | 128k | 493 (266 s) | 30.9 |
 | 252k | 352 (734 s) | 26.7 |
 
+- Main, not yet deployed (the same method from the build tree, production flags;
+  `docs/bench/serve-perf-26b-segments-fiona-2026-10-27.txt`): prefill 1,631 (5.0 s) / 1,529 (21.5 s) / 1,040 (126 s) /
+  703 (367 s) tok/s at 8k / 32k / 128k / 252k; decode and GSM8K unchanged (main and the branch alternated on one card
+  state decode alike; that run's own decode came ~10% low after hours of load on the card).
 - Cached document: the next question starts in 0.2-0.7 s.
 - GSM8K: 33.4 tok/s aggregate one at a time (34.0 per stream), 41.9 two at a time (21.4 per stream). Two streams add
   only 25%: at N = 51 the CPU computes both streams' cold experts (not separated further).
 - Beside the 26B (`coexist` probe, live service): an embedding 60 ms idle, 78 ms during a 32k prefill, 60 ms during
   decode; a title 368 ms idle, 457-471 ms during prefill or decode. Neither waits on the 26B.
-- What limits it: at depth, the global layers' prefill attention (~11 TFLOPS of 98.8; 61% of prefill at 32k depth with
-  every expert on the card); at short depth with N = 51, the cold experts (PCIe streaming's tax on every kernel,
+- What limits it: at depth, the global layers' prefill attention (deployed: ~11 TFLOPS of 98.8, 61% of prefill at 32k
+  depth with every expert on the card; main: ~31 TFLOPS, 34% there and 55% at 128k with N = 51); at short depth with N = 51, the cold experts (PCIe streaming's tax on every kernel,
   ~3x on the hot GEMMs, and the CPU). Decode: grouped expert GEMVs at ~180 GB/s of 399, and the CPU's cold pairs.
-- Engine numbers with every expert on the card (contexts up to ~2 x 32k; `bench.sh engine26`): prefill 1,234 tok/s
-  at 32k depth, decode 68.1 / 61.4 / 43.4 tok/s at 0 / 4k / 32k; two slots 53.9 per sequence at 0.
+- Engine numbers with every expert on the card (contexts up to ~2 x 32k; `bench.sh engine26`): prefill 1,914 tok/s
+  at 32k depth in main (1,234 with the flash kernel), decode 68.1 / 61.4 / 43.4 tok/s at 0 / 4k / 32k; two slots 53.9 per sequence at 0.
 - Accuracy (`bench.sh check26`, against eklow's fp32 reference over the 2,616-token prompt's last 256 positions):
   243/256 top-1 at mean KL 2.9e-2 with N = 51 and streaming; 242/256 at 2.8e-2 with every expert on the card;
   llama.cpp's CPU backend is 220/256 at 7.5e-2 on the same positions (the band).
@@ -97,11 +105,9 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
   tasks and reports go to `old-reports/` (all excluded from git by `.git/info/exclude`). The orchestrator reviews the
   diff, re-runs the gates, merges into main and keeps DECISIONS / STATUS. Local Qwen workers on son-of-anton were
   dropped so the rack stays quiet.
-- Worktrees now: `gemm` (m6/prefill) and `moe` (m6/stream) are merged and clean. `attn` (perf/attn-global) holds
-  the global-attention experiment uncommitted: an `ABL` knock-out bitmask in `src/kernels/attention.cpp` (from the
-  env var `EKLOW_ABL`), a 12-query-tile `FlashGroup` variant whose first run hung, and new `eklow-attn-test` flags
-  (`--heads N`, `--only KIND`, `--no-check`). Keep the flags, revert the rest, unless the 12-tile variant is
-  retried (on a card with the service stopped).
+- Worktrees now: `gemm` (m6/prefill), `moe` (m6/stream) and `attn-wide` (perf/attn-wide) are merged and clean.
+  `attn` (perf/attn-global) still holds the old flash-kernel knock-out experiment uncommitted; it is superseded (its
+  `eklow-attn-test` flags are in main) and can be removed.
 
 ## Milestone 1 (foundation)
 
@@ -201,6 +207,9 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
       34): decode 32.2 / 29.1 / 27.6 tok/s at 0 / 4k / 16k
 - [x] attention: prefill work-groups sharing each K/V block through shared local memory: 10.4 /
       10.9 TFLOPS (sliding / global)
+- [x] global prefill attention in key segments, each two GEMMs in the fp16 GEMM's shape (Q.K^T with the softmax in its
+      epilogue, P.V into a running output): ~31 TFLOPS from ~10 at 16k-131k keys; the 26B's engine prefill at 128k
+      depth 396 -> 787 tok/s, through the server 493 -> 1,040 at 128k (DECISIONS 2026-10-27)
 - [ ] prefill at 16k depth: 962 tok/s of the 1,500 target (`eklow-engine-bench --depth 16384`);
       needs global attention near 20 TFLOPS and the GEMMs near 60 (DECISIONS 2026-10-24); the
       GEMM waits on its shared-memory loads, not their bandwidth (knockouts, DECISIONS 2026-10-26)
@@ -225,11 +234,10 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
 
 ## Open, in order
 
-1. **Global prefill attention at depth** (head 512): the biggest lever for long contexts, for both models. Measured,
-   nothing kept (DECISIONS 2026-10-27, "global prefill attention: where its time goes"): latency-bound, the
-   128-register wall (the output accumulators take 64), barriers worth at most ~1.45x. Left to try: the 12-query-tile
-   variant in the `attn` worktree (hung on its first run; find out whether it is a kernel hang), then a restructure
-   that splits the 512 dimensions so each thread holds fewer accumulator registers.
+1. **Global prefill attention at depth** (head 512): now in segments as two GEMMs, ~31 TFLOPS from ~10 (DECISIONS
+   2026-10-27, "global prefill attention as two GEMMs"; in main, not yet deployed). Still 55% of prefill at 128k. P.V
+   (~29 TFLOPS) is the slower half and no single piece of it holds it (knock-outs give back at most 5% each); 4,096-key
+   segments gave +5% for 64 MB more. The sliding layers' prefill attention (FlashGroup, ~10 TFLOPS) is 4-6% of prefill.
 2. **The tool-call eval, 26B against the 12B** (the owner's). The owner's prior is that the 26B is better; nothing
    here measures model quality, only fidelity to each model.
 3. **Prefill chunks of 2,048 tokens** for the 26B: +30% prefill at N = 51 (2,196 against 1,682 tok/s on a 4k

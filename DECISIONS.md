@@ -915,3 +915,77 @@ A second eklow-server started beside the live one died at startup on pinned memo
 The live service then answered every request with UR_RESULT_ERROR_OUT_OF_RESOURCES until a restart, 14 minutes later.
 Once a running server has hit an out-of-resources launch, it stays broken. `bench.sh` and `tools/bench/serve-perf.sh`
 now refuse to run while the service is active.
+
+## 2026-10-27 — global prefill attention as two GEMMs
+
+The global layers' prefill attention (head 512) now runs a chunk over the cache in segments of 2,048 keys, each as
+two kernels in the shape of xmx.cpp's fp16 GEMM (src/kernels/attention.cpp, `run_segments`):
+- SegQK: S = Q K^T, 256 rows x 128 keys a work-group, the int8 K tiles dequantized into shared local memory as
+  the GEMM does its weights; its epilogue masks keys past each row's position, takes the row's maximum over the 128
+  keys and its running maximum, and writes P = exp(S - m) in fp16 (the A layout) with that maximum and the sum;
+- a combining step: per row, the segment's maximum, the running output's factor, each 128 keys' factor, the sum;
+- SegPV: O = alpha O + (beta P) V, 256 rows x 128 dimensions, the probabilities scaled as they are staged and the
+  running output kept in fp32 in device memory between segments;
+then a division by the sums. Chunks under 64 tokens (decode, short prompts) keep the flash kernels, and a decode
+token beside a long chunk in the same step runs through the split kernel on its own tile range.
+
+Why. The micro-benchmarks behind it (scratch tools on fiona, `~/eklow-micro`):
+- dpas with operands from shared local memory reach 81-92 TFLOPS when each thread holds 8 accumulators (2 x 4
+  tiles, 192 bytes loaded per dpas), and 72-81 with a barrier every 8 dpas: neither bandwidth (~10 TB/s from
+  shared memory or L1) nor barriers hold FlashGroup;
+- a 256-byte load from shared local memory takes 170 ns idle, 250 ns under load; from L1, 70 / 100 ns; a dependent
+  dpas 44 ns;
+- FlashGroup's ISA waits on every load right before the dpas that uses it, and all 128 threads of a core reach
+  the same phase together, so per 16-key block a thread runs a chain of load, dpas, store, barrier, exchange
+  loads, softmax, store, barrier, load, dpas: ~13,500 clocks for 16 dpas.
+Kept out: a version of the flash kernel with the work split by role (32 Q.K^T threads holding Q in registers, 64
+P.V threads that also ran the softmax, 32 loaders; the next block's scores beside this block's P.V) ran at the
+same ~9-10 TFLOPS: per block it still exchanged partial scores through shared memory with two barriers, the
+loaders alone cost 45%, and a 128-thread work-group of it hung (a 128-thread micro-benchmark does not, so not the
+work-group size; not found). Rescaling the output only when a correction is not 1 made the compiler keep two
+copies of the 64 output registers and spill 1 KB; unconditional is free.
+
+Measured (eklow-attn-test, a 1,024-token chunk, int8 cache; TFLOPS counting 4 x 512 per row and key):
+
+| shape | keys | FlashGroup | segments |
+|---|---|---|---|
+| 26B (8 heads a K/V head) | 16k | 10.3 | 30.5 |
+| 26B | 131k | 10.3 | 31.2 |
+| 12B (16) | 16k | ~10.9 | 33.3 |
+
+At 131k on the 26B's shape: Q.K^T 31 ms (~35 TFLOPS), combining 2 ms, P.V 37 ms (~29), the division 0.1.
+Segments of 4,096 keys gave 5% more for twice the probabilities' memory (128 MB for the 26B), 1,024 10% less. P.V
+as 64 rows x all 512 dimensions, so that each row's probabilities are read once rather than four times, ran 10%
+slower. Rounding: within the noise of the old kernel (global rel L2 3.6e-4 / int8 9.0e-3 against ref::attention;
+check26 long 245/256 at 2.38e-2, chat 23/25 at 6.87e-2; check 31/32 at 1.93e-2, chat 24/25 at 5.2e-3).
+
+The buffers (probabilities 2 bytes per row and key of a segment, statistics and the running output ~2.2 KB per
+row; ~100 MB for the 26B's 1,024-token chunks) are allocated when the engine starts, before the experts take the
+card's free memory (`attn::reserve`): at 2 x 262k the server now places N = 50 experts a layer (51 before).
+
+Engine (engine26 real text, N = 51, profile; tok/s and global attention's time per 2,048 tokens):
+
+| depth | before | now |
+|---|---|---|
+| 32k | 957 (1,007 ms, 47%) | 1,398 (332 ms, 23%) |
+| 128k | 396 (4,048 ms, 78%) | 787 (1,438 ms, 55%) |
+
+Through the server with production flags (`docs/bench/serve-perf-26b-segments-fiona-2026-10-27.txt`), prefill as
+time to first token on unique text:
+
+| depth | before | now |
+|---|---|---|
+| 8k | 1,578 tok/s (5.2 s) | 1,631 (5.0 s) |
+| 32k | 1,257 (26.1 s) | 1,529 (21.5 s) |
+| 128k | 493 (266 s) | 1,040 (126 s) |
+| 252k | 352 (734 s) | 703 (367 s) |
+
+GSM8K is unchanged (33.2 / 41.8 tok/s aggregate, 1 / 2 at a time). Decode is untouched (a decode token beside a long
+chunk still takes the split kernel): main and this tree, alternated on one card state, decode the same in the
+engine (46.2 / 41.5 tok/s at 0 / 8k) and through the server (35.6 at 8k); the server run's decode, ~10% under the
+morning's at every depth, came after hours of load on the card. N = 50 against 51 moves decode < 1%.
+
+What is left at depth: global attention is still 55% of prefill at 128k. P.V (~29 TFLOPS) with its pieces knocked
+out one at a time (the beta scaling, the V dequantization, the V loads, the running output's read) gives back at
+most 5% each, so no one of them holds it. Beyond it: 2,048-token chunks (open), and the sliding layers' prefill
+attention (FlashGroup, ~10 TFLOPS, 4-6% of prefill).

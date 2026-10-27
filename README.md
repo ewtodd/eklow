@@ -44,24 +44,26 @@ Gemma 4 12B (48 layers, dense) is 7.0 GB and fits the card whole.
 
 ## Performance
 
-Measured on that machine (October 2026), through `eklow-server` as fiona runs it in production: the 26B with two
-slots of 262,144 tokens, int8 global KV, 51 of 128 experts a layer on the card and EmbeddingGemma 2 loaded. The
+Measured on that machine (October 2026), through `eklow-server` with fiona's production flags: the 26B with two
+slots of 262,144 tokens, int8 global KV, 50 of 128 experts a layer on the card and EmbeddingGemma 2 loaded. The
 method is unholy's (`tools/bench/serve_perf.py`, on unholy's unique Pile documents cut to Gemma token depths;
-`docs/bench/serve-perf-26b-fiona-2026-10-27.txt`):
+prefill from `docs/bench/serve-perf-26b-segments-fiona-2026-10-27.txt`, decode and GSM8K from
+`docs/bench/serve-perf-26b-fiona-2026-10-27.txt`, which the change since does not touch):
 
 | | Gemma 4 26B A4B |
 |---|---|
-| prefill, one request, unique text (time to first token) | 1578 tok/s at 8k, 1257 at 32k, 493 at 128k, 352 at 252k (734 s) |
+| prefill, one request, unique text (time to first token) | 1631 tok/s at 8k, 1529 at 32k, 1040 at 128k, 703 at 252k (367 s) |
 | decode, one stream | 37.6 tok/s at 8k, 34.9 at 32k, 30.9 at 128k, 26.7 at 252k |
 | GSM8K chat (48 requests, thinking on), 1 / 2 at a time | 33.4 / 41.9 tok/s aggregate |
 
 A question on a document already in the prefix cache starts in 0.2-0.7 s. At depth the global layers' attention is
-what costs: it runs at ~11 TFLOPS of the card's 98.8 and grows with every token of context (DECISIONS 2026-10-27,
-"global prefill attention: where its time goes"). Two streams at once add 25% rather than doubling; most likely the CPU,
+still what costs (55% of prefill at 128k): it runs in segments of 2,048 keys as two GEMMs at ~31 TFLOPS of the
+card's 98.8, against ~10 for the flash kernel before, and grows with every token of context (DECISIONS 2026-10-27,
+"global prefill attention as two GEMMs"). Two streams at once add 25% rather than doubling; most likely the CPU,
 which then computes both streams' cold experts, is what holds them.
 
 With every expert on the card (contexts up to about 2 x 32k), `eklow-engine-bench` (one sequence, 1,024-token
-chunks) gives prefill 1,234 tok/s at 32k depth (global attention 61% of it) and decode 68.1 tok/s at 0, 61.4 at 4k,
+chunks) gives prefill 1,914 tok/s at 32k depth (global attention 34% of it) and decode 68.1 tok/s at 0, 61.4 at 4k,
 43.4 at 32k.
 
 Embeddings and titles do not wait for it: an embedding takes 60 ms idle and 78 ms during a 32k-token prefill, and
@@ -74,8 +76,9 @@ Before eklow, llama.cpp's Vulkan backend on this card gave the 12B ~110-150 tok/
 tok/s of decode, with 2 x 32k contexts.
 
 Production settings: two slots of 262,144 tokens, 1,024-token prefill chunks, the profile from four recordings, a 1 GiB
-card margin; the server prints the placement at startup (6.24 GiB of weights and 6.41 GiB of KV on the card, 51
-experts a layer, 40 streaming slots, 7.2 GiB of cold experts in pinned host memory).
+card margin; the server prints the placement at startup (6.14 GiB of weights and 6.41 GiB of KV on the card, 50
+experts a layer, 40 streaming slots, 7.3 GiB of cold experts in pinned host memory; ~100 MB of the card goes
+to the long prefill attention's buffers).
 
 ## Accuracy
 
@@ -180,7 +183,7 @@ This is not a general-purpose engine:
 | | |
 |---|---|
 | `src/engine` | the serving forward pass: steps of prefill chunks and decodes, the paged cache, expert placement, cold experts |
-| `src/kernels` | XMX matmuls for Q4_0 (int8 GEMVs for decode, fp16 GEMMs for prefill, grouped expert forms), flash attention over the paged cache, fused small kernels and routing (`fast`); `ref` holds the reference kernels |
+| `src/kernels` | XMX matmuls for Q4_0 (int8 GEMVs for decode, fp16 GEMMs for prefill, grouped expert forms), flash attention over the paged cache (and, for long prefill on the global layers, attention in key segments as two GEMMs), fused small kernels and routing (`fast`); `ref` holds the reference kernels |
 | `src/cpu` | the AVX-VNNI Q4_0 expert GEMVs for the 26B's cold experts |
 | `src/model` | GGUF loading, Gemma 4's configuration and reference forward pass, EmbeddingGemma 2 |
 | `src/serve`, `src/text` | scheduler, OpenAI layer, sampler and tool-call grammar; tokenizer, chat template and output parser |

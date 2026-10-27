@@ -233,6 +233,9 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     if (!*p) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(*p);
   }
+  // The attention scratch at its largest, before the experts take what is left of the card.
+  attn::reserve(q_, attn_scratch_, max_tiles_sliding_, c_.max_chunk * group_sliding_, hkv_sliding_, cfg_.head_dim_sliding);
+  attn::reserve(q_, attn_scratch_, max_tiles_global_, c_.max_chunk * group_global_, hkv_global_, cfg_.head_dim_global);
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * Dg));
   act_ffn_ = xmx::alloc_activations(q_, B, F);
   if (cfg_.n_expert > 0) {
@@ -762,6 +765,8 @@ Engine::~Engine() {
   if (attn_scratch_.q) sycl::free(attn_scratch_.q, q_);
   if (attn_scratch_.part) sycl::free(attn_scratch_.part, q_);
   if (attn_scratch_.part2) sycl::free(attn_scratch_.part2, q_);
+  if (attn_scratch_.p) sycl::free(attn_scratch_.p, q_);
+  if (attn_scratch_.stat) sycl::free(attn_scratch_.stat, q_);
   for (void* p : owned_) sycl::free(p, q_);
 }
 
