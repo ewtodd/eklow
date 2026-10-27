@@ -758,3 +758,47 @@ Through `eklow-server` the 26B answers and makes tool calls at 2 x 8k (batch 1,0
 the first request fails with UR_RESULT_ERROR_OUT_OF_RESOURCES: 13.43 GiB of weights, 1.48 GiB of
 KV and the workspace exceed the card. Longer contexts need the experts placed by the routing
 profile, with the rest off the card.
+
+## 2026-10-27 — the 26B with cold experts on the CPU (M6 stage 3a)
+
+The routing profile is a file, `data/gemma-4-26b-a4b-experts.json` (`tools/ref/expert_profile.py`
+over the four 2026-10-26 recordings: per-layer selection counts, 30 x 128). With
+`Config::expert_profile` and `experts_on_card` = N, each layer's N busiest experts (ties to the lower
+id) are repacked onto the card, rank by rank across the layers; the others stay in the GGUF mapping
+(touched at load so a request does not wait on the page cache) and are computed by `cpu::gemv_q4`'s
+AVX-VNNI kernels on a 16-thread pool. A cold expert is an `ExpertTable` entry with null tiles. With
+N = 128 nothing changes: the decode path has no host wait (ab.sh against main: 26B -0.1 / +0.2% decode,
+-0.1 / -0.0% prefill; 12B within 0.3%; check26 identical to main's).
+
+Decode (up to 4 tokens). After `moe_route`, one kernel (`fast::host_pack`) writes the ids and the
+experts' int8 input row (the card's own `act_exp_`, so the CPU runs the same quantization) straight into
+pinned host memory; the hot experts' kernels are enqueued; then the host waits on the pack kernel's event,
+computes the cold pairs (one expert's gate_up, GeGLU, int8 requantize, down; ~230 us a pair, 100 us being the DRAM floor,
+split over the pool) and `fast::cold_scatter` copies the rows into `gx_` for `moe_tail`. The grouped
+GEMVs skip cold pairs by an early return of the whole work-group (null tiles), leaving their output
+rows alone. Memcpys (three for the routing and the input row, one per cold pair for the rows) instead of the two kernels cost ~0.5 ms a step (each is a serialization point
+on the in-order queue). The pool's workers spin 400 us after a job during decode (a futex wake is
+50-100 us, a whole expert's GEMV); that took the CPU's share of a step from 2.8 to 1.6 ms at N = 112.
+Prefill turns the spin off: it only took cores from the host thread.
+
+Prefill. `moe_group` leaves cold experts out of the tile list (`row_of_pair` = -1 for their pairs),
+`moe_gather` and `moe_combine` skip them. The expert input rows go to the host as int8
+(`fast::quantize_rows`, a quarter of the fp32 bytes; the D2H copy sits in the queue ahead of the hot
+kernels and was 1-2 ms a layer at fp32). The host groups the cold pairs by expert and runs
+`cpu::gemv_q4_multi`, which unpacks each weight block once for four inputs (4M MACs per input-expert
+matrix in ~90 us on one thread; an expert's rows are read from DRAM once, not once a token), sums each
+token's cold experts weighted in slot order, and uploads only the rows of tokens that have any; `moe_combine`
+adds them. About 20 us a pair with 16 threads when an expert has dozens of rows, so N = 64 prefill is
+CPU-bound: ~600 tok/s on real text. Streaming the busy cold experts over PCIe instead (3.3 MB, ~290 us,
+against ~26 us a row on the CPU) would win above ~12 rows an expert; not done.
+
+Fit. Allocations succeed past what the card holds and the first kernels then fail, so the engine reads the
+driver's free memory (`rt::free_memory`, Level Zero Sysman; the nix shell and package set its variables)
+before and after each rank of experts and stops when the free memory less the margin (1 GiB) cannot hold
+another rank of the size the last one took (101 MiB; the weights are 96 MiB, allocation rounding the rest).
+The server loads the embedding model first, with its activations reserved for 8,192 tokens, so the
+placement sees it. Card: 15.11 GiB reported, 15.05 free at start. A 2 x 262k server: 6.41 GiB of KV, 6.08 GiB
+free after the rest, N = 51 (the margin left 1.03 GiB). Margins tried at 2 x 262k with two long requests
+(88k and 167k tokens): 1 GiB and 0.5 GiB run clean, and at 1 GiB (N = 51) so do 224k and 30k tokens; 0.04 GiB loses the device (DEVICE_LOST) once the
+long request is deep, so the margin pays for what the first long requests allocate later (kernel scratch,
+the attention partials) and the driver keeps.
