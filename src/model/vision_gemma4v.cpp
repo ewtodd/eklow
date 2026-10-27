@@ -1,4 +1,4 @@
-#include "model/vision_gemma4v.hpp"
+#include "model/vision_gemma4v_fast.hpp"
 
 #include <algorithm>
 #include <cfloat>
@@ -8,7 +8,7 @@
 
 namespace eklow::model {
 
-VisionGemma4V::VisionGemma4V(sycl::queue& q, const gguf::File& f) : q_(q) {
+VisionGemma4V::VisionGemma4V(sycl::queue& q, const gguf::File& f, bool reference) : q_(q), reference_(reference) {
   if (f.at("general.architecture").as_string() != "clip" || !f.find("clip.vision.projector_type") ||
       f.at("clip.vision.projector_type").as_string() != "gemma4v")
     throw std::runtime_error(f.path() + ": not a Gemma 4 mmproj with the gemma4v vision projector");
@@ -33,6 +33,10 @@ VisionGemma4V::VisionGemma4V(sycl::queue& q, const gguf::File& f) : q_(q) {
   if (f.tensor("v.pre_ln.weight") || f.tensor("v.post_ln.weight") || f.tensor("v.blk.0.attn_qkv.weight"))
     throw std::runtime_error(f.path() + ": pre/post layer norm and fused qkv are not in the gemma4v graph");
 
+  // The fast path takes the files it can (no biases, clamps or layer scales; 64- or 72-wide heads); others run the
+  // reference kernels.
+  if (!reference_ && load_fast(f)) return;
+  reference_ = true;
   auto find = [&](const std::string& name) { return f.tensor(name); };
   auto need = [&](const std::string& name) -> const gguf::Tensor& {
     const gguf::Tensor* t = find(name);
@@ -135,11 +139,6 @@ VisionGemma4V::VisionGemma4V(sycl::queue& q, const gguf::File& f) : q_(q) {
   if (d_head_ % 4) throw std::runtime_error(f.path() + ": head size not divisible by 4 for 2D RoPE");
 }
 
-VisionGemma4V::~VisionGemma4V() {
-  q_.wait();
-  for (void* p : owned_) sycl::free(p, q_);
-}
-
 image::Spec VisionGemma4V::spec(int tokens) const {
   image::Spec s;
   s.patch = patch_ * merge_;
@@ -170,6 +169,7 @@ DeviceRows VisionGemma4V::encode(const image::Patches& p) {
   if (p.cols <= 0 || p.rows <= 0 || p.cols % merge_ || p.rows % merge_)
     throw std::invalid_argument("vision encoder: the patch grid must be a multiple of the pooling kernel");
   if (p.cols > n_pos_ || p.rows > n_pos_) throw std::invalid_argument("vision encoder: the image is too wide or too tall");
+  if (!reference_) return encode_fast(p);
   const int64_t n = int64_t(p.cols) * p.rows, E = n_embd_, F = n_ff_, cols = p.cols, P = n_pos_;
   const int64_t H = n_head_, HK = n_head_kv_, D = d_head_;
   const int64_t ox = p.cols / merge_, oy = p.rows / merge_, n_out = ox * oy;

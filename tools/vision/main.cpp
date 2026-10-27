@@ -24,7 +24,7 @@ int main(int argc, char** argv) {
   std::string mmproj, path, out, taps;
   std::vector<std::string> prefixes{"inp", "pos_embd", "layer_out-", "pooled", "std_scaled", "projected"};
   int tokens = 280;
-  bool dump_patches = false, bf16_act = false;
+  bool dump_patches = false, bf16_act = false, ref = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -43,8 +43,9 @@ int main(int argc, char** argv) {
       }
     } else if (a == "--dump-patches") dump_patches = true;
     else if (a == "--bf16-act") bf16_act = true;
+    else if (a == "--ref") ref = true;
     else {
-      std::fprintf(stderr, "usage: eklow-vision --mmproj GGUF --image FILE [--tokens N] [--out ROWS.f32] [--bf16-act] [--taps DIR [--tap-prefix P,...]]\n");
+      std::fprintf(stderr, "usage: eklow-vision --mmproj GGUF --image FILE [--tokens N] [--out ROWS.f32] [--ref] [--bf16-act] [--taps DIR [--tap-prefix P,...]]\n");
       return 2;
     }
   }
@@ -57,7 +58,7 @@ int main(int argc, char** argv) {
     const auto rgb = image::decode(bytes);
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     auto f = gguf::File::open(mmproj);
-    model::VisionGemma4V v(q, f);
+    model::VisionGemma4V v(q, f, ref);
     v.set_bf16_activations(bf16_act);
     const image::Spec spec = v.spec(tokens);
     if (!taps.empty())
@@ -78,6 +79,7 @@ int main(int argc, char** argv) {
         std::ofstream(taps + "/patches.f32", std::ios::binary)
             .write(reinterpret_cast<const char*>(patches.data.data()), std::streamsize(patches.data.size() * sizeof(float)));
       const auto rows = v.encode(patches);
+      if (pass == 0) std::printf("%s path, card bytes held after the first encode: %.1f MiB (at 1120 tokens: %.1f MiB)\n", v.reference() ? "reference" : "fast", double(v.bytes()) / 1048576.0, double(v.card_bytes(1120)) / 1048576.0);
       const auto t2 = std::chrono::steady_clock::now();
       std::printf("%d x %d image, %d x %d patches, %lld tokens x %lld: prepared in %.1f ms, encoded in %.1f ms\n", rgb.width, rgb.height,
                   patches.cols, patches.rows, (long long)rows.n, (long long)rows.dim,
