@@ -504,24 +504,24 @@ struct FlashGroup {
 // - SegPV: O = alpha O + (beta P) V for 256 rows x 128 dimensions, the probabilities scaled by beta as they
 //   are staged; the running output stays in fp32 in device memory between segments.
 // Then the output is divided by the sums. Rows are a chunk's (token, head) pairs of one K/V head, in the tile
-// order of the TileList; the probabilities of a segment take 2 bytes per row and key (32 MB per K/V head of a
-// 1,024-token chunk of the 26B), the running output 2 KB per row. Measured on the 26B's shape at 131k keys
-// (eklow-attn-test): Q.K^T ~35 TFLOPS, P.V ~29, the whole ~31 (FlashGroup 10.3); 4,096-key segments gave 5%
+// order of the TileList; the probabilities of a segment take 2 bytes per row and key (64 MB for a 2,048-token
+// chunk of the 26B, one K/V head at a time), the running output 2 KB per row. Measured on the 26B's shape at 131k
+// keys (eklow-attn-test): Q.K^T ~35 TFLOPS, P.V ~29, the whole ~31 (FlashGroup 10.3); 4,096-key segments gave 5%
 // more for twice the probabilities' memory, 1,024 10% less. P.V as 64 rows x all 512 dimensions, reading each
 // row's probabilities once instead of four times, ran slower (-10%).
 constexpr int kSeg = 2048, kSegTiles = kSeg / 128;
 // Chunks of fewer tokens (decode, short prompts) keep the flash kernels.
 constexpr int64_t kSegMinTokens = 64;
 
-// Statistics of one chunk's segments, per K/V head h of H2 and row of R (padded to 256): tile maxima and sums
-// and the tiles' factors [h][tile][row], the output's factor, running maximum and sum [h][row], and the running
-// output [h][row][D].
+// Statistics of one K/V head's segments over a chunk, per row of R (padded to 256): tile maxima and sums and the
+// tiles' factors [tile][row], the output's factor, running maximum and sum [row], and the running output [row][D].
+// A chunk's K/V heads run one after the other on the same buffers, so that they do not grow with the heads.
 struct SegStats {
   float *mt, *lt, *beta, *alpha, *mrun, *lrun, *orun;
-  static size_t floats(int64_t H2, int64_t R, int64_t D) { return size_t(H2 * R * (3 * kSegTiles + 3 + D)); }
-  SegStats(float* s, int64_t H2, int64_t R) {
-    mt = s, lt = mt + H2 * kSegTiles * R, beta = lt + H2 * kSegTiles * R, alpha = beta + H2 * kSegTiles * R;
-    mrun = alpha + H2 * R, lrun = mrun + H2 * R, orun = lrun + H2 * R;
+  static size_t floats(int64_t R, int64_t D) { return size_t(R * (3 * kSegTiles + 3 + D)); }
+  SegStats(float* s, int64_t R) {
+    mt = s, lt = mt + kSegTiles * R, beta = lt + kSegTiles * R, alpha = beta + kSegTiles * R;
+    mrun = alpha + R, lrun = mrun + R, orun = lrun + R;
   }
 };
 
@@ -538,12 +538,12 @@ struct SegQK {
   sycl::half* p;
   float *mt, *lt;
   const float* mrun;
-  int32_t pages, n_head_kv, base, rows, tph, R, seg0, kend, first;
+  int32_t pages, n_head_kv, base, rows, tph, R, seg0, kend, first, h;  // h: the K/V head this launch runs
 
   void operator()(sycl::nd_item<3> it) const SYCL_ESIMD_KERNEL {
     esimd::slm_init<kSlm>();
     const int wi = int(it.get_local_id(1)), wj = int(it.get_local_id(2)), tid = wi * WN + wj;
-    const int32_t h = int32_t(it.get_group(0)), tm = int32_t(it.get_group(1)), tn = int32_t(it.get_group(2));
+    const int32_t tm = int32_t(it.get_group(1)), tn = int32_t(it.get_group(2));
     // Every thread stages one A piece (row tile tid / 2, K half tid % 2) and threads below 32 one B piece (the
     // work-group's key tile tid / 2, K half tid % 2) of each block.
     const int32_t a_tile = tm * 32 + tid / 2;
@@ -647,7 +647,7 @@ struct SegQK {
 #pragma unroll
     for (int r = 0; r < 2; ++r) {
       const int32_t row0 = (tm * 32 + wi * 2 + r) * 8;
-      m[r] = first ? esimd::simd<float, 8>(kNegBig) : esimd::block_load<float, 8>(mrun + h * R + row0);
+      m[r] = first ? esimd::simd<float, 8>(kNegBig) : esimd::block_load<float, 8>(mrun + row0);
 #pragma unroll
       for (int w = 0; w < 4; ++w) m[r] = esimd::max(m[r], esimd::slm_block_load<float, 8>(kRed + (w * 256 + (wi * 2 + r) * 8) * 4));
       esimd::simd<float, 64> mb;
@@ -672,7 +672,7 @@ struct SegQK {
           pt.select<8, 1>(i * 16) = esimd::simd<sycl::half, 8>(acc[r][2 * q2].template select<8, 1>(i * 8));
           pt.select<8, 1>(i * 16 + 8) = esimd::simd<sycl::half, 8>(acc[r][2 * q2 + 1].template select<8, 1>(i * 8));
         }
-        esimd::block_store<sycl::half, 128>(p + ((h * (R / 8) + tm * 32 + wi * 2 + r) * (kSeg / 16) + tn * 8 + wj * 2 + q2) * 128, pt);
+        esimd::block_store<sycl::half, 128>(p + ((tm * 32 + wi * 2 + r) * (kSeg / 16) + tn * 8 + wj * 2 + q2) * 128, pt);
       }
     }
     esimd::barrier();
@@ -683,8 +683,8 @@ struct SegQK {
       esimd::simd<float, 8> l = 0;
 #pragma unroll
       for (int w = 0; w < 4; ++w) l += esimd::slm_block_load<float, 8>(kRed + 4096 + (w * 256 + (wi * 2 + r) * 8) * 4);
-      esimd::block_store<float, 8>(mt + (h * kSegTiles + tn) * R + row0, m[r]);
-      esimd::block_store<float, 8>(lt + (h * kSegTiles + tn) * R + row0, l);
+      esimd::block_store<float, 8>(mt + tn * R + row0, m[r]);
+      esimd::block_store<float, 8>(lt + tn * R + row0, l);
     }
   }
 };
@@ -700,18 +700,18 @@ struct SegPV {
   const int32_t *slot_of, *table;
   const void* vc;
   const sycl::half* vs;
-  int32_t pages, n_head_kv, base, rows, R, seg0, kend, nb, first;
+  int32_t pages, n_head_kv, base, rows, R, seg0, kend, nb, first, h;
 
   void operator()(sycl::nd_item<3> it) const SYCL_ESIMD_KERNEL {
     esimd::slm_init<kSlm>();
     const int wi = int(it.get_local_id(1)), wj = int(it.get_local_id(2)), tid = wi * WN + wj;
-    const int32_t h = int32_t(it.get_group(0)), tm = int32_t(it.get_group(1)), tn = int32_t(it.get_group(2));
+    const int32_t tm = int32_t(it.get_group(1)), tn = int32_t(it.get_group(2));
     const int32_t slot = slot_of[base];
     // Every thread stages one A piece (row tile tid / 2, keys 16 * (tid % 2) of the block) and threads below
     // 32 one B piece (dimension tile tn*16 + tid / 2, keys 16 * (tid % 2) of the block).
     const int32_t a_tile = tm * 32 + tid / 2;
-    const sycl::half* a_src = p + ((h * (R / 8) + a_tile) * (kSeg / 16) + tid % 2) * 128;
-    const float* a_beta = beta + h * kSegTiles * R + a_tile * 8;
+    const sycl::half* a_src = p + (a_tile * (kSeg / 16) + tid % 2) * 128;
+    const float* a_beta = beta + a_tile * 8;
     const int32_t dt = tn * 16 + tid / 2;
     esimd::simd<sycl::half, 128> Araw;
     esimd::simd<float, 8> Abeta;
@@ -794,10 +794,10 @@ struct SegPV {
       for (int i = 0; i < 8; ++i) {
         const int32_t row = (tm * 32 + wi * 2 + r) * 8 + i;
         if (row >= rows) break;
-        const float a = first ? 0.0f : alpha[h * R + row];
+        const float a = first ? 0.0f : alpha[row];
 #pragma unroll
         for (int c = 0; c < 4; ++c) {
-          float* o = orun + (h * R + row) * D + tn * 128 + (wj * 4 + c) * 8;
+          float* o = orun + row * D + tn * 128 + (wj * 4 + c) * 8;
           esimd::simd<float, 8> v = acc[r][c].template select<8, 1>(i * 8);
           if (!first) v += a * esimd::block_load<float, 8>(o);
           esimd::block_store<float, 8>(o, v);
@@ -812,34 +812,36 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
                   Scratch& scratch) {
   const int32_t base = int32_t(ch[0]), rows = int32_t(ch[2]), kend = int32_t(ch[4] + 1);
   const int32_t H2 = int32_t(c.n_head_kv), tph = (rows + 7) / 8, R = (rows + 255) / 256 * 256, H = int32_t(n_head);
-  sycl::half* P = grow(q, scratch.p, scratch.p_halves, size_t(H2) * R * kSeg);
-  const SegStats st(grow(q, scratch.stat, scratch.stat_floats, SegStats::floats(H2, R, D)), H2, R);
-  for (int32_t s0 = 0; s0 < kend; s0 += kSeg) {
-    const int32_t kseg = std::min(kSeg, kend - s0), nk = (kseg + 127) / 128, nb = (kseg + 31) / 32, first = s0 == 0;
-    SegQK<D, G, Q8> qk{qt,   tok.slot, tok.pos,  c.table,          c.k, c.ks, P,     st.mt, st.lt, st.mrun, int32_t(c.pages),
-                       H2,   base,     rows,     tph,              R,   s0,   kend,  first};
-    q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(H2), size_t(R / 16), size_t(nk * 4)), sycl::range<3>(1, 16, 4)), qk);
-    q.parallel_for(sycl::range<2>(size_t(H2), size_t(R)), [=](sycl::id<2> id) {
-      const int32_t h = int32_t(id[0]), row = int32_t(id[1]), i = h * R + row;
-      const float m_old = first ? kNegBig : st.mrun[i], l_old = first ? 0.0f : st.lrun[i];
-      float mn = m_old;
-      for (int32_t t = 0; t < nk; ++t) mn = sycl::fmax(mn, st.mt[(h * kSegTiles + t) * R + row]);
-      const float a = sycl::exp(m_old - mn);
-      float l = a * l_old;
-      for (int32_t t = 0; t < nk; ++t) {
-        const float b = sycl::exp(st.mt[(h * kSegTiles + t) * R + row] - mn);
-        st.beta[(h * kSegTiles + t) * R + row] = b;
-        l += b * st.lt[(h * kSegTiles + t) * R + row];
-      }
-      st.mrun[i] = mn, st.lrun[i] = l, st.alpha[i] = a;
+  sycl::half* P = grow(q, scratch.p, scratch.p_halves, size_t(R) * kSeg);
+  const SegStats st(grow(q, scratch.stat, scratch.stat_floats, SegStats::floats(R, D)), R);
+  for (int32_t h = 0; h < H2; ++h) {
+    for (int32_t s0 = 0; s0 < kend; s0 += kSeg) {
+      const int32_t kseg = std::min(kSeg, kend - s0), nk = (kseg + 127) / 128, nb = (kseg + 31) / 32, first = s0 == 0;
+      SegQK<D, G, Q8> qk{qt, tok.slot, tok.pos, c.table, c.k, c.ks, P, st.mt, st.lt, st.mrun, int32_t(c.pages),
+                         H2, base,     rows,    tph,     R,   s0,   kend, first, h};
+      q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(nk * 4)), sycl::range<3>(1, 16, 4)), qk);
+      q.parallel_for(sycl::range<1>(size_t(R)), [=](sycl::id<1> id) {
+        const int32_t row = int32_t(id[0]);
+        const float m_old = first ? kNegBig : st.mrun[row], l_old = first ? 0.0f : st.lrun[row];
+        float mn = m_old;
+        for (int32_t t = 0; t < nk; ++t) mn = sycl::fmax(mn, st.mt[t * R + row]);
+        const float a = sycl::exp(m_old - mn);
+        float l = a * l_old;
+        for (int32_t t = 0; t < nk; ++t) {
+          const float b = sycl::exp(st.mt[t * R + row] - mn);
+          st.beta[t * R + row] = b;
+          l += b * st.lt[t * R + row];
+        }
+        st.mrun[row] = mn, st.lrun[row] = l, st.alpha[row] = a;
+      });
+      SegPV<D, Q8> pv{P, st.beta, st.alpha, st.orun, tok.slot, c.table, c.v, c.vs, int32_t(c.pages), H2, base, rows, R, s0, kend, nb, first, h};
+      q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(D / 32)), sycl::range<3>(1, 16, 4)), pv);
+    }
+    q.parallel_for(sycl::range<2>(size_t(rows), size_t(D)), [=](sycl::id<2> id) {
+      const int32_t row = int32_t(id[0]), d = int32_t(id[1]);
+      out[((base + row / G) * H + h * G + row % G) * D + d] = st.orun[row * D + d] / st.lrun[row];
     });
-    SegPV<D, Q8> pv{P, st.beta, st.alpha, st.orun, tok.slot, c.table, c.v, c.vs, int32_t(c.pages), H2, base, rows, R, s0, kend, nb, first};
-    q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(H2), size_t(R / 16), size_t(D / 32)), sycl::range<3>(1, 16, 4)), pv);
   }
-  q.parallel_for(sycl::range<3>(size_t(H2), size_t(rows), size_t(D)), [=](sycl::id<3> id) {
-    const int32_t h = int32_t(id[0]), row = int32_t(id[1]), d = int32_t(id[2]);
-    out[((base + row / G) * H + h * G + row % G) * D + d] = st.orun[(h * R + row) * D + d] / st.lrun[h * R + row];
-  });
 }
 
 constexpr int64_t kPerSplitMax = 8;
@@ -977,8 +979,8 @@ void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_ro
   grow(q, s.q, s.q_halves, size_t(max_tiles * kRows * head_dim));
   if (head_dim != 512) return;
   const int64_t R = (max_chunk_rows + 255) / 256 * 256;
-  grow(q, s.p, s.p_halves, size_t(n_head_kv * R * kSeg));
-  grow(q, s.stat, s.stat_floats, SegStats::floats(n_head_kv, R, head_dim));
+  grow(q, s.p, s.p_halves, size_t(R * kSeg));
+  grow(q, s.stat, s.stat_floats, SegStats::floats(R, head_dim));
 }
 
 void write(sycl::queue& q, const float* K, const float* V, const Tokens& tok, const Cache& cache) {
