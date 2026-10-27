@@ -6,6 +6,9 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
+#include <memory>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -31,14 +34,30 @@ struct ApiError : std::runtime_error {
 ApiError context_exceeded(int64_t prompt_tokens, int64_t n_ctx);
 std::string error_json(const ApiError& e);
 
+// An image through the vision encoder: `n` rows of fp32 [n][n_embd], and a hash of its content (and the token budget
+// it was encoded at) that names the image in prefix reuse (image_row_id).
+struct EncodedImage {
+  uint64_t hash = 0;
+  int64_t n = 0;
+  std::shared_ptr<const std::vector<float>> rows;
+};
+// The bytes of an image (JPEG, PNG, GIF or BMP) to its rows. Throws ApiError for a picture it cannot read.
+using ImageEncoder = std::function<EncodedImage(std::span<const uint8_t> bytes)>;
+
+// The bytes behind an image_url part's url: a base64 data: URL (or bare base64, as llama.cpp's server takes too) of a
+// JPEG, PNG, GIF or BMP. Throws ApiError (400) for an http(s) URL (the server fetches nothing), WebP, or anything else.
+std::vector<uint8_t> image_bytes(const std::string& url);
+
 struct ChatDefaults {
   SamplingParams sampling;  // what a request leaves out
   int64_t max_ctx;          // positions per slot
+  ImageEncoder encode_image = {};  // null: the server has no vision encoder and refuses image parts
 };
 
 struct ChatRequest {
   std::string model;
   std::vector<int32_t> prompt;
+  std::vector<ImageInput> images;  // the prompt's image spans (their positions hold ids below zero naming the rows)
   SamplingParams sampling;
   int64_t max_tokens = 0;
   std::vector<std::string> stop;
@@ -48,7 +67,9 @@ struct ChatRequest {
 };
 
 // Renders the conversation with Gemma 4's template and tokenizes it (request text without special
-// tokens). Throws ApiError for what the server cannot do or the request gets wrong.
+// tokens). An image part becomes what llama.cpp's server and mtmd make of it: the prompt is split at the image,
+// <|image>, the image's rows and <image|> go in, with no newline of their own. Throws ApiError for what the server
+// cannot do or the request gets wrong.
 ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, const ChatDefaults& d);
 
 std::string new_completion_id();

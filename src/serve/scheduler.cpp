@@ -9,6 +9,18 @@ namespace {
 
 double seconds(std::chrono::steady_clock::duration d) { return std::chrono::duration<double>(d).count(); }
 
+// The image rows of a prompt (the number of positions), and where a prefix of `pos` positions cuts one: back to its start.
+int64_t image_tokens(const Request& r) {
+  int64_t n = 0;
+  for (const auto& im : r.images) n += im.n;
+  return n;
+}
+int64_t cut_before_image(const Request& r, int64_t pos) {
+  for (const auto& im : r.images)
+    if (im.start < pos && pos < im.start + im.n) return im.start;
+  return pos;
+}
+
 }  // namespace
 
 bool Request::next(Event& e, std::chrono::milliseconds wait) {
@@ -45,6 +57,9 @@ void Scheduler::submit(std::shared_ptr<Request> r) {
   if (int64_t(r->prompt.size()) >= c_.max_ctx)
     throw std::invalid_argument("the prompt is " + std::to_string(r->prompt.size()) + " tokens, the context " +
                                 std::to_string(c_.max_ctx));
+  for (const auto& im : r->images)
+    if (im.n <= 0 || im.n > c_.max_chunk || im.start < 0 || im.start + im.n > int64_t(r->prompt.size()) || !im.rows)
+      throw std::invalid_argument("an image of " + std::to_string(im.n) + " rows does not fit a prefill chunk of " + std::to_string(c_.max_chunk));
   r->submitted = std::chrono::steady_clock::now();
   {
     std::lock_guard lk(mu_);
@@ -88,8 +103,9 @@ bool Scheduler::admit() {
     Seq& q = seqs_[size_t(best)];
     const size_t r_prompt = r->prompt.size();
     // At least the prompt's last token is fed again, for its logits.
-    int64_t keep = int64_t(std::min(best_lcp, r->prompt.size() - 1));
-    if (int64_t(q.tokens.size()) - keep > eng_.ring_slack()) keep = std::max<int64_t>(0, keep - eng_.model().window);
+    // A prefix never ends inside an image (its rows are prefilled together), nor, after the rewind, does the window.
+    int64_t keep = cut_before_image(*r, int64_t(std::min(best_lcp, r->prompt.size() - 1)));
+    if (int64_t(q.tokens.size()) - keep > eng_.ring_slack()) keep = cut_before_image(*r, std::max<int64_t>(0, keep - eng_.model().window));
     eng_.truncate(best, keep);
     q.tokens.resize(size_t(keep));
     q.fed = size_t(keep);
@@ -166,13 +182,26 @@ void Scheduler::step() {
   for (size_t s = 0; s < seqs_.size() && budget > 0; ++s) {
     Seq& q = seqs_[s];
     if (!q.req || q.next_token >= 0 || q.fed >= q.req->prompt.size()) continue;
-    const size_t n = size_t(std::min<int64_t>({c_.max_chunk, budget, int64_t(q.req->prompt.size() - q.fed)}));
-    const bool last = q.fed + n == q.req->prompt.size();
-    chunks.push_back({int(s), int64_t(q.tokens.size()),
-                      std::vector<int32_t>(q.req->prompt.begin() + std::ptrdiff_t(q.fed), q.req->prompt.begin() + std::ptrdiff_t(q.fed + n)),
-                      last ? 1 : 0});
+    int64_t n = std::min<int64_t>({c_.max_chunk, budget, int64_t(q.req->prompt.size() - q.fed)});
+    // An image is never split: the chunk ends before one it would cut, and an image that does not fit what is left
+    // of the step waits for the next.
+    const int64_t end = int64_t(q.fed) + n;
+    for (const auto& im : q.req->images)
+      if (im.start < end && end < im.start + im.n) {
+        n = std::max<int64_t>(0, im.start - int64_t(q.fed));
+        break;
+      }
+    if (n == 0) continue;
+    const bool last = q.fed + size_t(n) == q.req->prompt.size();
+    engine::Chunk chunk{int(s), int64_t(q.tokens.size()),
+                        std::vector<int32_t>(q.req->prompt.begin() + std::ptrdiff_t(q.fed), q.req->prompt.begin() + std::ptrdiff_t(q.fed) + n),
+                        last ? 1 : 0};
+    for (const auto& im : q.req->images)
+      if (im.start >= int64_t(q.fed) && im.start + im.n <= int64_t(q.fed) + n) chunk.images.push_back({im.start - int64_t(q.fed), im.n, im.rows->data()});
+    for (int32_t& t : chunk.tokens) t = std::max<int32_t>(t, 0);  // image rows carry ids below zero; the engine ignores them
+    chunks.push_back(std::move(chunk));
     owner.push_back(int(s));
-    budget -= int64_t(n);
+    budget -= n;
   }
   if (chunks.empty()) return;
   const std::vector<float> logits = eng_.step(chunks);
@@ -187,9 +216,15 @@ void Scheduler::step() {
   size_t row = 0;
   for (size_t i = 0; i < chunks.size(); ++i) {
     Seq& q = seqs_[size_t(owner[i])];
-    q.tokens.insert(q.tokens.end(), chunks[i].tokens.begin(), chunks[i].tokens.end());
-    if (q.next_token >= 0) q.next_token = -1;
-    else q.fed += chunks[i].tokens.size();
+    if (q.next_token >= 0) {
+      q.tokens.insert(q.tokens.end(), chunks[i].tokens.begin(), chunks[i].tokens.end());
+      q.next_token = -1;
+    } else {
+      // The prompt's own ids (an image's rows are named by theirs), not the zeros the engine was given.
+      const auto from = q.req->prompt.begin() + std::ptrdiff_t(q.fed);
+      q.tokens.insert(q.tokens.end(), from, from + std::ptrdiff_t(chunks[i].tokens.size()));
+      q.fed += chunks[i].tokens.size();
+    }
     if (chunks[i].logits_rows == 0) continue;
     const std::span<const float> l(logits.data() + row * V, V);
     const int32_t t = q.grammar && q.grammar->active() ? q.sampler->sample(l, &q.grammar->allowed()) : q.sampler->sample(l);
@@ -258,6 +293,7 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
     RequestLog l;
     l.tag = q.req->tag, l.reason = q.req->cancelled() ? "cancelled" : reason, l.error = error;
     l.prompt_tokens = e.prompt_tokens, l.cached_tokens = e.cached_tokens, l.completion_tokens = e.completion_tokens;
+    l.image_tokens = image_tokens(*q.req);
     l.queue_s = seconds(q.admitted - q.req->submitted);
     if (q.generated > 0) {
       l.ttft_s = seconds(q.first - q.req->submitted);
