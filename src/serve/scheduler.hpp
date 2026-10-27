@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -42,6 +43,7 @@ class Request {
   std::vector<std::string> stop;   // strings that end the content (not included)
   bool in_thinking = false;        // the prompt ends inside the thought channel
   std::vector<std::string> tools;  // the request's tool names; tool calls are constrained to them
+  std::string tag;                 // names the request in the log (the completion id)
 
   // Reader side: waits up to `wait` for the next event.
   bool next(Event& e, std::chrono::milliseconds wait);
@@ -49,6 +51,7 @@ class Request {
   // Scheduler side.
   void push(Event e);
   bool cancelled() const;
+  std::chrono::steady_clock::time_point submitted;
 
  private:
   mutable std::mutex mu_;
@@ -57,10 +60,20 @@ class Request {
   bool cancelled_ = false;
 };
 
+// A request as it ended, for the server's log (unholy's per-request line). Times in seconds, -1 for what did not
+// happen: queue from submission to a slot, ttft from submission to the first token, prefill from the slot to the
+// first token (the uncached part of the prompt), decode from the first token to the end.
+struct RequestLog {
+  std::string tag, reason, error;  // reason: stop, length, tool_calls or cancelled
+  int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;
+  double queue_s = -1, ttft_s = -1, prefill_s = -1, decode_s = -1;
+};
+
 struct SchedulerConfig {
   int64_t max_batch;  // tokens per step
   int64_t max_chunk;  // prefill tokens per sequence per step
   int64_t max_ctx;    // positions per slot
+  std::function<void(const RequestLog&)> on_finish = {};  // on the engine thread, as each request ends
 };
 
 class Scheduler {
@@ -72,8 +85,12 @@ class Scheduler {
   // The engine thread: runs until `stop` is set.
   void run(const std::atomic<bool>& stop);
 
+  // Counters since the start, and the state after the last step; the server's periodic log line takes differences.
   struct Stats {
-    int64_t active = 0, waiting = 0, steps = 0, prompt_tokens = 0, cached_tokens = 0, generated_tokens = 0;
+    int64_t active = 0, waiting = 0, steps = 0;
+    int64_t prompt_tokens = 0, cached_tokens = 0;      // of admitted prompts, and of those already in their slot
+    int64_t prefill_tokens = 0, generated_tokens = 0;  // fed as prefill, sampled
+    int64_t positions = 0, idle_positions = 0;         // held by the slots, and by those with no request (cached)
   };
   Stats stats() const;
 
@@ -102,6 +119,7 @@ class Scheduler {
     std::unique_ptr<Sampler> sampler;
     std::unique_ptr<ToolGrammar> grammar;
     int64_t generated = 0, cached = 0;
+    std::chrono::steady_clock::time_point admitted, first;  // the slot taken, the first token sampled
     std::string held;             // content held back while it could start a stop string
     bool called = false;          // a tool call came out
   };
@@ -111,6 +129,7 @@ class Scheduler {
   void on_token(int slot, int32_t token);
   void finish(int slot, const std::string& reason, const std::string& error = "");
   void fail_all(const std::string& error);
+  void note_positions();
 
   engine::Engine& eng_;
   const text::Tokenizer& tok_;

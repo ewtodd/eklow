@@ -5,6 +5,12 @@
 
 namespace eklow::serve {
 
+namespace {
+
+double seconds(std::chrono::steady_clock::duration d) { return std::chrono::duration<double>(d).count(); }
+
+}  // namespace
+
 bool Request::next(Event& e, std::chrono::milliseconds wait) {
   std::unique_lock lk(mu_);
   if (!cv_.wait_for(lk, wait, [&] { return !events_.empty(); })) return false;
@@ -39,6 +45,7 @@ void Scheduler::submit(std::shared_ptr<Request> r) {
   if (int64_t(r->prompt.size()) >= c_.max_ctx)
     throw std::invalid_argument("the prompt is " + std::to_string(r->prompt.size()) + " tokens, the context " +
                                 std::to_string(c_.max_ctx));
+  r->submitted = std::chrono::steady_clock::now();
   {
     std::lock_guard lk(mu_);
     waiting_.push_back(std::move(r));
@@ -56,6 +63,13 @@ Scheduler::Stats Scheduler::stats() const {
 bool Scheduler::admit() {
   std::lock_guard lk(mu_);
   while (!waiting_.empty() && waiting_.front()->cancelled()) {
+    if (c_.on_finish) {
+      RequestLog l;
+      l.tag = waiting_.front()->tag, l.reason = "cancelled";
+      l.prompt_tokens = int64_t(waiting_.front()->prompt.size());
+      l.queue_s = seconds(std::chrono::steady_clock::now() - waiting_.front()->submitted);
+      c_.on_finish(l);
+    }
     waiting_.pop_front();
     --stats_.waiting;
   }
@@ -72,6 +86,7 @@ bool Scheduler::admit() {
     }
     if (best < 0) break;
     Seq& q = seqs_[size_t(best)];
+    const size_t r_prompt = r->prompt.size();
     // At least the prompt's last token is fed again, for its logits.
     int64_t keep = int64_t(std::min(best_lcp, r->prompt.size() - 1));
     if (int64_t(q.tokens.size()) - keep > eng_.ring_slack()) keep = std::max<int64_t>(0, keep - eng_.model().window);
@@ -79,6 +94,7 @@ bool Scheduler::admit() {
     q.tokens.resize(size_t(keep));
     q.fed = size_t(keep);
     q.cached = keep;
+    q.admitted = std::chrono::steady_clock::now();
     q.next_token = -1;
     q.generated = 0;
     q.held.clear();
@@ -90,7 +106,9 @@ bool Scheduler::admit() {
     waiting_.pop_front();
     --stats_.waiting;
     ++stats_.active;
+    stats_.prompt_tokens += int64_t(r_prompt);
     stats_.cached_tokens += keep;
+    note_positions();
   }
   return stats_.active > 0;
 }
@@ -161,6 +179,9 @@ void Scheduler::step() {
   {
     std::lock_guard lk(mu_);
     ++stats_.steps;
+    for (const auto& c : chunks)
+      if (seqs_[size_t(c.slot)].next_token < 0) stats_.prefill_tokens += int64_t(c.tokens.size());  // a prefill chunk
+    note_positions();
   }
   const size_t V = size_t(eng_.model().n_vocab);
   size_t row = 0;
@@ -181,6 +202,7 @@ void Scheduler::step() {
 void Scheduler::on_token(int slot, int32_t token) {
   Seq& q = seqs_[size_t(slot)];
   q.sampler->accept(token);
+  if (q.generated == 0) q.first = std::chrono::steady_clock::now();
   ++q.generated;
   {
     std::lock_guard lk(mu_);
@@ -231,7 +253,19 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
   e.prompt_tokens = int64_t(q.req->prompt.size());
   e.cached_tokens = q.cached;
   e.completion_tokens = q.generated;
-  const int64_t prompt = e.prompt_tokens;
+  if (c_.on_finish) {
+    const auto now = std::chrono::steady_clock::now();
+    RequestLog l;
+    l.tag = q.req->tag, l.reason = q.req->cancelled() ? "cancelled" : reason, l.error = error;
+    l.prompt_tokens = e.prompt_tokens, l.cached_tokens = e.cached_tokens, l.completion_tokens = e.completion_tokens;
+    l.queue_s = seconds(q.admitted - q.req->submitted);
+    if (q.generated > 0) {
+      l.ttft_s = seconds(q.first - q.req->submitted);
+      l.prefill_s = seconds(q.first - q.admitted);
+      l.decode_s = seconds(now - q.first);
+    }
+    c_.on_finish(l);
+  }
   q.req->push(std::move(e));
   q.req.reset();
   q.parser.reset();
@@ -241,7 +275,16 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
   q.next_token = -1;
   std::lock_guard lk(mu_);
   --stats_.active;
-  stats_.prompt_tokens += prompt;
+  note_positions();
+}
+
+// The positions the slots hold, all and those of slots with no request; with mu_ held, on the engine thread.
+void Scheduler::note_positions() {
+  stats_.positions = stats_.idle_positions = 0;
+  for (size_t s = 0; s < seqs_.size(); ++s) {
+    stats_.positions += eng_.length(int(s));
+    if (!seqs_[s].req) stats_.idle_positions += eng_.length(int(s));
+  }
 }
 
 void Scheduler::fail_all(const std::string& error) {
