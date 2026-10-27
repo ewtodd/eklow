@@ -25,10 +25,17 @@
 
 namespace eklow::xmx {
 
+// The fp16 GEMM's weight formats. Q4_0 is the language models' (every path takes it); Q8_0 and F16 (from F16,
+// BF16 or F32 files) only the fp16 GEMM, for EmbeddingGemma 2 and the vision encoders. Tiles of 8 columns x 32 K in
+// the same [N/8][K/32] order: Q8_0 256 bytes of int8 laid out as the fp16 B operand (each 16-K half, element (k, n)
+// at (k/2)*16 + n*2 + k%2) with an fp16 scale per column; F16 512 bytes, the B operand itself, no scales.
+enum class WeightFormat : uint8_t { Q4_0, Q8_0, F16 };
+
 struct Weight {
   int64_t k = 0, n = 0;
   uint8_t* tiles = nullptr;
-  sycl::half* scales = nullptr;
+  sycl::half* scales = nullptr;  // null for F16
+  WeightFormat format = WeightFormat::Q4_0;
 };
 
 // Repacks a Q4_0 matrix (ggml layout, on the device) into a new allocation; the caller frees both
@@ -43,6 +50,11 @@ uint64_t weight_scale_bytes(int64_t k, int64_t n);
 // The same into tiles and scales the caller owns (w.k, w.n set; sizes as above); only enqueues, so `raw` must
 // stay put until the queue has run it. Streamed experts are repacked this way, from a raw staging buffer.
 void repack_q4_0_into(sycl::queue& q, const ref::Weight& raw, bool interleave, const Weight& w);
+// Repacks a Q4_0, Q8_0, F16, BF16 or F32 matrix (on the device) into a new allocation, Q4_0 as repack_q4_0 does,
+// Q8_0 as Q8_0, the rest as F16. K a multiple of 32, N of 8.
+Weight repack(sycl::queue& q, const ref::Weight& raw);
+// Rows [n0, n0 + n) of w (output columns), a view into its tiles; n0 and n a multiple of 8.
+Weight rows_of(const Weight& w, int64_t n0, int64_t n);
 void free_weight(sycl::queue& q, Weight& w);
 
 // Rows above which matmul takes fp16 activations.
@@ -62,7 +74,8 @@ void free_activations(sycl::queue& q, Activations& a);
 
 // Writes x[m][k] (fp32, row-major) into `a` in the form matmul takes for m rows: int8 per row and
 // 32-block, scale = max|x| / 127, q = round(x / scale); or fp16.
-void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a);
+// fp16 forces the fp16 form whatever m is (the Q8_0 and F16 weights have only the fp16 GEMM).
+void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a, bool fp16 = false);
 
 // For kernels that produce activations themselves: where element (row, k) of a matrix with kb
 // 32-blocks per row goes, where its block's scale goes, and the quantization rule applied to a run
@@ -80,7 +93,7 @@ inline float quantize_run(const float (&x)[N], float amax, int8_t* dst) {
 // Marks `a` as holding m rows of width k, in the form for m rows (a.fp16 says which), for a kernel
 // about to write them that way. Rows from m to the padded count keep whatever they held; matmul
 // never stores their results.
-void set_rows(Activations& a, int64_t m, int64_t k);
+void set_rows(Activations& a, int64_t m, int64_t k, bool fp16 = false);
 
 // out[m][n] = a . w^T, fp32, row-major. Up to 256 int8 rows run K-split GEMV schedules; fp16
 // activations the shared-memory GEMM (n a multiple of 128). quantize and matmul only enqueue (the
