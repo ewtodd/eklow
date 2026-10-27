@@ -802,3 +802,33 @@ free after the rest, N = 51 (the margin left 1.03 GiB). Margins tried at 2 x 262
 (88k and 167k tokens): 1 GiB and 0.5 GiB run clean, and at 1 GiB (N = 51) so do 224k and 30k tokens; 0.04 GiB loses the device (DEVICE_LOST) once the
 long request is deep, so the margin pays for what the first long requests allocate later (kernel scratch,
 the attention partials) and the driver keeps.
+
+## 2026-10-28 — streaming the busy cold experts to the card for prefill (M6 stage 3b)
+
+Measured (tools/copy_bench, tools/copy_bench/tax.cpp; fiona, PCIe 4.0 x8): a cold expert is 3,345,408 bytes.
+Host to card, per expert: 360 us from the GGUF's pageable mapping (9.3 GB/s), 307 us from pinned memory (10.9
+GB/s), 358 us from the mapping "registered" with prepare_for_device_copy (no gain: the driver still stages it, and a
+Level Zero copy-engine append from it blocks the host for the whole copy). Under the cold GEMVs' load the pageable
+copy takes ~530 us, pinned stays at 300. The card has one compute queue and one copy-only queue (blitter): a SYCL
+queue's memcpy runs on the compute engine and serializes with kernels; a Level Zero immediate command list on the
+copy group (src/rt/copy_engine.cpp) runs by itself and its fence can be a SYCL dependency (make_event), so the host
+only issues the copies.
+
+The finding that shapes everything: PCIe traffic slows every kernel on the card, copy engine or not. A VRAM-streaming
+kernel runs x1.07 / 1.26 / 1.98 / 5.8 beside DMA at 1.2 / 3.2 / 7 / 11.4 GB/s; the grouped GEMMs 2.5x; ALU-only
+kernels and card-to-card copies are untouched; every section of a prefill chunk slows 1.3-1.9x under continuous DMA
+(all-hot prefill 2,750 to 995 tok/s). The loss is roughly proportional to the bytes moved (~65 us of card time per
+MB), so a streamed expert costs ~0.3 ms of DMA that is mostly not free; overlap with the hot GEMMs gained little
+over serial. Streaming later (after the hot GEMMs) was worse than overlapped (1,685 against 1,939 tok/s at N = 64).
+
+Design. With streaming, the cold experts are copied once into pinned host memory (7.2 GiB at N = 51); the CPU
+computes from that copy too (decode unchanged). After the router, the host reads the ids, counts pairs per cold
+expert, and picks the busiest (at least stream_min_rows = 16 pairs, at most stream_slots) up to the point where
+slots x 300 us exceeds the CPU's 22 us a pair on the rest. The copy engine moves them into raw slots; the card
+repacks them (35 us an expert; kept raw so that pinned memory is the only copy) into repacked slots, a second
+fast::moe_group (group_of, row_base) numbers their pairs after the hot experts' rows, the same GEMM kernels run
+them over a second tile list, and moe_combine takes both from one row table (the pairs' inputs are gathered into
+att_, dead during the MoE). The CPU takes the other cold pairs meanwhile. A layer's experts also share one slab now.
+Rejected: warm repacked pinned copies (reach 64: 2,070 against 1,940 tok/s at N = 64, but 2x host memory or
+profile-limited coverage: reach 32/48 carried 61/73% of cold pairs); speculative prefetch of the next layer (more
+DMA, and DMA is what costs).

@@ -270,7 +270,7 @@ int main(int argc, char** argv) {
     }
     {
       // A kernel on the second queue reading pinned host memory into VRAM (zero-copy), beside the bandwidth kernel on q.
-      const size_t words = gu->nbytes / 16;
+      const size_t words = ex_b / 16;
       auto pull = [&](int nwg) {
         auto* dst = reinterpret_cast<sycl::uint4*>(card);
         const sycl::uint4* s4 = reinterpret_cast<const sycl::uint4*>(pg);
@@ -285,7 +285,7 @@ int main(int argc, char** argv) {
         q2.wait();
         const double tp = (now() - u0) / 5;
         u0 = now();
-        for (int i = 0; i < 5; ++i) pull(nwg);
+        for (int i = 0; i < 100; ++i) pull(nwg);
         int reps = 0;
         auto ev = q2.single_task([] {});
         while (ev.get_info<sycl::info::event::command_execution_status>() != sycl::info::event_command_status::complete) {

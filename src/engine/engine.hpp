@@ -50,7 +50,7 @@ struct Config {
   // the CPU takes the other cold pairs. 0 slots: the CPU takes all of them, from the GGUF's mapping (stage 3a).
   // The costs pick how many candidates to stream: about the point where the copies take as long as the CPU would
   // on the rest.
-  int stream_slots = 32;
+  int stream_slots = 40;
   int stream_min_rows = 16;
   double stream_copy_us = 300;  // one expert from pinned memory to the card (copy-bench: 307 us)
   double stream_cpu_us = 22;    // one cold pair on the CPU, 16 threads

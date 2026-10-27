@@ -145,6 +145,9 @@ eklow_sycl(eklow-probe)
 
 # eklow-xmx-bench: dpas layouts checked against the CPU, XMX throughput, the Q4_0 inner loops and
 add_executable(eklow-copy-bench tools/copy_bench/main.cpp)
+add_executable(eklow-tax tools/copy_bench/tax.cpp)
+target_link_libraries(eklow-tax PRIVATE eklow_model)
+eklow_sycl(eklow-tax)
 target_link_libraries(eklow-copy-bench PRIVATE eklow_model)
 eklow_sycl(eklow-copy-bench)
 

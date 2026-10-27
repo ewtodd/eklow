@@ -149,7 +149,7 @@ int main(int argc, char** argv) {
   std::string expert_profile;
   int64_t experts_on_card = -2;  // as many as fit, once there is a profile
   int64_t card_margin_mib = 1024;
-  int stream_slots = 32, stream_min_rows = 16;
+  int stream_slots = 40, stream_min_rows = 16;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -227,6 +227,9 @@ int main(int argc, char** argv) {
                    (long long)eng.experts_on_card(), (long long)eng.model().n_expert, eng.experts_on_card() < eng.model().n_expert ? ", the rest on the CPU" : "",
                    eng.expert_set_bytes() / 1048576.0, eng.free_at_placement() / GiB, double(ec.card_margin_bytes) / GiB,
                    rt::free_memory(q.get_device()).value_or(0) / GiB);
+    if (eng.model().n_expert > 0 && eng.stream_slots() > 0)
+      std::fprintf(stderr, "eklow-server: prefill streams busy cold experts to the card: %d slots (%.0f MiB on the card), %.2f GiB of cold experts pinned in host memory\n",
+                   eng.stream_slots(), eng.stream_slot_bytes() / 1048576.0, eng.pinned_bytes() / GiB);
 
     serve::Scheduler sched(eng, tok, {batch, chunk, ec.max_ctx});
     std::thread engine_thread([&] { sched.run(g_stop); });

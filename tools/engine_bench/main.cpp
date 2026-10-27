@@ -76,7 +76,7 @@ int main(int argc, char** argv) {
   std::string expert_profile;
   int64_t experts_on_card = -1;
   int cpu_threads = 0;
-  int stream_slots = 32, stream_min_rows = 16;
+  int stream_slots = 40, stream_min_rows = 16;
   double stream_copy_us = 300, stream_cpu_us = 22;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
