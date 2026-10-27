@@ -24,7 +24,10 @@
 // probabilities by its slice of V. Prefill puts several tiles of a chunk in one work-group, which
 // stages each block of K and V in shared local memory once for all of them, loaded by threads of
 // its own a block ahead. Decode, a tile or two per head, splits long key ranges across work-groups
-// and merges them (flash-decoding).
+// and merges them (flash-decoding). On the global layers (head 512) a prefill chunk of 64 tokens or
+// more instead runs over the cache in segments of 2,048 keys, each as two GEMMs (Q.K^T with the
+// softmax in its epilogue, then P.V into a running output in device memory), ~3x the flash kernel's
+// rate (DECISIONS 2026-10-27).
 #pragma once
 
 #include <sycl/sycl.hpp>
@@ -64,8 +67,10 @@ struct TileList {
   std::vector<int32_t> groups;  // 2 per group
   int64_t per_group;            // tiles per group
   int64_t max_keys = 0;         // bound on any tile's key range
+  // Per chunk: its first token in the batch, tokens, rows per K/V head, first tile, last position.
+  std::vector<int64_t> chunks;  // 5 per chunk
   void add_chunk(int32_t base, int64_t n_tok, int64_t last_pos, int64_t group, int64_t n_head_kv, int64_t window);
-  void clear() { desc.clear(), groups.clear(), max_keys = 0; }
+  void clear() { desc.clear(), groups.clear(), chunks.clear(), max_keys = 0; }
   int64_t size() const { return int64_t(desc.size() / 4); }
   int64_t n_groups() const { return int64_t(groups.size() / 2); }
   // desc then groups, as attend wants them on the device.
@@ -78,6 +83,11 @@ struct Scratch {
   float* part = nullptr;    // split partials
   float* part2 = nullptr;   // partials folded from groups of 8 splits, when the merge runs two levels
   size_t q_halves = 0, part_floats = 0, part2_floats = 0;
+  // Long prefill on the global layers, attention in key segments: probabilities, per-row statistics and the
+  // running output.
+  sycl::half* p = nullptr;
+  float* stat = nullptr;
+  size_t p_halves = 0, stat_floats = 0;
 };
 
 // out[t][h][:] = softmax(Q[t][h] . K^T * scale) V over the keys token t sees: positions up to its
@@ -85,6 +95,11 @@ struct Scratch {
 // `packed` is the TileList's packed() on the device.
 void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* packed, const Cache& c,
             int64_t n_head, float scale, float* out, Scratch& scratch);
+
+// Allocates the scratch attend needs for up to max_tiles query tiles a step and chunks of up to max_chunk_rows
+// rows per K/V head, for one kind of layer: the long prefill's buffers on the global layers take ~100 MB (the
+// 26B's 1,024-token chunks), which an engine should count before it spends the card's free memory on experts.
+void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim);
 
 // Writes K, V fp32 [n_tok][n_head_kv][head_dim] at each token's slot and position.
 void write(sycl::queue& q, const float* K, const float* V, const Tokens& tok, const Cache& c);

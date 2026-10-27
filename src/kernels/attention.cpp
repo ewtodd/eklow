@@ -20,6 +20,7 @@ TileList::TileList(int64_t head_dim) : per_group(head_dim >= 512 ? 6 : 12) {}
 
 void TileList::add_chunk(int32_t base, int64_t n_tok, int64_t last_pos, int64_t group, int64_t n_head_kv, int64_t window) {
   const int64_t rows = n_tok * group;
+  chunks.insert(chunks.end(), {base, n_tok, rows, size(), last_pos});
   for (int64_t g = 0; g < n_head_kv; ++g) {
     const int64_t first = size();
     for (int64_t r0 = 0; r0 < rows; r0 += 8) desc.insert(desc.end(), {base, int32_t(rows), int32_t(r0), int32_t(g)});
@@ -269,7 +270,8 @@ struct Flash {
   }
 };
 
-// The prefill kernel: a work-group per group of QT tiles of one chunk and K/V head. Its NC compute
+// The prefill kernel (the sliding layers; the global layers run long chunks in segments, below): a work-group per
+// group of QT tiles of one chunk and K/V head. Its NC compute
 // threads (P per tile, a 64-dimension slice each) run the tile loop of Flash over one shared copy
 // of each 16-key block of K and V in shared local memory; L loader threads keep the next block's
 // pieces in their registers and store them while the compute threads are past the point of
@@ -487,6 +489,358 @@ struct FlashGroup {
   }
 };
 
+// Long prefill on the global layers (head 512) in segments of kSeg keys (DECISIONS 2026-10-27, "global prefill
+// attention as two GEMMs"). FlashGroup runs Q.K^T, the softmax and P.V per 16-key block, exchanging the partial
+// scores of a 512-wide head through shared local memory with two barriers a block; each step waits on the one
+// before it, and it holds ~10 TFLOPS where the GEMM's loop shape runs the same loads and dpas at 40-90. Here a
+// chunk's attention over each segment of keys is two GEMMs in the shape of xmx.cpp's fp16 GEMM (work-groups of
+// 16 x 4 threads, 256 x 128 outputs, each thread 16 x 32; 32-deep K blocks staged in shared local memory, the
+// next block's loads issued before this block's dpas), the cache's int8 tiles dequantized as they are staged:
+// - SegQK: S = Q K^T for 256 rows x 128 keys; its epilogue masks keys past each row's position, takes each
+//   row's maximum over the 128 keys and its running maximum, and writes P = exp(S - m) (fp16, in the A layout),
+//   that maximum and the row's sum over the 128 keys;
+// - a combining step: per row, the segment's maximum, the factor for the running output (alpha) and for each
+//   128 keys' probabilities (beta), and the running sum;
+// - SegPV: O = alpha O + (beta P) V for 256 rows x 128 dimensions, the probabilities scaled by beta as they
+//   are staged; the running output stays in fp32 in device memory between segments.
+// Then the output is divided by the sums. Rows are a chunk's (token, head) pairs of one K/V head, in the tile
+// order of the TileList; the probabilities of a segment take 2 bytes per row and key (32 MB per K/V head of a
+// 1,024-token chunk of the 26B), the running output 2 KB per row. Measured on the 26B's shape at 131k keys
+// (eklow-attn-test): Q.K^T ~35 TFLOPS, P.V ~29, the whole ~31 (FlashGroup 10.3); 4,096-key segments gave 5%
+// more for twice the probabilities' memory, 1,024 10% less. P.V as 64 rows x all 512 dimensions, reading each
+// row's probabilities once instead of four times, ran slower (-10%).
+constexpr int kSeg = 2048, kSegTiles = kSeg / 128;
+// Chunks of fewer tokens (decode, short prompts) keep the flash kernels.
+constexpr int64_t kSegMinTokens = 64;
+
+// Statistics of one chunk's segments, per K/V head h of H2 and row of R (padded to 256): tile maxima and sums
+// and the tiles' factors [h][tile][row], the output's factor, running maximum and sum [h][row], and the running
+// output [h][row][D].
+struct SegStats {
+  float *mt, *lt, *beta, *alpha, *mrun, *lrun, *orun;
+  static size_t floats(int64_t H2, int64_t R, int64_t D) { return size_t(H2 * R * (3 * kSegTiles + 3 + D)); }
+  SegStats(float* s, int64_t H2, int64_t R) {
+    mt = s, lt = mt + H2 * kSegTiles * R, beta = lt + H2 * kSegTiles * R, alpha = beta + H2 * kSegTiles * R;
+    mrun = alpha + H2 * R, lrun = mrun + H2 * R, orun = lrun + H2 * R;
+  }
+};
+
+template <int D, int G, bool Q8>
+struct SegQK {
+  static constexpr int WM = 16, WN = 4, KB = D / 32;
+  // Per K block: B pieces (16 key tiles x 2 K halves) then A pieces (32 row tiles x 2 K halves), 256 bytes each;
+  // two such buffers, then the epilogue's per-row partial maxima and sums [4 column threads][256 rows].
+  static constexpr uint32_t kBBuf = 32 * 256, kBuf = kBBuf + 64 * 256, kRed = 2 * kBuf, kSlm = kRed + 2 * 4 * 256 * 4;
+  const sycl::half* qt;  // the chunk's Q tiles; K/V head h's at + h * tph tiles
+  const int32_t *slot_of, *pos_of, *table;
+  const void* kc;
+  const sycl::half* ks;
+  sycl::half* p;
+  float *mt, *lt;
+  const float* mrun;
+  int32_t pages, n_head_kv, base, rows, tph, R, seg0, kend, first;
+
+  void operator()(sycl::nd_item<3> it) const SYCL_ESIMD_KERNEL {
+    esimd::slm_init<kSlm>();
+    const int wi = int(it.get_local_id(1)), wj = int(it.get_local_id(2)), tid = wi * WN + wj;
+    const int32_t h = int32_t(it.get_group(0)), tm = int32_t(it.get_group(1)), tn = int32_t(it.get_group(2));
+    // Every thread stages one A piece (row tile tid / 2, K half tid % 2) and threads below 32 one B piece (the
+    // work-group's key tile tid / 2, K half tid % 2) of each block.
+    const int32_t a_tile = tm * 32 + tid / 2;
+    const bool a_ok = a_tile < tph;
+    const sycl::half* a_src = qt + (h * tph + (a_ok ? a_tile : 0)) * (kRows * D) + (tid % 2) * 128;
+    const int32_t key0 = seg0 + tn * 128 + (tid / 2) * 8;
+    const bool b_ok = tid < 32 && key0 < kend;
+    int32_t k_at = 0, k_sat = 0;
+    if (b_ok) {
+      const int32_t in_page = key0 % int32_t(kPage), hp = table[slot_of[base] * pages + key0 / int32_t(kPage)] * n_head_kv + h;
+      k_at = hp * int32_t(kPage * D) + ((in_page / 8) * (D / 16) + tid % 2) * 128;
+      k_sat = hp * int32_t(kPage * D / 16) + ((in_page / 8) * (D / 16) + tid % 2) * 8;
+    }
+    esimd::simd<sycl::half, 128> Araw;
+    esimd::simd<uint32_t, 32 * kElem<Q8>> Braw;
+    esimd::simd<sycl::half, 8> Bsc;
+    auto load = [&](int kb) SYCL_ESIMD_FUNCTION {
+      if (a_ok) Araw = esimd::block_load<sycl::half, 128>(a_src + kb * 256);
+      else Araw = 0;
+      if (b_ok) {
+        Braw = esimd::block_load<uint32_t, 32 * kElem<Q8>>(
+            reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(kc) + (k_at + kb * 256) * kElem<Q8>));
+        if constexpr (Q8) Bsc = esimd::block_load<sycl::half, 8>(ks + k_sat + kb * 16);
+      }
+    };
+    auto store = [&](uint32_t buf) SYCL_ESIMD_FUNCTION {
+      esimd::slm_block_store<sycl::half, 128>(buf + kBBuf + tid * 256, Araw);
+      if (tid < 32) {
+        esimd::simd<sycl::half, 128> B = 0;
+        if (b_ok) {
+          if constexpr (Q8) {
+            // Element (dim d, position n) is at (d/2)*16 + n*2 + d%2: the scale of n, twice, eight times.
+            esimd::simd<sycl::half, 16> pat;
+            pat.select<8, 2>(0) = Bsc;
+            pat.select<8, 2>(1) = Bsc;
+            const esimd::simd<int8_t, 128> q8 = Braw.template bit_cast_view<int8_t>();
+            B = esimd::simd<sycl::half, 128>(q8) * pat.replicate<8>();
+          } else {
+            B = Braw.template bit_cast_view<sycl::half>();
+          }
+        }
+        esimd::slm_block_store<sycl::half, 128>(buf + tid * 256, B);
+      }
+    };
+    esimd::simd<float, 64> acc[2][4];
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+      for (int c = 0; c < 4; ++c) acc[r][c] = 0;
+    load(0);
+    store(0);
+    esimd::barrier();
+    for (int kb = 0; kb < KB; ++kb) {
+      const uint32_t cur = (kb & 1) * kBuf, nxt = kBuf - cur;
+      if (kb + 1 < KB) load(kb + 1);
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        esimd::simd<sycl::half, 128> A[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) A[r] = esimd::slm_block_load<sycl::half, 128>(cur + kBBuf + ((wi * 2 + r) * 2 + hh) * 256);
+        esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(cur + (wj * 4 * 2 + hh) * 256);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          esimd::simd<sycl::half, 128> Bn;
+          if (c + 1 < 4) Bn = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4 + c + 1) * 2 + hh) * 256);
+#pragma unroll
+          for (int r = 0; r < 2; ++r) acc[r][c] = xmxd::dpas<8, 8, float>(acc[r][c], B, A[r]);
+          B = Bn;
+        }
+      }
+      if (kb + 1 < KB) store(nxt);
+      esimd::barrier();
+    }
+
+    // Epilogue: this thread's rows are tm*256 + (wi*2 + r)*8 + i, its keys seg0 + tn*128 + (wj*4 + c)*8 + n.
+    const int32_t key_t = seg0 + tn * 128 + wj * 32;
+    esimd::simd<int32_t, 64> kpat;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) kpat.select<8, 1>(i * 8) = esimd::simd<int32_t, 8>(0, 1);
+    esimd::simd<float, 8> m[2];
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int32_t row0 = (tm * 32 + wi * 2 + r) * 8;
+      esimd::simd<int32_t, 64> pos;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int32_t row = row0 + i;
+        pos.select<8, 1>(i * 8) = row < rows ? pos_of[base + row / G] : -1;
+      }
+      // Keys past the row's own position, or past the last written one, are out.
+      pos = esimd::min(pos, esimd::simd<int32_t, 64>(kend - 1));
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+        acc[r][c].merge(esimd::simd<float, 64>(-std::numeric_limits<float>::infinity()), kpat + (key_t + c * 8) > pos);
+      esimd::simd<float, 64> t = esimd::max(esimd::max(acc[r][0], acc[r][1]), esimd::max(acc[r][2], acc[r][3]));
+#pragma unroll
+      for (int i = 0; i < 8; ++i) m[r][i] = esimd::hmax<float>(esimd::simd<float, 8>(t.template select<8, 1>(i * 8)));
+      esimd::slm_block_store<float, 8>(kRed + (wj * 256 + (wi * 2 + r) * 8) * 4, m[r]);
+    }
+    esimd::barrier();
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int32_t row0 = (tm * 32 + wi * 2 + r) * 8;
+      m[r] = first ? esimd::simd<float, 8>(kNegBig) : esimd::block_load<float, 8>(mrun + h * R + row0);
+#pragma unroll
+      for (int w = 0; w < 4; ++w) m[r] = esimd::max(m[r], esimd::slm_block_load<float, 8>(kRed + (w * 256 + (wi * 2 + r) * 8) * 4));
+      esimd::simd<float, 64> mb;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) mb.select<8, 1>(i * 8) = float(m[r][i]);
+      esimd::simd<float, 64> s = 0;
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        acc[r][c] = esimd::exp(acc[r][c] - mb);
+        s += acc[r][c];
+      }
+      esimd::simd<float, 8> l;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) l[i] = esimd::reduce<float>(esimd::simd<float, 8>(s.template select<8, 1>(i * 8)), std::plus<>());
+      esimd::slm_block_store<float, 8>(kRed + 4096 + (wj * 256 + (wi * 2 + r) * 8) * 4, l);
+      // P in the A layout of P.V: per 8 rows, tiles of 16 keys.
+#pragma unroll
+      for (int q2 = 0; q2 < 2; ++q2) {
+        esimd::simd<sycl::half, 128> pt;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+          pt.select<8, 1>(i * 16) = esimd::simd<sycl::half, 8>(acc[r][2 * q2].template select<8, 1>(i * 8));
+          pt.select<8, 1>(i * 16 + 8) = esimd::simd<sycl::half, 8>(acc[r][2 * q2 + 1].template select<8, 1>(i * 8));
+        }
+        esimd::block_store<sycl::half, 128>(p + ((h * (R / 8) + tm * 32 + wi * 2 + r) * (kSeg / 16) + tn * 8 + wj * 2 + q2) * 128, pt);
+      }
+    }
+    esimd::barrier();
+    if (wj != 0) return;
+#pragma unroll
+    for (int r = 0; r < 2; ++r) {
+      const int32_t row0 = (tm * 32 + wi * 2 + r) * 8;
+      esimd::simd<float, 8> l = 0;
+#pragma unroll
+      for (int w = 0; w < 4; ++w) l += esimd::slm_block_load<float, 8>(kRed + 4096 + (w * 256 + (wi * 2 + r) * 8) * 4);
+      esimd::block_store<float, 8>(mt + (h * kSegTiles + tn) * R + row0, m[r]);
+      esimd::block_store<float, 8>(lt + (h * kSegTiles + tn) * R + row0, l);
+    }
+  }
+};
+
+template <int D, bool Q8>
+struct SegPV {
+  static constexpr int WM = 16, WN = 4;
+  // Per 32-key block: B pieces (16 dimension tiles x 2 key halves) then A pieces (32 row tiles x 2 key halves).
+  static constexpr uint32_t kBBuf = 32 * 256, kBuf = kBBuf + 64 * 256, kSlm = 2 * kBuf;
+  const sycl::half* p;
+  const float *beta, *alpha;
+  float* orun;
+  const int32_t *slot_of, *table;
+  const void* vc;
+  const sycl::half* vs;
+  int32_t pages, n_head_kv, base, rows, R, seg0, kend, nb, first;
+
+  void operator()(sycl::nd_item<3> it) const SYCL_ESIMD_KERNEL {
+    esimd::slm_init<kSlm>();
+    const int wi = int(it.get_local_id(1)), wj = int(it.get_local_id(2)), tid = wi * WN + wj;
+    const int32_t h = int32_t(it.get_group(0)), tm = int32_t(it.get_group(1)), tn = int32_t(it.get_group(2));
+    const int32_t slot = slot_of[base];
+    // Every thread stages one A piece (row tile tid / 2, keys 16 * (tid % 2) of the block) and threads below
+    // 32 one B piece (dimension tile tn*16 + tid / 2, keys 16 * (tid % 2) of the block).
+    const int32_t a_tile = tm * 32 + tid / 2;
+    const sycl::half* a_src = p + ((h * (R / 8) + a_tile) * (kSeg / 16) + tid % 2) * 128;
+    const float* a_beta = beta + h * kSegTiles * R + a_tile * 8;
+    const int32_t dt = tn * 16 + tid / 2;
+    esimd::simd<sycl::half, 128> Araw;
+    esimd::simd<float, 8> Abeta;
+    esimd::simd<uint32_t, 32 * kElem<Q8>> Braw;
+    esimd::simd<sycl::half, 16> Bsc;
+    int32_t nv = 0;  // positions of the B piece before kend
+    auto load = [&](int b) SYCL_ESIMD_FUNCTION {
+      Araw = esimd::block_load<sycl::half, 128>(a_src + b * 256);
+      Abeta = esimd::block_load<float, 8>(a_beta + (b / 4) * R);
+      const int32_t key0 = seg0 + b * 32 + (tid % 2) * 16;
+      nv = tid < 32 ? std::clamp(kend - key0, 0, 16) : 0;
+      if (nv > 0) {
+        const int32_t in_page = key0 % int32_t(kPage), hp = table[slot * pages + key0 / int32_t(kPage)] * n_head_kv + h;
+        const int32_t at = hp * int32_t(kPage * D) + ((in_page / 16) * (D / 8) + dt) * 128;
+        Braw = esimd::block_load<uint32_t, 32 * kElem<Q8>>(reinterpret_cast<const uint32_t*>(static_cast<const uint8_t*>(vc) + at * kElem<Q8>));
+        if constexpr (Q8) Bsc = esimd::block_load<sycl::half, 16>(vs + hp * int32_t(kPage * D / 16) + ((in_page / 16) * (D / 16) + dt / 2) * 16);
+      }
+    };
+    auto store = [&](uint32_t buf) SYCL_ESIMD_FUNCTION {
+      esimd::simd<sycl::half, 128> sb;
+#pragma unroll
+      for (int i = 0; i < 8; ++i) sb.select<16, 1>(i * 16) = sycl::half(Abeta[i]);
+      esimd::slm_block_store<sycl::half, 128>(buf + kBBuf + tid * 256, Araw * sb);
+      if (tid < 32) {
+        esimd::simd<sycl::half, 128> B = 0;
+        if (nv > 0) {
+          // Element (position k, dim n) is at (k/2)*16 + n*2 + k%2. Positions from kend on are stale (or never
+          // written), and their probabilities zero; they are zeroed here so that no NaN there reaches the sum.
+          if constexpr (Q8) {
+            esimd::simd<sycl::half, 16> sc = Bsc;
+            sc.merge(esimd::simd<sycl::half, 16>(0), esimd::simd<int32_t, 16>(0, 1) >= nv);
+            esimd::simd<sycl::half, 128> pat;
+#pragma unroll
+            for (int r = 0; r < 8; ++r) pat.select<16, 1>(16 * r) = sc.template replicate_vs_w_hs<8, 0, 2, 1>(2 * r);
+            const esimd::simd<int8_t, 128> q8 = Braw.template bit_cast_view<int8_t>();
+            B = esimd::simd<sycl::half, 128>(q8) * pat;
+          } else {
+            B = Braw.template bit_cast_view<sycl::half>();
+            if (nv < 16) {
+              const esimd::simd<int16_t, 128> e(0, 1);
+              B.merge(esimd::simd<sycl::half, 128>(0), (e / 16) * 2 + e % 2 >= int16_t(nv));
+            }
+          }
+        }
+        esimd::slm_block_store<sycl::half, 128>(buf + tid * 256, B);
+      }
+    };
+    esimd::simd<float, 64> acc[2][4];
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+      for (int c = 0; c < 4; ++c) acc[r][c] = 0;
+    load(0);
+    store(0);
+    esimd::barrier();
+    for (int b = 0; b < nb; ++b) {
+      const uint32_t cur = (b & 1) * kBuf, nxt = kBuf - cur;
+      if (b + 1 < nb) load(b + 1);
+#pragma unroll
+      for (int hh = 0; hh < 2; ++hh) {
+        esimd::simd<sycl::half, 128> A[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) A[r] = esimd::slm_block_load<sycl::half, 128>(cur + kBBuf + ((wi * 2 + r) * 2 + hh) * 256);
+        esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(cur + (wj * 4 * 2 + hh) * 256);
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          esimd::simd<sycl::half, 128> Bn;
+          if (c + 1 < 4) Bn = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4 + c + 1) * 2 + hh) * 256);
+#pragma unroll
+          for (int r = 0; r < 2; ++r) acc[r][c] = xmxd::dpas<8, 8, float>(acc[r][c], B, A[r]);
+          B = Bn;
+        }
+      }
+      if (b + 1 < nb) store(nxt);
+      esimd::barrier();
+    }
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int32_t row = (tm * 32 + wi * 2 + r) * 8 + i;
+        if (row >= rows) break;
+        const float a = first ? 0.0f : alpha[h * R + row];
+#pragma unroll
+        for (int c = 0; c < 4; ++c) {
+          float* o = orun + (h * R + row) * D + tn * 128 + (wj * 4 + c) * 8;
+          esimd::simd<float, 8> v = acc[r][c].template select<8, 1>(i * 8);
+          if (!first) v += a * esimd::block_load<float, 8>(o);
+          esimd::block_store<float, 8>(o, v);
+        }
+      }
+  }
+};
+
+// One chunk's attention over the global cache in segments; qt holds its Q tiles (K/V head h's at + h * tph).
+template <int D, int G, bool Q8>
+void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const Cache& c, int64_t n_head, const int64_t* ch, float* out,
+                  Scratch& scratch) {
+  const int32_t base = int32_t(ch[0]), rows = int32_t(ch[2]), kend = int32_t(ch[4] + 1);
+  const int32_t H2 = int32_t(c.n_head_kv), tph = (rows + 7) / 8, R = (rows + 255) / 256 * 256, H = int32_t(n_head);
+  sycl::half* P = grow(q, scratch.p, scratch.p_halves, size_t(H2) * R * kSeg);
+  const SegStats st(grow(q, scratch.stat, scratch.stat_floats, SegStats::floats(H2, R, D)), H2, R);
+  for (int32_t s0 = 0; s0 < kend; s0 += kSeg) {
+    const int32_t kseg = std::min(kSeg, kend - s0), nk = (kseg + 127) / 128, nb = (kseg + 31) / 32, first = s0 == 0;
+    SegQK<D, G, Q8> qk{qt,   tok.slot, tok.pos,  c.table,          c.k, c.ks, P,     st.mt, st.lt, st.mrun, int32_t(c.pages),
+                       H2,   base,     rows,     tph,              R,   s0,   kend,  first};
+    q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(H2), size_t(R / 16), size_t(nk * 4)), sycl::range<3>(1, 16, 4)), qk);
+    q.parallel_for(sycl::range<2>(size_t(H2), size_t(R)), [=](sycl::id<2> id) {
+      const int32_t h = int32_t(id[0]), row = int32_t(id[1]), i = h * R + row;
+      const float m_old = first ? kNegBig : st.mrun[i], l_old = first ? 0.0f : st.lrun[i];
+      float mn = m_old;
+      for (int32_t t = 0; t < nk; ++t) mn = sycl::fmax(mn, st.mt[(h * kSegTiles + t) * R + row]);
+      const float a = sycl::exp(m_old - mn);
+      float l = a * l_old;
+      for (int32_t t = 0; t < nk; ++t) {
+        const float b = sycl::exp(st.mt[(h * kSegTiles + t) * R + row] - mn);
+        st.beta[(h * kSegTiles + t) * R + row] = b;
+        l += b * st.lt[(h * kSegTiles + t) * R + row];
+      }
+      st.mrun[i] = mn, st.lrun[i] = l, st.alpha[i] = a;
+    });
+    SegPV<D, Q8> pv{P, st.beta, st.alpha, st.orun, tok.slot, c.table, c.v, c.vs, int32_t(c.pages), H2, base, rows, R, s0, kend, nb, first};
+    q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(H2), size_t(R / 16), size_t(D / 32)), sycl::range<3>(1, 16, 4)), pv);
+  }
+  q.parallel_for(sycl::range<3>(size_t(H2), size_t(rows), size_t(D)), [=](sycl::id<3> id) {
+    const int32_t h = int32_t(id[0]), row = int32_t(id[1]), d = int32_t(id[2]);
+    out[((base + row / G) * H + h * G + row % G) * D + d] = st.orun[(h * R + row) * D + d] / st.lrun[h * R + row];
+  });
+}
 
 constexpr int64_t kPerSplitMax = 8;
 
@@ -497,7 +851,7 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
   // spilled 928 B; at 32 it fits the 128-register budget and the tile gets twice the threads.
   constexpr int S = D == 256 ? 32 : kSlice;
   constexpr int P = Flash<D, G, Q8, S>::P, QT = D >= 512 ? 6 : 12;
-  const int64_t n_tiles = list.size(), max_keys = list.max_keys;
+  const int64_t n_tiles = list.size();
   if (list.per_group != QT) throw std::runtime_error("attention: tile list grouped for another head size");
   const int32_t H = int32_t(n_head);
   // Query tiles in fp16, the A operands of Q.K^T: [tile][D/16][8 rows][16].
@@ -509,6 +863,84 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
     if (r < rows) v = Q[((base + r / G) * H + kvh * G + r % G) * D + d] * scale;
     qt[tile * kRows * D + (d / 16) * 128 + i * 16 + d % 16] = sycl::half(v);
   });
+  // Enough threads to fill the card: when there are few tiles (decode), split each tile's keys.
+  // Each block costs a thread several microseconds of load latency, so short splits win, but every
+  // split adds partials to merge. Up to 4k keys the splits are as measured on 2026-10-24 (at least
+  // 4 blocks, at most 32 splits); beyond, at most kPerSplitMax blocks a split, with the two-level
+  // merge below (2026-10-26: global8 decode at 16k keys 470 -> 302 us; kPerSplitMax 4 gave 366).
+  auto split = [&](const sycl::half* qt, const int32_t* tiles, int64_t n_tiles, int64_t max_keys) {
+    const int64_t max_blocks = max_keys / kKeys + 2;
+    const int64_t per_split = std::clamp<int64_t>(max_blocks / 32, 4, kPerSplitMax);
+    const int64_t splits = std::clamp<int64_t>((8192 + n_tiles * P - 1) / (n_tiles * P), 1, std::max<int64_t>(1, max_blocks / per_split));
+    int32_t sp = int32_t(splits);
+    float* part = splits > 1 ? grow(q, scratch.part, scratch.part_floats, size_t(n_tiles * splits * part_stride(D))) : nullptr;
+    Flash<D, G, Q8, S> k{qt, tiles, tok.slot, tok.pos, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
+                         int32_t(c.n_head_kv), H, sp, out, part};
+    q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(splits), size_t(n_tiles * P)), sycl::range<2>(1, P)), k);
+    if (splits == 1) return;
+    // Each work-item of the merge below loops over every split, which at 128 splits was half of
+    // the decode time: past 32 splits, first fold each group of 8 consecutive splits into one
+    // partial in the same layout (the same rescaling as the merge), then merge those.
+    if (splits > 32) {
+      const int32_t sp2 = (sp + 7) / 8;
+      float* part2 = grow(q, scratch.part2, scratch.part2_floats, size_t(n_tiles) * sp2 * part_stride(D));
+      q.parallel_for(sycl::range<3>(size_t(n_tiles) * kRows, D, sp2), [=](sycl::id<3> id) {
+        const int32_t tile = int32_t(id[0]) / kRows, i = int32_t(id[0]) % kRows, d = int32_t(id[1]), g = int32_t(id[2]);
+        const int32_t rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i;
+        if (r >= rows) return;
+        const float* p = part + tile * sp * part_stride(D);
+        float* o2 = part2 + (tile * sp2 + g) * part_stride(D);
+        float mg = kNegBig, lg = 0, o = 0;
+        for (int32_t s = g * 8; s < g * 8 + 8 && s < sp; ++s)
+          if (p[s * part_stride(D) + kRows * D + kRows + i] > 0) mg = sycl::fmax(mg, p[s * part_stride(D) + kRows * D + i]);
+        for (int32_t s = g * 8; s < g * 8 + 8 && s < sp; ++s) {
+          const float* ps = p + s * part_stride(D);
+          const float ls = ps[kRows * D + kRows + i];
+          if (ls == 0) continue;
+          const float w = sycl::exp(ps[kRows * D + i] - mg);
+          lg += ls * w;
+          o += ps[i * D + d] * w;
+        }
+        o2[i * D + d] = o;
+        if (d == 0) o2[kRows * D + i] = mg, o2[kRows * D + kRows + i] = lg;
+      });
+      sp = sp2;
+      part = part2;
+    }
+    q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
+      const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), d = int32_t(id[2]);
+      const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];
+      if (r >= rows) return;
+      const float* p = part + tile * sp * part_stride(D);
+      float mx = kNegBig;
+      for (int32_t s = 0; s < sp; ++s)
+        if (p[s * part_stride(D) + kRows * D + kRows + i] > 0) mx = sycl::fmax(mx, p[s * part_stride(D) + kRows * D + i]);
+      float lsum = 0, o = 0;
+      for (int32_t s = 0; s < sp; ++s) {
+        const float* ps = p + s * part_stride(D);
+        const float ls = ps[kRows * D + kRows + i];
+        if (ls == 0) continue;  // a split with no keys for this row
+        const float w = sycl::exp(ps[kRows * D + i] - mx);
+        lsum += ls * w;
+        o += ps[i * D + d] * w;
+      }
+      out[((base + r / G) * H + kvh * G + r % G) * D + d] = o / lsum;
+    });
+  };
+  // The global layers' long chunks: attention in segments, each chunk on its own; the step's other chunks
+  // (decode tokens beside a prefill) each through the split kernel, their tiles being a contiguous run.
+  if constexpr (D == 512) {
+    bool any = false;
+    for (size_t i = 0; i < list.chunks.size(); i += 5) any |= list.chunks[i + 1] >= kSegMinTokens;
+    if (any && c.window == 0 && c.table) {
+      for (size_t i = 0; i < list.chunks.size(); i += 5) {
+        const int64_t* ch = &list.chunks[i];
+        if (ch[1] >= kSegMinTokens) run_segments<D, G, Q8>(q, qt + ch[3] * kRows * D, tok, c, n_head, ch, out, scratch);
+        else split(qt + ch[3] * kRows * D, tiles + 4 * ch[3], c.n_head_kv * ((ch[2] + 7) / 8), ch[4] + 1);
+      }
+      return;
+    }
+  }
   // Enough groups to fill the card (a prefill chunk): the group kernel, one pass over the keys.
   if (list.n_groups() * FlashGroup<D, G, QT, Q8>::NT >= 8192) {
     FlashGroup<D, G, QT, Q8> k{qt,   tiles, tiles + 4 * n_tiles, tok.slot, tok.pos, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages),
@@ -517,69 +949,9 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
     q.parallel_for(sycl::nd_range<1>(size_t(list.n_groups() * NT), NT), k);
     return;
   }
-  // Enough threads to fill the card: when there are few tiles (decode), split each tile's keys.
-  // Each block costs a thread several microseconds of load latency, so short splits win, but every
-  // split adds partials to merge. Up to 4k keys the splits are as measured on 2026-10-24 (at least
-  // 4 blocks, at most 32 splits); beyond, at most kPerSplitMax blocks a split, with the two-level
-  // merge below (2026-10-26: global8 decode at 16k keys 470 -> 302 us; kPerSplitMax 4 gave 366).
-  const int64_t max_blocks = max_keys / kKeys + 2;
-  const int64_t per_split = std::clamp<int64_t>(max_blocks / 32, 4, kPerSplitMax);
-  const int64_t splits = std::clamp<int64_t>((8192 + n_tiles * P - 1) / (n_tiles * P), 1, std::max<int64_t>(1, max_blocks / per_split));
-  int32_t sp = int32_t(splits);
-  float* part = splits > 1 ? grow(q, scratch.part, scratch.part_floats, size_t(n_tiles * splits * part_stride(D))) : nullptr;
-  Flash<D, G, Q8, S> k{qt, tiles, tok.slot, tok.pos, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
-                       int32_t(c.n_head_kv), H, sp, out, part};
-  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(splits), size_t(n_tiles * P)), sycl::range<2>(1, P)), k);
-  if (splits == 1) return;
-  // Each work-item of the merge below loops over every split, which at 128 splits was half of
-  // the decode time: past 32 splits, first fold each group of 8 consecutive splits into one
-  // partial in the same layout (the same rescaling as the merge), then merge those.
-  if (splits > 32) {
-    const int32_t sp2 = (sp + 7) / 8;
-    float* part2 = grow(q, scratch.part2, scratch.part2_floats, size_t(n_tiles) * sp2 * part_stride(D));
-    q.parallel_for(sycl::range<3>(size_t(n_tiles) * kRows, D, sp2), [=](sycl::id<3> id) {
-      const int32_t tile = int32_t(id[0]) / kRows, i = int32_t(id[0]) % kRows, d = int32_t(id[1]), g = int32_t(id[2]);
-      const int32_t rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i;
-      if (r >= rows) return;
-      const float* p = part + tile * sp * part_stride(D);
-      float* o2 = part2 + (tile * sp2 + g) * part_stride(D);
-      float mg = kNegBig, lg = 0, o = 0;
-      for (int32_t s = g * 8; s < g * 8 + 8 && s < sp; ++s)
-        if (p[s * part_stride(D) + kRows * D + kRows + i] > 0) mg = sycl::fmax(mg, p[s * part_stride(D) + kRows * D + i]);
-      for (int32_t s = g * 8; s < g * 8 + 8 && s < sp; ++s) {
-        const float* ps = p + s * part_stride(D);
-        const float ls = ps[kRows * D + kRows + i];
-        if (ls == 0) continue;
-        const float w = sycl::exp(ps[kRows * D + i] - mg);
-        lg += ls * w;
-        o += ps[i * D + d] * w;
-      }
-      o2[i * D + d] = o;
-      if (d == 0) o2[kRows * D + i] = mg, o2[kRows * D + kRows + i] = lg;
-    });
-    sp = sp2;
-    part = part2;
-  }
-  q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
-    const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), d = int32_t(id[2]);
-    const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];
-    if (r >= rows) return;
-    const float* p = part + tile * sp * part_stride(D);
-    float mx = kNegBig;
-    for (int32_t s = 0; s < sp; ++s)
-      if (p[s * part_stride(D) + kRows * D + kRows + i] > 0) mx = sycl::fmax(mx, p[s * part_stride(D) + kRows * D + i]);
-    float lsum = 0, o = 0;
-    for (int32_t s = 0; s < sp; ++s) {
-      const float* ps = p + s * part_stride(D);
-      const float ls = ps[kRows * D + kRows + i];
-      if (ls == 0) continue;  // a split with no keys for this row
-      const float w = sycl::exp(ps[kRows * D + i] - mx);
-      lsum += ls * w;
-      o += ps[i * D + d] * w;
-    }
-    out[((base + r / G) * H + kvh * G + r % G) * D + d] = o / lsum;
-  });
+  split(qt, tiles, n_tiles, list.max_keys);
 }
+
 
 }  // namespace
 
@@ -599,6 +971,14 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
     else run<512, 8, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   }
   else throw std::runtime_error("attention: no kernel for head_dim " + std::to_string(c.head_dim) + ", group " + std::to_string(group));
+}
+
+void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim) {
+  grow(q, s.q, s.q_halves, size_t(max_tiles * kRows * head_dim));
+  if (head_dim != 512) return;
+  const int64_t R = (max_chunk_rows + 255) / 256 * 256;
+  grow(q, s.p, s.p_halves, size_t(n_head_kv * R * kSeg));
+  grow(q, s.stat, s.stat_floats, SegStats::floats(n_head_kv, R, head_dim));
 }
 
 void write(sycl::queue& q, const float* K, const float* V, const Tokens& tok, const Cache& cache) {
