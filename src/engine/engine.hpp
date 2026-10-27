@@ -88,6 +88,8 @@ class Engine {
     const float *router_in_scale = nullptr, *post_ffw_norm_1 = nullptr, *pre_ffw_norm_2 = nullptr,
         *post_ffw_norm_2 = nullptr;
     std::vector<float> exp_down_scale;
+    xmx::ExpertTable tab_gate_up, tab_down;  // device pointer tables over exp_gate_up / exp_down (decode path)
+    const float* exp_down_scale_dev = nullptr;
   };
   struct Slot {
     int64_t length = 0;
@@ -128,6 +130,10 @@ class Engine {
   // indices and weights and the expert activation buffers.
   float *moe_ = nullptr, *rlog_ = nullptr, *gx_ = nullptr, *dws_ = nullptr;
   int32_t* dids_ = nullptr;
+  // Decode-path MoE (T * n_used <= kFp16Rows pairs): chosen expert ids and weights, the grouped
+  // gate_up output before GeGLU.
+  int32_t* moe_ids_ = nullptr;
+  float *moe_w_ = nullptr, *moe_gu_ = nullptr;
   xmx::Activations act_exp_, act_exp_ffn_;
   int32_t *tok_, *slot_, *pos_, *tiles_sliding_, *tiles_global_;
   int64_t max_tiles_sliding_ = 0, max_tiles_global_ = 0;
