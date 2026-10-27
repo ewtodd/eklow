@@ -1018,3 +1018,29 @@ GSM8K two at a time 40.2 tok/s aggregate (41.8-41.9 at N = 50-51), the CPU's lar
 experts. A long prefill step now takes about twice as long, so another slot's decode waits longer between tokens
 while a prompt prefills. check26 with 2,048-token chunks is identical to 1,024 (245/256, 2.38e-2; chat 23/25,
 6.87e-2): every kernel computes each row on its own.
+
+## 2026-10-27 — EmbeddingGemma 2 in GEMMs
+
+The embedding endpoint ran ~900 tok/s through production while Open WebUI reindexed (the server's log): the model ran
+on the reference kernels, one input at a time, every matrix a per-output dot product over Q8_0 weights. Now
+(`src/model/embed_gemma2.cpp`) a request's inputs go through together in passes of up to the reserved 8,192 tokens,
+RoPE at each row's position within its input, attention input by input (still `ref::attention_bidir`), each input
+averaged on the card. Every matrix runs on xmx's fp16 GEMM, which gains two weight forms (`xmx::repack`): Q8_0, tiles
+of int8 already in B-operand order dequantized in shared local memory as Q4_0's are, and F16 (from F16, BF16 or F32
+files; EmbeddingGemma's one BF16 matrix, the per-layer projection). Each layer's per-layer input is made from the
+scaled embeddings when the layer needs it: precomputing all 24 layers' took 400 MB of the card at 8,192 tokens.
+
+Through the server with production flags (`tools/bench/embed_bench.py`: unholy's 32k Pile document cut into
+1,800-character chunks with EmbeddingGemma's document prefix, Open WebUI's shape; main against this, one card state):
+
+| | before | now |
+|---|---|---|
+| 16 inputs a request (~470 tokens each) | 883 tok/s | 3,717 |
+| 1 input a request | 890 | 2,335 |
+| ~5,900-token inputs, 4 a request | 425 | 610 |
+
+The vectors are the old ones to six places (cosine 1.000000, the least over 98 inputs), and check26 is unchanged
+(the Q4_0 path is the same code). The activations at 8,192 tokens fell from ~0.9 GB to ~0.45, so the 26B at 2 x 262k
+places N = 50 experts a layer again (46). What holds it now is attention on the reference kernel, a work-group
+reduction per key (long inputs barely moved); the engine's attention kernels with a key range per token, which image
+input needs too, are next.

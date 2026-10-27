@@ -78,6 +78,72 @@ Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave) {
   return w;
 }
 
+namespace {
+
+constexpr int64_t tile_bytes(WeightFormat f) { return f == WeightFormat::Q4_0 ? kTileBytes : f == WeightFormat::Q8_0 ? 256 : 512; }
+
+// The B-operand index of element (k, n) of a 16-K half: (k/2)*16 + n*2 + k%2.
+inline int64_t vnni(int64_t k, int64_t n) { return (k / 2) * 16 + n * 2 + k % 2; }
+
+}  // namespace
+
+Weight repack(sycl::queue& q, const ref::Weight& raw) {
+  if (raw.type == gguf::Type::Q4_0) return repack_q4_0(q, raw);
+  if (raw.k % 32 || raw.n % 8) throw std::runtime_error("xmx: matrix shape not a multiple of 32 x 8");
+  const bool q8 = raw.type == gguf::Type::Q8_0;
+  if (!q8 && raw.type != gguf::Type::F16 && raw.type != gguf::Type::BF16 && raw.type != gguf::Type::F32)
+    throw std::runtime_error("xmx: no repack for this weight type");
+  Weight w{raw.k, raw.n, nullptr, nullptr, q8 ? WeightFormat::Q8_0 : WeightFormat::F16};
+  const int64_t kb = raw.k / 32, ng = raw.n / 8;
+  w.tiles = sycl::malloc_device<uint8_t>(size_t(ng * kb * tile_bytes(w.format)), q);
+  if (q8) w.scales = sycl::malloc_device<sycl::half>(size_t(ng * kb * 8), q);
+  if (!w.tiles || (q8 && !w.scales)) throw std::runtime_error("xmx: out of device memory repacking weights");
+  const uint8_t* src = raw.data;
+  const uint64_t row_bytes = raw.row_bytes;
+  const gguf::Type type = raw.type;
+  uint8_t* tiles = w.tiles;
+  sycl::half* scales = w.scales;
+  // One work-item per (tile, column): its 32 K of one column.
+  q.parallel_for(sycl::range<3>(size_t(ng), size_t(kb), 8), [=](sycl::id<3> id) {
+    const int64_t g = int64_t(id[0]), b = int64_t(id[1]), n = int64_t(id[2]);
+    const uint8_t* row = src + uint64_t(g * 8 + n) * row_bytes;
+    if (q8) {
+      // A Q8_0 block: the fp16 scale, then 32 int8.
+      const uint8_t* blk = row + uint64_t(b) * 34;
+      int8_t* t = reinterpret_cast<int8_t*>(tiles + tile_at(b, g, kb) * 256);
+      for (int k = 0; k < 32; ++k) t[(k / 16) * 128 + vnni(k % 16, n)] = int8_t(blk[2 + k]);
+      scales[tile_at(b, g, kb) * 8 + n] = sycl::bit_cast<sycl::half>(uint16_t(blk[0] | blk[1] << 8));
+      return;
+    }
+    sycl::half* t = reinterpret_cast<sycl::half*>(tiles + tile_at(b, g, kb) * 512);
+    for (int k = 0; k < 32; ++k) {
+      const int64_t i = b * 32 + k;
+      float v;
+      if (type == gguf::Type::F32) {
+        uint32_t u;
+        __builtin_memcpy(&u, row + i * 4, 4);
+        v = sycl::bit_cast<float>(u);
+      } else {
+        const uint16_t u = uint16_t(row[i * 2] | row[i * 2 + 1] << 8);
+        v = type == gguf::Type::F16 ? float(sycl::bit_cast<sycl::half>(u)) : sycl::bit_cast<float>(uint32_t(u) << 16);
+      }
+      t[(k / 16) * 128 + vnni(k % 16, n)] = sycl::half(v);
+    }
+  });
+  q.wait();
+  return w;
+}
+
+Weight rows_of(const Weight& w, int64_t n0, int64_t n) {
+  if (n0 % 8 || n % 8 || n0 + n > w.n) throw std::runtime_error("xmx: rows_of outside the matrix");
+  const int64_t kb = w.k / 32;
+  Weight v = w;
+  v.n = n;
+  v.tiles = w.tiles + (n0 / 8) * kb * tile_bytes(w.format);
+  if (w.scales) v.scales = w.scales + (n0 / 8) * kb * 8;
+  return v;
+}
+
 void free_weight(sycl::queue& q, Weight& w) {
   if (w.tiles) sycl::free(w.tiles, q);
   if (w.scales) sycl::free(w.scales, q);
@@ -106,8 +172,8 @@ void free_activations(sycl::queue& q, Activations& a) {
   a.h = nullptr;
 }
 
-void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a) {
-  set_rows(a, m, a.k);
+void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a, bool fp16) {
+  set_rows(a, m, a.k, fp16);
   const int64_t m_pad = a.m_pad, kb = a.k / 32, k = a.k;
   if (a.fp16) {
     sycl::half* hd = a.h;
@@ -137,9 +203,9 @@ void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a) {
    });
 }
 
-void set_rows(Activations& a, int64_t m, int64_t k) {
+void set_rows(Activations& a, int64_t m, int64_t k, bool fp16) {
   if (k % 32) throw std::runtime_error("xmx: activation width not a multiple of 32");
-  a.fp16 = m > kFp16Rows;
+  a.fp16 = fp16 || m > kFp16Rows;
   const int64_t m_pad = a.fp16 ? (m + 255) / 256 * 256 : (m + 31) / 32 * 32;
   if (m_pad * k > a.capacity) throw std::runtime_error("xmx: activation buffer too small");
   a.m = m;
@@ -156,9 +222,10 @@ namespace {
 // b+1 before block b's dpas and stores them after, so their latency hides behind the dpas.
 // (DECISIONS 2026-10-24, "fp16 GEMM": 48-52 TFLOPS on the 12B's shapes, against 23-37 TOPS for
 // the int8 GEMM, whose per-block scaling the vector units cannot keep up with.)
-template <int WM, int WN, bool Grouped = false>
+template <int WM, int WN, bool Grouped = false, WeightFormat F = WeightFormat::Q4_0>
 struct Gemm16Kernel {
   static constexpr int NT = WM * WN, BT = WN * 4, AT = WM * 2;  // threads; weight / activation 8-tiles
+  static constexpr int DW = F == WeightFormat::Q4_0 ? 16 : F == WeightFormat::Q8_0 ? 32 : 64;  // dwords of a (tile, K half) piece
   static constexpr int kBPieces = BT * 2, kAPieces = AT * 2;     // per block: (tile, K half) pieces
   static constexpr int BP = (kBPieces + NT - 1) / NT, AP = (kAPieces + NT - 1) / NT;
   static constexpr uint32_t kBBuf = kBPieces * 256, kBuf = kBBuf + kAPieces * 256;
@@ -195,7 +262,7 @@ struct Gemm16Kernel {
       rt0 = row0 / 8;
       if (!live) kbl = 0;
     }
-    esimd::simd<uint32_t, 16> D[BP];
+    esimd::simd<uint32_t, DW> D[BP];
     esimd::simd<sycl::half, 8> S[BP];
     esimd::simd<sycl::half, 128> Araw[AP];
     auto load = [&](int b) SYCL_ESIMD_FUNCTION {
@@ -203,8 +270,8 @@ struct Gemm16Kernel {
       for (int i = 0; i < BP; ++i) {
         const int p = tid + i * NT, g = tn * BT + p / 2, h = p % 2;
         if (p >= kBPieces) break;
-        D[i] = esimd::block_load<uint32_t, 16>(reinterpret_cast<const uint32_t*>(bt + tile_at(b, g, kb) * kTileBytes + h * 64));
-        S[i] = esimd::block_load<sycl::half, 8>(bs + tile_at(b, g, kb) * 8);
+        D[i] = esimd::block_load<uint32_t, DW>(reinterpret_cast<const uint32_t*>(bt + tile_at(b, g, kb) * (8 * DW) + h * (4 * DW)));
+        if constexpr (F != WeightFormat::F16) S[i] = esimd::block_load<sycl::half, 8>(bs + tile_at(b, g, kb) * 8);
       }
 #pragma unroll
       for (int i = 0; i < AP; ++i) {
@@ -218,24 +285,35 @@ struct Gemm16Kernel {
       for (int i = 0; i < BP; ++i) {
         const int p = tid + i * NT;
         if (p >= kBPieces) break;
+        if constexpr (F == WeightFormat::F16) {
+          esimd::slm_block_store<uint32_t, 64>(buf + p * 256, D[i]);
+          continue;
+        }
         esimd::simd<sycl::half, 16> sc2;
         sc2.select<8, 2>(0) = S[i];
         sc2.select<8, 2>(1) = S[i];
-        // One dword holds a column's 8 nibbles of one K octet, each the s4 value; flipping bit 3
-        // gives back the Q4_0 nibble q (value q - 8). Each pair of nibbles becomes a VNNI word, q
-        // as the fp16 1024 + q (exponent bits 0x6400 over the low mantissa).
-        esimd::simd<uint32_t, 16> Dq = D[i] ^ 0x88888888u;
-        esimd::simd<uint32_t, 64> W;
+        if constexpr (F == WeightFormat::Q8_0) {
+          // Already in B-operand order: each int8 times its column's scale.
+          const esimd::simd<int8_t, 128> q8 = D[i].template bit_cast_view<int8_t>();
+          esimd::slm_block_store<sycl::half, 128>(buf + p * 256, esimd::simd<sycl::half, 128>(q8) * sc2.replicate<8>());
+          continue;
+        } else if constexpr (F == WeightFormat::Q4_0) {
+          // One dword holds a column's 8 nibbles of one K octet, each the s4 value; flipping bit 3
+          // gives back the Q4_0 nibble q (value q - 8). Each pair of nibbles becomes a VNNI word, q
+          // as the fp16 1024 + q (exponent bits 0x6400 over the low mantissa).
+          esimd::simd<uint32_t, 16> Dq = D[i] ^ 0x88888888u;
+          esimd::simd<uint32_t, 64> W;
 #pragma unroll
-        for (int g2 = 0; g2 < 2; ++g2)
+          for (int g2 = 0; g2 < 2; ++g2)
 #pragma unroll
-          for (int q = 0; q < 4; ++q) {
-            const esimd::simd<uint32_t, 8> t = esimd::simd<uint32_t, 8>(Dq.template select<8, 1>(g2 * 8)) >> (8 * q);
-            W.select<8, 1>((g2 * 4 + q) * 8) = (t & 0xF) | ((t << 12) & 0xF0000) | 0x64006400u;
-          }
-        esimd::simd<sycl::half, 128> Wh = W.template bit_cast_view<sycl::half>();
-        Wh = (Wh - sycl::half(1032)) * sc2.replicate<8>();
-        esimd::slm_block_store<sycl::half, 128>(buf + p * 256, Wh);
+            for (int q = 0; q < 4; ++q) {
+              const esimd::simd<uint32_t, 8> t = esimd::simd<uint32_t, 8>(Dq.template select<8, 1>(g2 * 8)) >> (8 * q);
+              W.select<8, 1>((g2 * 4 + q) * 8) = (t & 0xF) | ((t << 12) & 0xF0000) | 0x64006400u;
+            }
+          esimd::simd<sycl::half, 128> Wh = W.template bit_cast_view<sycl::half>();
+          Wh = (Wh - sycl::half(1032)) * sc2.replicate<8>();
+          esimd::slm_block_store<sycl::half, 128>(buf + p * 256, Wh);
+        }
       }
 #pragma unroll
       for (int i = 0; i < AP; ++i)
@@ -302,7 +380,8 @@ struct Gemm16Kernel {
   }
 };
 
-void gemm16(sycl::queue& q, const Activations& a, const Weight& w, float* out, sycl::half* glu = nullptr) {
+template <WeightFormat F>
+void gemm16_f(sycl::queue& q, const Activations& a, const Weight& w, float* out, sycl::half* glu) {
   // At 1,024 rows the 256 x 128 tile leaves the narrow matrices (N 3,840) with 4 x 30
   // work-groups, under two waves of the 64 the card holds at once; the 128 x 128 tile doubles
   // the groups with the same per-thread work.
@@ -310,14 +389,22 @@ void gemm16(sycl::queue& q, const Activations& a, const Weight& w, float* out, s
   if ((a.m_pad / 256) * (w.n / 128) < kMinGroups) {
     constexpr int WM = 8, WN = 4;
     if (a.m_pad % (16 * WM) || w.n % (32 * WN)) throw std::runtime_error("xmx: fp16 GEMM tile does not divide the problem");
-    Gemm16Kernel<WM, WN> k{a.h, w.tiles, w.scales, out, int32_t(a.k / 32), int32_t(w.n / 8), int32_t(a.m), int32_t(w.n), glu};
+    Gemm16Kernel<WM, WN, false, F> k{a.h, w.tiles, w.scales, out, int32_t(a.k / 32), int32_t(w.n / 8), int32_t(a.m), int32_t(w.n), glu};
     q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(a.m_pad / 16), size_t(w.n / 32)), sycl::range<2>(WM, WN)), k);
     return;
   }
   constexpr int WM = 16, WN = 4;
   if (a.m_pad % (16 * WM) || w.n % (32 * WN)) throw std::runtime_error("xmx: fp16 GEMM tile does not divide the problem");
-  Gemm16Kernel<WM, WN> k{a.h, w.tiles, w.scales, out, int32_t(a.k / 32), int32_t(w.n / 8), int32_t(a.m), int32_t(w.n), glu};
+  Gemm16Kernel<WM, WN, false, F> k{a.h, w.tiles, w.scales, out, int32_t(a.k / 32), int32_t(w.n / 8), int32_t(a.m), int32_t(w.n), glu};
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(a.m_pad / 16), size_t(w.n / 32)), sycl::range<2>(WM, WN)), k);
+}
+
+void gemm16(sycl::queue& q, const Activations& a, const Weight& w, float* out, sycl::half* glu = nullptr) {
+  switch (w.format) {
+    case WeightFormat::Q8_0: return gemm16_f<WeightFormat::Q8_0>(q, a, w, out, glu);
+    case WeightFormat::F16: return gemm16_f<WeightFormat::F16>(q, a, w, out, glu);
+    default: return gemm16_f<WeightFormat::Q4_0>(q, a, w, out, glu);
+  }
 }
 
 template <int WM>
@@ -607,6 +694,7 @@ void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
     gemm16(q, a, w, out);
     return;
   }
+  if (w.format != WeightFormat::Q4_0) throw std::runtime_error("xmx: Q8_0 and F16 weights need fp16 activations (quantize with fp16)");
   if (row_tiles > 4) throw std::runtime_error("xmx: int8 activations of more than 32 rows");
   // T = the largest power of two <= the row-count's thread target / ng, clamped to [1, 32].
   const int64_t ng = w.n / 8;
