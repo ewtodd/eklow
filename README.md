@@ -45,16 +45,16 @@ Gemma 4 12B (48 layers, dense) is 7.0 GB and fits the card whole.
 ## Performance
 
 Measured on that machine (October 2026), through `eklow-server` with fiona's production flags: the 26B with two
-slots of 262,144 tokens, int8 global KV, 50 of 128 experts a layer on the card and EmbeddingGemma 2 loaded. The
-method is unholy's (`tools/bench/serve_perf.py`, on unholy's unique Pile documents cut to Gemma token depths;
-prefill from `docs/bench/serve-perf-26b-segments-fiona-2026-10-27.txt`, decode and GSM8K from
-`docs/bench/serve-perf-26b-fiona-2026-10-27.txt`, which the change since does not touch):
+slots of 262,144 tokens, int8 global KV, 2,048-token prefill chunks, 46 of 128 experts a layer on the card and
+EmbeddingGemma 2 loaded. The method is unholy's (`tools/bench/serve_perf.py`, on unholy's unique Pile documents cut
+to Gemma token depths; `docs/bench/serve-perf-26b-chunk2048-fiona-2026-10-27.txt`, and for GSM8K one at a time
+`docs/bench/serve-perf-26b-fiona-2026-10-27.txt`, at N = 51 and 1,024-token chunks):
 
 | | Gemma 4 26B A4B |
 |---|---|
-| prefill, one request, unique text (time to first token) | 1631 tok/s at 8k, 1529 at 32k, 1040 at 128k, 703 at 252k (367 s) |
-| decode, one stream | 37.6 tok/s at 8k, 34.9 at 32k, 30.9 at 128k, 26.7 at 252k |
-| GSM8K chat (48 requests, thinking on), 1 / 2 at a time | 33.4 / 41.9 tok/s aggregate |
+| prefill, one request, unique text (time to first token) | 1865 tok/s at 8k, 1794 at 32k, 1177 at 128k, 765 at 252k (338 s) |
+| decode, one stream | 36.6 tok/s at 8k, 34.0 at 32k, 30.5 at 128k, 26.5 at 252k |
+| GSM8K chat (48 requests, thinking on), 1 / 2 at a time | 33.4 / 40.2 tok/s aggregate |
 
 A question on a document already in the prefix cache starts in 0.2-0.7 s. At depth the global layers' attention is
 still what costs (55% of prefill at 128k): it runs in segments of 2,048 keys as two GEMMs at ~31 TFLOPS of the
@@ -75,10 +75,11 @@ cached), then decoded 27.4 tok/s; two 259k-token prompts at once prefilled in 36
 Before eklow, llama.cpp's Vulkan backend on this card gave the 12B ~110-150 tok/s of prefill at 16k depth and ~22
 tok/s of decode, with 2 x 32k contexts.
 
-Production settings: two slots of 262,144 tokens, 1,024-token prefill chunks, the profile from four recordings, a 1 GiB
-card margin; the server prints the placement at startup (6.14 GiB of weights and 6.41 GiB of KV on the card, 50
-experts a layer, 40 streaming slots, 7.3 GiB of cold experts in pinned host memory; ~100 MB of the card goes
-to the long prefill attention's buffers).
+Production settings: two slots of 262,144 tokens, 2,048-token prefill chunks, the profile from four recordings, a 1 GiB
+card margin; the server prints the placement at startup (5.77 GiB of weights and 6.80 GiB of KV on the card, 46
+experts a layer, 40 streaming slots, 7.7 GiB of cold experts in pinned host memory; ~100 MB of the card goes
+to the long prefill attention's buffers). 1,024-token chunks (`--chunk 1024`) keep 4 more experts a layer and
+prefill ~14% slower (DECISIONS 2026-10-27, "2,048-token prefill chunks by default").
 
 ## Accuracy
 
@@ -112,7 +113,7 @@ an exact CPU emulation of the quantized arithmetic (`eklow-kernel-test`, `eklow-
 - **The chat format and tokenizer, matching the references exactly**: Google's chat template ported to C++ and
   byte-identical to Hugging Face's rendering (a GGUF carrying any other template is refused); a tokenizer identical
   to Hugging Face's; a streaming parser for the thinking channel and tool calls.
-- **Scheduling**: continuous batching of two slots with chunked prefill (1,024 tokens a sequence a step), decodes
+- **Scheduling**: continuous batching of two slots with chunked prefill (2,048 tokens a sequence a step), decodes
   first, the rest of the step filled with prefill; a paged cache for the global layers and a ring per sequence for
   the sliding ones; the global layers' K/V in int8 with a scale per 16 dimensions (what lets 2 x 262k fit); prefix
   reuse, a new request taking the slot whose cached sequence shares the longest prefix with its prompt.

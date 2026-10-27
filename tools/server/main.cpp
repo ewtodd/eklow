@@ -5,9 +5,10 @@
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME]]
 //
 // --ctx is the context of each slot (positions), Gemma's full 262,144 by default; --batch the
-// tokens of one engine step and --chunk the prefill tokens of one sequence in a step. The global
-// layers' K/V are int8 by default, which is what lets 2 x 262k fit beside the weights; --kv-fp16
-// decodes a little faster at depth but cannot hold 2 x 262k.
+// tokens of one engine step and --chunk the prefill tokens of one sequence in a step (2,048: twice the rows per
+// expert GEMM of 1,024 and half the steps, +14% prefill at 32k for ~0.4 GB of sliding rings, 4 experts a layer at
+// 2 x 262k; DECISIONS 2026-10-27). The global layers' K/V are int8 by default, which is what lets 2 x 262k
+// fit beside the weights; --kv-fp16 decodes a little faster at depth but cannot hold 2 x 262k.
 // --expert-profile (the 26B): the experts of each layer that the routing profile says are busiest stay on
 // the card and the rest are computed on the CPU. How many (--experts-on-card) is, by default, as many as fit
 // in the card's free memory after the KV cache, the workspace and the embedding model, less
@@ -144,7 +145,7 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 int main(int argc, char** argv) {
   std::string model_path, alias = "gemma-4-12b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2";
   int port = 8081, slots = 2, embed_port = 8082;
-  int64_t ctx = 262144, batch = 2048, chunk = 1024;
+  int64_t ctx = 262144, batch = 2048, chunk = 2048;
   bool kv_int8 = true;
   std::string expert_profile;
   int64_t experts_on_card = -2;  // as many as fit, once there is a profile

@@ -98,7 +98,7 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
 
 // Allocates the scratch attend needs for up to max_tiles query tiles a step and chunks of up to max_chunk_rows
 // rows per K/V head, for one kind of layer: the long prefill's buffers on the global layers take ~100 MB (the
-// 26B's 1,024-token chunks), which an engine should count before it spends the card's free memory on experts.
+// 26B's 2,048-token chunks), which an engine should count before it spends the card's free memory on experts.
 void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim);
 
 // Writes K, V fp32 [n_tok][n_head_kv][head_dim] at each token's slot and position.

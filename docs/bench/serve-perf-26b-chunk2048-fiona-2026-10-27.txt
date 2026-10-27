@@ -1,0 +1,49 @@
+# Gemma 4 26B A4B through eklow-server with production flags and 2,048-token prefill chunks (the server's default from
+# branch perf/chunk2048), 2026-10-27: 2 slots of 262,144 tokens, int8 global KV, EmbeddingGemma 2 loaded,
+# --expert-profile data/gemma-4-26b-a4b-experts.json. The sliding rings hold one more chunk, so N = 46 of 128 experts a
+# layer fit on the card (50 with 1,024-token chunks). eklow.service was stopped; the server ran from the build tree
+# (~/eklow-micro/sp8k.sh: serve-perf.sh's parts one at a time). Method as in serve-perf-26b-fiona-2026-10-27.txt.
+
+## startup
+eklow-server: gemma-4-26b-a4b on Intel(R) Arc(TM) A770M Graphics, 5.77 GiB of weights, 6.80 GiB of KV cache (2 slots of 262144), 3.6 s
+eklow-server: experts on the card: N = 46 of 128 per layer, the rest on the CPU (one expert of every layer is 96 MiB; free card memory before them 5.57 GiB, margin 1.00 GiB, free after 1.00 GiB)
+eklow-server: prefill streams busy cold experts to the card: 40 slots (255 MiB on the card), 7.66 GiB of cold experts pinned in host memory
+eklow-server: embeddinggemma-2, 0.27 GiB, listening on 127.0.0.1:18182
+eklow-server: listening on 127.0.0.1:18181
+
+## depth
+request | prompt 8191 (0 cached), completion 256 | ttft 4.39 s, prefill 1864.9 tok/s, decode 36.6 tok/s
+request | prompt 8190 (8177 cached), completion 256 | ttft 0.20 s, prefill 63.5 tok/s, decode 36.7 tok/s
+request | prompt 8193 (8177 cached), completion 256 | ttft 0.22 s, prefill 73.6 tok/s, decode 36.6 tok/s
+request | prompt 8190 (8177 cached), completion 256 | ttft 0.20 s, prefill 65.0 tok/s, decode 36.8 tok/s
+request | prompt 8190 (8177 cached), completion 256 | ttft 0.20 s, prefill 65.1 tok/s, decode 36.2 tok/s
+request | prompt 32795 (0 cached), completion 256 | ttft 18.28 s, prefill 1794.2 tok/s, decode 34.0 tok/s
+request | prompt 32794 (32781 cached), completion 256 | ttft 0.25 s, prefill 51.7 tok/s, decode 34.1 tok/s
+request | prompt 32797 (32781 cached), completion 256 | ttft 0.26 s, prefill 61.0 tok/s, decode 33.0 tok/s
+request | prompt 32794 (32781 cached), completion 256 | ttft 0.25 s, prefill 51.9 tok/s, decode 34.4 tok/s
+request | prompt 32794 (32781 cached), completion 256 | ttft 0.25 s, prefill 52.5 tok/s, decode 34.0 tok/s
+request | prompt 131099 (0 cached), completion 256 | ttft 111.43 s, prefill 1176.5 tok/s, decode 30.5 tok/s
+request | prompt 131098 (131085 cached), completion 256 | ttft 0.43 s, prefill 30.6 tok/s, decode 30.6 tok/s
+request | prompt 131101 (131085 cached), completion 256 | ttft 0.44 s, prefill 36.5 tok/s, decode 30.6 tok/s
+request | prompt 131098 (131085 cached), completion 256 | ttft 0.42 s, prefill 30.9 tok/s, decode 30.4 tok/s
+request | prompt 131098 (131085 cached), completion 256 | ttft 0.41 s, prefill 31.4 tok/s, decode 30.5 tok/s
+request | prompt 258075 (0 cached), completion 256 | ttft 337.56 s, prefill 764.5 tok/s, decode 26.4 tok/s
+request | prompt 258074 (258061 cached), completion 256 | ttft 0.68 s, prefill 19.1 tok/s, decode 26.5 tok/s
+request | prompt 258077 (258061 cached), completion 256 | ttft 0.71 s, prefill 22.5 tok/s, decode 26.6 tok/s
+request | prompt 258074 (258061 cached), completion 256 | ttft 0.70 s, prefill 18.6 tok/s, decode 26.5 tok/s
+request | prompt 258074 (258061 cached), completion 256 | ttft 0.69 s, prefill 18.9 tok/s, decode 25.8 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 5
+8k         1865 (4.4 s)        36.6
+32k         1794 (18.3 s)        34.0
+128k         1177 (111.4 s)        30.5
+252k          765 (337.6 s)        26.5
+
+## against 1,024-token chunks (the same tree with --chunk 1024: N = 50), alternated at 32k
+chunk 2048: N = 46 32k         1741 (18.8 s)        32.8
+chunk 1024: N = 50 32k         1535 (21.4 s)        33.0
+chunk 2048: N = 46 32k         1758 (18.7 s)        32.4
+chunk 1024: N = 50 32k         1534 (21.4 s)        33.0
+
+## concurrency (2,048-token chunks, N = 46; 1 at a time not rerun)
+gsm, 48 requests, 2 at a time: 45921 completion tokens in 1141.7 s, 40.2 tok/s aggregate, decode per stream median 20.7 tok/s
