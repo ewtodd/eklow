@@ -1078,3 +1078,31 @@ request's own overhead (497 tokens in 0.106 s). The cache and scratch cost the 2
 5.24e-3). Alternating `eklow-attn-test` runs against main: decode the same (global8 at 16k 302-306 us against
 305-308), prefill the same but the int8 sliding layers' 1024-token chunk at 16k, 1.71 ms against 1.67-1.68 (the group
 kernel reads `lo` at run time; ~0.15% of a prefill chunk).
+
+## 2026-10-27 — Gemma 4's vision encoder, on the reference kernels
+
+Image input for the 26B and EmbeddingGemma 2 starts from llama.cpp's projector `gemma4v` (both models' mmproj files:
+the 26B's 27 layers of 1,152, 16 heads of 72, BF16, out 2,816; EmbeddingGemma 2's 16 of 768, 12 heads of 64, Q8_0,
+out 512). `model::VisionGemma4V` (from `m7/vision`) follows `tools/mtmd/models/gemma4v.cpp` and `build_vit` at the
+oracle's revision on the reference kernels: the patch embedding, x/y position tables, 2D NeoX RoPE (base 100, a head's
+halves by column and row), unweighted V norm, attention scale 1, post norms, 3 x 3 average pooling, sqrt(n_embd),
+std_bias / std_scale, an unweighted RMS norm and the projection. Neither file sets `use_gelu`, so the FFN is
+llama.cpp's fallback, gelu_quick. `image::prepare` (from `image-input`) decodes with the stb_image llama.cpp vendors
+and resizes as mtmd does (a token budget, 70 to 1,120, default 280; Pillow's bicubic in fixed point). The oracle gains
+`--image-tokens N --encode-only` (mtmd's encoder on the CPU, rows and taps), `eklow-vision` encodes an image, and
+`tools/ref/compare_rows.cpp` compares rows.
+
+Token counts equal llama.cpp's on every image. Against the stock oracle the rows miss the gate on their tail rows
+(26B min cosine 0.994-0.998, total rel L2 1.2-1.9e-2; EmbeddingGemma 2 to 0.32 on one row of one image, 3-9e-2): ggml's
+CPU backend rounds activations to bf16 / q8_0 and gelu and im2col through fp16, and the stock oracle differs from the
+same oracle on F32-converted weights by as much as eklow does from it. Against the F32-weight oracle (280 tokens):
+
+| | cosine min / mean | rel L2 worst row / total |
+|---|---|---|
+| 26B, test-1 / tall / wide | 0.99715 / 0.999932, 0.99986 / 0.999983, 0.99954 / 0.999995 | 7.6e-2 / 1.2e-2, 1.7e-2 / 5.7e-3, 3.0e-2 / 3.3e-3 |
+| EmbeddingGemma 2, the same | 0.99985 / 0.999997, 0.99994 / 0.999997, 0.99997 / 0.999999 | 1.7e-2 / 2.5e-3, 1.1e-2 / 2.7e-3, 8.2e-3 / 1.2e-3 |
+
+Layer by layer (26B, tall) the difference grows smoothly from 1e-4 to 1.4e-2, no step. The encoder is judged against
+the F32-weight oracle; the 26B's one row at 0.997 is left to the end-to-end check (the model's answers about images).
+The reference kernels are correctness only: 7.5 s for 72 tokens of the 26B, 41 s for 270, EmbeddingGemma 2 148 s for
+1,080 (llama.cpp's CPU: 4-19 s); one work-item per output and a serial attention.

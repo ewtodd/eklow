@@ -60,6 +60,24 @@ void attention(sycl::queue& q, const float* Q, const float* K, const float* V, i
 void attention_bidir(sycl::queue& q, const float* Q, const float* K, const float* V, int64_t n_tok, int64_t n_head,
                      int64_t n_head_kv, int64_t head_dim, int64_t half_window, float scale, float* out);
 
+// Attention over all n_tok keys for every query, no mask (a vision encoder's): query head h reads
+// K/V head h / (n_head / n_head_kv); one work-item per (query, head), online softmax.
+// out[t][h][d] = softmax_j(scale * q.k_j) . v_j
+void attention_dense(sycl::queue& q, const float* Q, const float* K, const float* V, int64_t n_tok, int64_t n_head,
+                     int64_t n_head_kv, int64_t head_dim, float scale, float* out);
+
+// x[r][:] += v[:], rows of `cols`.
+void add_rows(sycl::queue& q, float* x, const float* v, int64_t rows, int64_t cols);
+
+// out = gelu_quick(gate) * up, gelu_quick(x) = x / (1 + exp(-1.702 x)) (ggml_geglu_quick_split)
+void gelu_quick_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out);
+// out = x rounded to bf16 (nearest even) and back: what ggml's CPU backend does to the activations of a BF16 weight
+void round_bf16(sycl::queue& q, const float* x, int64_t n, float* out);
+// out = min(max(x, lo), hi)
+void clamp(sycl::queue& q, const float* x, float lo, float hi, int64_t n, float* out);
+// x[r][:] *= v[:], rows of `cols`.
+void mul_rows(sycl::queue& q, float* x, const float* v, int64_t rows, int64_t cols);
+
 // out = gelu_tanh(gate) * up
 void gelu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out);
 // out = gelu_tanh(x)

@@ -246,6 +246,67 @@ void attention_bidir(sycl::queue& q, const float* Q, const float* K, const float
   }
 }
 
+void attention_dense(sycl::queue& q, const float* Q, const float* K, const float* V, int64_t n_tok, int64_t n_head,
+                     int64_t n_head_kv, int64_t head_dim, float scale_by, float* out) {
+  const int64_t group = n_head / n_head_kv;
+  // Queries in launches of about 2e9 multiply-adds per matrix product: well under xe's 5 s.
+  const int64_t per = std::max<int64_t>(1, int64_t(2e9 / double(n_head * n_tok * head_dim)));
+  for (int64_t t0 = 0; t0 < n_tok; t0 += per) {
+    const int64_t tc = std::min(per, n_tok - t0);
+    q.parallel_for(sycl::range<2>(size_t(tc), size_t(n_head)), [=](sycl::id<2> id) {
+       const int64_t t = t0 + int64_t(id[0]), h = int64_t(id[1]), kh = h / group;
+       const float* qv = Q + (t * n_head + h) * head_dim;
+       float* o = out + (t * n_head + h) * head_dim;
+       for (int64_t d = 0; d < head_dim; ++d) o[d] = 0;
+       float m = -INFINITY, l = 0;
+       for (int64_t j = 0; j < n_tok; ++j) {
+         const float* kv = K + (j * n_head_kv + kh) * head_dim;
+         const float* vv = V + (j * n_head_kv + kh) * head_dim;
+         float s = 0;
+         for (int64_t d = 0; d < head_dim; ++d) s += qv[d] * kv[d];
+         s *= scale_by;
+         const float mn = sycl::fmax(m, s);
+         const float corr = sycl::exp(m - mn), p = sycl::exp(s - mn);
+         l = l * corr + p;
+         for (int64_t d = 0; d < head_dim; ++d) o[d] = o[d] * corr + p * vv[d];
+         m = mn;
+       }
+       for (int64_t d = 0; d < head_dim; ++d) o[d] /= l;
+     });
+  }
+}
+
+void add_rows(sycl::queue& q, float* x, const float* v, int64_t rows, int64_t cols) {
+  q.parallel_for(sycl::range<2>(size_t(rows), size_t(cols)), [=](sycl::id<2> id) {
+     x[int64_t(id[0]) * cols + int64_t(id[1])] += v[id[1]];
+   });
+}
+
+void gelu_quick_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+     const float g = gate[id[0]];
+     out[id[0]] = g * (1.0f / (1.0f + sycl::exp(-1.702f * g))) * up[id[0]];
+   });
+}
+
+void round_bf16(sycl::queue& q, const float* x, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+     uint32_t b = sycl::bit_cast<uint32_t>(x[id[0]]);
+     if ((b & 0x7fffffffu) <= 0x7f800000u) b += 0x7fffu + ((b >> 16) & 1u);
+     out[id[0]] = sycl::bit_cast<float>(b & 0xffff0000u);
+   });
+}
+
+void clamp(sycl::queue& q, const float* x, float lo, float hi, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = sycl::fmin(sycl::fmax(x[id[0]], lo), hi); });
+}
+
+void mul_rows(sycl::queue& q, float* x, const float* v, int64_t rows, int64_t cols) {
+  q.parallel_for(sycl::range<2>(size_t(rows), size_t(cols)), [=](sycl::id<2> id) {
+     x[int64_t(id[0]) * cols + int64_t(id[1])] *= v[id[1]];
+   });
+}
+
 void gelu(sycl::queue& q, const float* x, int64_t n, float* out) {
   q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
      const float g = x[id[0]];

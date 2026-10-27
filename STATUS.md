@@ -87,8 +87,10 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
 - Toolchain: the fleet's nixpkgs (c3f15ff4): intel-llvm 7.1.1, level-zero 1.32.0, intel-compute-runtime 26.31.
 - fiona: A770M on PCIe 4.0 x8 (~11 GB/s; `level_zero:0`), Iris Xe (`level_zero:1`, titles), i7-12700H (AVX-VNNI),
   32 GB DDR4.
-- Image input: the branch `image-input` (cf6e8a2, pushed): image preparation, the 12B's gemma4uv embedder on
-  reference kernels, the oracle through mtmd; not checked against the oracle, not in the engine.
+- Image input: in main, Gemma 4's vision encoder for the 26B's and EmbeddingGemma 2's mmproj files on the reference
+  kernels (`model::VisionGemma4V`, `eklow-vision`; DECISIONS 2026-10-27, "Gemma 4's vision encoder"), checked against
+  the oracle on F32-converted weights (`fiona:~/eklow-vision-data`); not in the server yet. The branch `image-input`
+  (cf6e8a2) still holds the 12B's gemma4uv embedder.
 
 ## How to work on it
 
