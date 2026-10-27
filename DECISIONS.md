@@ -803,7 +803,7 @@ free after the rest, N = 51 (the margin left 1.03 GiB). Margins tried at 2 x 262
 long request is deep, so the margin pays for what the first long requests allocate later (kernel scratch,
 the attention partials) and the driver keeps.
 
-## 2026-10-28 — streaming the busy cold experts to the card for prefill (M6 stage 3b)
+## 2026-10-27 — streaming the busy cold experts to the card for prefill (M6 stage 3b)
 
 Measured (tools/copy_bench, tools/copy_bench/tax.cpp; fiona, PCIe 4.0 x8): a cold expert is 3,345,408 bytes.
 Host to card, per expert: 360 us from the GGUF's pageable mapping (9.3 GB/s), 307 us from pinned memory (10.9
@@ -832,3 +832,26 @@ att_, dead during the MoE). The CPU takes the other cold pairs meanwhile. A laye
 Rejected: warm repacked pinned copies (reach 64: 2,070 against 1,940 tok/s at N = 64, but 2x host memory or
 profile-limited coverage: reach 32/48 carried 61/73% of cold pairs); speculative prefetch of the next layer (more
 DMA, and DMA is what costs).
+
+Results (`engine26` on real text, prefill at 1k / 4k / at 4k depth in tok/s; decode unchanged within noise):
+
+| N | before | streamed |
+|---|---|---|
+| 51 | 516 / 487 / 516 | 1,734 / 1,730 / 1,644 |
+| 64 | 609 / 610 / 669 | 1,931 / 1,907 / 1,792 |
+| 96 | 1,441 / 1,429 / 1,643 | 2,526 / 2,417 / 2,228 |
+| 112 | 2,381 / 2,354 / 2,321 | 2,788 / 2,572 / 2,342 |
+
+40 slots (255 MiB, paid for by the slab, so N stays 51 at 2 x 262k); 24 / 32 / 40 / 48 slots gave 1,467 / 1,692 /
+1,730 / 1,733 tok/s at N = 51. A 1k chunk at N = 51:
+- hot GEMMs 248 ms, ~3x their undisturbed time, the DMA tax;
+- copy wait and repack 89 ms;
+- streamed GEMM 39 ms;
+- CPU wait 20 ms;
+- attention and the dense layers ~210 ms.
+
+The server at 2 x 262k with the embedding model takes a 106,708-token prompt to its first token in 140 s (298 s
+before), held back by attention at depth. check26 at N = 51 with 40 slots gives 243/256 at 2.9e-2 (chat 22/25,
+5.1e-2), inside the band; with every expert on the card it is unchanged. 2,048-token chunks would halve the DMA per
+token (2,196 against 1,682 tok/s at N = 51 on a 4k prompt), but the sliding rings hold the window plus one chunk,
+so they cost card memory (~0.4 GB at two slots, about 4 ranks of experts); the server keeps 1,024.

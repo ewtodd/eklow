@@ -122,8 +122,11 @@ e-desktop, `~/eklow-wt-*` on fiona).
       the server at 2 x 262k, two needle requests of 88k and 167k tokens found; real-text engine26 at
       N = 112 / 96 / 64: decode 63 / 61 / 53 tok/s, prefill 2,420 / 1,445 / 612 tok/s (DECISIONS
       2026-10-27, "the 26B with cold experts on the CPU")
-- [ ] the tool-call eval against the 12B; cold prefill past N = 64 is CPU-bound (streaming busy cold
-      experts to the card would fix it)
+- [x] the busiest cold experts streamed to the card for prefill (copy engine, 40 slots): real-text
+      prefill at N = 51 / 64 / 96 from 516 / 609 / 1,441 to 1,734 / 1,931 / 2,526 tok/s; a 107k-token
+      prompt's first token at 2 x 262k in 140 s (main 298 s); decode unchanged (DECISIONS
+      2026-10-27, "streaming the busy cold experts")
+- [ ] the tool-call eval against the 12B
 
 ## Milestone 4 (speed), started early
 
