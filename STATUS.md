@@ -22,8 +22,8 @@ Live state, written as a handoff (2026-10-27). Design and targets: `DESIGN.md`; 
   `ac7f4993` (the eklow module serves the 26B: model by URL and sha256, alias `gemma-4-26b-a4b`, the profile in
   `extraArgs`; maitred's `gemma` upstream entry renamed to `eklow/gemma-4-26b-a4b`) and `f7391db6` (opencode gets an
   `eklow/gemma-4-26b-a4b` model; son-of-anton on e-desktop gets its effort metadata; son-of-anton discovers maitred's
-  models itself). The owner committed the eklow input update (`ebaa96b7`). Open WebUI seeds its settings into its DB on first start only, so on mu they are set in its admin UI
-  (2026-10-27 advice to the owner): Documents: engine OpenAI, maitred `http://127.0.0.1:4002/v1` with its maitred key,
+  models itself). The owner committed the eklow input update (`ebaa96b7`). Open WebUI seeds its settings into its
+  DB on first start only, so on mu they are set in its admin UI (2026-10-27 advice to the owner): Documents: engine OpenAI, maitred `http://127.0.0.1:4002/v1` with its maitred key,
   model `embed/embeddinggemma-2`, then reindex (the old vectors were bge-m3's); titles: a second OpenAI connection to
   maitred whose Model IDs hold only `llama/little-titles-json` (hidden in maitred's listing, which Open WebUI checks the
   task model against), that as the external task model, tag / follow-up / query / autocomplete generation off.
