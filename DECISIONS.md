@@ -615,3 +615,42 @@ cached, against ~290 us to copy it over PCIe.
 
 The worker on these tasks moved from Qwen 3.8 27B to Sonnet subagents in the evening, to let the
 rack's R9700s rest.
+
+## 2026-10-26 — the 26B in the engine; its yardstick is the fp32 reference, not llama.cpp
+
+The engine runs the 26B's MoE layers as the reference does, on a slow path for now: router logits
+through `ref::matmul`, routing on the host, then one expert at a time (gather its tokens' rows,
+GeGLU, down, scatter-add), every expert repacked on the card (13.4 GiB in all). An expert's rows
+are padded to 33 so that its matmuls take the fp16 path. The int8 GeGLU takes any width that is a
+multiple of 64 (sub-groups of 8; the experts are 704 wide, the dense FFN 2,112), and attention
+dispatches (512, 8) for the global layers' 2 K/V heads. Speed, for the record: prefill 1,540 tok/s
+at 1,024 tokens and 1,736 at 4,096; decode 18.9 / 18.3 tok/s at 0 / 4k (a wait per expert per layer).
+
+Against llama.cpp's CPU dumps the long prompt missed the band set above (30/32, mean KL 4.1e-2
+against <= 3.5e-2). The band was wrong, not the engine. llama.cpp quantizes activations to int8 per
+32-block before every Q4_0 matmul (Q8_0 on the CPU, Q8_1 in CUDA's MMQ); the engine's prefill
+GEMMs take fp16. At layer 0's attention output llama.cpp (CPU and CUDA) and the engine's own int8
+path are 6.8e-3 from eklow's fp32 reference forward, its fp16 path 3e-4. The router turns such
+differences into different experts wherever the 8th and 9th logits nearly tie (margins of
+0.0005-0.008): at layer 0 of the 2,616-token prompt, 90 positions route differently between
+llama.cpp CPU and the engine, but only 16 between llama.cpp CPU and CUDA, whose int8 rounding is
+the same. So llama.cpp's two backends agree with each other far better than either does with fp32,
+and their distance understated the 26B's noise. Over the long prompt's last 256 positions against
+the fp32 reference (the engine's last 64 decoded):
+
+| | top-1 | mean KL |
+|---|---|---|
+| llama.cpp CPU | 220/256 | 7.5e-2 |
+| engine, fp16 expert matmuls (kept) | 249/256 | 1.7e-2 |
+| engine, int8 expert matmuls up to 32 rows | 244/256 | 3.6e-2 |
+
+(On its last 32 positions alone llama.cpp CPU happened to land at 2.5e-2.) The chat prompt's 25
+positions tell these apart poorly: llama.cpp CPU 23/25 at 4.2e-2, CUDA 23/25 at 2.3e-2, the engine
+23/25 at 6.4e-2 (int8 experts 22/25, 5.9e-2). Int8 experts are as close to fp32 as llama.cpp's at
+layer 0 (ffn_moe-0 6.0e-3 for both; fp16 2.7e-3), so the decode GEMVs may stay int8: it doubles the
+engine's distance from fp32 but keeps it at half llama.cpp's.
+
+The 26B is judged from here by `check26.sh` (in the fiona harness): the engine against
+`eklow-ref-run`'s dumps on those 256 positions, inside llama.cpp CPU's own distance (>= 220/256,
+mean KL <= 7.5e-2; chat >= 22/25, <= 8e-2). The 12B keeps its check against llama.cpp: without
+routing the same int8 difference stays small (long 31/32, 1.3e-2).

@@ -104,8 +104,12 @@ e-desktop, `~/eklow-wt-*` on fiona).
 - [x] the reference forward with the MoE layers, inside the 26B's noise band (8x the 12B's)
 - [x] a routing profile: each layer's busiest 96 of 128 experts take ~98% of its selections
 - [x] Q4_0 expert GEMVs on the CPU (AVX-VNNI): ~100 us an expert from DRAM
-- [ ] the engine runs it (all experts on the card, short contexts), then MoE kernels, then experts
-      placed by the profile with the rest on the CPU; the tool-call eval against the 12B
+- [x] the engine runs it (all experts on the card, short contexts), on a slow path (routing on the
+      host, one expert at a time): against the fp32 reference 249/256 top-1, mean KL 1.7e-2 on the
+      long prompt's last 256 positions, where llama.cpp CPU is 220/256, 7.5e-2 (DECISIONS
+      2026-10-26, "the 26B in the engine"); prefill 1,540 tok/s at 1k, decode 18.9 tok/s
+- [ ] MoE kernels (routing on the card, grouped expert GEMVs and GEMMs), then experts placed by the
+      profile with the rest on the CPU; the tool-call eval against the 12B
 
 ## Milestone 4 (speed), started early
 
