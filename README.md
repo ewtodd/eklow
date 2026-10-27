@@ -15,7 +15,7 @@ It is *vertical*: two models, one card. It was built in four days by Claude Opus
 ## The machine
 
 ```
-                 i7-12700H, 32 GB DDR5 (two channels)
+                 i7-12700H, 32 GB DDR4 (two channels)
           ┌─────────────────────────────────────────────┐
           │  CPU: tokenizer, scheduler, HTTP server;      │
           │    the 26B's cold experts at decode           │

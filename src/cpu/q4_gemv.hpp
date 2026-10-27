@@ -1,5 +1,5 @@
 // Q4_0 GEMVs on the host CPU, for the 26B's cold experts: the weights come out of RAM (fiona's
-// two DDR5 channels) and the one activation row is quantized to int8 per 32-block, the same
+// two DDR4 channels) and the one activation row is quantized to int8 per 32-block, the same
 // arithmetic the card's int8 decode path does (src/kernels/xmx.cpp). AVX-VNNI's
 // _mm256_dpbusd_avx_epi32 (unsigned bytes x signed bytes) takes the nibbles as unsigned 0..15,
 // and the (nibble - 8) is removed with the block's activation sum.

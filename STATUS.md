@@ -67,7 +67,7 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
   (gemma4v, 1.19 GB) is not downloaded. The service's copies come from the Nix store (fetchurl in the module).
 - Toolchain: the fleet's nixpkgs (c3f15ff4): intel-llvm 7.1.1, level-zero 1.32.0, intel-compute-runtime 26.31.
 - fiona: A770M on PCIe 4.0 x8 (~11 GB/s; `level_zero:0`), Iris Xe (`level_zero:1`, titles), i7-12700H (AVX-VNNI),
-  32 GB DDR5.
+  32 GB DDR4.
 - Image input: the branch `image-input` (cf6e8a2, pushed): image preparation, the 12B's gemma4uv embedder on
   reference kernels, the oracle through mtmd; not checked against the oracle, not in the engine.
 
