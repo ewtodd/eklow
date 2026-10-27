@@ -855,3 +855,47 @@ before), held back by attention at depth. check26 at N = 51 with 40 slots gives 
 5.1e-2), inside the band; with every expert on the card it is unchanged. 2,048-token chunks would halve the DMA per
 token (2,196 against 1,682 tok/s at N = 51 on a 4k prompt), but the sliding rings hold the window plus one chunk,
 so they cost card memory (~0.4 GB at two slots, about 4 ranks of experts); the server keeps 1,024.
+
+## 2026-10-27 — global prefill attention: where its time goes (measured, nothing kept yet)
+
+At 32k depth the 26B's global attention is 61% of prefill (1,016 ms of 1.66 s for 2,048 tokens,
+from 5 of 30 layers); in the 12B at 16k it is ~45%. `FlashGroup` (head 512) runs at ~11 TFLOPS of
+the 98.8 the fp16 dpas offer. Copies of it with parts switched off (results wrong on purpose;
+`eklow-attn-test`, a 1,024-token chunk, the 12B's group of 16, int8 cache) took:
+
+| removed | 4k keys, ms | 16k keys, ms | at 16k |
+|---|---|---|---|
+| nothing | 10.9 | 47.2 | |
+| the two barriers a block | 7.5 | 31.9 | -32% |
+| barriers and the score exchange | 6.9 | 29.9 | -37% |
+| the loaders' work | 9.3 | 39.4 | -17% |
+| Q.K^T (dpas and K loads) | 8.8 | 43.9 | -7% |
+| P.V (dpas and V loads) | 9.2 | 41.1 | -13% |
+| Q.K^T and P.V together | 2.6 | 12.8 | -73% |
+| all of the above | 0.8 | 2.5 | -95% |
+| the softmax arithmetic | 11.1 | 47.3 | 0 |
+
+The 26B's group of 8 behaves the same (barriers -32% at 16k), and the fp16 cache runs within 2% of
+the int8 one, so the int8 dequantization costs nothing. What the table says:
+- The kernel is latency-bound through chains of stages, not bandwidth-bound: shared memory runs at
+  about a third of its bandwidth.
+- The barriers are the largest single item, worth at most ~1.45x. The two halves of the matrix work
+  are strongly super-additive, each hiding behind the other.
+- The 128-register wall is what holds it: the output accumulators take 64. Each attempt to add
+  independence spilled 2.6 KB and ran 2-2.5x slower:
+  - Q.K^T's B operands in two 1 KB loads: 91.5 ms;
+  - four Q.K^T accumulators: 116 ms;
+  - both: 105 ms.
+- The baseline already spills 288 B (fp16 cache) or 416 B (int8). A per-row rescale factor instead
+  of a broadcast changed nothing (47.4 ms).
+
+Reasoned out, not built:
+- **One barrier a block** needs K and V double-buffered (64 KB), leaving no room for the scores.
+  Staging int8 and dequantizing in the compute threads adds work to the threads that are already
+  latency-bound.
+- **Int8 Q.K^T** is worth at most its ~12% share, with an accuracy risk and a cache format change.
+
+Left to try: a group of 12 query tiles (112 threads, partial scores exchanged in fp16, one
+work-group a core, sharing the barriers and loads over twice the rows). It builds within 64 KB,
+but its first run hung (2026-10-27). Beyond it, the likely remaining lever is a deeper restructure
+that splits the 512 dimensions so each thread holds fewer than 64 accumulator registers.
