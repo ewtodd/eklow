@@ -16,6 +16,9 @@ namespace {
 constexpr int kTileBytes = 128;   // weight tile: 32 K x 8 N nibbles
 constexpr int kATileBytes = 256;  // activation tile: 8 rows x 32 K bytes
 
+// Tiles of one 8-column group run contiguously along K, so a decode thread's consecutive blocks are adjacent.
+inline int64_t tile_at(int64_t b, int64_t g, int64_t kb) { return g * kb + b; }
+
 }  // namespace
 
 Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave) {
@@ -38,14 +41,14 @@ Weight repack_q4_0(sycl::queue& q, const ref::Weight& raw, bool interleave) {
      for (int n = 0; n < 8; ++n) {
        const int64_t row = interleave ? (g % 2) * half_rows + (g / 2) * 8 + n : g * 8 + n;
        const uint8_t* blk = src + uint64_t(row) * row_bytes + uint64_t(b) * 18;
-       scales[(b * ng + g) * 8 + n] = sycl::bit_cast<sycl::half>(uint16_t(blk[0] | blk[1] << 8));
+       scales[tile_at(b, g, kb) * 8 + n] = sycl::bit_cast<sycl::half>(uint16_t(blk[0] | blk[1] << 8));
        for (int k = 0; k < 32; ++k) {
          const uint32_t q4 = (k < 16 ? blk[2 + k] & 15 : blk[2 + k - 16] >> 4) ^ 8;
          const int idx = ((k / 8) * 8 + n) * 8 + k % 8;  // nibble index in the tile
          words[idx / 8] |= q4 << (4 * (idx % 8));
        }
      }
-     uint32_t* dst = reinterpret_cast<uint32_t*>(tiles + (b * ng + g) * kTileBytes);
+     uint32_t* dst = reinterpret_cast<uint32_t*>(tiles + tile_at(b, g, kb) * kTileBytes);
      for (int i = 0; i < 32; ++i) dst[i] = words[i];
    }).wait();
   return w;
@@ -154,8 +157,8 @@ struct Gemm16Kernel {
       for (int i = 0; i < BP; ++i) {
         const int p = tid + i * NT, g = tn * BT + p / 2, h = p % 2;
         if (p >= kBPieces) break;
-        D[i] = esimd::block_load<uint32_t, 16>(reinterpret_cast<const uint32_t*>(bt + (int64_t(b) * ng + g) * kTileBytes + h * 64));
-        S[i] = esimd::block_load<sycl::half, 8>(bs + (int64_t(b) * ng + g) * 8);
+        D[i] = esimd::block_load<uint32_t, 16>(reinterpret_cast<const uint32_t*>(bt + tile_at(b, g, kb) * kTileBytes + h * 64));
+        S[i] = esimd::block_load<sycl::half, 8>(bs + tile_at(b, g, kb) * 8);
       }
 #pragma unroll
       for (int i = 0; i < AP; ++i) {
@@ -290,7 +293,7 @@ void gemv(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
                    for (int r = 0; r < RT; ++r) acc[r] = 0;
                    const int64_t b0 = int64_t(t) * per, b1 = std::min(kb, b0 + per);
                    for (int64_t b = b0; b < b1; ++b) {
-                     const int64_t wt = b * ng + g;
+                     const int64_t wt = tile_at(b, g, kb);
                      esimd::simd<uint8_t, kTileBytes> B = esimd::block_load<uint8_t, kTileBytes>(bt + wt * kTileBytes);
                      esimd::simd<sycl::half, 8> h = esimd::block_load<sycl::half, 8>(bs + wt * 8);
                      esimd::simd<float, 8> sb = h;
@@ -366,32 +369,32 @@ void gemv1(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
                    esimd::simd<float, 8> acc = 0;
                    const int64_t b0 = int64_t(t) * per, b1 = std::min(kb, b0 + per);
                    int64_t b = b0;
-                   // Four blocks per step, every load issued before the first dpas, so each
-                   // thread keeps several weight reads in flight.
+                   // Four blocks per step: the group's tiles run contiguously along K, so the four
+                   // come from one 512-byte load and their scales from one 64-byte load, and every
+                   // load is issued before the first dpas, so each thread keeps the reads in flight.
                    for (; b + 4 <= b1; b += 4) {
-                     esimd::simd<uint8_t, kTileBytes> B[4];
-                     esimd::simd<float, 8> sb[4];
+                     esimd::simd<uint8_t, 4 * kTileBytes> B4 =
+                         esimd::block_load<uint8_t, 4 * kTileBytes>(bt + tile_at(b, g, kb) * kTileBytes);
+                     esimd::simd<sycl::half, 32> h4 = esimd::block_load<sycl::half, 32>(bs + tile_at(b, g, kb) * 8);
                      esimd::simd<uint8_t, 32> A[4];
                      float sa[4];
 #pragma unroll
                      for (int u = 0; u < 4; ++u) {
-                       const int64_t wt = (b + u) * ng + g;
-                       B[u] = esimd::block_load<uint8_t, kTileBytes>(bt + wt * kTileBytes);
-                       esimd::simd<sycl::half, 8> h = esimd::block_load<sycl::half, 8>(bs + wt * 8);
-                       sb[u] = h;
                        A[u] = esimd::block_load<uint8_t, 32>(reinterpret_cast<const uint8_t*>(aq) + (b + u) * kATileBytes);
                        sa[u] = as[(b + u) * 8];
                      }
 #pragma unroll
                      for (int u = 0; u < 4; ++u) {
+                       const esimd::simd<uint8_t, kTileBytes> B = B4.template select<kTileBytes, 1>(u * kTileBytes);
+                       const esimd::simd<float, 8> sb = h4.template select<8, 1>(u * 8);
                        esimd::simd<int, 8> ci =
-                           xmxd::dpas<8, 1, int, uint8_t, uint8_t, dpas_argument_type::s4, dpas_argument_type::s8>(B[u], A[u]);
+                           xmxd::dpas<8, 1, int, uint8_t, uint8_t, dpas_argument_type::s4, dpas_argument_type::s8>(B, A[u]);
                        esimd::simd<float, 8> cf = ci;
-                       acc += cf * (sb[u] * sa[u]);
+                       acc += cf * (sb * sa[u]);
                      }
                    }
                    for (; b < b1; ++b) {
-                     const int64_t wt = b * ng + g;
+                     const int64_t wt = tile_at(b, g, kb);
                      esimd::simd<uint8_t, kTileBytes> B = esimd::block_load<uint8_t, kTileBytes>(bt + wt * kTileBytes);
                      esimd::simd<sycl::half, 8> h = esimd::block_load<sycl::half, 8>(bs + wt * 8);
                      esimd::simd<float, 8> sb = h;

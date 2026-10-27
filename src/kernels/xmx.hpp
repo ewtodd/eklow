@@ -8,9 +8,9 @@
 //     fp16 once in shared local memory for all its rows, and the dpas accumulate across all of K.
 //
 // Layouts, all written by eklow so that every load is contiguous:
-//   weights: tiles of 8 output columns x 32 K, [K/32][N/8] (K-block major), 128 bytes each, in the
-//     dpas B layout for s8 x s4: element (k, n) is nibble ((k/8)*8 + n)*8 + k%8, low nibble first;
-//     plus fp16 scales [K/32][N/8][8];
+//   weights: tiles of 8 output columns x 32 K, [N/8][K/32] (column-group major), 128 bytes each, in
+//     the dpas B layout for s8 x s4: element (k, n) is nibble ((k/8)*8 + n)*8 + k%8, low nibble first;
+//     plus fp16 scales [N/8][K/32][8];
 //   int8 activations: tiles of 8 rows x 32 K, [M_pad/8][K/32], 256 bytes each, row-major (the dpas
 //     A layout); plus fp32 scales [M_pad/8][K/32][8];
 //   fp16 activations: tiles of 8 rows x 16 K, [M_pad/8][K/16], 256 bytes each, row-major.
