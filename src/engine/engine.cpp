@@ -351,12 +351,17 @@ void Engine::load_experts() {
   };
   host(hp_ids_, P);
   host(hp_w_, P);
-  host(hp_x_, B * E);
+  host(hp_xq_, B * E);
+  host(hp_xs_, B * E / 32);
+  host(hp_map_, B);
   host(hp_y_, xmx::kFp16Rows * E);
-  host(hp_sum_, B * E);
+  host(hp_sum_, B * E);  // as many rows as tokens in the worst case
   host(hp_aq_, E / 32 * 256);
   host(hp_as_, E / 32 * 8);
-  cold_sum_ = dev(B * E);
+  cold_map_ = reinterpret_cast<int32_t*>(dev(B));
+  // cold_sum_, the quantized inputs and their scales live in workspace that is dead during the MoE
+  // (qkv_, qb_, kb_: B x 2,816 fp32, B x 2,816 fp32 and B x 88 fp32 fit them), see step().
+  cold_sum_ = qkv_;
   std::vector<std::pair<const uint8_t*, size_t>> spans;
   for (const Layer& L : layers_)
     for (int e = 0; e < NE; ++e)
@@ -467,7 +472,9 @@ void Engine::cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event route
       }
     }
     cold_compute(L, cp, hp_ids_, x, hp_y_);
-    for (size_t k = 0; k < cp.size(); ++k) q_.memcpy(gx_ + int64_t(cp[k]) * E, hp_y_ + int64_t(k) * E, size_t(E) * sizeof(float));
+    fast::PairList pl{};
+    for (size_t k = 0; k < cp.size(); ++k) pl.pair[k] = cp[k];
+    fast::cold_scatter(q_, hp_y_, pl, int64_t(cp.size()), E, gx_);
   }
   (void)NU;
   const auto t2 = Clock::now();
@@ -492,21 +499,31 @@ void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event rout
     k_of[size_t(cp[k])] = int32_t(k);
     need[size_t(cp[k] / NU)] = 1;
   }
+  const int64_t kb = E / 32;
   std::vector<cpu::Q8Blocks> x(static_cast<size_t>(T));
+  int32_t n_need = 0;
+  for (int64_t t = 0; t < T; ++t) hp_map_[t] = need[size_t(t)] ? n_need++ : -1;
   pool_->for_each(T, 8, [&](int64_t lo, int64_t hi) {
-    for (int64_t t = lo; t < hi; ++t)
-      if (need[size_t(t)]) x[size_t(t)] = cpu::quantize(hp_x_ + t * E, E);
+    for (int64_t t = lo; t < hi; ++t) {
+      if (!need[size_t(t)]) continue;
+      cpu::Q8Blocks& r = x[size_t(t)];
+      r.q.assign(hp_xq_ + t * E, hp_xq_ + (t + 1) * E);
+      r.s.assign(hp_xs_ + t * kb, hp_xs_ + (t + 1) * kb);
+      r.sum.resize(size_t(kb));
+      for (int64_t b = 0; b < kb; ++b) {
+        int32_t sum = 0;
+        for (int i = 0; i < 32; ++i) sum += r.q[size_t(b * 32 + i)];
+        r.sum[size_t(b)] = sum;
+      }
+    }
   });
   cold_y_.resize(cp.size() * size_t(E));
   cold_compute(L, cp, hp_ids_, x, cold_y_.data());
   // Each token's cold share, weighted and summed in slot order (zero for the others).
   pool_->for_each(T, 16, [&](int64_t lo, int64_t hi) {
     for (int64_t t = lo; t < hi; ++t) {
-      float* out = hp_sum_ + t * E;
-      if (!need[size_t(t)]) {
-        std::fill(out, out + E, 0.0f);
-        continue;
-      }
+      if (!need[size_t(t)]) continue;
+      float* out = hp_sum_ + int64_t(hp_map_[t]) * E;
       bool first = true;
       for (int64_t i = 0; i < NU; ++i) {
         const int32_t k = k_of[size_t(t * NU + i)];
@@ -521,7 +538,8 @@ void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event rout
       }
     }
   });
-  q_.memcpy(cold_sum_, hp_sum_, size_t(T * E) * sizeof(float));
+  q_.memcpy(cold_sum_, hp_sum_, size_t(n_need) * size_t(E) * sizeof(float));
+  q_.memcpy(cold_map_, hp_map_, size_t(T) * 4);
   const auto t2 = Clock::now();
   cold_.wait_s += std::chrono::duration<double>(t1 - t0).count();
   cold_.cpu_s += std::chrono::duration<double>(t2 - t1).count();
@@ -722,9 +740,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         sycl::event routed;
         if (L.n_cold) {
           const int64_t kb = E / 32;
-          q_.memcpy(hp_ids_, moe_ids_, size_t(P) * 4);
-          q_.memcpy(hp_aq_, act_exp_.q, size_t(kb) * 256);
-          routed = q_.memcpy(hp_as_, act_exp_.s, size_t(kb) * 8 * 4);
+          routed = fast::host_pack(q_, moe_ids_, P, act_exp_.q, kb * 256, act_exp_.s, kb * 8, hp_ids_, hp_aq_, hp_as_);
         }
         // The dense FFN's gate|up rides along as three more experts; its down follows.
         xmx::matmul_geglu_grouped_dense(q_, act_exp_, act_, L.tab_gate_up, moe_ids_, P, n_used, T, act_exp_ffn_, act_ffn_, moe_gu_);
@@ -756,7 +772,10 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
           // As at decode, the host waits for the routing and the input rows after the hot work is enqueued.
           q_.memcpy(hp_ids_, moe_ids_, size_t(P) * 4);
           q_.memcpy(hp_w_, moe_w_, size_t(P) * 4);
-          routed = q_.memcpy(hp_x_, h_, size_t(T * E) * sizeof(float));
+          // The expert inputs go as int8 (the form the CPU computes with), a quarter of the bytes.
+          fast::quantize_rows(q_, h_, T, E, reinterpret_cast<int8_t*>(qb_), kb_);
+          q_.memcpy(hp_xq_, qb_, size_t(T * E));
+          routed = q_.memcpy(hp_xs_, kb_, size_t(T) * size_t(E / 32) * sizeof(float));
         }
         fast::moe_group(q_, moe_ids_, P, n_expert, moe_tile_, moe_scratch_, moe_tiles_, moe_row_, L.cold_dev);
         mark("moe_group");
@@ -769,7 +788,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         xmx::matmul_grouped16(q_, moe_h_, L.tab_down, moe_tiles_, max_tiles, moe_tile_, moe_y_);
         mark("moe_down");
         if (L.n_cold) cold_prefill(L, T, P, routed, q_.single_task([] {}));
-        fast::moe_combine(q_, moe_y_, moe_w_, T, n_used, E, moe_, moe_row_, L.n_cold ? cold_sum_ : nullptr);
+        fast::moe_combine(q_, moe_y_, moe_w_, T, n_used, E, moe_, moe_row_, L.n_cold ? cold_sum_ : nullptr, L.n_cold ? cold_map_ : nullptr);
         mark("moe_sum");
       }
       if (!fused) fast::rmsnorm(q_, moe_, L.post_ffw_norm_2, T, E, cfg_.eps, moe_);

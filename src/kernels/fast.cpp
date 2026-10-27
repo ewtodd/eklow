@@ -269,7 +269,7 @@ void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_exp
 }
 
 void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out,
-                 const int32_t* rows, const float* extra) {
+                 const int32_t* rows, const float* extra, const int32_t* extra_row) {
   const int32_t NU = int32_t(n_used), C = int32_t(cols);
   q.parallel_for(sycl::range<1>(size_t(n_tok * cols)), [=](sycl::id<1> id) {
     const int32_t t = int32_t(id[0]) / C, j = int32_t(id[0]) % C;
@@ -278,7 +278,46 @@ void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n
       const int32_t r = rows ? rows[t * NU + i] : t * NU + i;
       if (r >= 0) s += weights[t * NU + i] * y[size_t(r) * C + j];  // r < 0: a cold expert, in `extra`
     }
-    out[id[0]] = extra ? s + extra[id[0]] : s;
+    if (extra) {
+      const int32_t er = extra_row[t];
+      if (er >= 0) s += extra[size_t(er) * C + j];
+    }
+    out[id[0]] = s;
+  });
+}
+
+sycl::event host_pack(sycl::queue& q, const int32_t* ids, int64_t n_ids, const int8_t* a, int64_t a_bytes, const float* s, int64_t s_n,
+                      int32_t* h_ids, int8_t* h_a, float* h_s) {
+  const int64_t w0 = n_ids, w1 = w0 + a_bytes / 4, w2 = w1 + s_n;
+  return q.parallel_for(sycl::range<1>(size_t(w2)), [=](sycl::id<1> id) {
+    const int64_t i = int64_t(id[0]);
+    if (i < w0) h_ids[i] = ids[i];
+    else if (i < w1) reinterpret_cast<int32_t*>(h_a)[i - w0] = reinterpret_cast<const int32_t*>(a)[i - w0];
+    else h_s[i - w1] = s[i - w1];
+  });
+}
+
+void cold_scatter(sycl::queue& q, const float* host_y, const PairList& pairs, int64_t n, int64_t cols, float* y) {
+  const int32_t C = int32_t(cols);
+  const PairList pl = pairs;
+  q.parallel_for(sycl::range<1>(size_t(n * cols)), [=](sycl::id<1> id) {
+    const int32_t k = int32_t(id[0]) / C, j = int32_t(id[0]) % C;
+    y[size_t(pl.pair[k]) * C + j] = host_y[id[0]];
+  });
+}
+
+void quantize_rows(sycl::queue& q, const float* x, int64_t rows, int64_t cols, int8_t* out, float* scale) {
+  if (cols % 32) throw std::runtime_error("fast::quantize_rows: width not a multiple of 32");
+  const int32_t KB = int32_t(cols / 32);
+  q.parallel_for(sycl::range<1>(size_t(rows * KB)), [=](sycl::id<1> id) {
+    const int64_t b = int64_t(id[0]);
+    const float* src = x + b * 32;
+    float v[32], amax = 0;
+    for (int i = 0; i < 32; ++i) {
+      v[i] = src[i];
+      amax = sycl::fmax(amax, sycl::fabs(v[i]));
+    }
+    scale[b] = xmx::quantize_run(v, amax, out + b * 32);
   });
 }
 

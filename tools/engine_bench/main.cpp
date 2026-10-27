@@ -3,7 +3,12 @@
 //
 //   eklow-engine-bench --model GGUF [--prefill 1024,4096,16384] [--chunk 2048]
 //                      [--depth 0,4096,16384] [--decode-ctx 0,4096,16384] [--decode-steps 64]
-//                      [--slots N] [--profile] [--kv-int8] [--json FILE]
+//                      [--slots N] [--profile] [--kv-int8] [--json FILE] [--tokens-json FILE]
+//                      [--expert-profile JSON --experts-on-card N] [--cpu-threads N]
+//
+// --tokens-json: draw the prompts from a real text's token ids (cycled from a random offset) instead of
+// random ids. It matters for the 26B with cold experts: random tokens route almost uniformly, where
+// real text concentrates on the busiest experts, so the CPU's share is several times higher.
 //
 // Prefill: a fresh sequence of N tokens in chunks of --chunk; tokens per second over the whole
 // prompt. Depth (llama-bench's -d): the sequence first filled to D tokens untimed, then two chunks
@@ -14,6 +19,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <stdexcept>
 #include <fstream>
 #include <map>
 #include <random>
@@ -21,7 +27,10 @@
 #include <string>
 #include <vector>
 
+#include <iterator>
+
 #include "core/json.hpp"
+#include "core/json_value.hpp"
 #include "engine/engine.hpp"
 #include "model/gguf.hpp"
 #include "rt/device.hpp"
@@ -59,7 +68,7 @@ void print_profile(const std::map<std::string, double>& p, json::Writer& w) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, json_path;
+  std::string model, json_path, tokens_json;
   std::vector<int64_t> prefill = {1024, 4096, 16384}, decode_ctx = {0, 4096, 16384}, depth;
   int64_t chunk = 2048, decode_steps = 64;
   int slots = 1;
@@ -79,13 +88,14 @@ int main(int argc, char** argv) {
     else if (a == "--slots") slots = std::atoi(next().c_str());
     else if (a == "--profile") profile = true;
     else if (a == "--json") json_path = next();
+    else if (a == "--tokens-json") tokens_json = next();
     else if (a == "--kv-int8") kv_int8 = true;
     else if (a == "--expert-profile") expert_profile = next();
     else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
     else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--depth N,...] [--decode-ctx N,...] "
-                           "[--decode-steps N] [--slots N] [--profile] [--kv-int8] [--json FILE] [--expert-profile JSON --experts-on-card N] [--cpu-threads N]\n");
+                           "[--decode-steps N] [--slots N] [--profile] [--kv-int8] [--json FILE] [--tokens-json FILE] [--expert-profile JSON --experts-on-card N] [--cpu-threads N]\n");
       return 2;
     }
   }
@@ -116,9 +126,18 @@ int main(int argc, char** argv) {
     if (cold) std::printf("experts on the card: %lld of %lld per layer, the rest on the CPU\n", (long long)eng.experts_on_card(), (long long)eng.model().n_expert);
     std::mt19937 rng(7);
     std::uniform_int_distribution<int32_t> id(256, 200000);
+    std::vector<int32_t> text;
+    if (!tokens_json.empty()) {
+      std::ifstream in(tokens_json);
+      const json::Value doc = json::parse(std::string((std::istreambuf_iterator<char>(in)), {}));
+      const json::Value* ids = doc.find("ids");
+      if (!ids || !ids->is_array() || ids->items().empty()) throw std::runtime_error(tokens_json + ": no ids");
+      for (const auto& v : ids->items()) text.push_back(int32_t(std::atoll(v.int_digits().c_str())));
+    }
     auto tokens = [&](int64_t n) {
       std::vector<int32_t> t(static_cast<size_t>(n));
-      for (auto& x : t) x = id(rng);
+      size_t at = text.empty() ? 0 : size_t(rng()) % text.size();
+      for (auto& x : t) x = text.empty() ? id(rng) : text[at++ % text.size()];
       return t;
     };
     std::map<std::string, double> prof;
@@ -138,12 +157,20 @@ int main(int argc, char** argv) {
     for (int64_t n : prefill) {
       prof.clear();
       eng.set_profile(profile ? &prof : nullptr);
+      const auto cs0 = eng.cold_stats();
+      const uint64_t pr0 = eng.pairs(), cp0 = eng.cold_pairs();
       auto t0 = std::chrono::steady_clock::now();
       fill(0, n);
       const double s = since(t0);
       eng.set_profile(nullptr);
       eng.release(0);
       std::printf("prefill %6lld tokens: %7.2f s, %8.1f tok/s\n", (long long)n, s, double(n) / s);
+      if (cold) {
+        const auto cs = eng.cold_stats();
+        std::printf("    cold experts: %.2f s waiting on the card's routing, %.2f s computing on the CPU, %.1f%% of pairs on the CPU, %llu of %llu layers with the card finished first\n",
+                    cs.wait_s - cs0.wait_s, cs.cpu_s - cs0.cpu_s, 100.0 * double(eng.cold_pairs() - cp0) / double(std::max<uint64_t>(1, eng.pairs() - pr0)),
+                    (unsigned long long)(cs.late_layers - cs0.late_layers), (unsigned long long)(cs.layers - cs0.layers));
+      }
       w.begin_object().kv("tokens", n).kv("seconds", s).kv("tok_per_s", double(n) / s);
       if (profile) print_profile(prof, w);
       w.end_object();

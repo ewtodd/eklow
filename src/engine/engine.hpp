@@ -183,13 +183,16 @@ class Engine {
   xmx::Activations act_, act_ffn_;  // matmul inputs: of width E or H x D, and of the FFN's width
   attn::Scratch attn_scratch_;
   // Cold experts (see Config): the host pool, pinned buffers for the routing and inputs the host
-  // reads (hp_ids_, hp_w_, hp_x_ the fp32 rows, hp_aq_ hp_as_ decode's int8 row tile), for the rows it
-  // writes (hp_y_: decode's output rows; hp_sum_: prefill's weighted sums, copied to cold_sum_).
+  // reads (hp_ids_, hp_w_; prefill's int8 expert inputs hp_xq_ with scales hp_xs_; decode's int8 row tile
+  // hp_aq_ hp_as_), for what it writes (hp_y_: decode's output rows; prefill's weighted sums of the tokens
+  // with cold experts in hp_sum_ rows, token t's row in hp_map_[t] or -1, copied to the card's cold_sum_ and
+  // cold_map_).
   int64_t n_hot_ = 0;
   std::unique_ptr<cpu::Pool> pool_;
   int32_t* hp_ids_ = nullptr;
-  float *hp_w_ = nullptr, *hp_x_ = nullptr, *hp_y_ = nullptr, *hp_sum_ = nullptr, *hp_as_ = nullptr, *cold_sum_ = nullptr;
-  int8_t* hp_aq_ = nullptr;
+  float *hp_w_ = nullptr, *hp_xs_ = nullptr, *hp_y_ = nullptr, *hp_sum_ = nullptr, *hp_as_ = nullptr, *cold_sum_ = nullptr;
+  int8_t *hp_aq_ = nullptr, *hp_xq_ = nullptr;
+  int32_t *hp_map_ = nullptr, *cold_map_ = nullptr;
   std::vector<float> cold_y_, cold_gu_;
   std::vector<cpu::Q8Blocks> cold_g_;
   uint64_t pairs_ = 0, cold_pairs_ = 0;

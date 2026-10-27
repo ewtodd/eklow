@@ -62,10 +62,24 @@ void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_exp
                int32_t* ids, float* weights);
 // out[t][:] = sum_i weights[t][i] * y[row(t, i)][:], summed in the order i = 0..n_used-1; row(t, i)
 // is t * n_used + i, or rows[t * n_used + i] when given (the grouped GEMM's sorted order), where a
-// negative row is a pair left out (a cold expert). `extra` [n_tok][cols], when given, is added to the
-// sum: the cold experts' share, already weighted, from the host.
+// negative row is a pair left out (a cold expert). `extra`, when given, holds the cold experts' share
+// (already weighted, from the host) in rows [extra_row[t]][cols], added to token t's sum unless
+// extra_row[t] is negative.
 void moe_combine(sycl::queue& q, const float* y, const float* weights, int64_t n_tok, int64_t n_used, int64_t cols, float* out,
-                 const int32_t* rows = nullptr, const float* extra = nullptr);
+                 const int32_t* rows = nullptr, const float* extra = nullptr, const int32_t* extra_row = nullptr);
+// Decode with cold experts: one kernel that copies the routing (ids [n_ids]) and the experts' input
+// row (the first 8-row tile of int8 activations, a_bytes, and its scales, s_n floats) into pinned host
+// memory, so the host needs one event instead of three copies' worth of launches and waits.
+sycl::event host_pack(sycl::queue& q, const int32_t* ids, int64_t n_ids, const int8_t* a, int64_t a_bytes, const float* s, int64_t s_n,
+                      int32_t* h_ids, int8_t* h_a, float* h_s);
+// The cold pairs' output rows from pinned host memory: row k of host_y [n][cols] becomes row pair[k] of y.
+struct PairList {
+  int32_t pair[32];
+};
+void cold_scatter(sycl::queue& q, const float* host_y, const PairList& pairs, int64_t n, int64_t cols, float* y);
+// Row-major int8 for the host: out[r][cols] and one fp32 scale per 32-block, s[r][cols / 32] = max|x| / 127,
+// q = round(x / s), as xmx::quantize_run does it.
+void quantize_rows(sycl::queue& q, const float* x, int64_t rows, int64_t cols, int8_t* out, float* scale);
 
 // Prefill's grouping of the (token, slot) pairs p = t * n_used + i by expert (ids as moe_route wrote
 // them), a stable counting sort so that results do not depend on scheduling: expert e's pairs, in

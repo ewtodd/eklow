@@ -213,6 +213,11 @@ int main(int argc, char** argv) {
       std::printf("experts on the card: %lld of %lld per layer; %.2f%% of %llu routed pairs went to the CPU\n", (long long)eng.experts_on_card(),
                   (long long)eng.model().n_expert, eng.pairs() ? 100.0 * double(eng.cold_pairs()) / double(eng.pairs()) : 0.0,
                   (unsigned long long)eng.pairs());
+    if (eng.model().n_expert > eng.experts_on_card()) {
+      const auto& cs = eng.cold_stats();
+      std::printf("cold experts: %.2f s waiting on the card's routing, %.2f s computing on the CPU over %llu layers (%llu with the card finished first)\n",
+                  cs.wait_s, cs.cpu_s, (unsigned long long)cs.layers, (unsigned long long)cs.late_layers);
+    }
 
     if (twin) {
       if (twin_logits.size() != logits.size()) throw std::runtime_error("twin produced a different number of logits");

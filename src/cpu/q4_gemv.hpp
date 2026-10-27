@@ -41,10 +41,13 @@ void gemv_q4(const uint8_t* rows, int64_t k, int64_t n, const Q8Blocks& x, float
 // A pool of idle workers. for_each runs f(lo, hi) over contiguous chunks of [0, n),
 // claimed dynamically in grain-row steps (the i7-12700H mixes P and E cores, so a static even
 // split leaves the fast cores waiting), by the workers and the caller; returns when all are done.
-// One call at a time.
+// One call at a time. A worker that has just finished a job spins for about spin_us before it sleeps
+// on the condition variable, and the caller spins for the workers the same way: a futex wake costs
+// 50-100 us, as much as a decode-time expert's whole GEMV, and decode calls come every few hundred
+// microseconds. A job of one grain runs on the caller alone.
 class Pool {
  public:
-  explicit Pool(int threads);  // total threads including the caller
+  explicit Pool(int threads, int spin_us = 400);  // total threads including the caller
   ~Pool();
   Pool(const Pool&) = delete;
   Pool& operator=(const Pool&) = delete;
@@ -53,15 +56,16 @@ class Pool {
 
  private:
   void run(int id);
+  int spin_us_;
   std::vector<std::thread> workers_;
   std::mutex mu_;
   std::condition_variable wake_, done_;
   const std::function<void(int64_t, int64_t)>* job_ = nullptr;
   int64_t n_ = 0, grain_ = 1;
   std::atomic<int64_t> next_{0};
-  uint64_t gen_ = 0;  // bumped per job so each worker runs each job exactly once
-  int pending_ = 0;
-  bool stop_ = false;
+  std::atomic<uint64_t> gen_{0};  // bumped per job so each worker runs each job exactly once
+  std::atomic<int> pending_{0};
+  std::atomic<bool> stop_{false};
 };
 
 void gemv_q4(const uint8_t* rows, int64_t k, int64_t n, const Q8Blocks& x, float* y, Pool& pool);
