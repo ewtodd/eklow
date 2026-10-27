@@ -688,3 +688,33 @@ runs in the engine as fast as in its test (~50 us). The gap is unexplained. A la
 launches, of which the small MoE kernels take ~3 ms of the step.
 
 Prefill: 1,014 tok/s at 1k and 973 at 4k depth, the per-expert loop with a host wait per expert.
+
+## 2026-10-26 — the 26B's decode step in fewer kernels
+
+The gate_up "gap" above was the profiler's doing. With the kernels around it fused, the grouped
+gate_up profiles at ~92 us a layer, the same as the kernel test. `--profile`'s `mark()`s wait on
+the queue after every section, so a short kernel's section also carries its neighbours' launch and
+ramp. Small decode sections must be judged by ab.sh deltas, not by the profile. The grouped GEMV's
+work-item count, swept 2,048-32,768: 14.9 / 14.6 / 14.8 / 15.4 / 17.3 ms a step. 8,192 is kept.
+
+Decode steps of the 26B (T x 8 <= 32) now run 10 launches a layer outside attention, from 18:
+- **`fast::residual_norm_quant3`:** one kernel takes the post-attention residual and one rmsnorm,
+  then writes the dense FFN's int8 input, the experts' int8 input and the router's fp32 input.
+- **The dense FFN's gate|up rides in the grouped GEMV as three more "experts".** Its 4,224
+  interleaved columns are 3 x 1,408, and in the column-group-major layout each third is a
+  contiguous range of tiles, so the thirds are just pointer offsets in the expert table. One GeGLU
+  launch then serves the experts and the dense FFN.
+- **`fast::moe_tail`:** one kernel per row does the dense norm, the experts' weighted sum, its norm,
+  the add, the residual and the next layer's quantize.
+
+| decode, tok/s | at 0 | at 4k |
+|---|---|---|
+| one slot (stage 2b) | 68.2 (51.0) | 61.9 (46.9) |
+| two slots, per sequence (stage 2b) | 53.9 (41.3) | 48.3 (38.1) |
+
+One slot at 0 is 14.7 ms a step, from 19.6. check26 gives 247/256 at mean KL 2.6e-2; the 12B is
+unchanged. Folding the GeGLU into the grouped GEMV's epilogue gave wrong logits and no gain
+(14.73 against 14.64 ms), so it was dropped.
+
+The grouped GEMVs read at ~180 GB/s against the card's 399. A profiled step at 0 (18.3 ms with
+marks): gate_up (experts and dense) 3.8 ms, head 2.8, qkv 1.9, wo 1.75, expert down 1.6.
