@@ -163,6 +163,20 @@ installs the profile as `share/eklow/gemma-4-26b-a4b-experts.json`, and the flak
 `services.eklow` (`model`, `alias`, `contextSize`, `slots`, `kvInt8`, the embedding model, `extraArgs`). The comment
 at the top of `tools/server/main.cpp` explains every flag.
 
+The log, on stdout (`journalctl -u eklow` under the module), is unholy's: a line per chat request as it ends, a line
+per embedding request and per rejected request, and every 10 s while there is traffic (`--log-interval`) the
+engine's rates, slots and prefix hits:
+
+```
+15:21:29 request chatcmpl-2ca6…: length | prompt 22, completion 48 | queue 0.00 s, ttft 0.18 s, prefill 119.7 tok/s, decode 36.3 tok/s
+15:21:33 embeddings: 3 inputs, 28 tokens | wait 0.00 s, 0.157 s, 178 tok/s
+15:21:33 error 400 (invalid_request_error): the body is not JSON: JSON: expected a key at byte 1
+15:21:38 engine: prompt 5.8 tok/s, generation 16.1 tok/s | running 0, waiting 0 | kv 0.0% (126 of 524288 positions, 126 cached) | prefix hit 6.5% | embeddings 1 requests, 3 inputs, 2.8 tok/s
+```
+
+Prefill in a request's line is over the uncached part of its prompt, from the slot to the first token; cached
+positions are those kept in idle slots for prefix reuse.
+
 `eklow-probe` measures what the card actually does (allocatable memory, copy rates, launch and host-signal latency),
 and `eklow-copy-bench` what PCIe copies cost the kernels beside them: the first things to run on new hardware.
 

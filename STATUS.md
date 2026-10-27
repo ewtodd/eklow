@@ -16,12 +16,17 @@ Live state, written as a handoff (2026-10-27). Design and targets: `DESIGN.md`; 
   2.2-2.3x prefill at 128k-252k through the server (below). Deploying them is the owner's (update the eklow input in
   `/etc/nixos`'s flake.lock, rebuild; the module sets no `--chunk`). The server then places N = 46 of 128 experts a
   layer: the rings hold one more chunk (~0.4 GB) and the attention's ~100 MB is reserved before the experts.
+  Also in main: the server's log in unholy's form (a line per request, embedding request and rejection, and the
+  engine's every 10 s while there is traffic; README "Running").
 - **`/etc/nixos`** (the owner deploys; agents only commit, as son-of-anton-bot, no co-author trailers):
   `ac7f4993` (the eklow module serves the 26B: model by URL and sha256, alias `gemma-4-26b-a4b`, the profile in
   `extraArgs`; maitred's `gemma` upstream entry renamed to `eklow/gemma-4-26b-a4b`) and `f7391db6` (opencode gets an
   `eklow/gemma-4-26b-a4b` model; son-of-anton on e-desktop gets its effort metadata; son-of-anton discovers maitred's
-  models itself). The eklow input update in `flake.lock` (to 71bfb75) is staged there but not committed: the
-  owner's. Open WebUI still had the old model id/URL when this was written (the owner is fixing it).
+  models itself). The owner committed the eklow input update (`ebaa96b7`). Open WebUI seeds its settings into its DB on first start only, so on mu they are set in its admin UI
+  (2026-10-27 advice to the owner): Documents: engine OpenAI, maitred `http://127.0.0.1:4002/v1` with its maitred key,
+  model `embed/embeddinggemma-2`, then reindex (the old vectors were bge-m3's); titles: a second OpenAI connection to
+  maitred whose Model IDs hold only `llama/little-titles-json` (hidden in maitred's listing, which Open WebUI checks the
+  task model against), that as the external task model, tag / follow-up / query / autocomplete generation off.
 - **Clients**: pick `eklow/gemma-4-26b-a4b` explicitly (maitred's `auto` does not route to it). Text only: image
   parts get a clear "not supported yet" error.
 - **The card is the service's.** Anything else on the A770M beside it (a second eklow-server, a bench) can starve it
