@@ -1202,3 +1202,10 @@ channel's name all but the ends; in reasoning all but `<channel|>` and the ends;
 and `<|"|>`. The sampler drops them before anything else (from the tool grammar's allowed set too), so the model
 takes its next choice instead. llama.cpp samples them and its parser copes as it can. `eklow-grammar-test` checks that
 in each state the banned set is exactly what the parser refuses (96 of 96 state and token pairs).
+
+The sampler took 1.2-1.8 ms a token (on the host, between two decode steps of ~27 ms): every one of the 262,144
+candidates went into an array for `nth_element`. Dropping the bans from that array cost another 0.33 ms, as did
+setting them to -inf (`nth_element`'s pivots on that data). Top-k now keeps the k best in a heap during one pass over
+the logits, skipping the bans by comparing each id with the next one: 0.21 ms with or without bans, and the same picks
+as before (900 of 900 against main's sampler over greedy, top-k 64 and none, top-p, min-p and penalties, ties
+included).
