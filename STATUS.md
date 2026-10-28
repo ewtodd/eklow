@@ -30,8 +30,9 @@ Live state, written as a handoff (2026-10-27). Design and targets: `DESIGN.md`; 
   old vectors were bge-m3's); titles: a second OpenAI connection to maitred whose Model IDs hold only
   `llama/little-titles-json` (hidden in maitred's listing, which Open WebUI checks the task model against), that as the
   external task model, tag / follow-up / query / autocomplete generation off.
-- **Clients**: pick `eklow/gemma-4-26b-a4b` explicitly (maitred's `auto` does not route to it). Text only: image
-  parts get a clear "not supported yet" error.
+- **Clients**: pick `eklow/gemma-4-26b-a4b` explicitly (maitred's `auto` does not route to it). Text only in production:
+  image parts get a clear "not supported" error until the service runs with `--mmproj` (main has image input,
+  DECISIONS 2026-10-27, "image input through the server"; the encoders cost the 26B five experts a layer).
 - **The card is the service's.** Anything else on the A770M beside it (a second eklow-server, a bench) can starve it
   into `UR_RESULT_ERROR_OUT_OF_RESOURCES` on every request until it restarts: that happened 2026-10-27 09:05-09:19
   when a test server was started beside it, and `systemctl restart eklow` fixed it. `bench.sh` and
@@ -88,9 +89,9 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
 - fiona: A770M on PCIe 4.0 x8 (~11 GB/s; `level_zero:0`), Iris Xe (`level_zero:1`, titles), i7-12700H (AVX-VNNI),
   32 GB DDR4.
 - Image input: in main, Gemma 4's vision encoder for the 26B's and EmbeddingGemma 2's mmproj files on the reference
-  kernels (`model::VisionGemma4V`, `eklow-vision`; DECISIONS 2026-10-27, "Gemma 4's vision encoder"), checked against
-  the oracle on F32-converted weights (`fiona:~/eklow-vision-data`); not in the server yet. The branch `image-input`
-  (cf6e8a2) still holds the 12B's gemma4uv embedder.
+  kernels and on the matrix units (`model::VisionGemma4V`, `eklow-vision`; DECISIONS 2026-10-27), checked against the
+  oracle on F32-converted weights (`fiona:~/eklow-vision-data`), and through the server (`--mmproj`, `--embed-mmproj`;
+  "image input through the server"). The branch `image-input` (cf6e8a2) still holds the 12B's gemma4uv embedder.
 
 ## How to work on it
 

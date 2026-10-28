@@ -121,6 +121,11 @@ an exact CPU emulation of the quantized arithmetic (`eklow-kernel-test`, `eklow-
   reuse, a new request taking the slot whose cached sequence shares the longest prefix with its prompt.
 - **Embeddings beside chat**: EmbeddingGemma 2 on its own queue on the card, so an embedding does not wait behind a
   long prefill.
+- **Image input**: OpenAI `image_url` parts (base64 `data:` URLs; JPEG, PNG, GIF, BMP) for the 26B with its mmproj
+  (`--mmproj`), and image inputs to `/v1/embeddings` with EmbeddingGemma 2's (`--embed-mmproj`): Gemma 4's vision
+  encoder on the matrix units (~0.15-0.3 s an image at the default 280-row budget, `--image-tokens` up to 1,120), its
+  weights streamed from host memory a layer at a time, the image tokens bidirectional on the sliding layers as
+  llama.cpp runs them, and prefix reuse that tells images apart.
 - **Mixture of experts on 16 GB** (the 26B): routing, grouping and the experts' GEMVs and GEMMs on the card with no
   host round trip when every expert fits; a placement by routing profile when they do not, with cold experts on the
   CPU (AVX-VNNI) at decode and streamed over PCIe for prefill.
@@ -148,7 +153,8 @@ drivers, so it runs on any host.
 ```sh
 eklow-server --model gemma-4-26b-a4b-it-qat-q4_0.gguf --alias gemma-4-26b-a4b \
   --slots 2 --ctx 262144 --kv-int8 --expert-profile data/gemma-4-26b-a4b-experts.json \
-  --embed-model embeddinggemma-2-Q8_0.gguf --embed-port 8082 --host 0.0.0.0 --port 8081
+  --embed-model embeddinggemma-2-Q8_0.gguf --embed-port 8082 --host 0.0.0.0 --port 8081 \
+  --mmproj gemma-4-26b-a4b-it-mmproj.gguf --embed-mmproj mmproj-embeddinggemma-2-Q8_0.gguf
 ```
 
 ```sh
