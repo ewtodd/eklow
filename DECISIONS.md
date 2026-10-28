@@ -1178,3 +1178,18 @@ End to end at production flags: an image encodes in 0.14-0.18 s at 280 rows (1.4
 after a 130-row request; a second turn reuses the prefix with the image (`prompt 297 (149 cached, 130 image)`); two
 different same-size pictures are told apart. The 26B described test-1 as the New York Times front page of July 21,
 1969, "MEN WALK ON MOON", and a 1,080-row IDE screenshot as a C++ file in an editor with a build log, both right.
+
+## 2026-10-27 — structural tokens only where they parse
+
+The 26B, through son-of-anton at 46k tokens of context (request `chatcmpl-48ecc99c`, 21:25), wrote `<channel|>` in the
+middle of a word of its answer ("doesn'"): the end of a thought channel, with no channel open. The output parser
+refuses a special token its state cannot take and the server shows the refusal in the content, so the answer ended in
+"[malformed tool call: unexpected <channel|> in content]". The model does this by itself (the owner has seen such
+slips under llama.cpp); eklow's arithmetic is within the oracle's noise.
+
+Gemma 4 has 24 special tokens (17 control, 7 user-defined), all structural. `OutputParser::banned()` lists, for the
+parser's state, the ones it would refuse: in content all but `<|channel>`, `<|tool_call>` and the turn's ends; in a
+channel's name all but the ends; in reasoning all but `<channel|>` and the ends; in a tool call all but `<tool_call|>`
+and `<|"|>`. The sampler drops them before anything else (from the tool grammar's allowed set too), so the model
+takes its next choice instead. llama.cpp samples them and its parser copes as it can. `eklow-grammar-test` checks that
+in each state the banned set is exactly what the parser refuses (96 of 96 state and token pairs).

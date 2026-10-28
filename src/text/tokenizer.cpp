@@ -201,6 +201,13 @@ std::vector<int32_t> Tokenizer::encode(std::span<const Piece> pieces) const {
   return out;
 }
 
+std::vector<int32_t> Tokenizer::special_ids() const {
+  std::vector<int32_t> ids;
+  for (size_t i = 0; i < special_.size(); ++i)
+    if (special_[i]) ids.push_back(int32_t(i));
+  return ids;
+}
+
 std::string Tokenizer::bytes(int32_t id) const {
   if (id < 0 || size_t(id) >= pieces_.size()) throw std::out_of_range("token id " + std::to_string(id));
   if (byte_of_[id] >= 0) return std::string(1, char(byte_of_[id]));

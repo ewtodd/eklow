@@ -6,7 +6,9 @@
 // Calls: random well-formed calls (nested arguments of every kind, strings full of the
 // punctuation the syntax uses), written as the template writes them and tokenized as the model
 // would see them; every token must be allowed. Walks: random token sequences drawn from the
-// allowed sets until the call closes; every one must parse into a call of a declared tool.
+// allowed sets until the call closes; every one must parse into a call of a declared tool. Bans:
+// in each state of the output parser, the special tokens it bans are exactly those it refuses.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <memory>
@@ -197,9 +199,35 @@ int main(int argc, char** argv) {
         }
       }
     }
+    // Bans: in each state of the output parser, the special tokens it bans (never sampled) are exactly those it
+    // refuses there.
+    int bad_bans = 0, checked = 0;
+    {
+      const int32_t channel = tok.id("<|channel>");
+      std::vector<int32_t> thought{channel}, call{vocab->call_open};
+      for (int32_t id : tok.encode("thought\n", false)) thought.push_back(id);
+      // A call with its body written, so that closing it is well formed.
+      for (int32_t id : tok.encode("call:todo{}", false)) call.push_back(id);
+      const std::vector<std::pair<const char*, std::vector<int32_t>>> states = {
+          {"content", {}}, {"channel name", {channel}}, {"reasoning", thought}, {"tool call", call}};
+      for (const auto& [name, prefix] : states) {
+        text::OutputParser p(tok);
+        for (int32_t id : prefix) p.push(id);
+        const std::vector<int32_t>& banned = p.banned();
+        for (int32_t s : tok.special_ids()) {
+          text::OutputParser q = p;
+          const bool refused = !q.push(s).errors.empty(), is_banned = std::binary_search(banned.begin(), banned.end(), s);
+          ++checked;
+          if (refused != is_banned && ++bad_bans <= 5)
+            std::fprintf(stderr, "%s: %s is %s but %s\n", name, tok.piece(s).c_str(), refused ? "refused" : "taken",
+                         is_banned ? "banned" : "not banned");
+        }
+      }
+    }
     std::printf("calls: %d of %d accepted token by token\n", calls - bad_calls, calls);
     std::printf("walks: %d closed (%d hit the length cap), %d failed to parse or got stuck\n", closed, capped, bad_walks);
-    return bad_calls || bad_walks ? 1 : 0;
+    std::printf("bans: %d of %d (state, special token) pairs banned exactly when refused\n", checked - bad_bans, checked);
+    return bad_calls || bad_walks || bad_bans ? 1 : 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-grammar-test: %s\n", e.what());
     return 1;

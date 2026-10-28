@@ -9,23 +9,37 @@ namespace eklow::serve {
 
 Sampler::Sampler(const SamplingParams& p) : p_(p), rng_(p.seed) {}
 
-int32_t Sampler::sample(std::span<const float> logits, const std::vector<int32_t>* allowed) {
+int32_t Sampler::sample(std::span<const float> logits, const std::vector<int32_t>* allowed, const std::vector<int32_t>* banned) {
   const int32_t V = int32_t(logits.size());
   auto adjusted = [&](int32_t id) {
     float l = logits[size_t(id)];
     if (auto it = counts_.find(id); it != counts_.end()) l -= p_.presence_penalty + p_.frequency_penalty * float(it->second);
     return l;
   };
+  const bool bans = banned && !banned->empty();
   cand_.clear();
   if (allowed) {
     if (allowed->empty()) throw std::runtime_error("sampler: no token allowed");
-    for (int32_t id : *allowed) cand_.push_back({adjusted(id), id});
-  } else if (counts_.empty()) {
-    cand_.reserve(size_t(V));
-    for (int32_t id = 0; id < V; ++id) cand_.push_back({logits[size_t(id)], id});
+    for (int32_t id : *allowed)
+      if (!bans || !std::binary_search(banned->begin(), banned->end(), id)) cand_.push_back({adjusted(id), id});
+    if (cand_.empty())
+      for (int32_t id : *allowed) cand_.push_back({adjusted(id), id});
   } else {
     cand_.reserve(size_t(V));
-    for (int32_t id = 0; id < V; ++id) cand_.push_back({adjusted(id), id});
+    if (counts_.empty())
+      for (int32_t id = 0; id < V; ++id) cand_.push_back({logits[size_t(id)], id});
+    else
+      for (int32_t id = 0; id < V; ++id) cand_.push_back({adjusted(id), id});
+    if (bans) {
+      // The candidates are in id order, as the bans are: drop them in one pass.
+      size_t w = 0, b = 0;
+      for (size_t r = 0; r < cand_.size(); ++r) {
+        while (b < banned->size() && (*banned)[b] < cand_[r].second) ++b;
+        if (b < banned->size() && (*banned)[b] == cand_[r].second) continue;
+        cand_[w++] = cand_[r];
+      }
+      cand_.resize(w);
+    }
   }
   auto by_logit = [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); };
   if (p_.temperature <= 0) return std::min_element(cand_.begin(), cand_.end(), by_logit)->second;

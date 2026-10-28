@@ -28,8 +28,10 @@ class Sampler {
   explicit Sampler(const SamplingParams& p);
 
   // `allowed`, when given, holds the only token ids that may be picked (a constraint's mask);
-  // it must not be empty.
-  int32_t sample(std::span<const float> logits, const std::vector<int32_t>* allowed = nullptr);
+  // it must not be empty. `banned`, ascending, holds ids that are never picked (unless they are all
+  // that `allowed` leaves).
+  int32_t sample(std::span<const float> logits, const std::vector<int32_t>* allowed = nullptr,
+                 const std::vector<int32_t>* banned = nullptr);
   // Counts a token of the completion for the penalties.
   void accept(int32_t id) { ++counts_[id]; }
 

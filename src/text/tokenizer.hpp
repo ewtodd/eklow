@@ -52,6 +52,8 @@ class Tokenizer {
   // -1 when the piece is not in the vocabulary.
   int32_t id(std::string_view piece) const;
   bool is_special(int32_t id) const { return special_.at(size_t(id)); }
+  // Every special (control or user-defined) token's id, ascending.
+  std::vector<int32_t> special_ids() const;
   int32_t bos() const { return bos_; }
   int32_t eos() const { return eos_; }
 
