@@ -42,6 +42,41 @@ in
       description = "The embedding model's GGUF, served on `embedPort`; null serves chat only.";
     };
 
+    mmproj = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = lib.literalExpression ''
+        pkgs.fetchurl {
+          name = "gemma-4-26b-a4b-it-mmproj.gguf";
+          url = "https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-gguf/resolve/d1c082be9cf3c8a514acf63b8761f4b41935842e/gemma-4-26B-it-mmproj.gguf";
+          sha256 = "a359953a076b877db30c31dbbb4c6d93b4a6e017ee5db5784247e4d4c0dd4f3b";
+        }
+      '';
+      description = ''
+        The chat model's vision projector (a gemma4v mmproj GGUF: the 26B A4B's), for image_url parts in chat; null
+        refuses them. Its card memory (~282 MiB at 280-row images) is reserved before the experts are placed.
+      '';
+    };
+
+    embedMmproj = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = lib.literalExpression ''
+        pkgs.fetchurl {
+          name = "mmproj-embeddinggemma-2-Q8_0.gguf";
+          url = "https://huggingface.co/ggml-org/embeddinggemma-2-GGUF/resolve/58faf90940886df2d62be555c8765d00dac362c5/mmproj-embeddinggemma-2-Q8_0.gguf";
+          sha256 = "c4a8a52691ecef40618438928bdf9e68379b854e24166f292592353db0aab64f";
+        }
+      '';
+      description = "EmbeddingGemma 2's vision projector, for image inputs to /v1/embeddings (~264 MiB of the card); null refuses them.";
+    };
+
+    imageTokens = lib.mkOption {
+      type = lib.types.ints.between 70 1120;
+      default = 280;
+      description = "Rows an image becomes at most (Gemma 4's budget; Google's default is 280, the projector's maximum 1120).";
+    };
+
     host = lib.mkOption {
       type = lib.types.str;
       default = "127.0.0.1";
@@ -146,6 +181,18 @@ in
             (toString cfg.embedPort)
             "--embed-alias"
             cfg.embedAlias
+          ]
+          ++ lib.optionals (cfg.mmproj != null) [
+            "--mmproj"
+            cfg.mmproj
+          ]
+          ++ lib.optionals (cfg.embedMmproj != null) [
+            "--embed-mmproj"
+            cfg.embedMmproj
+          ]
+          ++ lib.optionals (cfg.mmproj != null || cfg.embedMmproj != null) [
+            "--image-tokens"
+            (toString cfg.imageTokens)
           ]
           ++ cfg.extraArgs
         );

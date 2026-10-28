@@ -168,8 +168,9 @@ curl http://localhost:8081/v1/chat/completions -H 'Content-Type: application/jso
 Loading takes 4-7 s once the files are in the page cache. The server prints what it placed where: the weights
 and KV on the card, how many experts a layer stayed there, the streaming slots and the pinned memory. The package
 installs the profile as `share/eklow/gemma-4-26b-a4b-experts.json`, and the flake's NixOS module runs the server as
-`services.eklow` (`model`, `alias`, `contextSize`, `slots`, `kvInt8`, the embedding model, `extraArgs`). The comment
-at the top of `tools/server/main.cpp` explains every flag.
+`services.eklow` (`model`, `alias`, `contextSize`, `slots`, `kvInt8`, the embedding model, the vision projectors
+`mmproj` / `embedMmproj` / `imageTokens`, `extraArgs`). The comment at the top of `tools/server/main.cpp` explains
+every flag.
 
 The log, on stdout (`journalctl -u eklow` under the module), is unholy's: a line per chat request as it ends, a line
 per embedding request and per rejected request, and every 10 s while there is traffic (`--log-interval`) the
