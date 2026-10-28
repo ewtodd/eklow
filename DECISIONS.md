@@ -34,7 +34,16 @@ The prompt diet (son-of-anton 85300ef3) cut the prefix before the user's message
 10,425 tokens with no loss on the Gemma probe (149 vs 155 calls, 11 vs 14 errors).
 
 A tool-call checker was evaluated on 1,082 hand-labelled steps from Gemma Signal probes plus 201
-synthetic mistakes. Generic "is this step ok" questions ranked a real bad call above a good one
+synthetic mistakes. Generic and `<|"|>`. The sampler drops them before anything else (from the tool grammar's allowed set too), so the model
+takes its next choice instead. llama.cpp samples them and its parser copes as it can. `eklow-grammar-test` checks that
+in each state the banned set is exactly what the parser refuses (96 of 96 state and token pairs).
+
+The sampler took 1.2-1.8 ms a token (on the host, between two decode steps of ~27 ms): every one of the 262,144
+candidates went into an array for `nth_element`. Dropping the bans from that array cost another 0.33 ms, as did
+setting them to -inf (`nth_element`'s pivots on that data). Top-k now keeps the k best in a heap during one pass over
+the logits, skipping the bans by comparing each id with the next one: 0.21 ms with or without bans, and the same
+picks as before (900 of 900 against main's sampler over greedy, top-k 64 and none, top-p, min-p and penalties, ties
+included).is this step ok" questions ranked a real bad call above a good one
 69-76% of the time (AUROC) for Gemma 12B as a judge, decider-2b/4b and StartLux 4B. Targeted
 questions (repeat, progress, valid arguments; claims an action it did not take, gives up while a
 tool could help, unsupported facts) on Bespoke-Nimble-9B-v3, combined by a fitted logistic model,
@@ -1178,3 +1187,25 @@ End to end at production flags: an image encodes in 0.14-0.18 s at 280 rows (1.4
 after a 130-row request; a second turn reuses the prefix with the image (`prompt 297 (149 cached, 130 image)`); two
 different same-size pictures are told apart. The 26B described test-1 as the New York Times front page of July 21,
 1969, "MEN WALK ON MOON", and a 1,080-row IDE screenshot as a C++ file in an editor with a build log, both right.
+
+## 2026-10-27 — structural tokens only where they parse
+
+The 26B, through son-of-anton at 46k tokens of context (request `chatcmpl-48ecc99c`, 21:25), wrote `<channel|>` in the
+middle of a word of its answer ("doesn'"): the end of a thought channel, with no channel open. The output parser
+refuses a special token its state cannot take and the server shows the refusal in the content, so the answer ended in
+"[malformed tool call: unexpected <channel|> in content]". The model does this by itself (the owner has seen such
+slips under llama.cpp); eklow's arithmetic is within the oracle's noise.
+
+Gemma 4 has 24 special tokens (17 control, 7 user-defined), all structural. `OutputParser::banned()` lists, for the
+parser's state, the ones it would refuse: in content all but `<|channel>`, `<|tool_call>` and the turn's ends; in a
+channel's name all but the ends; in reasoning all but `<channel|>` and the ends; in a tool call all but `<tool_call|>`
+and `<|"|>`. The sampler drops them before anything else (from the tool grammar's allowed set too), so the model
+takes its next choice instead. llama.cpp samples them and its parser copes as it can. `eklow-grammar-test` checks that
+in each state the banned set is exactly what the parser refuses (96 of 96 state and token pairs).
+
+The sampler took 1.2-1.8 ms a token (on the host, between two decode steps of ~27 ms): every one of the 262,144
+candidates went into an array for `nth_element`. Dropping the bans from that array cost another 0.33 ms, as did
+setting them to -inf (`nth_element`'s pivots on that data). Top-k now keeps the k best in a heap during one pass over
+the logits, skipping the bans by comparing each id with the next one: 0.21 ms with or without bans, and the same picks
+as before (900 of 900 against main's sampler over greedy, top-k 64 and none, top-p, min-p and penalties, ties
+included).

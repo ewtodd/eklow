@@ -227,7 +227,9 @@ void Scheduler::step() {
     }
     if (chunks[i].logits_rows == 0) continue;
     const std::span<const float> l(logits.data() + row * V, V);
-    const int32_t t = q.grammar && q.grammar->active() ? q.sampler->sample(l, &q.grammar->allowed()) : q.sampler->sample(l);
+    // Special tokens the output parser cannot take where it stands are never sampled (OutputParser::banned).
+    const std::vector<int32_t>* banned = &q.parser->banned();
+    const int32_t t = q.grammar && q.grammar->active() ? q.sampler->sample(l, &q.grammar->allowed(), banned) : q.sampler->sample(l, nullptr, banned);
     if (q.grammar) q.grammar->accept(t);
     ++row;
     on_token(owner[i], t);

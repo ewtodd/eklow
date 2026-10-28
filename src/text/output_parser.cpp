@@ -1,5 +1,6 @@
 #include "text/output_parser.hpp"
 
+#include <algorithm>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -197,6 +198,16 @@ OutputParser::OutputParser(const Tokenizer& tok, bool in_thinking) : tok_(tok) {
   tool_response_ = need_id(tok, "<|tool_response>");
   turn_open_ = need_id(tok, "<|turn>");
   if (in_thinking) state_ = State::Thinking;
+  // What push() takes in each state besides text: the state's own markers, and the turn's ends except inside a
+  // tool call (one not closed is an error).
+  auto ban_all_but = [&](State s, std::vector<int32_t> ok) {
+    for (int32_t id : tok.special_ids())
+      if (std::find(ok.begin(), ok.end(), id) == ok.end()) banned_[size_t(s)].push_back(id);
+  };
+  ban_all_but(State::Content, {channel_open_, call_open_, eos_, turn_end_, tool_response_, turn_open_});
+  ban_all_but(State::ChannelName, {eos_, turn_end_, tool_response_, turn_open_});
+  ban_all_but(State::Thinking, {channel_close_, eos_, turn_end_, tool_response_, turn_open_});
+  ban_all_but(State::ToolCall, {call_close_, quote_});
 }
 
 void OutputParser::emit_text(std::string& pending, std::string& out, bool flush) {
