@@ -1135,3 +1135,46 @@ streaming: the copies (1.1 GB at ~12 GB/s) overlap compute in time, but DMA slow
 copies, as a diagnostic, 195-210 ms; the same with the copies issued up front, 2 or 3 buffers ahead, on the copy engine
 or a second queue). At 1,080 tokens attention is 61% (~14 TFLOPS counting the real 72 dims): its K blocks are 3 dpas
 deep against 16 at head 512, so the epilogue weighs more; that and a resident-weights option are what is left.
+
+## 2026-10-27 — image input through the server
+
+`eklow-server --mmproj GGUF` (chat) and `--embed-mmproj GGUF` (embeddings), `--image-tokens N` (70-1,120, default 280,
+Google's `max_soft_tokens`; llama.cpp's server defaults to the projector's 1,120). Chat takes OpenAI `image_url` parts
+with base64 `data:` URLs (JPEG, PNG, GIF, BMP; WebP and http(s) refused with a 400, nothing is fetched); embeddings take
+an input item that is an array of `text` / `image_url` parts or llama.cpp's `{"content": [parts]}`.
+
+What llama.cpp does, from its source at the oracle's revision and checked by running it (llama-server and the oracle,
+CPU): the server turns an `image_url` part into a media marker in the message's text (text parts joined by newlines,
+none around a marker), the template runs on that string, and mtmd tokenizes the text before and after each marker on
+its own with `<|image>`, the rows and `<image|>` between, no newlines, BOS (and EOS for embeddings) added. Image rows
+are fed unscaled; the 26B has no per-layer inputs, and EmbeddingGemma 2 makes its per-layer inputs from the rows like
+from any row. Gemma 4's `non_causal_type` is SWA-only: on the sliding layers each image row sees the whole image (and
+the window back), the global layers stay causal.
+
+eklow: `Chunk::images` (spans of rows in place of lookups; on the sliding layers those tokens' `hi` is the span's last
+position, through `attn::Tokens::lo, hi` when a step holds any), the scheduler never splits an image across chunks and
+cuts a reused prefix back to an image's start, and an image's positions hold ids below zero derived from a hash of its
+bytes (and budget) and the row, so that prefix reuse tells images apart. Each image is encoded on its request's thread
+with the scheduler held (`Scheduler::Hold`), one at a time per encoder, and the host rows of the last six are kept by
+hash (a conversation resends its images every turn). The encoders' card memory is reserved before the experts are
+placed: encoding inside the 1 GiB margin and releasing after each image would keep the experts, but the margin is what
+long requests allocate into later (stage 3a: 0.04 GiB lost the device), and an image can arrive during one. 26B 282 MiB
+at 280 rows; EmbeddingGemma 2's projector at 1,120 rows, 264 MiB, because `reserve(280)` on it once gave NaN embeddings
+for some images (test-1, tall; `reserve(400)`, `reserve(1120)` and no reserve did not). That did not reproduce in three
+later server runs at `reserve(280)` (fresh, and after chat images, test-1 / tall / wide twice): the workaround stays
+until it is understood. On the 26B at production flags the encoders cost N = 44 experts a layer (49 without them), 41
+with `--image-tokens 1120`.
+
+Against llama.cpp: token ids and image spans equal for one image, two, and a conversation with an image in an earlier
+turn (llama-server's `prompt_tokens` 160, 354, 109, as eklow's). The 26B's logits over the 90 positions after a
+130-row image, from the oracle's own rows: top-1 77/90, mean KL 6.3e-2 (within check26's band); from eklow's rows
+(1.6e-2 from the stock oracle's) 0.12; with the image forced causal 0.25. A two-image prompt reads 0.25 (median per
+position 0.02) from either row set, and eklow's two runs with the two row sets differ from each other by the same
+0.26: the 26B's routing is chaotic at this size, not a different computation. Embeddings of images against
+llama-server: cosine 0.99966-0.99996, token counts equal; string inputs against main: 1.000000. check, check26 and the
+attention test unchanged.
+
+End to end at production flags: an image encodes in 0.14-0.18 s at 280 rows (1.44 s at 1,080), first token 0.3 s
+after a 130-row request; a second turn reuses the prefix with the image (`prompt 297 (149 cached, 130 image)`); two
+different same-size pictures are told apart. The 26B described test-1 as the New York Times front page of July 21,
+1969, "MEN WALK ON MOON", and a 1,080-row IDE screenshot as a C++ file in an editor with a build log, both right.

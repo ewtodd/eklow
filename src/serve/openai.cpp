@@ -1,7 +1,9 @@
 #include "serve/openai.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <random>
+#include <string_view>
 
 #include "core/json.hpp"
 #include "text/chat_gemma4.hpp"
@@ -20,21 +22,62 @@ double number(const json::Value& v, const char* name) {
   throw bad(std::string(name) + " must be a number");
 }
 
-// OpenAI's messages as the template takes them: tool-call arguments parsed from their JSON
-// strings, text-only content.
-json::Value template_messages(const json::Value& msgs) {
+int base64_digit(char c) {
+  if (c >= 'A' && c <= 'Z') return c - 'A';
+  if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+  if (c >= '0' && c <= '9') return c - '0' + 52;
+  return c == '+' ? 62 : c == '/' ? 63 : -1;
+}
+
+// The picture formats stb_image reads here (image/stb_image.cpp), by their signatures; WebP is told apart for a clearer
+// refusal.
+bool has_prefix(const std::vector<uint8_t>& b, std::string_view sig, size_t at = 0) {
+  return b.size() >= at + sig.size() && std::equal(sig.begin(), sig.end(), b.begin() + std::ptrdiff_t(at), [](char s, uint8_t x) { return uint8_t(s) == x; });
+}
+
+// OpenAI's messages as the template takes them: tool-call arguments parsed from their JSON strings. A content array
+// with images becomes one string with `marker` where each image goes, as llama.cpp's server hands it to the template
+// (text parts joined by newlines, none around a marker); the images' bytes go to `images` in order.
+json::Value template_messages(const json::Value& msgs, const std::string& marker, bool vision, std::vector<std::vector<uint8_t>>& images) {
   json::Value out = json::Value::array();
   for (const auto& m : msgs.items()) {
     if (!m.is_object()) throw bad("each message must be an object");
     json::Value c = m;
-    // Worded as clients expect, so that they drop images rather than retry them.
-    if (const json::Value* content = field(m, "content"); content && content->is_array())
+    if (const json::Value* content = field(m, "content"); content && content->is_array()) {
+      bool has_image = false;
       for (const auto& part : content->items()) {
         const json::Value* type = field(part, "type");
-        if (!type || !type->is_string() || type->as_string() != "text")
+        if (type && type->is_string() && type->as_string() == "image_url") has_image = true;
+        else if (!type || !type->is_string() || type->as_string() != "text")
+          // Worded as clients expect, so that they drop images rather than retry them.
           throw ApiError(400, "invalid_request_error", "unsupported_content",
-                         "image_url is not supported: this server does not support image input yet, only text parts");
+                         "unsupported content[].type: only text and image_url parts are supported");
       }
+      if (has_image && !vision)
+        throw ApiError(400, "invalid_request_error", "unsupported_content",
+                       "image_url is not supported: this server was started without a vision projector (--mmproj), only text parts");
+      if (has_image) {
+        std::string text;
+        bool last_was_marker = false;
+        for (const auto& part : content->items()) {
+          const bool is_image = part.find("type")->as_string() == "image_url";
+          if (is_image) {
+            const json::Value* iu = field(part, "image_url");
+            const json::Value* url = iu && iu->is_object() ? iu->find("url") : (iu && iu->is_string() ? iu : nullptr);
+            if (!url || !url->is_string()) throw bad("an image_url part needs image_url.url");
+            images.push_back(image_bytes(url->as_string()));
+            text += marker;
+            last_was_marker = true;
+          } else {
+            const json::Value* t = field(part, "text");
+            if (!last_was_marker && !text.empty()) text += '\n';
+            last_was_marker = false;
+            if (t && t->is_string()) text += t->as_string();
+          }
+        }
+        c.set("content", json::Value::string(text));
+      }
+    }
     if (const json::Value* calls = field(m, "tool_calls"); calls && calls->is_array()) {
       json::Value fixed = json::Value::array();
       for (json::Value call : calls->items()) {
@@ -69,6 +112,40 @@ std::string random_hex(int n) {
 }
 
 }  // namespace
+
+std::vector<uint8_t> image_bytes(const std::string& url) {
+  auto starts = [&](std::string_view p) { return url.compare(0, p.size(), p) == 0; };
+  auto unsupported = [](const std::string& m) { return ApiError(400, "invalid_request_error", "unsupported_content", m); };
+  if (starts("http://") || starts("https://"))
+    throw unsupported("image_url: the server does not fetch http(s) URLs; send the image as a base64 data: URL");
+  if (starts("file://")) throw unsupported("image_url: file:// URLs are not supported; send the image as a base64 data: URL");
+  std::string_view b64 = url;
+  if (starts("data:")) {
+    const size_t comma = url.find(',');
+    const std::string_view head = std::string_view(url).substr(0, comma == std::string::npos ? url.size() : comma);
+    if (comma == std::string::npos || head.compare(0, 11, "data:image/") != 0) throw bad("image_url: not a data:image/...;base64 URL");
+    if (head.size() < 7 || head.substr(head.size() - 7) != ";base64") throw bad("image_url: the data: URL must be base64 encoded");
+    b64 = std::string_view(url).substr(comma + 1);
+  }
+  std::vector<uint8_t> bytes;
+  bytes.reserve(b64.size() / 4 * 3);
+  uint32_t acc = 0;
+  int bits = 0;
+  for (char ch : b64) {
+    if (ch == '=' || ch == '\n' || ch == '\r' || ch == ' ') continue;
+    const int d = base64_digit(ch);
+    if (d < 0) throw bad("image_url: invalid base64");
+    acc = (acc << 6) | uint32_t(d);
+    bits += 6;
+    if (bits >= 8) bits -= 8, bytes.push_back(uint8_t(acc >> bits));
+  }
+  if (bytes.empty()) throw bad("image_url: no image data");
+  if (has_prefix(bytes, "RIFF") && has_prefix(bytes, "WEBP", 8))
+    throw unsupported("image_url: WebP is not supported; send JPEG, PNG, GIF or BMP");
+  if (!(has_prefix(bytes, "\xFF\xD8") || has_prefix(bytes, "\x89PNG") || has_prefix(bytes, "GIF8") || has_prefix(bytes, "BM")))
+    throw unsupported("image_url: not a JPEG, PNG, GIF or BMP picture");
+  return bytes;
+}
 
 std::string error_json(const ApiError& e) {
   json::Writer w(false);
@@ -119,15 +196,44 @@ ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, cons
   text::ChatOptions opt;
   opt.add_generation_prompt = true;
   opt.enable_thinking = r.thinking;
+  // Where the images go: a marker per request, so that no text of the conversation can be taken for one.
+  const std::string marker = "<__media_" + random_hex(16) + "__>";
+  std::vector<std::vector<uint8_t>> pictures;
   std::vector<text::ChatPart> parts;
   try {
-    parts = text::render_gemma4(template_messages(*msgs), tools, opt);
+    parts = text::render_gemma4(template_messages(*msgs, marker, bool(d.encode_image), pictures), tools, opt);
   } catch (const text::ChatError& e) {
     throw bad(std::string("the chat template rejects the conversation: ") + e.what());
   }
+  // mtmd tokenizes the text before and after each marker on its own and puts <|image>, the rows and <image|> between.
   std::vector<text::Tokenizer::Piece> pieces;
-  for (const auto& p : parts) pieces.push_back({p.text, !p.input});
-  r.prompt = tok.encode(pieces);
+  auto flush = [&] {
+    if (pieces.empty()) return;
+    for (int32_t id : tok.encode(pieces)) r.prompt.push_back(id);
+    pieces.clear();
+  };
+  size_t placed = 0;
+  for (const auto& p : parts) {
+    std::string_view t = p.text;
+    while (p.input && !pictures.empty()) {
+      const size_t at = t.find(marker);
+      if (at == std::string_view::npos) break;
+      if (at > 0) pieces.push_back({t.substr(0, at), false});
+      flush();
+      if (placed >= pictures.size()) break;
+      const int32_t open = tok.id("<|image>"), close = tok.id("<image|>");
+      if (open < 0 || close < 0) throw bad("the model's vocabulary has no image tokens");
+      EncodedImage img = d.encode_image(pictures[placed++]);
+      r.prompt.push_back(open);
+      r.images.push_back({int64_t(r.prompt.size()), img.n, img.rows});
+      for (int64_t row = 0; row < img.n; ++row) r.prompt.push_back(image_row_id(img.hash, row));
+      r.prompt.push_back(close);
+      t.remove_prefix(at + marker.size());
+    }
+    if (!t.empty()) pieces.push_back({t, !p.input});
+  }
+  flush();
+  if (placed != pictures.size()) throw bad("an image sits where the chat template cannot place it");
   {
     const std::string text = text::join(parts);
     const std::string open = "<|channel>thought\n";

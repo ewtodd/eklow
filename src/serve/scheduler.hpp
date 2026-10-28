@@ -35,9 +35,23 @@ struct Event {
   int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;  // with done
 };
 
+// An image in a prompt: its rows stand for `n` consecutive prompt positions from `start`. The prompt holds, at those
+// positions, ids below zero that name the image and the row (image_row_id), so that prefix reuse tells images apart.
+struct ImageInput {
+  int64_t start = 0, n = 0;
+  std::shared_ptr<const std::vector<float>> rows;  // fp32 [n][n_embd]
+};
+// The prompt id of row `row` of the image whose content hashes to `hash`: negative, never a vocabulary id.
+inline int32_t image_row_id(uint64_t hash, int64_t row) {
+  uint64_t x = hash ^ (uint64_t(row) + 0x9e3779b97f4a7c15ull + (hash << 6) + (hash >> 2));
+  x ^= x >> 33, x *= 0xff51afd7ed558ccdull, x ^= x >> 33;
+  return -1 - int32_t(x & 0x3fffffff);
+}
+
 class Request {
  public:
   std::vector<int32_t> prompt;
+  std::vector<ImageInput> images;  // in order, each within the prompt
   SamplingParams sampling;
   int64_t max_tokens = 0;          // 0: as far as the context allows
   std::vector<std::string> stop;   // strings that end the content (not included)
@@ -66,6 +80,7 @@ class Request {
 struct RequestLog {
   std::string tag, reason, error;  // reason: stop, length, tool_calls or cancelled
   int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;
+  int64_t image_tokens = 0;  // of the prompt, rows of images
   double queue_s = -1, ttft_s = -1, prefill_s = -1, decode_s = -1;
 };
 

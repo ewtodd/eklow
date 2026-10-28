@@ -3,7 +3,11 @@
 //
 //   eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens 2,105,...)
 //                    [--tensors PREFIX,...] [--logits-last N] [--chunk N] [--decode-last N]
-//                    [--twin] [--max-ctx N] [--kv-int8]
+//                    [--twin] [--max-ctx N] [--kv-int8] [--image-rows FILE ...]
+//
+// --image-rows injects an image's rows in place of its tokens: tokens.json's "images" (the oracle's, in image mode:
+// each image's first position and row count; its tokens are -1) in order, FILE the rows as fp32 [n][n_embd] (the
+// oracle's image_K.f32, or eklow-vision --out). A chunk never splits an image: a step's end moves to the image's end.
 //
 // The prompt is fed in prefill chunks of --chunk tokens (default: one chunk), then its last
 // --decode-last tokens one per step, as decode would. --twin runs the same prompt in a second slot
@@ -72,6 +76,7 @@ int main(int argc, char** argv) {
   std::string model, out, tokens_json, tokens_arg;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   std::set<int64_t> moe_layers;
+  std::vector<std::string> image_files;
   int64_t logits_last = 1, chunk = 0, decode_last = 0, max_ctx = 0;
   bool twin = false, kv_int8 = false;
   std::string expert_profile;
@@ -93,6 +98,7 @@ int main(int argc, char** argv) {
     else if (a == "--decode-last") decode_last = std::atoll(next().c_str());
     else if (a == "--max-ctx") max_ctx = std::atoll(next().c_str());
     else if (a == "--kv-int8") kv_int8 = true;
+    else if (a == "--image-rows") image_files.push_back(next());
     else if (a == "--expert-profile") expert_profile = next();
     else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
     else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
@@ -107,7 +113,7 @@ int main(int argc, char** argv) {
     else {
       std::fprintf(stderr, "usage: eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens IDS) "
                            "[--tensors PREFIX,...] [--logits-last N] [--chunk N] [--decode-last N] [--twin] "
-                           "[--twin-tol KL] [--max-ctx N] [--kv-int8] [--moe-layers N,...] [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [[--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US]\n");
+                           "[--twin-tol KL] [--max-ctx N] [--kv-int8] [--image-rows FILE ...] [--moe-layers N,...] [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [[--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US]\n");
       return 2;
     }
   }
@@ -115,6 +121,7 @@ int main(int argc, char** argv) {
     for (const auto& mp : moe_prefixes) prefixes.push_back(mp);
   try {
     std::vector<int32_t> tokens;
+    std::vector<std::pair<int64_t, int64_t>> image_spans;  // first position and rows of each image
     if (!tokens_json.empty()) {
       std::ifstream in(tokens_json);
       std::string s((std::istreambuf_iterator<char>(in)), {});
@@ -122,6 +129,9 @@ int main(int argc, char** argv) {
       const json::Value* ids = doc.find("ids");
       if (!ids || !ids->is_array()) throw std::runtime_error(tokens_json + ": no \"ids\" array");
       for (const auto& v : ids->items()) tokens.push_back(int32_t(std::atoll(v.int_digits().c_str())));
+      if (const json::Value* imgs = doc.find("images"); imgs && imgs->is_array())
+        for (const auto& im : imgs->items())
+          image_spans.push_back({std::atoll(im.find("pos")->int_digits().c_str()), std::atoll(im.find("n")->int_digits().c_str())});
     } else {
       for (const auto& t : split(tokens_arg, ',')) tokens.push_back(int32_t(std::atoi(t.c_str())));
     }
@@ -132,9 +142,16 @@ int main(int argc, char** argv) {
     const int64_t prefill = n - decode_last;
     if (chunk <= 0) chunk = prefill;
 
-    // The steps, as [start, end) token ranges.
+    if (image_files.size() != image_spans.size()) throw std::runtime_error("need one --image-rows file for each of tokens.json's images");
+    // The steps, as [start, end) token ranges; an image is never cut (the step ends after it).
     std::vector<std::pair<int64_t, int64_t>> steps;
-    for (int64_t s = 0; s < prefill; s += chunk) steps.push_back({s, std::min(prefill, s + chunk)});
+    for (int64_t s = 0; s < prefill;) {
+      int64_t e = std::min(prefill, s + chunk);
+      for (auto [p, c] : image_spans)
+        if (p < e && e < p + c) e = std::min(prefill, p + c);
+      steps.push_back({s, e});
+      s = e;
+    }
     for (int64_t s = prefill; s < n; ++s) steps.push_back({s, s + 1});
 
     engine::Config ec;
@@ -159,6 +176,23 @@ int main(int argc, char** argv) {
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     engine::Engine eng(q, f, ec);
     const int64_t V = eng.model().n_vocab;
+    std::vector<std::vector<float>> image_data;
+    for (size_t k = 0; k < image_files.size(); ++k) {
+      std::ifstream in(image_files[k], std::ios::binary);
+      std::vector<float> rows(size_t(image_spans[k].second * eng.model().n_embd));
+      in.read(reinterpret_cast<char*>(rows.data()), std::streamsize(rows.size() * sizeof(float)));
+      if (!in) throw std::runtime_error(image_files[k] + ": fewer than " + std::to_string(image_spans[k].second) + " rows of " + std::to_string(eng.model().n_embd));
+      image_data.push_back(std::move(rows));
+    }
+    // A chunk of tokens [a, b): the ids (image positions are 0), and the images inside it.
+    auto make_chunk = [&](int slot, int64_t a, int64_t b, int64_t rows) {
+      engine::Chunk c{slot, a, std::vector<int32_t>(tokens.begin() + a, tokens.begin() + b), rows};
+      for (int32_t& t : c.tokens) t = std::max<int32_t>(t, 0);
+      for (size_t k = 0; k < image_spans.size(); ++k)
+        if (image_spans[k].first >= a && image_spans[k].first + image_spans[k].second <= b)
+          c.images.push_back({image_spans[k].first - a, image_spans[k].second, image_data[k].data()});
+      return c;
+    };
     std::printf("loaded %.2f GiB of weights, %.2f GiB of KV cache onto %s in %.1f s\n", eng.weight_bytes() / 1073741824.0,
                 eng.cache_bytes() / 1073741824.0, q.get_device().get_info<sycl::info::device::name>().c_str(), since(t0));
 
@@ -201,11 +235,11 @@ int main(int argc, char** argv) {
       bool main_in = i < steps.size();
       if (main_in) {
         auto [a, b] = steps[i];
-        chunks.push_back({0, a, std::vector<int32_t>(tokens.begin() + a, tokens.begin() + b), rows_in(a, b)});
+        chunks.push_back(make_chunk(0, a, b, rows_in(a, b)));
       }
       if (twin && i > 0) {
         auto [a, b] = steps[i - 1];
-        chunks.push_back({1, a, std::vector<int32_t>(tokens.begin() + a, tokens.begin() + b), rows_in(a, b)});
+        chunks.push_back(make_chunk(1, a, b, rows_in(a, b)));
       }
       auto t1 = std::chrono::steady_clock::now();
       auto l = eng.step(chunks, twin ? nullptr : &sink);

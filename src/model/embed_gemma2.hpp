@@ -24,6 +24,7 @@
 #include "kernels/ref.hpp"
 #include "kernels/xmx.hpp"
 #include "model/gguf.hpp"
+#include "model/image_rows.hpp"
 
 namespace eklow::model {
 
@@ -37,10 +38,13 @@ class EmbedGemma2 {
 
   // The normalized embedding of one sequence of token ids.
   std::vector<float> embed(const std::vector<int32_t>& tokens);
-  // Those of several, in passes of up to max_tokens() tokens, with a single wait for the card.
-  std::vector<std::vector<float>> embed(const std::vector<std::vector<int32_t>>& seqs);
+  // Those of several, in passes of up to max_tokens() tokens, with a single wait for the card. `images`, if given, holds
+  // for each input the spans of its tokens whose rows are given (an image's, host memory) instead of looked up and scaled.
+  std::vector<std::vector<float>> embed(const std::vector<std::vector<int32_t>>& seqs,
+                                        const std::vector<std::vector<ImageRows>>* images = nullptr);
 
   int64_t dim() const { return n_out_; }
+  int64_t n_embd() const { return n_embd_; }
   int64_t max_tokens() const { return max_tok_; }
   // Allocates the activations for passes of up to n_tok tokens (the longest input) now, so that a request never
   // allocates.
@@ -60,7 +64,8 @@ class EmbedGemma2 {
   // Enqueues one pass over seqs[i0, i1) (at most max_tok_ tokens together) and the copy of their averaged last
   // layers, [i1 - i0][dim], to `means` on the host.
   // The pass's host arrays go into `keep`, which must live until the queue has run the copies from them.
-  void forward(const std::vector<std::vector<int32_t>>& seqs, size_t i0, size_t i1, float* means, std::vector<std::vector<int32_t>>& keep);
+  void forward(const std::vector<std::vector<int32_t>>& seqs, const std::vector<std::vector<ImageRows>>* images, size_t i0, size_t i1,
+               float* means, std::vector<std::vector<int32_t>>& keep);
 
   sycl::queue& q_;
   std::vector<void*> owned_;

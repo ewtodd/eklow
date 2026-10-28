@@ -22,6 +22,7 @@
 #include "kernels/xmx.hpp"
 #include "model/gemma4.hpp"
 #include "model/gguf.hpp"
+#include "model/image_rows.hpp"
 #include "rt/copy_engine.hpp"
 
 namespace eklow::engine {
@@ -61,6 +62,10 @@ struct Chunk {
   int64_t start_pos;  // position of tokens[0]
   std::vector<int32_t> tokens;
   int64_t logits_rows = 1;
+  // Spans of tokens whose input rows are given (an image's, unscaled) instead of looked up in the embedding table; the
+  // tokens there are ignored. On the sliding layers each span's tokens see the whole span (llama.cpp runs an image
+  // bidirectionally on those layers only; the global layers stay causal). A span lies within one chunk, in order.
+  std::vector<model::ImageRows> images = {};
 };
 
 class Engine {
@@ -214,7 +219,7 @@ class Engine {
   int32_t *moe_tiles_ = nullptr, *moe_scratch_ = nullptr, *moe_row_ = nullptr;
   sycl::half *moe_a_ = nullptr, *moe_h_ = nullptr;
   float* moe_y_ = nullptr;
-  int32_t *tok_, *slot_, *pos_, *tiles_sliding_, *tiles_global_;
+  int32_t *tok_, *slot_, *pos_, *lo_, *hi_, *tiles_sliding_, *tiles_global_;
   int64_t max_tiles_sliding_ = 0, max_tiles_global_ = 0;
   xmx::Activations act_, act_ffn_;  // matmul inputs: of width E or H x D, and of the FFN's width
   attn::Scratch attn_scratch_;

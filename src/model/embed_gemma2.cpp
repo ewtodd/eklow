@@ -186,7 +186,7 @@ std::vector<float> EmbedGemma2::embed(const std::vector<int32_t>& tokens) {
 // Passes of consecutive inputs up to max_tok_ tokens each, their means copied to the host, and a single wait at the
 // end: with a long prefill on the card, every wait costs a turn on it (DECISIONS 2026-10-26, "embeddings beside a
 // long prefill").
-std::vector<std::vector<float>> EmbedGemma2::embed(const std::vector<std::vector<int32_t>>& seqs) {
+std::vector<std::vector<float>> EmbedGemma2::embed(const std::vector<std::vector<int32_t>>& seqs, const std::vector<std::vector<ImageRows>>* images) {
   int64_t longest = 0;
   for (const auto& s : seqs) {
     if (s.empty()) throw std::runtime_error("embedding model: empty input");
@@ -201,7 +201,7 @@ std::vector<std::vector<float>> EmbedGemma2::embed(const std::vector<std::vector
       int64_t tokens = 0;
       while (i1 < seqs.size() && i1 - i0 < size_t(kPassInputs) && tokens + int64_t(seqs[i1].size()) <= max_tok_)
         tokens += int64_t(seqs[i1++].size());
-      forward(seqs, i0, i1, means.data() + i0 * size_t(n_out_), keep);
+      forward(seqs, images, i0, i1, means.data() + i0 * size_t(n_out_), keep);
       i0 = i1;
     }
   } catch (...) {
@@ -222,8 +222,8 @@ std::vector<std::vector<float>> EmbedGemma2::embed(const std::vector<std::vector
   return out;
 }
 
-void EmbedGemma2::forward(const std::vector<std::vector<int32_t>>& seqs, size_t i0, size_t i1, float* means,
-                          std::vector<std::vector<int32_t>>& keep) {
+void EmbedGemma2::forward(const std::vector<std::vector<int32_t>>& seqs, const std::vector<std::vector<ImageRows>>* images, size_t i0,
+                          size_t i1, float* means, std::vector<std::vector<int32_t>>& keep) {
   const int64_t E = n_embd_, H = n_head_, L = n_layer_, n_seq = int64_t(i1 - i0);
   std::vector<int32_t> tokens, pos;
   std::vector<int64_t> start{0};
@@ -299,6 +299,13 @@ void EmbedGemma2::forward(const std::vector<std::vector<int32_t>>& seqs, size_t 
   };
 
   ref::embed(q_, tok_embd_, tok, T, std::sqrt(float(E)), x);
+  // Image rows go in unscaled, as llama.cpp feeds them; the per-layer inputs below are made from them like from any row.
+  if (images)
+    for (size_t i = i0; i < i1; ++i)
+      for (const ImageRows& im : (*images)[i]) {
+        if (im.n <= 0 || im.offset < 0 || im.offset + im.n > int64_t(seqs[i].size()) || !im.rows) throw std::runtime_error("embedding model: bad image span");
+        q_.memcpy(x + (start[i - i0] + im.offset) * E, im.rows, size_t(im.n * E) * sizeof(float));
+      }
   gemm_in(a0_, x, E);
   for (int64_t l = 0; l < L; ++l) {
     const Layer& Ly = layers_[size_t(l)];
