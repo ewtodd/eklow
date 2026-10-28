@@ -34,7 +34,16 @@ The prompt diet (son-of-anton 85300ef3) cut the prefix before the user's message
 10,425 tokens with no loss on the Gemma probe (149 vs 155 calls, 11 vs 14 errors).
 
 A tool-call checker was evaluated on 1,082 hand-labelled steps from Gemma Signal probes plus 201
-synthetic mistakes. Generic "is this step ok" questions ranked a real bad call above a good one
+synthetic mistakes. Generic and `<|"|>`. The sampler drops them before anything else (from the tool grammar's allowed set too), so the model
+takes its next choice instead. llama.cpp samples them and its parser copes as it can. `eklow-grammar-test` checks that
+in each state the banned set is exactly what the parser refuses (96 of 96 state and token pairs).
+
+The sampler took 1.2-1.8 ms a token (on the host, between two decode steps of ~27 ms): every one of the 262,144
+candidates went into an array for `nth_element`. Dropping the bans from that array cost another 0.33 ms, as did
+setting them to -inf (`nth_element`'s pivots on that data). Top-k now keeps the k best in a heap during one pass over
+the logits, skipping the bans by comparing each id with the next one: 0.21 ms with or without bans, and the same
+picks as before (900 of 900 against main's sampler over greedy, top-k 64 and none, top-p, min-p and penalties, ties
+included).is this step ok" questions ranked a real bad call above a good one
 69-76% of the time (AUROC) for Gemma 12B as a judge, decider-2b/4b and StartLux 4B. Targeted
 questions (repeat, progress, valid arguments; claims an action it did not take, gives up while a
 tool could help, unsupported facts) on Bespoke-Nimble-9B-v3, combined by a fitted logistic model,
