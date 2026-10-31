@@ -1,0 +1,45 @@
+== IQ4_XS (IQ4_XS)
+  IQ4_XS   expert gate|up           2048x1024    rows   1     0.0140 ms       80 GB/s  (4.250 bits a weight)
+  IQ4_XS   expert gate|up           2048x1024    rows   2     0.0141 ms       79 GB/s  (4.250 bits a weight)
+  IQ4_XS   expert gate|up           2048x1024    rows   8     0.0136 ms       82 GB/s  (4.250 bits a weight)
+  IQ4_XS   expert gate|up           2048x1024    rows  16     0.0155 ms       72 GB/s  (4.250 bits a weight)
+  IQ4_XS   expert gate|up           2048x1024    rows  32     0.0218 ms       51 GB/s  (4.250 bits a weight)
+  IQ4_XS   expert down               512x2048    rows   1     0.0095 ms       58 GB/s  (4.250 bits a weight)
+  IQ4_XS   expert down               512x2048    rows   2     0.0097 ms       57 GB/s  (4.250 bits a weight)
+  IQ4_XS   expert down               512x2048    rows   8     0.0100 ms       56 GB/s  (4.250 bits a weight)
+  IQ4_XS   expert down               512x2048    rows  16     0.0131 ms       43 GB/s  (4.250 bits a weight)
+  IQ4_XS   expert down               512x2048    rows  32     0.0191 ms       29 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_qkv / attn_q        2048x8192    rows   1     0.0555 ms      161 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_qkv / attn_q        2048x8192    rows   2     0.0661 ms      135 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_qkv / attn_q        2048x8192    rows   8     0.0670 ms      133 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_qkv / attn_q        2048x8192    rows  16     0.0748 ms      119 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_qkv / attn_q        2048x8192    rows  32     0.1018 ms       88 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_gate                2048x4096    rows   1     0.0329 ms      135 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_gate                2048x4096    rows   2     0.0419 ms      106 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_gate                2048x4096    rows   8     0.0423 ms      105 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_gate                2048x4096    rows  16     0.0464 ms       96 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_gate                2048x4096    rows  32     0.0616 ms       72 GB/s  (4.250 bits a weight)
+  IQ4_XS   ssm_out / attn_output    4096x2048    rows   1     0.0325 ms      137 GB/s  (4.250 bits a weight)
+  IQ4_XS   ssm_out / attn_output    4096x2048    rows   2     0.0485 ms       92 GB/s  (4.250 bits a weight)
+  IQ4_XS   ssm_out / attn_output    4096x2048    rows   8     0.0509 ms       88 GB/s  (4.250 bits a weight)
+  IQ4_XS   ssm_out / attn_output    4096x2048    rows  16     0.0567 ms       79 GB/s  (4.250 bits a weight)
+  IQ4_XS   ssm_out / attn_output    4096x2048    rows  32     0.0661 ms       67 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_k / attn_v          2048x512     rows   1     0.0096 ms       58 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_k / attn_v          2048x512     rows   2     0.0099 ms       56 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_k / attn_v          2048x512     rows   8     0.0101 ms       55 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_k / attn_v          2048x512     rows  16     0.0131 ms       43 GB/s  (4.250 bits a weight)
+  IQ4_XS   attn_k / attn_v          2048x512     rows  32     0.0188 ms       30 GB/s  (4.250 bits a weight)
+  IQ4_XS   head                     2048x248320  rows   1     1.2398 ms      218 GB/s  (4.250 bits a weight)
+  IQ4_XS   head                     2048x248320  rows   2     1.3072 ms      207 GB/s  (4.250 bits a weight)
+  IQ4_XS   head                     2048x248320  rows   8     1.3134 ms      206 GB/s  (4.250 bits a weight)
+  IQ4_XS   head                     2048x248320  rows  16     1.5097 ms      179 GB/s  (4.250 bits a weight)
+  IQ4_XS   head                     2048x248320  rows  32     2.2523 ms      120 GB/s  (4.250 bits a weight)
+  IQ4_XS   grouped gate|up      P= 8  distinct   7.9     0.0629 ms      141 GB/s
+  IQ4_XS   grouped   + SwiGLU   P= 8  distinct   7.9     0.0727 ms      122 GB/s
+  IQ4_XS   grouped gate|up      P=16  distinct  15.4     0.1042 ms      165 GB/s
+  IQ4_XS   grouped   + SwiGLU   P=16  distinct  15.4     0.1146 ms      150 GB/s
+  IQ4_XS   grouped gate|up      P=32  distinct  30.2     0.1879 ms      179 GB/s
+  IQ4_XS   grouped   + SwiGLU   P=32  distinct  30.2     0.1981 ms      170 GB/s
+  IQ4_XS   grouped down         P= 8  distinct   7.9     0.0407 ms      108 GB/s
+  IQ4_XS   grouped down         P=16  distinct  15.8     0.0647 ms      136 GB/s
+  IQ4_XS   grouped down         P=32  distinct  30.1     0.1082 ms      155 GB/s

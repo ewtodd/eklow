@@ -1,0 +1,45 @@
+== Q8_0 (Q8_0)
+  Q8_0     expert gate|up           2048x1024    rows   1     0.0152 ms      147 GB/s  (8.500 bits a weight)
+  Q8_0     expert gate|up           2048x1024    rows   2     0.0195 ms      114 GB/s  (8.500 bits a weight)
+  Q8_0     expert gate|up           2048x1024    rows   8     0.0170 ms      131 GB/s  (8.500 bits a weight)
+  Q8_0     expert gate|up           2048x1024    rows  16     0.0193 ms      115 GB/s  (8.500 bits a weight)
+  Q8_0     expert gate|up           2048x1024    rows  32     0.0249 ms       90 GB/s  (8.500 bits a weight)
+  Q8_0     expert down               512x2048    rows   1     0.0081 ms      138 GB/s  (8.500 bits a weight)
+  Q8_0     expert down               512x2048    rows   2     0.0087 ms      127 GB/s  (8.500 bits a weight)
+  Q8_0     expert down               512x2048    rows   8     0.0091 ms      123 GB/s  (8.500 bits a weight)
+  Q8_0     expert down               512x2048    rows  16     0.0108 ms      103 GB/s  (8.500 bits a weight)
+  Q8_0     expert down               512x2048    rows  32     0.0152 ms       73 GB/s  (8.500 bits a weight)
+  Q8_0     attn_qkv / attn_q        2048x8192    rows   1     0.0589 ms      303 GB/s  (8.500 bits a weight)
+  Q8_0     attn_qkv / attn_q        2048x8192    rows   2     0.0599 ms      298 GB/s  (8.500 bits a weight)
+  Q8_0     attn_qkv / attn_q        2048x8192    rows   8     0.0615 ms      290 GB/s  (8.500 bits a weight)
+  Q8_0     attn_qkv / attn_q        2048x8192    rows  16     0.0714 ms      250 GB/s  (8.500 bits a weight)
+  Q8_0     attn_qkv / attn_q        2048x8192    rows  32     0.1011 ms      176 GB/s  (8.500 bits a weight)
+  Q8_0     attn_gate                2048x4096    rows   1     0.0320 ms      278 GB/s  (8.500 bits a weight)
+  Q8_0     attn_gate                2048x4096    rows   2     0.0355 ms      251 GB/s  (8.500 bits a weight)
+  Q8_0     attn_gate                2048x4096    rows   8     0.0358 ms      249 GB/s  (8.500 bits a weight)
+  Q8_0     attn_gate                2048x4096    rows  16     0.0414 ms      215 GB/s  (8.500 bits a weight)
+  Q8_0     attn_gate                2048x4096    rows  32     0.0583 ms      153 GB/s  (8.500 bits a weight)
+  Q8_0     ssm_out / attn_output    4096x2048    rows   1     0.0318 ms      280 GB/s  (8.500 bits a weight)
+  Q8_0     ssm_out / attn_output    4096x2048    rows   2     0.0390 ms      228 GB/s  (8.500 bits a weight)
+  Q8_0     ssm_out / attn_output    4096x2048    rows   8     0.0396 ms      225 GB/s  (8.500 bits a weight)
+  Q8_0     ssm_out / attn_output    4096x2048    rows  16     0.0467 ms      191 GB/s  (8.500 bits a weight)
+  Q8_0     ssm_out / attn_output    4096x2048    rows  32     0.0654 ms      136 GB/s  (8.500 bits a weight)
+  Q8_0     attn_k / attn_v          2048x512     rows   1     0.0084 ms      133 GB/s  (8.500 bits a weight)
+  Q8_0     attn_k / attn_v          2048x512     rows   2     0.0106 ms      105 GB/s  (8.500 bits a weight)
+  Q8_0     attn_k / attn_v          2048x512     rows   8     0.0108 ms      103 GB/s  (8.500 bits a weight)
+  Q8_0     attn_k / attn_v          2048x512     rows  16     0.0126 ms       89 GB/s  (8.500 bits a weight)
+  Q8_0     attn_k / attn_v          2048x512     rows  32     0.0164 ms       68 GB/s  (8.500 bits a weight)
+  Q8_0     head                     2048x248320  rows   1     1.4865 ms      364 GB/s  (8.500 bits a weight)
+  Q8_0     head                     2048x248320  rows   2     1.5863 ms      341 GB/s  (8.500 bits a weight)
+  Q8_0     head                     2048x248320  rows   8     1.6153 ms      335 GB/s  (8.500 bits a weight)
+  Q8_0     head                     2048x248320  rows  16     1.8396 ms      294 GB/s  (8.500 bits a weight)
+  Q8_0     head                     2048x248320  rows  32     5.5816 ms       97 GB/s  (8.500 bits a weight)
+  Q8_0     grouped gate|up      P= 8  distinct   7.8     0.0618 ms      283 GB/s
+  Q8_0     grouped   + SwiGLU   P= 8  distinct   7.8     0.0720 ms      243 GB/s
+  Q8_0     grouped gate|up      P=16  distinct  15.7     0.1135 ms      308 GB/s
+  Q8_0     grouped   + SwiGLU   P=16  distinct  15.7     0.1229 ms      284 GB/s
+  Q8_0     grouped gate|up      P=32  distinct  30.1     0.2189 ms      307 GB/s
+  Q8_0     grouped   + SwiGLU   P=32  distinct  30.1     0.2292 ms      293 GB/s
+  Q8_0     grouped down         P= 8  distinct   7.9     0.0400 ms      221 GB/s
+  Q8_0     grouped down         P=16  distinct  15.5     0.0651 ms      265 GB/s
+  Q8_0     grouped down         P=32  distinct  30.0     0.1153 ms      290 GB/s

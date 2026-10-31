@@ -1,0 +1,15 @@
+memory: threads streaming 3 GiB (sequential, per-thread slices)
+   1 threads    23.4 GB/s
+   2 threads    36.2 GB/s
+   4 threads    39.3 GB/s
+   6 threads    42.8 GB/s
+   8 threads    43.2 GB/s
+  12 threads    43.0 GB/s
+  16 threads    42.9 GB/s
+  20 threads    43.0 GB/s
+== Q4_0
+== Q8_0
+== Q4_K
+== Q5_K
+== Q6_K
+== IQ4_XS

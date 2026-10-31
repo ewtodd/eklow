@@ -1,0 +1,141 @@
+== Q4_0
+  Q4_0     expert gate|up              2048x1024   inputs  1  vs fp32  1.26e-02  vs emul  1.02e-06 
+  Q4_0     expert gate|up              2048x1024   inputs  2  vs fp32  8.90e-03  vs emul  1.09e-06 
+  Q4_0     expert gate|up              2048x1024   inputs  5  vs fp32  1.03e-02  vs emul  1.40e-06 
+  Q4_0     expert gate|up              2048x1024   inputs  8  vs fp32  1.18e-02  vs emul  2.22e-06 
+  Q4_0     expert gate|up              2048x1024   inputs 16  vs fp32  1.06e-02  vs emul  1.67e-06 
+  Q4_0     expert down                  512x2048   inputs  1  vs fp32  9.35e-03  vs emul  4.71e-07 
+  Q4_0     expert down                  512x2048   inputs  2  vs fp32  9.79e-03  vs emul  5.59e-07 
+  Q4_0     expert down                  512x2048   inputs  5  vs fp32  9.06e-03  vs emul  7.48e-07 
+  Q4_0     expert down                  512x2048   inputs  8  vs fp32  1.15e-02  vs emul  1.22e-06 
+  Q4_0     expert down                  512x2048   inputs 16  vs fp32  1.00e-02  vs emul  1.08e-06 
+  Q4_0     attn_qkv                    2048x8192   inputs  1  vs fp32  9.44e-03  vs emul  9.62e-07 
+  Q4_0     attn_qkv                    2048x8192   inputs  2  vs fp32  9.62e-03  vs emul  1.18e-06 
+  Q4_0     attn_qkv                    2048x8192   inputs  5  vs fp32  1.02e-02  vs emul  1.36e-06 
+  Q4_0     attn_qkv                    2048x8192   inputs  8  vs fp32  1.11e-02  vs emul  1.90e-06 
+  Q4_0     attn_qkv                    2048x8192   inputs 16  vs fp32  1.06e-02  vs emul  2.24e-06 
+== Q8_0
+  Q8_0     real blk.0.ffn_gate.weight  3840x2048   inputs  1  vs fp32  1.01e-02  vs emul  1.05e-06 
+  Q8_0     real blk.0.ffn_gate.weight  3840x2048   inputs  8  vs fp32  1.09e-02  vs emul  1.02e-06 
+  Q8_0     real blk.0.ffn_gate.weight  3840x2048   inputs 16  vs fp32  9.95e-03  vs emul  1.15e-06 
+  Q8_0     real blk.0.ffn_down.weight 15360x2048   inputs  1  vs fp32  1.00e-02  vs emul  8.83e-07 
+  Q8_0     real blk.0.ffn_down.weight 15360x2048   inputs  8  vs fp32  1.07e-02  vs emul  1.83e-06 
+  Q8_0     real blk.0.ffn_down.weight 15360x2048   inputs 16  vs fp32  1.06e-02  vs emul  2.03e-06 
+  Q8_0     real blk.5.attn_q.weight    3840x2048   inputs  1  vs fp32  9.10e-03  vs emul  5.75e-07 
+  Q8_0     real blk.5.attn_q.weight    3840x2048   inputs  8  vs fp32  1.00e-02  vs emul  6.98e-07 
+  Q8_0     real blk.5.attn_q.weight    3840x2048   inputs 16  vs fp32  1.08e-02  vs emul  9.93e-07 
+  Q8_0     expert gate|up              2048x1024   inputs  1  vs fp32  1.30e-02  vs emul  4.87e-07 
+  Q8_0     expert gate|up              2048x1024   inputs  2  vs fp32  8.96e-03  vs emul  4.76e-07 
+  Q8_0     expert gate|up              2048x1024   inputs  5  vs fp32  1.16e-02  vs emul  5.04e-07 
+  Q8_0     expert gate|up              2048x1024   inputs  8  vs fp32  1.09e-02  vs emul  8.30e-07 
+  Q8_0     expert gate|up              2048x1024   inputs 16  vs fp32  1.22e-02  vs emul  1.16e-06 
+  Q8_0     expert down                  512x2048   inputs  1  vs fp32  9.35e-03  vs emul  2.51e-07 
+  Q8_0     expert down                  512x2048   inputs  2  vs fp32  8.77e-03  vs emul  3.73e-07 
+  Q8_0     expert down                  512x2048   inputs  5  vs fp32  1.22e-02  vs emul  4.73e-07 
+  Q8_0     expert down                  512x2048   inputs  8  vs fp32  1.11e-02  vs emul  8.38e-07 
+  Q8_0     expert down                  512x2048   inputs 16  vs fp32  1.21e-02  vs emul  5.15e-07 
+  Q8_0     attn_qkv                    2048x8192   inputs  1  vs fp32  9.91e-03  vs emul  3.35e-07 
+  Q8_0     attn_qkv                    2048x8192   inputs  2  vs fp32  9.63e-03  vs emul  6.53e-07 
+  Q8_0     attn_qkv                    2048x8192   inputs  5  vs fp32  9.69e-03  vs emul  5.92e-07 
+  Q8_0     attn_qkv                    2048x8192   inputs  8  vs fp32  1.01e-02  vs emul  7.52e-07 
+  Q8_0     attn_qkv                    2048x8192   inputs 16  vs fp32  1.07e-02  vs emul  5.21e-07 
+== Q4_K
+  Q4_K     real blk.0.ffn_gate.weight  3840x2048   inputs  1  vs fp32  7.05e-03  vs emul  1.05e-06 
+  Q4_K     real blk.0.ffn_gate.weight  3840x2048   inputs  8  vs fp32  1.10e-02  vs emul  2.40e-06 
+  Q4_K     real blk.0.ffn_gate.weight  3840x2048   inputs 16  vs fp32  9.99e-03  vs emul  4.59e-06 
+  Q4_K     real blk.0.ffn_down.weight 15360x2048   inputs  1  vs fp32  8.60e-03  vs emul  3.06e-06 
+  Q4_K     real blk.0.ffn_down.weight 15360x2048   inputs  8  vs fp32  1.16e-02  vs emul  8.10e-06 
+  Q4_K     real blk.0.ffn_down.weight 15360x2048   inputs 16  vs fp32  1.08e-02  vs emul  9.29e-06 
+  Q4_K     real blk.5.attn_q.weight    3840x2048   inputs  1  vs fp32  6.96e-03  vs emul  8.31e-07 
+  Q4_K     real blk.5.attn_q.weight    3840x2048   inputs  8  vs fp32  1.07e-02  vs emul  2.41e-06 
+  Q4_K     real blk.5.attn_q.weight    3840x2048   inputs 16  vs fp32  1.06e-02  vs emul  4.95e-06 
+  Q4_K     expert gate|up              2048x1024   inputs  1  vs fp32  1.35e-02  vs emul  3.11e-07 
+  Q4_K     expert gate|up              2048x1024   inputs  2  vs fp32  1.37e-02  vs emul  9.65e-07 
+  Q4_K     expert gate|up              2048x1024   inputs  5  vs fp32  9.10e-03  vs emul  7.96e-07 
+  Q4_K     expert gate|up              2048x1024   inputs  8  vs fp32  1.11e-02  vs emul  6.32e-07 
+  Q4_K     expert gate|up              2048x1024   inputs 16  vs fp32  8.98e-03  vs emul  8.13e-07 
+  Q4_K     expert down                  512x2048   inputs  1  vs fp32  1.18e-02  vs emul  2.27e-07 
+  Q4_K     expert down                  512x2048   inputs  2  vs fp32  7.27e-03  vs emul  4.21e-07 
+  Q4_K     expert down                  512x2048   inputs  5  vs fp32  1.76e-02  vs emul  5.68e-07 
+  Q4_K     expert down                  512x2048   inputs  8  vs fp32  1.22e-02  vs emul  3.30e-07 
+  Q4_K     expert down                  512x2048   inputs 16  vs fp32  8.54e-03  vs emul  9.25e-07 
+  Q4_K     attn_qkv                    2048x8192   inputs  1  vs fp32  1.20e-02  vs emul  6.73e-07 
+  Q4_K     attn_qkv                    2048x8192   inputs  2  vs fp32  1.22e-02  vs emul  8.30e-07 
+  Q4_K     attn_qkv                    2048x8192   inputs  5  vs fp32  9.10e-03  vs emul  7.75e-07 
+  Q4_K     attn_qkv                    2048x8192   inputs  8  vs fp32  9.69e-03  vs emul  6.67e-07 
+  Q4_K     attn_qkv                    2048x8192   inputs 16  vs fp32  1.41e-02  vs emul  1.25e-06 
+== Q5_K
+  Q5_K     real blk.0.ffn_gate.weight  3840x2048   inputs  1  vs fp32  1.14e-02  vs emul  2.01e-06 
+  Q5_K     real blk.0.ffn_gate.weight  3840x2048   inputs  8  vs fp32  1.09e-02  vs emul  3.57e-06 
+  Q5_K     real blk.0.ffn_gate.weight  3840x2048   inputs 16  vs fp32  1.09e-02  vs emul  4.55e-06 
+  Q5_K     real blk.0.ffn_down.weight 15360x2048   inputs  1  vs fp32  1.40e-02  vs emul  4.87e-06 
+  Q5_K     real blk.0.ffn_down.weight 15360x2048   inputs  8  vs fp32  1.20e-02  vs emul  4.71e-06 
+  Q5_K     real blk.0.ffn_down.weight 15360x2048   inputs 16  vs fp32  1.11e-02  vs emul  7.87e-06 
+  Q5_K     real blk.5.attn_q.weight    3840x2048   inputs  1  vs fp32  1.58e-02  vs emul  3.37e-06 
+  Q5_K     real blk.5.attn_q.weight    3840x2048   inputs  8  vs fp32  1.05e-02  vs emul  2.04e-06 
+  Q5_K     real blk.5.attn_q.weight    3840x2048   inputs 16  vs fp32  1.05e-02  vs emul  2.98e-06 
+  Q5_K     expert gate|up              2048x1024   inputs  1  vs fp32  4.99e-03  vs emul  2.51e-07 
+  Q5_K     expert gate|up              2048x1024   inputs  2  vs fp32  1.15e-02  vs emul  4.74e-07 
+  Q5_K     expert gate|up              2048x1024   inputs  5  vs fp32  1.17e-02  vs emul  4.92e-07 
+  Q5_K     expert gate|up              2048x1024   inputs  8  vs fp32  1.02e-02  vs emul  6.51e-07 
+  Q5_K     expert gate|up              2048x1024   inputs 16  vs fp32  1.18e-02  vs emul  1.27e-06 
+  Q5_K     expert down                  512x2048   inputs  1  vs fp32  7.03e-03  vs emul  2.84e-07 
+  Q5_K     expert down                  512x2048   inputs  2  vs fp32  9.33e-03  vs emul  2.73e-07 
+  Q5_K     expert down                  512x2048   inputs  5  vs fp32  1.15e-02  vs emul  3.39e-07 
+  Q5_K     expert down                  512x2048   inputs  8  vs fp32  9.37e-03  vs emul  7.36e-07 
+  Q5_K     expert down                  512x2048   inputs 16  vs fp32  1.16e-02  vs emul  5.58e-07 
+  Q5_K     attn_qkv                    2048x8192   inputs  1  vs fp32  1.38e-02  vs emul  8.60e-07 
+  Q5_K     attn_qkv                    2048x8192   inputs  2  vs fp32  1.69e-02  vs emul  8.51e-07 
+  Q5_K     attn_qkv                    2048x8192   inputs  5  vs fp32  9.27e-03  vs emul  5.59e-07 
+  Q5_K     attn_qkv                    2048x8192   inputs  8  vs fp32  8.31e-03  vs emul  8.85e-07 
+  Q5_K     attn_qkv                    2048x8192   inputs 16  vs fp32  9.75e-03  vs emul  1.56e-06 
+== Q6_K
+  Q6_K     real blk.0.ffn_gate.weight  3840x2048   inputs  1  vs fp32  1.32e-02  vs emul  5.22e-07 
+  Q6_K     real blk.0.ffn_gate.weight  3840x2048   inputs  8  vs fp32  1.00e-02  vs emul  8.66e-07 
+  Q6_K     real blk.0.ffn_gate.weight  3840x2048   inputs 16  vs fp32  1.22e-02  vs emul  1.17e-06 
+  Q6_K     real blk.0.ffn_down.weight 15360x2048   inputs  1  vs fp32  1.21e-02  vs emul  1.70e-06 
+  Q6_K     real blk.0.ffn_down.weight 15360x2048   inputs  8  vs fp32  1.01e-02  vs emul  2.00e-06 
+  Q6_K     real blk.0.ffn_down.weight 15360x2048   inputs 16  vs fp32  9.65e-03  vs emul  1.92e-06 
+  Q6_K     real blk.5.attn_q.weight    3840x2048   inputs  1  vs fp32  1.12e-02  vs emul  4.44e-07 
+  Q6_K     real blk.5.attn_q.weight    3840x2048   inputs  8  vs fp32  9.98e-03  vs emul  9.07e-07 
+  Q6_K     real blk.5.attn_q.weight    3840x2048   inputs 16  vs fp32  1.13e-02  vs emul  9.82e-07 
+  Q6_K     expert gate|up              2048x1024   inputs  1  vs fp32  9.98e-03  vs emul  2.84e-07 
+  Q6_K     expert gate|up              2048x1024   inputs  2  vs fp32  1.14e-02  vs emul  6.35e-07 
+  Q6_K     expert gate|up              2048x1024   inputs  5  vs fp32  1.06e-02  vs emul  5.04e-07 
+  Q6_K     expert gate|up              2048x1024   inputs  8  vs fp32  1.22e-02  vs emul  6.66e-07 
+  Q6_K     expert gate|up              2048x1024   inputs 16  vs fp32  1.09e-02  vs emul  1.39e-06 
+  Q6_K     expert down                  512x2048   inputs  1  vs fp32  9.54e-03  vs emul  3.31e-07 
+  Q6_K     expert down                  512x2048   inputs  2  vs fp32  6.93e-03  vs emul  2.51e-07 
+  Q6_K     expert down                  512x2048   inputs  5  vs fp32  1.10e-02  vs emul  3.68e-07 
+  Q6_K     expert down                  512x2048   inputs  8  vs fp32  1.12e-02  vs emul  4.82e-07 
+  Q6_K     expert down                  512x2048   inputs 16  vs fp32  1.21e-02  vs emul  5.82e-07 
+  Q6_K     attn_qkv                    2048x8192   inputs  1  vs fp32  9.43e-03  vs emul  3.15e-07 
+  Q6_K     attn_qkv                    2048x8192   inputs  2  vs fp32  1.05e-02  vs emul  6.33e-07 
+  Q6_K     attn_qkv                    2048x8192   inputs  5  vs fp32  1.20e-02  vs emul  4.65e-07 
+  Q6_K     attn_qkv                    2048x8192   inputs  8  vs fp32  1.09e-02  vs emul  8.88e-07 
+  Q6_K     attn_qkv                    2048x8192   inputs 16  vs fp32  1.08e-02  vs emul  1.67e-06 
+== IQ4_XS
+  IQ4_XS   real blk.0.ffn_gate.weight  3840x2048   inputs  1  vs fp32  7.88e-03  vs emul  7.37e-07 
+  IQ4_XS   real blk.0.ffn_gate.weight  3840x2048   inputs  8  vs fp32  1.07e-02  vs emul  1.15e-06 
+  IQ4_XS   real blk.0.ffn_gate.weight  3840x2048   inputs 16  vs fp32  1.14e-02  vs emul  1.02e-06 
+  IQ4_XS   real blk.0.ffn_down.weight 15360x2048   inputs  1  vs fp32  8.12e-03  vs emul  9.86e-07 
+  IQ4_XS   real blk.0.ffn_down.weight 15360x2048   inputs  8  vs fp32  1.08e-02  vs emul  1.45e-06 
+  IQ4_XS   real blk.0.ffn_down.weight 15360x2048   inputs 16  vs fp32  1.09e-02  vs emul  1.80e-06 
+  IQ4_XS   real blk.5.attn_q.weight    3840x2048   inputs  1  vs fp32  9.31e-03  vs emul  4.18e-07 
+  IQ4_XS   real blk.5.attn_q.weight    3840x2048   inputs  8  vs fp32  1.05e-02  vs emul  9.70e-07 
+  IQ4_XS   real blk.5.attn_q.weight    3840x2048   inputs 16  vs fp32  1.09e-02  vs emul  1.19e-06 
+  IQ4_XS   expert gate|up              2048x1024   inputs  1  vs fp32  1.18e-02  vs emul  4.96e-07 
+  IQ4_XS   expert gate|up              2048x1024   inputs  2  vs fp32  1.16e-02  vs emul  4.19e-07 
+  IQ4_XS   expert gate|up              2048x1024   inputs  5  vs fp32  1.21e-02  vs emul  1.00e-06 
+  IQ4_XS   expert gate|up              2048x1024   inputs  8  vs fp32  1.21e-02  vs emul  9.04e-07 
+  IQ4_XS   expert gate|up              2048x1024   inputs 16  vs fp32  1.15e-02  vs emul  5.39e-07 
+  IQ4_XS   expert down                  512x2048   inputs  1  vs fp32  9.06e-03  vs emul  2.16e-07 
+  IQ4_XS   expert down                  512x2048   inputs  2  vs fp32  1.06e-02  vs emul  3.97e-07 
+  IQ4_XS   expert down                  512x2048   inputs  5  vs fp32  9.86e-03  vs emul  3.22e-07 
+  IQ4_XS   expert down                  512x2048   inputs  8  vs fp32  1.05e-02  vs emul  5.18e-07 
+  IQ4_XS   expert down                  512x2048   inputs 16  vs fp32  1.05e-02  vs emul  6.96e-07 
+  IQ4_XS   attn_qkv                    2048x8192   inputs  1  vs fp32  1.13e-02  vs emul  3.92e-07 
+  IQ4_XS   attn_qkv                    2048x8192   inputs  2  vs fp32  9.90e-03  vs emul  4.18e-07 
+  IQ4_XS   attn_qkv                    2048x8192   inputs  5  vs fp32  1.08e-02  vs emul  7.72e-07 
+  IQ4_XS   attn_qkv                    2048x8192   inputs  8  vs fp32  1.05e-02  vs emul  2.25e-06 
+  IQ4_XS   attn_qkv                    2048x8192   inputs 16  vs fp32  1.06e-02  vs emul  1.11e-06 

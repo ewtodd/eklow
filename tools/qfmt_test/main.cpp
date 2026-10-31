@@ -148,12 +148,14 @@ std::vector<float> random_x(int64_t m, int64_t k) {
 
 struct Stat {
   double fp32 = 0, emul = 0;
+  double eps = 0;  // the worst emulation error in units of fp32 epsilon x sum |terms| (what float accumulation alone can cost)
 };
 
 // out[m][n] vs the references on sampled columns (and at most 48 sampled rows): fp32 dot of ggml's dequantization with the
 // fp32 activations, and the exact emulation of the arithmetic the form does: int8 activations (up to 32 rows) or the fp16
 // GEMM's (fp16 activations, the dequantization's fp16 weights, fp32 accumulation).
-Stat compare(const FormatInfo& f, const Mat& mat, const std::vector<float>& x, int64_t m, const std::vector<float>& y, int cols) {
+Stat compare(const FormatInfo& f, const Mat& mat, const std::vector<float>& x, int64_t m, const std::vector<float>& y, int cols,
+             const std::vector<refs::QRow>* dev_q = nullptr) {
   const int64_t k = mat.k, n = mat.n;
   const bool fp16 = m > xmx::kFp16Rows;
   std::vector<int64_t> pick, rpick;
@@ -164,14 +166,17 @@ Stat compare(const FormatInfo& f, const Mat& mat, const std::vector<float>& x, i
     refs::dequant_row(f.type, mat.raw + uint64_t(pick[i]) * mat.rb, k, deq[i].data());
     refs::weights16_row(f.type, mat.raw + uint64_t(pick[i]) * mat.rb, k, w16[i].data());
   }
-  double num = 0, den = 0, emax = 0, ersum = 0;
+  double num = 0, den = 0, emax = 0, ersum = 0, epsmax = 0;
   int cnt = 0;
   for (int64_t r : rpick) {
     refs::QRow qr;
-    if (!fp16) qr = refs::quantize_row(x.data() + r * k, k);
+    if (!fp16) qr = dev_q ? (*dev_q)[size_t(r)] : refs::quantize_row(x.data() + r * k, k);
     for (size_t i = 0; i < pick.size(); ++i) {
-      double ref = 0, em = 0;
-      for (int64_t c = 0; c < k; ++c) ref += double(x[size_t(r * k + c)]) * double(deq[i][size_t(c)]);
+      double ref = 0, em = 0, cond = 0;
+      for (int64_t c = 0; c < k; ++c) {
+        ref += double(x[size_t(r * k + c)]) * double(deq[i][size_t(c)]);
+        cond += std::fabs(double(x[size_t(r * k + c)]) * double(deq[i][size_t(c)]));
+      }
       const double got = y[size_t(r * n + pick[i])];
       num += (got - ref) * (got - ref);
       den += ref * ref;
@@ -182,11 +187,12 @@ Stat compare(const FormatInfo& f, const Mat& mat, const std::vector<float>& x, i
       }
       ersum += em * em;
       emax = std::max(emax, std::fabs(got - em));
+      epsmax = std::max(epsmax, std::fabs(got - em) / (1.2e-7 * cond));
       ++cnt;
     }
   }
   const double rms = std::sqrt(ersum / std::max(cnt, 1));
-  return {std::sqrt(num / std::max(den, 1e-30)), emax / std::max(rms, 1e-30)};
+  return {std::sqrt(num / std::max(den, 1e-30)), emax / std::max(rms, 1e-30), epsmax};
 }
 
 void check_matmul(sycl::queue& q, const FormatInfo& f, const char* label, Mat& mat, const std::vector<int64_t>& rows, json::Writer& jw,
@@ -205,11 +211,29 @@ void check_matmul(sycl::queue& q, const FormatInfo& f, const char* label, Mat& m
     q.wait();
     std::vector<float> y(static_cast<size_t>(m * n));
     q.memcpy(y.data(), yd, y.size() * 4).wait();
-    const Stat s = compare(f, mat, x, m, y, 24);
-    std::printf("  %-8s %-26s %4lldx%-7lld rows %3lld  vs fp32 %9.2e  vs emul %9.2e %s\n", f.name, label, (long long)k, (long long)n,
-                (long long)m, s.fp32, s.emul, (fp16_rows ? (s.fp32 < 2e-3 && s.emul < 2e-5) : (s.fp32 < 3e-2 && s.emul < 2e-5)) ? "" : "  <-- OUT OF BAND");
+    // The emulation takes the card's own int8 activations (a quantization tie can round either way by an ulp of the reciprocal).
+    std::vector<refs::QRow> dq;
+    if (m <= xmx::kFp16Rows) {
+      const int64_t kb = k / 32;
+      std::vector<int8_t> hq(static_cast<size_t>(act.m_pad * k));
+      std::vector<float> hs(static_cast<size_t>(act.m_pad * kb));
+      q.memcpy(hq.data(), act.q, hq.size());
+      q.memcpy(hs.data(), act.s, hs.size() * 4).wait();
+      for (int64_t r = 0; r < m; ++r) {
+        refs::QRow row;
+        row.q.resize(static_cast<size_t>(k));
+        row.s.resize(static_cast<size_t>(kb));
+        for (int64_t c = 0; c < k; ++c) row.q[size_t(c)] = hq[size_t(xmx::act_index(r, c, kb))];
+        for (int64_t b = 0; b < kb; ++b) row.s[size_t(b)] = hs[size_t(xmx::act_scale_index(r, b * 32, kb))];
+        dq.push_back(std::move(row));
+      }
+    }
+    const Stat s = compare(f, mat, x, m, y, 24, m <= xmx::kFp16Rows ? &dq : nullptr);
+    const bool ok = (fp16_rows ? s.fp32 < 2e-3 : s.fp32 < 3e-2) && (s.emul < 2e-5 || s.eps < 64);
+    std::printf("  %-8s %-26s %4lldx%-7lld rows %3lld  vs fp32 %9.2e  vs emul %9.2e (%4.1f eps) %s\n", f.name, label, (long long)k, (long long)n,
+                (long long)m, s.fp32, s.emul, s.eps, ok ? "" : "  <-- OUT OF BAND");
     jw.begin_object().kv("format", f.name).kv("shape", label).kv("k", k).kv("n", n).kv("rows", m).kv("rel_vs_fp32", s.fp32)
-        .kv("rel_vs_emulation", s.emul).end_object();
+        .kv("rel_vs_emulation", s.emul).kv("emulation_error_in_eps", s.eps).end_object();
   }
   sycl::free(xd, q);
   sycl::free(yd, q);
