@@ -303,19 +303,10 @@ std::vector<float> reference_forward(sycl::queue& q, const Qwen35Config& c, cons
       // q | k | v along the channels; q and k per key head, l2-normalized.
       ref::l2_norm_heads(q, conv, CD, T, HK, S, c.eps, qn);
       ref::l2_norm_heads(q, conv + KEY, CD, T, HK, S, c.eps, kn);
-      if (dump && (dump->wants("q_conv_predelta" + s) || dump->wants("k_conv_predelta" + s))) {
-        // llama.cpp repeats the key heads to the value heads (tiled) before the recurrence.
-        for (int which = 0; which < 2; ++which) {
-          const std::string name = std::string(which ? "k" : "q") + "_conv_predelta" + s;
-          if (!dump->wants(name)) continue;
-          std::vector<float> src(size_t(T * KEY)), rep(size_t(T * HV * S));
-          q.memcpy(src.data(), which ? kn : qn, src.size() * sizeof(float)).wait();
-          for (int64_t t = 0; t < T; ++t)
-            for (int64_t hv = 0; hv < HV; ++hv)
-              std::copy_n(src.data() + (t * HK + hv % HK) * S, S, rep.data() + (t * HV + hv) * S);
-          dump->put(name, rep, {S, HV, T, 1});
-        }
-      }
+      // llama.cpp at this revision runs the fused recurrence, which takes the key heads untiled (the repeat to
+      // the value heads is the graph's only when it is not fused).
+      emit("q_conv_predelta" + s, qn, {S, HK, T, 1});
+      emit("k_conv_predelta" + s, kn, {S, HK, T, 1});
       ref::gated_delta_rule(q, qn, kn, conv + 2 * KEY, CD, alpha, beta, T, HK, HV, S, state, dout);
       emit("attn_output" + s, dout, {S, HV, T, 1});
       ref::gated_rmsnorm(q, dout, z, L.ssm_norm, T * HV, S, c.eps, dout);
@@ -327,7 +318,7 @@ std::vector<float> reference_forward(sycl::queue& q, const Qwen35Config& c, cons
       emit("Qcur_full" + s, qfull, {2 * H * D, T});
       ref::matmul(q, L.wk, h, T, kb);
       ref::matmul(q, L.wv, h, T, vb);
-      emit("Vcur" + s, vb, {D, Hkv, T});
+      emit("Vcur" + s, vb, {Hkv * D, T});
       ref::split_q_gate(q, qfull, T, H, D, qb, gate);
       emit("gate_reshaped" + s, gate, {H * D, T});
       ref::rmsnorm(q, qb, L.q_norm, T * H, D, c.eps, qb);
@@ -388,7 +379,7 @@ std::vector<float> reference_forward(sycl::queue& q, const Qwen35Config& c, cons
         }
       }
       emit_host("ffn_moe_probs" + s, probs, {NE, T});
-      emit_host("ffn_moe_weights_norm" + s, wnorm, {1, K, T});
+      emit_host("ffn_moe_weights_norm" + s, wnorm, {K, T});
     }
     q.fill(moe, 0.0f, size_t(T * E)).wait();
     for (int64_t e = 0; e < NE; ++e) {
