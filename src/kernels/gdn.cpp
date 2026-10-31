@@ -506,7 +506,7 @@ namespace {
 struct Fused {
   using K = Cols<kScanCols>;
   static constexpr int C = kScanCols, kThreads = kHead / kScanCols, kMaxTok = kFusedMaxTokens;
-  static constexpr int kQkvOff = 0, kGbOff = kMaxTok * kHC * 4, kOOff = kGbOff + 2 * kMaxTok * 4, kSlm = kOOff + kMaxTok * kHead * 4;
+  static constexpr int kQkvOff = 0, kOOff = kMaxTok * kHC * 4, kSlm = kOOff + kMaxTok * kHead * 4;  // 32 KB: four work-groups fit a core
 
   const SlotStep* slots;
   const float *x, *z, *a, *b, *conv_w, *ssm_a, *dt, *norm_w;
@@ -540,7 +540,11 @@ struct Fused {
     // A part's channels of x: q and k of the key head, v of the head.
     auto xch = [&](int32_t part) SYCL_ESIMD_FUNCTION { return part == 0 ? kh * kHead : part == 1 ? kQk + kh * kHead : 2 * kQk + h * kHead; };
 
-    // 1. A unit of each token: its three parts' conv outputs into shared memory, and the head's gate.
+    // exp(g) and beta of the head for each token, in registers (every thread wants them).
+    esimd::simd<float, 16> eg_all, beta_all;
+    gate_beta(a + tok0 * lda + h, b + tok0 * ldb + h, lda, ldb, ssm_a[h], dt[h], n, eg_all, beta_all);
+
+    // 1. A unit of each token: its three parts' conv outputs into shared memory.
     if (tid < 3 * n) {
       const int32_t j = tid / 3, part = tid % 3, hg = part == 0 ? kh : part == 1 ? kKeyHeads + kh : 2 * kKeyHeads + h;
       const int64_t ch0 = int64_t(hg) * kHead;
@@ -553,11 +557,6 @@ struct Fused {
       const esimd::simd<float, 128> xn = row128(x + (tok0 + j) * ldx + ch0);
       esimd::slm_block_store<float, 128>(kQkvOff + (j * kHC + part * kHead) * 4,
                                          conv_unit(hist[0], hist[1], hist[2], xn, conv_w + int64_t(hg) * kConvTaps * kHead, hg, eps));
-    } else if (tid == 3 * n) {
-      esimd::simd<float, 16> eg, beta;
-      gate_beta(a + tok0 * lda + h, b + tok0 * ldb + h, lda, ldb, ssm_a[h], dt[h], n, eg, beta);
-      esimd::slm_block_store<float, 16>(kGbOff, eg);
-      esimd::slm_block_store<float, 16>(kGbOff + kMaxTok * 4, beta);
     }
     esimd::barrier();
 
@@ -598,8 +597,9 @@ struct Fused {
           t.q = esimd::slm_block_load<float, 128>(kQkvOff + j * kHC * 4);
           t.k = esimd::slm_block_load<float, 128>(kQkvOff + (j * kHC + kHead) * 4);
           t.v = esimd::slm_block_load<float, C>(kQkvOff + (j * kHC + 2 * kHead + col0) * 4);
-          t.eg = esimd::slm_scalar_load<float>(kGbOff + j * 4);
-          t.beta = esimd::slm_scalar_load<float>(kGbOff + (kMaxTok + j) * 4);
+          const float egj = eg_all[j], bj = beta_all[j];
+          t.eg = egj;
+          t.beta = bj;
         }
         K::token(S, t, ov);
         if (i >= st.accept) esimd::slm_block_store<float, C>(kOOff + ((i - st.accept) * kHead + col0) * 4, ov);
@@ -646,8 +646,8 @@ struct Fused {
     }
     if (tid == kThreads - 1)
       for (int32_t p = 0; p < np; ++p) {
-        pg[p * 64 + h] = esimd::slm_scalar_load<float>(kGbOff + (st.commit + p) * 4);
-        pg[p * 64 + 32 + h] = esimd::slm_scalar_load<float>(kGbOff + (kMaxTok + st.commit + p) * 4);
+        pg[p * 64 + h] = eg_all[st.commit + p];
+        pg[p * 64 + 32 + h] = beta_all[st.commit + p];
       }
   }
 };
