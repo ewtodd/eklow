@@ -1,0 +1,46 @@
+device: Intel(R) Arc(TM) A770M Graphics, 512 EUs, 2050 MHz max
+verify fp16           vnni ops=2               max error 1.62981e-07 ok
+verify s8             vnni ops=4               max error 0          ok
+verify s8xs4          vnni ops=4               max error 5984       MISMATCH
+verify s8xs4          vnni ops=8               max error 0          ok
+verify s4             vnni ops=8               max error 0          ok
+verify s8xs8 K=32     dword (k/4)*8+n          max error 0          ok
+verify s8xu8 K=32     dword (k/4)*8+n          max error 0          ok
+verify u8xs8 K=32     dword (k/4)*8+n          max error 0          ok
+verify u8xu8 K=32     dword (k/4)*8+n          max error 0          ok
+verify s8xs4 K=32     dword (k/8)*8+n          max error 0          ok
+verify s8xu4 K=32     dword (k/8)*8+n          max error 0          ok
+verify u8xs4 K=32     dword (k/8)*8+n          max error 0          ok
+verify u8xu4 K=32     dword (k/8)*8+n          max error 0          ok
+verify s8xs2 K=32     dword (k/16)*8+n         max error 0          ok
+verify s8xu2 K=32     dword (k/16)*8+n         max error 0          ok
+verify u8xs2 K=32     dword (k/16)*8+n         max error 0          ok
+verify u8xu2 K=32     dword (k/16)*8+n         max error 0          ok
+verify u4xu4 K=64     dword (k/8)*8+n          max error 0          ok
+verify s4xs2 K=64     dword (k/16)*8+n         max error 0          ok
+verify s4xu2 K=64     dword (k/16)*8+n         max error 0          ok
+fp16              98.8 TOPS  (89 ms)
+bf16              98.8 TOPS  (89 ms)
+s8               197.6 TOPS  (89 ms)
+s8xs4            197.6 TOPS  (89 ms)
+s4               395.3 TOPS  (89 ms)
+s8xu4            197.6 TOPS  (89 ms)
+u8xu4            197.6 TOPS  (89 ms)
+s8xs2            197.6 TOPS  (89 ms)
+s8xu2            197.6 TOPS  (89 ms)
+s8xu8            197.6 TOPS  (89 ms)
+s8xs4+scale      221.8 TOPS  (40 ms)
+fp16+dequant      26.6 TOPS  (331 ms)
+VRAM read:   8192 threads, 2 loads in flight: 386 GB/s
+VRAM read:   8192 threads, 4 loads in flight: 392 GB/s
+VRAM read:   8192 threads, 8 loads in flight: 397 GB/s
+VRAM read:  16384 threads, 2 loads in flight: 398 GB/s
+VRAM read:  16384 threads, 4 loads in flight: 389 GB/s
+VRAM read:  16384 threads, 8 loads in flight: 392 GB/s
+VRAM read:  32768 threads, 2 loads in flight: 395 GB/s
+VRAM read:  32768 threads, 4 loads in flight: 392 GB/s
+VRAM read:  32768 threads, 8 loads in flight: 391 GB/s
+slm read      8408 GB/s  (175.16 B/clk/Xe-core)
+l1 read       9835 GB/s  (204.89 B/clk/Xe-core)
+slm+l1 read   8291 GB/s  (172.73 B/clk/Xe-core)
+wrote /tmp/xmx-qmm.json

@@ -1,0 +1,254 @@
+{
+  "device": "Intel(R) Arc(TM) A770M Graphics",
+  "eus": 512,
+  "max_clock_mhz": 2050,
+  "verify": [
+    {
+      "kind": "fp16",
+      "layout": "vnni ops=2",
+      "max_err": 1.6298145055770874e-07,
+      "ok": true
+    },
+    {
+      "kind": "s8",
+      "layout": "vnni ops=4",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xs4",
+      "layout": "vnni ops=4",
+      "max_err": 5984,
+      "ok": false
+    },
+    {
+      "kind": "s8xs4",
+      "layout": "vnni ops=8",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s4",
+      "layout": "vnni ops=8",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xs8 K=32",
+      "layout": "dword (k/4)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xu8 K=32",
+      "layout": "dword (k/4)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xs8 K=32",
+      "layout": "dword (k/4)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xu8 K=32",
+      "layout": "dword (k/4)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xs4 K=32",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xu4 K=32",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xs4 K=32",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xu4 K=32",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xs2 K=32",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xu2 K=32",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xs2 K=32",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xu2 K=32",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u4xu4 K=64",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s4xs2 K=64",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s4xu2 K=64",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    }
+  ],
+  "throughput": [
+    {
+      "kind": "fp16",
+      "seconds": 0.089007708,
+      "tops": 98.82394704746245
+    },
+    {
+      "kind": "bf16",
+      "seconds": 0.089007708,
+      "tops": 98.82394704746245
+    },
+    {
+      "kind": "s8",
+      "seconds": 0.089007604,
+      "tops": 197.64812503453075
+    },
+    {
+      "kind": "s8xs4",
+      "seconds": 0.089007708,
+      "tops": 197.6478940949249
+    },
+    {
+      "kind": "s4",
+      "seconds": 0.089007709,
+      "tops": 395.29578374870874
+    },
+    {
+      "kind": "s8xu4",
+      "seconds": 0.08904635400000001,
+      "tops": 197.56211516999335
+    },
+    {
+      "kind": "u8xu4",
+      "seconds": 0.089007604,
+      "tops": 197.64812503453075
+    },
+    {
+      "kind": "s8xs2",
+      "seconds": 0.089007708,
+      "tops": 197.6478940949249
+    },
+    {
+      "kind": "s8xu2",
+      "seconds": 0.089007605,
+      "tops": 197.64812281395507
+    },
+    {
+      "kind": "s8xu8",
+      "seconds": 0.089007708,
+      "tops": 197.6478940949249
+    },
+    {
+      "kind": "s8xs4+scale",
+      "seconds": 0.039655521,
+      "tops": 221.8125698615333
+    },
+    {
+      "kind": "fp16+dequant",
+      "seconds": 0.330967604,
+      "tops": 26.57690032468555
+    }
+  ],
+  "read_bandwidth": [
+    {
+      "threads": 8192,
+      "loads_in_flight": 2,
+      "gbps": 386.19472346988397
+    },
+    {
+      "threads": 8192,
+      "loads_in_flight": 4,
+      "gbps": 392.42855607851334
+    },
+    {
+      "threads": 8192,
+      "loads_in_flight": 8,
+      "gbps": 396.5194738243454
+    },
+    {
+      "threads": 16384,
+      "loads_in_flight": 2,
+      "gbps": 398.1276176047348
+    },
+    {
+      "threads": 16384,
+      "loads_in_flight": 4,
+      "gbps": 389.19849473730756
+    },
+    {
+      "threads": 16384,
+      "loads_in_flight": 8,
+      "gbps": 392.0853563996303
+    },
+    {
+      "threads": 32768,
+      "loads_in_flight": 2,
+      "gbps": 395.27275002963415
+    },
+    {
+      "threads": 32768,
+      "loads_in_flight": 4,
+      "gbps": 391.5045059366937
+    },
+    {
+      "threads": 32768,
+      "loads_in_flight": 8,
+      "gbps": 390.9255162440573
+    }
+  ],
+  "read_bandwidth_gbps": 398.1276176047348,
+  "local_read": [
+    {
+      "kind": "slm read",
+      "gbps": 8407.763578543694,
+      "bytes_per_clock_per_core": 175.16174121966029
+    },
+    {
+      "kind": "l1 read",
+      "gbps": 9834.624314490553,
+      "bytes_per_clock_per_core": 204.88800655188652
+    },
+    {
+      "kind": "slm+l1 read",
+      "gbps": 8291.106530430234,
+      "bytes_per_clock_per_core": 172.73138605062988
+    }
+  ]
+}
