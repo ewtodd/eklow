@@ -44,6 +44,8 @@ add_library(eklow_text STATIC
   src/text/output_parser.cpp
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
+  src/text/tokenizer_qwen.cpp
+  src/text/unicode.cpp
 )
 target_link_libraries(eklow_text PUBLIC eklow_host)
 

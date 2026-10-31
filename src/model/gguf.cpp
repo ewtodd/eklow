@@ -260,8 +260,9 @@ File File::open(const std::string& path) {
   }
 
   f.data_offset_ = (c.pos + f.alignment_ - 1) / f.alignment_ * f.alignment_;
-  if (f.data_offset_ > f.size_) fail(path, "data section starts past the end of the file");
-  const uint64_t data_size = f.size_ - f.data_offset_;
+  // A file with no tensors (a vocab-only conversion) ends where its metadata does, short of the alignment padding.
+  if (f.data_offset_ > f.size_ && !f.tensors_.empty()) fail(path, "data section starts past the end of the file");
+  const uint64_t data_size = f.data_offset_ > f.size_ ? 0 : f.size_ - f.data_offset_;
 
   // Tensors must lie inside the data section and must not overlap.
   std::vector<const Tensor*> order;
