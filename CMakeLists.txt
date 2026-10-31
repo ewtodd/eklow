@@ -74,6 +74,7 @@ eklow_sycl(eklow_rt)
 add_library(eklow_model STATIC
   src/kernels/attention.cpp
   src/kernels/fast.cpp
+  src/kernels/gdn.cpp
   src/kernels/ref.cpp
   src/kernels/xmx.cpp
   src/model/embed_gemma2.cpp
@@ -100,6 +101,10 @@ eklow_sycl(eklow-vision)
 add_executable(eklow-attn-test tools/attn_test/main.cpp)
 target_link_libraries(eklow-attn-test PRIVATE eklow_model)
 eklow_sycl(eklow-attn-test)
+
+add_executable(eklow-gdn-test tools/gdn_test/main.cpp)
+target_link_libraries(eklow-gdn-test PRIVATE eklow_model)
+eklow_sycl(eklow-gdn-test)
 
 add_executable(eklow-ref-run tools/ref_run/main.cpp)
 target_link_libraries(eklow-ref-run PRIVATE eklow_model)
@@ -176,6 +181,6 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-cpu-gemv-test RUNTIME DESTINATION bin)
+install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-cpu-gemv-test RUNTIME DESTINATION bin)
 # The 26B's routing profile, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/gemma-4-26b-a4b-experts.json DESTINATION share/eklow)
