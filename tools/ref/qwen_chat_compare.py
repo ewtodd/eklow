@@ -246,6 +246,7 @@ def hand_cases():
         [{"role": "tool", "content": "t1"}, {"role": "tool", "content": "t2"}, u],
         [u, {"role": "tool", "content": "t1"}, {"role": "tool", "content": "t2"}, {"role": "user", "content": "w"}],
         [u, {}, {"role": "tool", "content": "after empty"}],
+        [{"role": "user", "content": "nul\x00char and \x00"}, a(content="\x00", reasoning_content="r\x00r", tool_calls=[{"function": {"name": "f", "arguments": {"k": "v\x00"}}}])],
         [u, a(content="", tool_calls=[call]), {"role": "tool", "content": ""}, {"role": "tool", "content": None}],
     ]
     errors_only = []
