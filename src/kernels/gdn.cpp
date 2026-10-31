@@ -3,6 +3,7 @@
 #include <sycl/ext/intel/esimd.hpp>
 
 #include <algorithm>
+#include <cmath>
 #include <stdexcept>
 #include <string>
 
@@ -98,113 +99,174 @@ void free_scratch(sycl::queue& q, Scratch& s) {
   s = Scratch{};
 }
 
+
 namespace {
 
 inline float silu(float x) { return x / (1.0f + sycl::exp(-x)); }
 
-// Tokens a prepare work-group walks (its window of conv inputs slides along them).
-constexpr int kTile = 16;
+// Tokens a prepare thread walks (its window of conv inputs slides along them).
+constexpr int kTile = 8;
+
+}  // namespace
+
+float* repack_conv_w(sycl::queue& q, const float* raw) {
+  auto* out = sycl::malloc_device<float>(size_t(kChannels) * kConvTaps, q);
+  if (!out) throw std::runtime_error("gdn::repack_conv_w: out of device memory");
+  q.parallel_for(sycl::range<1>(size_t(kChannels) * kConvTaps), [=](sycl::id<1> id) {
+    const int32_t i = int32_t(id[0]), c = i / kConvTaps, t = i % kConvTaps;
+    out[(c / kHead * kConvTaps + t) * kHead + c % kHead] = raw[i];
+  }).wait();
+  return out;
+}
+
+namespace {
+
+// One thread of prepare: 128 channels (one head's q, k or v) over up to kTile tokens of one slot, the window of three
+// earlier rows sliding in registers; thread 64 of each tile does g and beta.
+struct Prepare {
+  const SlotStep* slots;
+  const float *x, *a, *b, *conv_w, *ssm_a, *dt;
+  int64_t ldx, lda, ldb;
+  float* conv;  // this layer, slot 0
+  int64_t conv_slot;
+  const float* pend_x;
+  int64_t pend_slot;
+  float *out, *gb;
+  float eps;
+
+  static esimd::simd<float, 128> row128(const float* p) SYCL_ESIMD_FUNCTION { return esimd::block_load<float, 128>(p); }
+
+  void operator()(sycl::nd_item<3> it) const SYCL_ESIMD_KERNEL {
+    const SlotStep st = slots[it.get_group(0)];
+    const int32_t j0 = int32_t(it.get_group(1)) * kTile, hg = int32_t(it.get_group(2));
+    const int32_t j1 = std::min(j0 + kTile, st.n);
+    if (hg == 64) {
+      // g and beta of the tile's tokens, 32 heads at a time.
+      const esimd::simd<float, 32> sa = esimd::block_load<float, 32>(ssm_a), db = esimd::block_load<float, 32>(dt);
+      for (int32_t j = j0; j < j1; ++j) {
+        const int64_t row = st.tok0 + j;
+        const esimd::simd<float, 32> sp = esimd::block_load<float, 32>(a + row * lda) + db;
+        esimd::simd<float, 32> soft = esimd::log(1.0f + esimd::exp(sp));
+        soft.merge(sp, sp > 20.0f);
+        const esimd::simd<float, 32> g = sa * soft, bv = esimd::block_load<float, 32>(b + row * ldb);
+        esimd::block_store<float, 32>(gb + row * 64, esimd::exp(g));
+        esimd::block_store<float, 32>(gb + row * 64 + 32, 1.0f / (1.0f + esimd::exp(-bv)));
+      }
+      return;
+    }
+    const int32_t ch0 = hg * kHead;
+    const float* wp = conv_w + int64_t(hg) * kConvTaps * kHead;
+    float* cs = conv + int64_t(st.slot) * conv_slot;
+    const float* px = pend_x + int64_t(st.slot) * pend_slot;
+    // The window: the three rows before this tile's first token. Row e of the history [conv state ++ accepted pending rows].
+    esimd::simd<float, 128> h0, h1, h2;
+    {
+      const float* src[3];
+      for (int r = 0; r < 3; ++r) {
+        const int32_t pos = j0 - 3 + r, e = pos + 3 + st.accept;
+        src[r] = pos >= 0 ? x + int64_t(st.tok0 + pos) * ldx + ch0 : e < 3 ? cs + int64_t(e) * kChannels + ch0 : px + int64_t(e - 3) * kChannels + ch0;
+      }
+      h0 = row128(src[0]), h1 = row128(src[1]), h2 = row128(src[2]);
+    }
+    if (j0 == 0) {
+      // The slot's conv state through its accepted and committed tokens: the last three rows of
+      // [state ++ accepted pending rows ++ committed new rows]. Only this tile reads or writes the state, and a new row r
+      // only ever comes from an old row at or after r.
+      const int32_t len = 3 + st.accept + st.commit;
+      for (int r = 0; r < 3; ++r) {
+        const int32_t e = len - 3 + r;
+        if (e == r) continue;
+        const float* src = e < 3 ? cs + int64_t(e) * kChannels + ch0
+                           : e < 3 + st.accept ? px + int64_t(e - 3) * kChannels + ch0
+                                                : x + int64_t(st.tok0 + e - 3 - st.accept) * ldx + ch0;
+        esimd::block_store<float, 128>(cs + int64_t(r) * kChannels + ch0, row128(src));
+      }
+    }
+    for (int32_t j = j0; j < j1; ++j) {
+      const int64_t row = st.tok0 + j;
+      const esimd::simd<float, 128> xn = row128(x + row * ldx + ch0);
+      esimd::simd<float, 128> s = h0 * row128(wp);
+      s += h1 * row128(wp + kHead);
+      s += h2 * row128(wp + 2 * kHead);
+      s += xn * row128(wp + 3 * kHead);
+      h0 = h1, h1 = h2, h2 = xn;
+      esimd::simd<float, 128> v = s / (1.0f + esimd::exp(-s));
+      if (hg < 2 * kKeyHeads) {
+        const float ss = esimd::reduce<float>(v * v, std::plus<>());
+        float inv = esimd::inv(esimd::sqrt(esimd::simd<float, 1>(ss + eps)))[0];
+        if (hg < kKeyHeads) inv *= 0.08838834764831845f;  // 1/sqrt(128)
+        v *= inv;
+      }
+      esimd::block_store<float, 128>(out + row * kChannels + ch0, v);
+    }
+  }
+};
 
 }  // namespace
 
 sycl::event prepare(sycl::queue& q, const Weights& w, const Cache& c, int layer, const Plan& p, const Inputs& in, const Scratch& s) {
   if (p.n_slots == 0) return {};
   const int32_t tiles = std::max(1, (p.max_n + kTile - 1) / kTile);
-  const SlotStep* slots = p.dev;
-  const int64_t sl_stride = int64_t(c.n_layers);
-  float* conv = c.conv + int64_t(layer) * c.conv_floats_per_layer();
-  const int64_t conv_slot = sl_stride * c.conv_floats_per_layer();
-  const float* pend_x = c.pend_x + int64_t(layer) * c.max_pending * kChannels;
-  const int64_t pend_slot = sl_stride * c.max_pending * kChannels;
-  const float *x = in.x, *a = in.a, *b = in.b, *conv_w = w.conv_w, *ssm_a = w.ssm_a, *dt = w.dt_bias;
-  const int64_t ldx = in.ldx, lda = in.lda, ldb = in.ldb;
-  const float eps = w.eps;
-  float* out = s.in;
-  float* gb = s.gb;
-  return q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(p.n_slots), size_t(tiles), 65 * 16), sycl::range<3>(1, 1, 16)),
-                 [=](sycl::nd_item<3> it) [[sycl::reqd_sub_group_size(16)]] {
-    const SlotStep st = slots[it.get_group(0)];
-    const int32_t j0 = int32_t(it.get_group(1)) * kTile, hg = int32_t(it.get_group(2)), l = int32_t(it.get_local_id(2));
-    const int32_t j1 = std::min(j0 + kTile, st.n);
-    if (hg == 64) {
-      // g and beta: head l and l + 16 of each token.
-      for (int32_t j = j0; j < j1; ++j) {
-        const int64_t row = st.tok0 + j;
-        for (int32_t hh = l; hh < kValueHeads; hh += 16) {
-          const float sp = a[row * lda + hh] + dt[hh];
-          const float g = ssm_a[hh] * (sp > 20.0f ? sp : sycl::log(1.0f + sycl::exp(sp)));
-          gb[row * 64 + hh] = sycl::exp(g);
-          gb[row * 64 + 32 + hh] = 1.0f / (1.0f + sycl::exp(-b[row * ldb + hh]));
-        }
-      }
-      return;
-    }
-    const int32_t ch0 = hg * kHead + l * 8;
-    const float* cw = conv_w + int64_t(ch0) * 4;
-    float wt[8][4];
-    for (int i = 0; i < 8; ++i)
-      for (int t = 0; t < 4; ++t) wt[i][t] = cw[i * 4 + t];
-    float* cs = conv + int64_t(st.slot) * conv_slot;
-    const float* px = pend_x + int64_t(st.slot) * pend_slot;
-    // The window: the three rows before this tile's first token. Row e of the history [conv state ++ accepted pending rows].
-    float h[3][8];
-    for (int r = 0; r < 3; ++r) {
-      const int32_t pos = j0 - 3 + r;
-      for (int i = 0; i < 8; ++i) {
-        if (pos >= 0) h[r][i] = x[int64_t(st.tok0 + pos) * ldx + ch0 + i];
-        else {
-          const int32_t e = pos + 3 + st.accept;
-          h[r][i] = e < 3 ? cs[int64_t(e) * kChannels + ch0 + i] : px[int64_t(e - 3) * kChannels + ch0 + i];
-        }
-      }
-    }
-    if (j0 == 0) {
-      // The slot's conv state through its accepted and committed tokens: the last three rows of
-      // [state ++ accepted pending rows ++ committed new rows]. Only this tile reads or writes the state.
-      const int32_t len = 3 + st.accept + st.commit;
-      float nr[3][8];
-      for (int r = 0; r < 3; ++r) {
-        const int32_t e = len - 3 + r;
-        for (int i = 0; i < 8; ++i)
-          nr[r][i] = e < 3                ? cs[int64_t(e) * kChannels + ch0 + i]
-                     : e < 3 + st.accept ? px[int64_t(e - 3) * kChannels + ch0 + i]
-                                          : x[int64_t(st.tok0 + e - 3 - st.accept) * ldx + ch0 + i];
-      }
-      for (int r = 0; r < 3; ++r)
-        for (int i = 0; i < 8; ++i) cs[int64_t(r) * kChannels + ch0 + i] = nr[r][i];
-    }
-    for (int32_t j = j0; j < j1; ++j) {
-      const int64_t row = st.tok0 + j;
-      float v[8], ss = 0;
-      for (int i = 0; i < 8; ++i) {
-        const float xn = x[row * ldx + ch0 + i];
-        float sum = 0;
-        sum += h[0][i] * wt[i][0];
-        sum += h[1][i] * wt[i][1];
-        sum += h[2][i] * wt[i][2];
-        sum += xn * wt[i][3];
-        h[0][i] = h[1][i], h[1][i] = h[2][i], h[2][i] = xn;
-        v[i] = silu(sum);
-        ss += v[i] * v[i];
-      }
-      if (hg < 2 * kKeyHeads) {
-        ss = sycl::reduce_over_group(it.get_sub_group(), ss, sycl::plus<float>());
-        float inv = 1.0f / sycl::sqrt(ss + eps);
-        if (hg < kKeyHeads) inv *= 0.08838834764831845f;  // 1/sqrt(128)
-        for (int i = 0; i < 8; ++i) v[i] *= inv;
-      }
-      for (int i = 0; i < 8; ++i) out[row * kChannels + ch0 + i] = v[i];
-    }
-  });
+  const int64_t nl = c.n_layers;
+  Prepare k{p.dev,
+            in.x,
+            in.a,
+            in.b,
+            w.conv_w,
+            w.ssm_a,
+            w.dt_bias,
+            in.ldx,
+            in.lda,
+            in.ldb,
+            c.conv + int64_t(layer) * c.conv_floats_per_layer(),
+            nl * c.conv_floats_per_layer(),
+            c.pend_x + int64_t(layer) * c.max_pending * kChannels,
+            nl * c.max_pending * kChannels,
+            s.in,
+            s.gb,
+            w.eps};
+  return q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(p.n_slots), size_t(tiles), 65), sycl::range<3>(1, 1, 1)), k);
 }
 
 namespace {
 
-// One thread of the scan: C columns of one value head's state (C x 128 floats) in registers, walking a slot's tokens.
-// The 128 rows of a column are eight SIMD16 chunks; a dot product is eight fused multiply-adds into one chunk and a
-// horizontal sum of its 16 lanes, the update eight more, so a column costs about 40 instructions a token.
-template <int C>
+// 128 products summed into 16 lanes, in kDotChains independent chains (a single chain of eight dependent multiply-adds
+// ran serially through one accumulator register).
+constexpr int kDotChains = 2;
+constexpr int kGroup = 2;
+inline esimd::simd<float, 16> dot16(esimd::simd<float, 128> a, esimd::simd<float, 128> b) SYCL_ESIMD_FUNCTION {
+  esimd::simd<float, 16> c[kDotChains];
+#pragma unroll
+  for (int j = 0; j < kDotChains; ++j) c[j] = a.template select<16, 1>(16 * j) * b.template select<16, 1>(16 * j);
+#pragma unroll
+  for (int i = kDotChains; i < 8; ++i) c[i % kDotChains] += a.template select<16, 1>(16 * i) * b.template select<16, 1>(16 * i);
+  if constexpr (kDotChains == 1) return c[0];
+  else if constexpr (kDotChains == 2) return c[0] + c[1];
+  else return (c[0] + c[1]) + (c[2] + c[3]);
+}
+
+// M batches of 16 lanes to M sums (log steps on all batches at once).
+template <int M, int W>
+esimd::simd<float, M> hsum(esimd::simd<float, M * W> a) SYCL_ESIMD_FUNCTION {
+  if constexpr (W == 1) {
+    return a;
+  } else {
+    auto v = a.template bit_cast_view<float, M, W>();
+    esimd::simd<float, M * (W / 2)> b = v.template select<M, 1, W / 2, 1>(0, 0) + v.template select<M, 1, W / 2, 1>(0, W / 2);
+    return hsum<M, W / 2>(b);
+  }
+}
+
+// One thread of the scan: C columns of each of NH value heads (h and h + 16, which share a key head) of one slot, the
+// state (M = C NH columns of 128 floats) in registers, walking the slot's tokens. The 128 rows of a column are eight
+// SIMD16 chunks; per column and token the two dots (S^T k and S^T q, both on the state before this token's update) are
+// 16 fused multiply-adds, the update 16 more, with the horizontal sums of all columns done together:
+//   kv = eg (S^T k);  d = beta (v - kv);  o = eg (S^T q) + d (k . q);  S = eg S + k d^T
+// which is the recurrence of llama.cpp with the decay folded in (S *= exp(g) first, then kv, then S += k d^T, then
+// o = S^T q), in fp32 rounding.
+template <int C, int NH>
 struct Scan {
+  static constexpr int M = C * NH;
   const SlotStep* slots;
   float* ssm;            // this layer, slot 0
   int64_t ssm_slot;      // floats between slots
@@ -213,92 +275,129 @@ struct Scan {
   const float *pend_in, *pend_gb;  // this layer, slot 0
   int64_t pend_in_slot, pend_gb_slot;
 
-  // S *= exp(g); d = beta (v - S^T k); S += k d^T; and o = S^T q when Out. kv and o are per column.
-  template <bool Out>
-  static void token(esimd::simd<float, 128> (&S)[C], const float* kp, const float* qp, const float* vp, float eg, float beta,
-                    esimd::simd<float, C>& ov) SYCL_ESIMD_FUNCTION {
-    esimd::simd<float, 128> k = esimd::block_load<float, 128>(kp);
-    const esimd::simd<float, C> v = esimd::block_load<float, C>(vp);
-    esimd::simd<float, C> kv;
+  struct Tok {
+    esimd::simd<float, 128> k, q;
+    esimd::simd<float, M> v, eg, beta;
+  };
+
+  // A token's operands: qp, kp the row's q and k heads (128 floats), vp the first value head's columns (heads NH apart by
+  // 16 x 128), gp the row's exp(g) | beta at the first head.
+  static Tok load(const float* qp, const float* kp, const float* vp, const float* gp) SYCL_ESIMD_FUNCTION {
+    Tok t;
+    t.k = esimd::block_load<float, 128>(kp);
+    t.q = esimd::block_load<float, 128>(qp);
 #pragma unroll
-    for (int c = 0; c < C; ++c) {
-      S[c] *= eg;
-      esimd::simd<float, 16> acc = S[c].template select<16, 1>(0) * k.template select<16, 1>(0);
-#pragma unroll
-      for (int i = 1; i < 8; ++i) acc += S[c].template select<16, 1>(16 * i) * k.template select<16, 1>(16 * i);
-      kv[c] = esimd::reduce<float>(acc, std::plus<>());
+    for (int i = 0; i < NH; ++i) {
+      t.v.template select<C, 1>(i * C) = esimd::block_load<float, C>(vp + i * kKeyHeads * kHead);
+      t.eg.template select<C, 1>(i * C) = gp[i * kKeyHeads];
+      t.beta.template select<C, 1>(i * C) = gp[32 + i * kKeyHeads];
     }
-    const esimd::simd<float, C> d = (v - kv) * beta;
+    return t;
+  }
+
+  static void token(esimd::simd<float, 128> (&S)[M], Tok t, esimd::simd<float, M>& ov) SYCL_ESIMD_FUNCTION {
+    // Columns in groups of kGroup, each group's dots and update done before the next group's, so that the accumulators of
+    // only one group are live next to the state (M = 4 columns fill 64 of the 128 registers, k and q 32 more).
+    constexpr int G = M < kGroup ? M : kGroup, NA = 2 * G + 1;  // S^T k and S^T q of each column, then k . q
+    float kq = 0;
 #pragma unroll
-    for (int c = 0; c < C; ++c) {
-      const float dc = d[c];
+    for (int g0 = 0; g0 < M; g0 += G) {
+      esimd::simd<float, 16 * NA> acc;
 #pragma unroll
-      for (int i = 0; i < 8; ++i) S[c].template select<16, 1>(16 * i) += k.template select<16, 1>(16 * i) * dc;
-    }
-    if constexpr (Out) {
-      esimd::simd<float, 128> qv = esimd::block_load<float, 128>(qp);
+      for (int c = 0; c < G; ++c) {
+        acc.template select<16, 1>(16 * c) = dot16(S[g0 + c], t.k);
+        acc.template select<16, 1>(16 * (G + c)) = dot16(S[g0 + c], t.q);
+      }
+      acc.template select<16, 1>(16 * 2 * G) = dot16(t.k, t.q);
+      esimd::simd<float, NA> sums = hsum<NA, 16>(acc);
+      kq = sums[2 * G];
+      const esimd::simd<float, G> eg = t.eg.template select<G, 1>(g0);
+      const esimd::simd<float, G> kv = eg * sums.template select<G, 1>(0);
+      const esimd::simd<float, G> d = (t.v.template select<G, 1>(g0) - kv) * t.beta.template select<G, 1>(g0);
+      ov.template select<G, 1>(g0) = eg * sums.template select<G, 1>(G) + d * kq;
 #pragma unroll
-      for (int c = 0; c < C; ++c) {
-        esimd::simd<float, 16> acc = S[c].template select<16, 1>(0) * qv.template select<16, 1>(0);
+      for (int c = 0; c < G; ++c) {
+        const float ec = eg[c], dc = d[c];
 #pragma unroll
-        for (int i = 1; i < 8; ++i) acc += S[c].template select<16, 1>(16 * i) * qv.template select<16, 1>(16 * i);
-        ov[c] = esimd::reduce<float>(acc, std::plus<>());
+        for (int i = 0; i < 8; ++i)
+          S[g0 + c].template select<16, 1>(16 * i) = S[g0 + c].template select<16, 1>(16 * i) * ec + t.k.template select<16, 1>(16 * i) * dc;
       }
     }
   }
 
-  static void store(float* sp, esimd::simd<float, 128> (&S)[C]) SYCL_ESIMD_FUNCTION {
+
+  static void store(float* const (&sp)[M], esimd::simd<float, 128> (&S)[M]) SYCL_ESIMD_FUNCTION {
 #pragma unroll
-    for (int c = 0; c < C; ++c) esimd::block_store<float, 128>(sp + c * kHead, S[c]);
+    for (int c = 0; c < M; ++c) esimd::block_store<float, 128>(sp[c], S[c]);
   }
 
   void operator()(sycl::nd_item<3> it) const SYCL_ESIMD_KERNEL {
     const SlotStep st = slots[it.get_group(0)];
     if (st.n == 0 && st.accept == 0) return;
-    const int32_t h = int32_t(it.get_group(1)), col0 = int32_t(it.get_global_id(2)) * C, kh = h % kKeyHeads;
-    float* sp = ssm + int64_t(st.slot) * ssm_slot + (int64_t(h) * kHead + col0) * kHead;
-    esimd::simd<float, 128> S[C];
+    const int32_t h0 = int32_t(it.get_group(1)), col0 = int32_t(it.get_global_id(2)) * C, kh = h0 % kKeyHeads;
+    float* sp[M];
+    esimd::simd<float, 128> S[M];
 #pragma unroll
-    for (int c = 0; c < C; ++c) S[c] = esimd::block_load<float, 128>(sp + c * kHead);
-    esimd::simd<float, C> ov = 0;
-    // The tokens accepted from the last step's pending ones, replayed from their saved inputs.
-    const float* pi = pend_in + int64_t(st.slot) * pend_in_slot;
-    const float* pg = pend_gb + int64_t(st.slot) * pend_gb_slot;
-    for (int32_t j = 0; j < st.accept; ++j) {
-      const float* r = pi + int64_t(j) * kChannels;
-      token<false>(S, r + kQk + kh * kHead, nullptr, r + 2 * kQk + h * kHead + col0, pg[j * 64 + h], pg[j * 64 + 32 + h], ov);
-    }
-    if (st.commit == 0 && st.accept > 0) store(sp, S);
-    for (int32_t j = 0; j < st.n; ++j) {
-      const int64_t row = st.tok0 + j;
-      const float* r = in + row * kChannels;
-      token<true>(S, r + kQk + kh * kHead, r + kh * kHead, r + 2 * kQk + h * kHead + col0, gb[row * 64 + h], gb[row * 64 + 32 + h], ov);
-      esimd::block_store<float, C>(o + row * kInner + h * kHead + col0, ov);
-      if (j + 1 == st.commit) store(sp, S);
+    for (int i = 0; i < NH; ++i)
+#pragma unroll
+      for (int c = 0; c < C; ++c) {
+        sp[i * C + c] = ssm + int64_t(st.slot) * ssm_slot + (int64_t(h0 + i * kKeyHeads) * kHead + col0 + c) * kHead;
+        S[i * C + c] = esimd::block_load<float, 128>(sp[i * C + c]);
+      }
+    esimd::simd<float, M> ov = 0;
+    // One loop over the tokens accepted from the last step's pending ones (replayed from their saved inputs, which hold q
+    // too, so that the same code runs them as runs new tokens: the state after them is then bit-identical to having run
+    // only those) and then the new ones. The state is stored once, after the last accepted-or-committed token. The rows
+    // are walked by pointers advanced a row at a time (64-bit address arithmetic costs more than the loads).
+    const int32_t total = st.accept + st.n, store_at = st.accept + st.commit;
+    const int64_t new0 = int64_t(st.tok0);
+    const float* r = st.accept > 0 ? pend_in + int64_t(st.slot) * pend_in_slot : in + new0 * kChannels;
+    const float* g = st.accept > 0 ? pend_gb + int64_t(st.slot) * pend_gb_slot : gb + new0 * 64;
+    float* op = o + new0 * kInner + int64_t(h0) * kHead + col0;
+    const int32_t qoff = kh * kHead, koff = kQk + kh * kHead, voff = 2 * kQk + h0 * kHead + col0;
+    for (int32_t i = 0; i < total; ++i) {
+      if (i == st.accept && i > 0) r = in + new0 * kChannels, g = gb + new0 * 64;
+      token(S, load(r + qoff, r + koff, r + voff, g + h0), ov);
+      r += kChannels, g += 64;
+      if (i >= st.accept) {
+#pragma unroll
+        for (int h = 0; h < NH; ++h) esimd::block_store<float, C>(op + h * kKeyHeads * kHead, esimd::simd<float, C>(ov.template select<C, 1>(h * C)));
+        op += kInner;
+      }
+      if (i + 1 == store_at) store(sp, S);
     }
   }
 };
 
-constexpr int kScanCols = 4;
+// Two columns of one value head a thread: 2,048 threads for a slot. Measured (DECISIONS-style notes in REPORT.md): four columns
+// halve the key and query loads, which are what limits the scan (the card's load ports deliver 64 B a clock a core, and every
+// thread takes its own copy of the 1 KB of k and q a token), but leave a lone slot with 1,024 threads and too little to hide
+// latency with (2.6 ms against 2.2 for 2,048 tokens), though two slots are faster that way (2.9 against 3.2 ms for 2 x 2,048).
+constexpr int kScanCols = 2;
+
+template <int C, int NH>
+sycl::event launch_scan(sycl::queue& q, const Cache& c, int layer, const Plan& p, const Scratch& s) {
+  constexpr int kPer = kHead / C;
+  const int64_t nl = c.n_layers;
+  Scan<C, NH> k{p.dev,
+                      c.ssm + int64_t(layer) * c.ssm_floats_per_layer(),
+                      nl * c.ssm_floats_per_layer(),
+                      s.in,
+                      s.gb,
+                      s.o,
+                      c.pend_in + int64_t(layer) * c.max_pending * kChannels,
+                      c.pend_gb + int64_t(layer) * c.max_pending * 64,
+                      nl * c.max_pending * kChannels,
+                      nl * c.max_pending * 64};
+  constexpr int kLocal = kPer < 8 ? kPer : 8;
+  return q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(p.n_slots), kValueHeads / NH, kPer), sycl::range<3>(1, 1, kLocal)), k);
+}
 
 }  // namespace
 
 sycl::event scan(sycl::queue& q, const Cache& c, int layer, const Plan& p, const Scratch& s) {
   if (p.n_slots == 0) return {};
-  constexpr int C = kScanCols, kPer = kHead / C;
-  const int64_t nl = c.n_layers;
-  Scan<C> k{p.dev,
-            c.ssm + int64_t(layer) * c.ssm_floats_per_layer(),
-            nl * c.ssm_floats_per_layer(),
-            s.in,
-            s.gb,
-            s.o,
-            c.pend_in + int64_t(layer) * c.max_pending * kChannels,
-            c.pend_gb + int64_t(layer) * c.max_pending * 64,
-            nl * c.max_pending * kChannels,
-            nl * c.max_pending * 64};
-  constexpr int kLocal = kPer < 8 ? kPer : 8;
-  return q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(p.n_slots), kValueHeads, kPer), sycl::range<3>(1, 1, kLocal)), k);
+  return launch_scan<kScanCols, 1>(q, c, layer, p, s);
 }
 
 sycl::event gated_norm(sycl::queue& q, const Weights& w, const Cache& c, int layer, const Plan& p, const Inputs& in, const Scratch& s,

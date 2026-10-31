@@ -97,8 +97,12 @@ void reset_slot(sycl::queue& q, const Cache& c, int slot);
 sycl::event snapshot_to_host(sycl::queue& q, const Cache& c, int slot, void* host);
 sycl::event restore_from_host(sycl::queue& q, const Cache& c, int slot, const void* host);
 
+// ssm_conv1d as llama.cpp stores it (raw: [8192][4], the 4 taps of each channel) into the layout the kernels read; a new
+// device allocation, freed with sycl::free. Waits.
+float* repack_conv_w(sycl::queue& q, const float* raw);
+
 struct Weights {
-  const float* conv_w;   // [8192][4]: the 4 taps of each channel, tap 3 on the newest row (llama.cpp's ssm_conv1d)
+  const float* conv_w;   // from repack_conv_w: [64 groups of 128 channels][4 taps][128], tap 3 on the newest row
   const float* ssm_a;    // [32], -exp(A_log)
   const float* dt_bias;  // [32]
   const float* norm_w;   // [128]: ssm_norm

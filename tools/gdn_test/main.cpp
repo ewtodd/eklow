@@ -62,7 +62,13 @@ Model make_model(sycl::queue& q, std::mt19937& rng, bool edge) {
     m.dt[h] = edge ? 3.0f * nd(rng) : 0.5f + 0.5f * nd(rng);
   }
   for (auto& v : m.norm_w) v = 1.0f + 0.2f * nd(rng);
-  m.d_conv_w = upload(q, m.conv_w), m.d_ssm_a = upload(q, m.ssm_a), m.d_dt = upload(q, m.dt), m.d_norm_w = upload(q, m.norm_w);
+  {
+    float* raw = upload(q, m.conv_w);
+    m.d_conv_w = repack_conv_w(q, raw);
+    q.wait();
+    sycl::free(raw, q);
+  }
+  m.d_ssm_a = upload(q, m.ssm_a), m.d_dt = upload(q, m.dt), m.d_norm_w = upload(q, m.norm_w);
   return m;
 }
 
@@ -354,28 +360,27 @@ void accuracy(bool edge, bool quick) {
         for (double x : v) s += x * x;
         return std::sqrt(s / double(std::max<size_t>(v.size(), 1)));
       };
-      double invh[kValueHeads];
       const double fo = 1e-3 * rms_of(ro), fy = 1e-3 * rms_of(ry);
       for (size_t t = 0; t < ranges[i].second; ++t) {
         for (int h = 0; h < kValueHeads; ++h) {
+          // The norm and gate stage alone: y from the device's own o (the scan's fp32 noise is judged on o itself; a head
+          // whose o is near zero would amplify it through the norm), in double, to the quantization's bound.
           double ss = 0;
-          for (int e = 0; e < kD; ++e) ss += ro[t * kInner + size_t(h * kD + e)] * ro[t * kInner + size_t(h * kD + e)];
-          invh[h] = 1.0 / std::sqrt(ss / kD + kEps);
-        }
-        for (size_t c = 0; c < size_t(kInner); ++c) {
-          const size_t k = (t0 + t) * kInner + c;
-          e_o.add(o[k], ro[t * kInner + c], fo);
-          const double ref_y = ry[t * kInner + c], ey = std::fabs(double(y[k]) - ref_y);
-          // The quantization's own bound (half a step, or fp16's relative step) plus fp32 noise in o and in the scale.
-          const double zz = data[size_t(s)].z[(ranges[i].first + t) * kInner + c];
-          // o carries an absolute fp32 noise (measured max 6e-8 here); a head whose o is near zero is amplified by its norm.
-          const double amp = 3e-7 * invh[c / kD] * std::fabs(double(b.m.norm_w[c % kD])) * std::fabs(zz / (1.0 + std::exp(-zz)));
-          const double ratio = ey / (double(stp[k]) + 2e-4 * std::fabs(ref_y) + 1e-7 + amp);
-          if (ratio > worst_ratio_y) {
-            worst_ratio_y = ratio;
-            worst = {int(t0 + t), int(c), double(y[k]), ref_y, double(stp[k]), double(o[k]), ro[t * kInner + c]};
+          for (int e = 0; e < kD; ++e) ss += double(o[(t0 + t) * kInner + size_t(h * kD + e)]) * double(o[(t0 + t) * kInner + size_t(h * kD + e)]);
+          const double inv = 1.0 / std::sqrt(ss / kD + kEps);
+          for (int e = 0; e < kD; ++e) {
+            const size_t c = size_t(h * kD + e), k = (t0 + t) * kInner + c;
+            e_o.add(o[k], ro[t * kInner + c], fo);
+            const double zz = data[size_t(s)].z[(ranges[i].first + t) * kInner + c];
+            const double y2 = double(o[k]) * inv * double(b.m.norm_w[size_t(e)]) * (zz / (1.0 + std::exp(-zz)));
+            // half a quantization step (or fp16's relative step) plus fp32 noise in the norm's scale and the gate
+            const double ratio = std::fabs(double(y[k]) - y2) / (double(stp[k]) + 2e-4 * std::fabs(y2) + 1e-7);
+            if (ratio > worst_ratio_y) {
+              worst_ratio_y = ratio;
+              worst = {int(t0 + t), int(c), double(y[k]), y2, double(stp[k]), double(o[k]), ro[t * kInner + c]};
+            }
+            e_y.add(y[k], ry[t * kInner + c], fy);
           }
-          e_y.add(y[k], ref_y, fy);
         }
       }
       done[size_t(s)] += int(ranges[i].second);
@@ -386,8 +391,8 @@ void accuracy(bool edge, bool quick) {
   std::printf("  %d steps\n", steps);
   e_o.print("scan output o");
   e_y.print("activations y (dequant)");
-  std::printf("  worst y: row %d col %d got %.6g ref %.6g step %.3g o %.6g ro %.6g (%s)\n", worst.t, worst.c, worst.got, worst.ref, worst.step, worst.o, worst.ro, b.act.fp16 ? "fp16" : "int8");
-  std::printf("  y worst error / (quantization bound + 2e-4 |y| + o noise through the norm): %.3f\n", worst_ratio_y);
+  std::printf("  worst y: row %d col %d got %.6g expected %.6g step %.3g o %.6g ro %.6g (%s)\n", worst.t, worst.c, worst.got, worst.ref, worst.step, worst.o, worst.ro, b.act.fp16 ? "fp16" : "int8");
+  std::printf("  y (against the norm and gate of the device's own o) worst error / (quantization bound + 2e-4 |y|): %.3f\n", worst_ratio_y);
   check(worst_ratio_y <= 1.01, "y beyond the quantization bound");
   // The state after the last token of each slot.
   Err e_s;
@@ -574,6 +579,13 @@ void timing(int layers, int reps) {
   fill_dev(b.q, b.da, 4096 * int64_t(kValueHeads), 3, 2.0f);
   fill_dev(b.q, b.db, 4096 * int64_t(kValueHeads), 4, 2.0f);
   const Weights w = b.m.dev();
+  {  // warm up: the card clocks down when idle, which doubles the first small kernels
+    Plan wp = make_plan(b.q, {SlotStep{0, 0, 2048, 0, 2048, {0, 0, 0}}, SlotStep{1, 2048, 2048, 0, 2048, {0, 0, 0}}});
+    for (int rep = 0; rep < 3; ++rep)
+      for (int l = 0; l < layers; ++l) gdn::step(b.q, w, b.cache, l, wp, b.inputs(), b.scr, b.act);
+    b.q.wait();
+    free_plan(b.q, wp);
+  }
   for (const Cfg& c : cfgs) {
     std::vector<SlotStep> sl;
     int tok = 0;
