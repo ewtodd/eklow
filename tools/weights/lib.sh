@@ -39,13 +39,15 @@ hub_fetch() {
     local repo=$1 rev=$2 dest=$3 excl=${4:-^$}
     mkdir -p "$dest"
     curl -fsS "https://huggingface.co/api/models/$repo/revision/$rev?blobs=true" > "$dest/.api.json"
+    rev=$(jq -r .sha "$dest/.api.json")   # short revisions expanded
     jq -r --arg x "$excl" '.siblings[] | select(.rfilename|test($x)|not)
         | [.rfilename, .size, (.lfs.sha256 // ""), .blobId] | @tsv' "$dest/.api.json" > "$dest/.files.tsv"
     export dest repo rev
     fetch_one() {
         local f=$1 size=$2 sha=$3 blob=$4 got
         mkdir -p "$dest/$(dirname "$f")"
-        if [ "$(stat -c %s "$dest/$f" 2>/dev/null || echo 0)" != "$size" ]; then
+        if [ "$size" = 0 ]; then : > "$dest/$f"
+        elif [ "$(stat -c %s "$dest/$f" 2>/dev/null || echo 0)" != "$size" ]; then
             curl -fsSL --retry 8 --retry-delay 5 -C - -o "$dest/$f" \
                 "https://huggingface.co/$repo/resolve/$rev/$f"
         fi

@@ -31,7 +31,7 @@ fetch() {
 
 convert() {
     [ -s "$BF16" ] && { echo "$BF16 exists"; return; }
-    python3 -I "$LLAMA_SRC/convert_hf_to_gguf.py" "$HF" --outtype bf16 --no-mtp --outfile "$BF16.part"
+    python3 "$LLAMA_SRC/convert_hf_to_gguf.py" "$HF" --outtype bf16 --no-mtp --outfile "$BF16.part"
     mv "$BF16.part" "$BF16"
 }
 
@@ -86,7 +86,7 @@ check() {
     (cd "$OUT" && sha256sum "$M"-*.gguf | tee SHA256SUMS)
 }
 
-unhf() { rm -rf "$HF"; }
+unhf() { rm -f "$HF"/*.safetensors; }   # config and tokenizer stay: the DFlash drafts convert against them
 clean() { rm -rf "$HF" "$BF16"; }
 
 for s in $STAGES; do echo "== $s $(date -Is)"; "$s"; done
