@@ -1274,3 +1274,32 @@ re-renders earlier reasoning exactly as generated, which helps.
 **The card.** Development needs fiona's A770M for long stretches, and the owner chose to stop production for the
 duration: `eklow.service` (the 26B) stopped 2026-10-31 17:40. The work happens on `qwen/*` branches merged into
 `qwen/main`; main keeps the 26B until the new model serves, then the Gemma 4 chat code goes.
+
+## 2026-10-31 — the Gated DeltaNet's serving kernels
+
+`src/kernels/gdn.*` (`qwen/gdn`, merged): everything between a DeltaNet layer's input matmuls and `ssm_out`, for steps
+holding several slots' tokens. Two forms with one layout and interface: for up to 16 new tokens a slot (decode, verify
+blocks) one fused kernel, a work-group per (slot, value head) in 32 KB of shared memory (conv, silu, l2 norm, the
+recurrence, the gated norm, the quantization for `ssm_out`); for longer steps three (prepare, scan, gated norm), the
+scan's threads each holding two columns of a head's state in registers and walking the slot's tokens. The recurrence is
+llama.cpp's with the decay folded in (`kv = eg S^T k; d = beta (v - kv); o = eg S^T q + d (k.q); S = eg S + k d^T`);
+value head h reads key head h % 16 (the converter's tiled order).
+
+Rollback: a verify block runs with `commit = 0` (outputs from the committed state walked through the block in
+registers, nothing written back, the tokens' post-conv inputs and raw rows saved as pending); the slot's next step says
+how many were accepted and the scan replays them first through the same loop. Against a twin that ran only the
+accepted tokens: 1,524 of 1,524 comparisons bit-identical per form (blocks of 2-16, every acceptance count, 200-block
+random chains), and a mutated replay fails it. A separate replay loop did not stay bit-identical (IGC fused the
+multiply-adds differently), hence the one loop. The fused and split forms agree to a few ulp, not bitwise. Against a
+double emulation in llama.cpp's op order over 4,200 tokens: rms error / rms signal 1.4e-7 on the output, 1.3e-7 on the
+state, no drift; 4e-6 at the edges (decay from 0 to below -100, beta saturated).
+
+Measured (`eklow-gdn-test`, fiona, GPU time for 30 layers): decode 0.59 ms (0.66 wall), two slots 1.0 ms; verify blocks
+of 8 and 16 tokens 0.79 and 0.96 ms; a 2,048-token prefill chunk 84 ms (138 ms for two slots at once); a slot's
+state (64 MiB) to or from pinned host memory in 6 ms, exact. Decode sits at about twice its state traffic (2 MiB read and
+written a layer, 316 us for 30 layers at 399 GB/s). Prefill is the weak part: ~1 us a token and layer, not the 0.2-0.3
+estimated, about 17% of the ~400 ms the rest of a chunk was estimated at. The scan is bound by its threads' loads of k and
+q (each thread takes its own 1 KB a token; an Xe-core delivers 64 B a clock); with them removed it runs at 0.58 us.
+Four columns a thread halve that traffic but leave one slot only 1,024 threads (slower for the common case). Untried,
+in order: carrying the decay's running product instead of rescaling the state every token, k and q in fp16, the chunked
+form on the matrix units.
