@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "core/json.hpp"
+#include "kernels/fast.hpp"
 #include "kernels/ref.hpp"
 #include "kernels/xmx.hpp"
 #include "model/gguf.hpp"
@@ -149,26 +150,36 @@ struct Stat {
   double fp32 = 0, emul = 0;
 };
 
-// out[m][n] vs the references on sampled columns.
+// out[m][n] vs the references on sampled columns (and at most 48 sampled rows): fp32 dot of ggml's dequantization with the
+// fp32 activations, and the exact emulation of the arithmetic the form does: int8 activations (up to 32 rows) or the fp16
+// GEMM's (fp16 activations, the dequantization's fp16 weights, fp32 accumulation).
 Stat compare(const FormatInfo& f, const Mat& mat, const std::vector<float>& x, int64_t m, const std::vector<float>& y, int cols) {
   const int64_t k = mat.k, n = mat.n;
-  std::vector<int64_t> pick;
+  const bool fp16 = m > xmx::kFp16Rows;
+  std::vector<int64_t> pick, rpick;
   for (int i = 0; i < cols; ++i) pick.push_back(int64_t(g_rng() % uint32_t(n)));
-  std::vector<std::vector<float>> deq(pick.size(), std::vector<float>(static_cast<size_t>(k)));
-  for (size_t i = 0; i < pick.size(); ++i) refs::dequant_row(f.type, mat.raw + uint64_t(pick[i]) * mat.rb, k, deq[i].data());
+  for (int64_t r = 0; r < std::min<int64_t>(m, 48); ++r) rpick.push_back(m <= 48 ? r : int64_t(g_rng() % uint32_t(m)));
+  std::vector<std::vector<float>> deq(pick.size(), std::vector<float>(static_cast<size_t>(k))), w16 = deq;
+  for (size_t i = 0; i < pick.size(); ++i) {
+    refs::dequant_row(f.type, mat.raw + uint64_t(pick[i]) * mat.rb, k, deq[i].data());
+    refs::weights16_row(f.type, mat.raw + uint64_t(pick[i]) * mat.rb, k, w16[i].data());
+  }
   double num = 0, den = 0, emax = 0, ersum = 0;
   int cnt = 0;
-  std::vector<double> emu_vals;
-  for (int64_t r = 0; r < m; ++r) {
-    const auto qr = refs::quantize_row(x.data() + r * k, k);
+  for (int64_t r : rpick) {
+    refs::QRow qr;
+    if (!fp16) qr = refs::quantize_row(x.data() + r * k, k);
     for (size_t i = 0; i < pick.size(); ++i) {
-      double ref = 0;
+      double ref = 0, em = 0;
       for (int64_t c = 0; c < k; ++c) ref += double(x[size_t(r * k + c)]) * double(deq[i][size_t(c)]);
       const double got = y[size_t(r * n + pick[i])];
       num += (got - ref) * (got - ref);
       den += ref * ref;
-      const double em = refs::emulate(f.type, mat.raw + uint64_t(pick[i]) * mat.rb, k, qr);
-      emu_vals.push_back(em);
+      if (fp16) {
+        for (int64_t c = 0; c < k; ++c) em += double(float(sycl::half(x[size_t(r * k + c)]))) * double(w16[i][size_t(c)]);
+      } else {
+        em = refs::emulate(f.type, mat.raw + uint64_t(pick[i]) * mat.rb, k, qr);
+      }
       ersum += em * em;
       emax = std::max(emax, std::fabs(got - em));
       ++cnt;
@@ -178,14 +189,15 @@ Stat compare(const FormatInfo& f, const Mat& mat, const std::vector<float>& x, i
   return {std::sqrt(num / std::max(den, 1e-30)), emax / std::max(rms, 1e-30)};
 }
 
-void check_matmul(sycl::queue& q, const FormatInfo& f, const char* label, Mat& mat, const std::vector<int64_t>& rows, json::Writer& jw) {
+void check_matmul(sycl::queue& q, const FormatInfo& f, const char* label, Mat& mat, const std::vector<int64_t>& rows, json::Writer& jw,
+                  bool fp16_rows = false) {
   const int64_t k = mat.k, n = mat.n;
   const int64_t max_m = *std::max_element(rows.begin(), rows.end());
   xmx::Activations act = xmx::alloc_activations(q, max_m, k);
   auto* xd = sycl::malloc_device<float>(size_t(max_m * k), q);
   auto* yd = sycl::malloc_device<float>(size_t(max_m * n), q);
   for (int64_t m : rows) {
-    if (m > xmx::kFp16Rows) continue;  // the fp16 GEMM: --gemm
+    if ((m > xmx::kFp16Rows) != fp16_rows) continue;  // int8 GEMVs up to 32 rows, the fp16 GEMM above
     const auto x = random_x(m, k);
     q.memcpy(xd, x.data(), x.size() * 4).wait();
     xmx::quantize(q, xd, m, act);
@@ -195,7 +207,7 @@ void check_matmul(sycl::queue& q, const FormatInfo& f, const char* label, Mat& m
     q.memcpy(y.data(), yd, y.size() * 4).wait();
     const Stat s = compare(f, mat, x, m, y, 24);
     std::printf("  %-8s %-26s %4lldx%-7lld rows %3lld  vs fp32 %9.2e  vs emul %9.2e %s\n", f.name, label, (long long)k, (long long)n,
-                (long long)m, s.fp32, s.emul, (s.fp32 < 3e-2 && s.emul < 2e-5) ? "" : "  <-- OUT OF BAND");
+                (long long)m, s.fp32, s.emul, (fp16_rows ? (s.fp32 < 2e-3 && s.emul < 2e-5) : (s.fp32 < 3e-2 && s.emul < 2e-5)) ? "" : "  <-- OUT OF BAND");
     jw.begin_object().kv("format", f.name).kv("shape", label).kv("k", k).kv("n", n).kv("rows", m).kv("rel_vs_fp32", s.fp32)
         .kv("rel_vs_emulation", s.emul).end_object();
   }
@@ -208,7 +220,8 @@ double silu(double g) { return g / (1.0 + std::exp(-g)); }
 double gelu(double g) { return 0.5 * g * (1.0 + std::tanh(0.7978845608028654 * (g + 0.044715 * g * g * g))); }
 
 // matmul_geglu on a stacked gate|up (interleaved repack) against the fp32 GLU of its dequantized halves.
-void check_glu(sycl::queue& q, const FormatInfo& f, int64_t k, int64_t n2, xmx::Glu act, const std::vector<int64_t>& rows, json::Writer& jw) {
+void check_glu(sycl::queue& q, const FormatInfo& f, int64_t k, int64_t n2, xmx::Glu act, const std::vector<int64_t>& rows, json::Writer& jw,
+               bool fp16_rows = false) {
   Mat mat = make_mat(q, f, n2, k, true);
   const int64_t n = n2 / 2;
   const int64_t max_m = *std::max_element(rows.begin(), rows.end());
@@ -219,14 +232,19 @@ void check_glu(sycl::queue& q, const FormatInfo& f, int64_t k, int64_t n2, xmx::
   std::vector<std::vector<float>> deq(static_cast<size_t>(n2), std::vector<float>(static_cast<size_t>(k)));
   for (int64_t r = 0; r < n2; ++r) refs::dequant_row(f.type, mat.raw + uint64_t(r) * mat.rb, k, deq[size_t(r)].data());
   for (int64_t m : rows) {
-    if (m > xmx::kFp16Rows) continue;
+    if ((m > xmx::kFp16Rows) != fp16_rows) continue;
     const auto x = random_x(m, k);
     q.memcpy(xd, x.data(), x.size() * 4).wait();
     xmx::quantize(q, xd, m, in);
     xmx::matmul_geglu(q, in, mat.w, out, scr, act);
-    q.parallel_for(sycl::range<2>(size_t(m), size_t(n)), [=, o = out](sycl::id<2> id) {
-      yd[id[0] * n + id[1]] = float(o.q[xmx::act_index(int64_t(id[0]), int64_t(id[1]), n / 32)]) * o.s[xmx::act_scale_index(int64_t(id[0]), int64_t(id[1]), n / 32)];
-    });
+    if (out.fp16)
+      q.parallel_for(sycl::range<2>(size_t(m), size_t(n)), [=, o = out](sycl::id<2> id) {
+        yd[id[0] * n + id[1]] = float(o.h[xmx::act16_index(int64_t(id[0]), int64_t(id[1]), n / 16)]);
+      });
+    else
+      q.parallel_for(sycl::range<2>(size_t(m), size_t(n)), [=, o = out](sycl::id<2> id) {
+        yd[id[0] * n + id[1]] = float(o.q[xmx::act_index(int64_t(id[0]), int64_t(id[1]), n / 32)]) * o.s[xmx::act_scale_index(int64_t(id[0]), int64_t(id[1]), n / 32)];
+      });
     q.wait();
     std::vector<float> y(static_cast<size_t>(m * n));
     q.memcpy(y.data(), yd, y.size() * 4).wait();
@@ -242,7 +260,7 @@ void check_glu(sycl::queue& q, const FormatInfo& f, int64_t k, int64_t n2, xmx::
       }
     const double rel = std::sqrt(num / std::max(den, 1e-30));
     std::printf("  %-8s %-8s gate|up %4lldx%-6lld rows %3lld  vs fp32 %9.2e %s\n", f.name, act == xmx::Glu::Silu ? "SwiGLU" : "GeGLU", (long long)k,
-                (long long)n2, (long long)m, rel, rel < 5e-2 ? "" : "  <-- OUT OF BAND");
+                (long long)n2, (long long)m, rel, rel < (fp16_rows ? 3e-3 : 5e-2) ? "" : "  <-- OUT OF BAND");
     jw.begin_object().kv("format", f.name).kv("glu", act == xmx::Glu::Silu ? "silu" : "gelu").kv("rows", m).kv("rel_vs_fp32", rel).end_object();
   }
   sycl::free(xd, q);
@@ -439,6 +457,154 @@ void bench_grouped(sycl::queue& q, const FormatInfo& f, json::Writer& jw) {
   }
 }
 
+
+// The fp16 GEMM on the Qwen shapes at 2,048 and 4,096 rows, plain and with the SwiGLU epilogue (gate|up interleaved).
+void bench_gemm(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>& rows, json::Writer& jw) {
+  for (const Shape& s : kQwen) {
+    if (s.n > 100000 || s.k % refs::block_k(f.type)) continue;
+    const bool glu = std::string(s.name) == "expert gate|up";
+    for (int variant = 0; variant < (glu ? 2 : 1); ++variant) {
+      Mat mat = make_mat(q, f, s.n, s.k, variant == 1);
+      const int64_t max_m = *std::max_element(rows.begin(), rows.end());
+      xmx::Activations act = xmx::alloc_activations(q, max_m, s.k), out = xmx::alloc_activations(q, max_m, s.n / 2);
+      auto* xd = sycl::malloc_device<float>(size_t(max_m * s.k), q);
+      auto* yd = sycl::malloc_device<float>(size_t(max_m * s.n), q);
+      for (int64_t m : rows) {
+        const auto x = random_x(m, s.k);
+        q.memcpy(xd, x.data(), x.size() * 4).wait();
+        xmx::quantize(q, xd, m, act);
+        const double t = best_time(q, 6, [&](int) {
+          if (variant == 1) xmx::matmul_geglu(q, act, mat.w, out, nullptr, xmx::Glu::Silu);
+          else xmx::matmul(q, act, mat.w, yd);
+        });
+        const double tf = 2.0 * double(m) * double(s.n) * double(s.k) / t / 1e12;
+        std::printf("  %-8s %-24s %4lldx%-7lld rows %4lld  %9.3f ms %7.1f TFLOPS %s\n", f.name, variant ? "expert gate|up + SwiGLU" : s.name, (long long)s.k,
+                    (long long)s.n, (long long)m, t * 1e3, tf, variant ? "(GLU epilogue, TFLOPS counted on the stacked matrix)" : "");
+        jw.begin_object().kv("format", f.name).kv("shape", variant ? "expert gate|up + SwiGLU" : s.name).kv("k", s.k).kv("n", s.n).kv("rows", m)
+            .kv("ms", t * 1e3).kv("tflops", tf).end_object();
+      }
+      sycl::free(xd, q);
+      sycl::free(yd, q);
+      xmx::free_activations(q, act);
+      xmx::free_activations(q, out);
+      xmx::free_weight(q, mat.w);
+    }
+  }
+}
+
+// The grouped fp16 GEMMs (prefill's MoE) on 256 experts, 2,048 tokens each routed to 8 of them (Qwen's: gate|up 2048 -> 2 x 512 with
+// SwiGLU, down 512 -> 2048): against the dense fp16 path per expert (same arithmetic: ~1e-6..1e-4) and timed.
+void grouped16(sycl::queue& q, const FormatInfo& f, int64_t tile, bool check, json::Writer& jw) {
+  const int64_t T = 2048, NU = 8, P = T * NU, NE = 256, E = 2048, Fe = 512;
+  std::vector<Mat> gum, dnm;
+  std::vector<xmx::Weight> gu, dn;
+  for (int64_t e = 0; e < NE; ++e) {
+    gum.push_back(make_mat(q, f, 2 * Fe, E, true));
+    dnm.push_back(make_mat(q, f, E, Fe, false));
+    gu.push_back(gum.back().w);
+    dn.push_back(dnm.back().w);
+    if (!check) {  // timing only: the host copies are not needed
+      gum.back().host.clear();
+      dnm.back().host.clear();
+    }
+  }
+  xmx::ExpertTable tab_gu = xmx::make_expert_table(q, gu), tab_dn = xmx::make_expert_table(q, dn);
+  std::vector<int32_t> ids(static_cast<size_t>(P)), perm(static_cast<size_t>(NE));
+  for (int64_t t = 0; t < T; ++t) {
+    std::iota(perm.begin(), perm.end(), 0);
+    std::shuffle(perm.begin(), perm.end(), g_rng);
+    for (int64_t j = 0; j < NU; ++j) ids[size_t(t * NU + j)] = perm[size_t(j)];
+  }
+  const auto x = random_x(T, E);
+  const int64_t max_tiles = (P + tile - 1) / tile + NE, rows = max_tiles * tile;
+  auto* idd = sycl::malloc_device<int32_t>(size_t(P), q);
+  auto* rowp = sycl::malloc_device<int32_t>(size_t(P), q);
+  auto* scr = sycl::malloc_device<int32_t>(size_t((P / 256 + 2) * NE), q);
+  auto* tiles = sycl::malloc_device<int32_t>(size_t(4 + 4 * max_tiles), q);
+  auto* xd = sycl::malloc_device<float>(size_t(T * E), q);
+  auto* a = sycl::malloc_device<sycl::half>(size_t(rows * E), q);
+  auto* h = sycl::malloc_device<sycl::half>(size_t(rows * Fe), q);
+  auto* y = sycl::malloc_device<float>(size_t(rows * E), q);
+  q.memcpy(idd, ids.data(), ids.size() * 4);
+  q.memcpy(xd, x.data(), x.size() * 4).wait();
+  q.memset(a, 0, size_t(rows * E) * 2).wait();
+  fast::moe_group(q, idd, P, NE, tile, scr, tiles, rowp);
+  fast::moe_gather(q, xd, rowp, P, NU, E, a);
+  xmx::matmul_geglu_grouped16(q, a, tab_gu, tiles, max_tiles, tile, h, xmx::Glu::Silu);
+  xmx::matmul_grouped16(q, h, tab_dn, tiles, max_tiles, tile, y);
+  q.wait();
+  double rel_gu = 0, rel_dn = 0;
+  if (check) {
+    std::vector<int32_t> hrow(static_cast<size_t>(P)), htiles(static_cast<size_t>(4 + 4 * max_tiles));
+    q.memcpy(hrow.data(), rowp, hrow.size() * 4);
+    q.memcpy(htiles.data(), tiles, htiles.size() * 4).wait();
+    std::vector<std::vector<int64_t>> by_expert(static_cast<size_t>(NE));
+    for (int64_t p = 0; p < P; ++p) by_expert[size_t(ids[size_t(p)])].push_back(p);
+    std::vector<sycl::half> hh(static_cast<size_t>(rows * Fe));
+    std::vector<float> hy(static_cast<size_t>(rows * E));
+    q.memcpy(hh.data(), h, hh.size() * 2);
+    q.memcpy(hy.data(), y, hy.size() * 4).wait();
+    xmx::Activations ain = xmx::alloc_activations(q, 4096, E), ah = xmx::alloc_activations(q, 4096, Fe);
+    auto* xe = sycl::malloc_device<float>(size_t(4096 * E), q);
+    auto* ye = sycl::malloc_device<float>(size_t(4096 * E), q);
+    std::vector<float> hye(static_cast<size_t>(4096 * E));
+    double ngu = 0, dgu = 0, ndn = 0, ddn = 0;
+    for (int64_t e = 0; e < NE; e += 7) {  // a spread of experts
+      const auto& prs = by_expert[size_t(e)];
+      if (prs.empty()) continue;
+      const int64_t cnt = int64_t(prs.size()), m = std::max<int64_t>(cnt, xmx::kFp16Rows + 1);
+      std::vector<float> xs(static_cast<size_t>(m * E), 0.0f);
+      for (int64_t i = 0; i < cnt; ++i) std::copy_n(x.begin() + (prs[size_t(i)] / NU) * E, E, xs.begin() + i * E);
+      q.memcpy(xe, xs.data(), xs.size() * 4).wait();
+      xmx::quantize(q, xe, m, ain);
+      xmx::matmul_geglu(q, ain, gu[size_t(e)], ah, nullptr, xmx::Glu::Silu);
+      xmx::matmul(q, ah, dn[size_t(e)], ye);
+      std::vector<sycl::half> rh(static_cast<size_t>(ah.m_pad * Fe));
+      q.memcpy(rh.data(), ah.h, rh.size() * 2);
+      q.memcpy(hye.data(), ye, size_t(m * E) * 4).wait();
+      for (int64_t i = 0; i < cnt; ++i) {
+        const int64_t row = hrow[size_t(prs[size_t(i)])];
+        for (int64_t c = 0; c < Fe; ++c) {
+          const double g = double(float(hh[size_t(xmx::act16_index(row, c, Fe / 16))])), r = double(float(rh[size_t(xmx::act16_index(i, c, Fe / 16))]));
+          ngu += (g - r) * (g - r);
+          dgu += r * r;
+        }
+        for (int64_t c = 0; c < E; ++c) {
+          const double g = double(hy[size_t(row * E + c)]), r = double(hye[size_t(i * E + c)]);
+          ndn += (g - r) * (g - r);
+          ddn += r * r;
+        }
+      }
+    }
+    rel_gu = std::sqrt(ngu / std::max(dgu, 1e-30));
+    rel_dn = std::sqrt(ndn / std::max(ddn, 1e-30));
+    sycl::free(xe, q);
+    sycl::free(ye, q);
+    xmx::free_activations(q, ain);
+    xmx::free_activations(q, ah);
+  }
+  std::vector<int32_t> htl(static_cast<size_t>(4));
+  q.memcpy(htl.data(), tiles, 16).wait();
+  const int64_t used_rows = htl[0] * tile;
+  const double t_gu = best_time(q, 10, [&](int) { xmx::matmul_geglu_grouped16(q, a, tab_gu, tiles, max_tiles, tile, h, xmx::Glu::Silu); });
+  const double t_dn = best_time(q, 10, [&](int) { xmx::matmul_grouped16(q, h, tab_dn, tiles, max_tiles, tile, y); });
+  const double fl_gu = 2.0 * double(P) * double(E) * double(2 * Fe), fl_dn = 2.0 * double(P) * double(Fe) * double(E);
+  std::printf("  %-8s grouped16 tile %3lld  gate|up+SwiGLU %8.3f ms %6.1f TFLOPS (%6.1f padded)   down %8.3f ms %6.1f TFLOPS (%6.1f padded)", f.name,
+              (long long)tile, t_gu * 1e3, fl_gu / t_gu / 1e12, fl_gu * double(used_rows) / double(P) / t_gu / 1e12, t_dn * 1e3, fl_dn / t_dn / 1e12,
+              fl_dn * double(used_rows) / double(P) / t_dn / 1e12);
+  if (check) std::printf("   vs dense: gate|up %.2e  down %.2e %s", rel_gu, rel_dn, (rel_gu < 1e-3 && rel_dn < 1e-3) ? "" : "  <-- OUT OF BAND");
+  std::printf("\n");
+  jw.begin_object().kv("format", f.name).kv("tile", tile).kv("ms_gate_up", t_gu * 1e3).kv("ms_down", t_dn * 1e3).kv("tflops_gate_up", fl_gu / t_gu / 1e12)
+      .kv("tflops_down", fl_dn / t_dn / 1e12).kv("tflops_gate_up_padded", fl_gu * double(used_rows) / double(P) / t_gu / 1e12)
+      .kv("tflops_down_padded", fl_dn * double(used_rows) / double(P) / t_dn / 1e12).kv("rel_gate_up", rel_gu).kv("rel_down", rel_dn).end_object();
+  for (void* p : {static_cast<void*>(idd), static_cast<void*>(rowp), static_cast<void*>(scr), static_cast<void*>(tiles), static_cast<void*>(xd),
+                  static_cast<void*>(a), static_cast<void*>(h), static_cast<void*>(y)})
+    sycl::free(p, q);
+  xmx::free_expert_table(q, tab_gu);
+  xmx::free_expert_table(q, tab_dn);
+  for (auto& w : gu) xmx::free_weight(q, w);
+  for (auto& w : dn) xmx::free_weight(q, w);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -499,6 +665,22 @@ int main(int argc, char** argv) {
         check_grouped(q, f, jw);
         jw.end_array();
       }
+      if (gemm) {
+        jw.key(std::string("gemm_check_") + f.name).begin_array();
+        const std::vector<int64_t> big = {64, 256, 2048};
+        for (const Shape& s : kQwen) {
+          if (s.n > 100000 || s.k % refs::block_k(f.type)) continue;
+          Mat mat = make_mat(q, f, s.n, s.k, false);
+          check_matmul(q, f, s.name, mat, big, jw, true);
+          xmx::free_weight(q, mat.w);
+        }
+        for (xmx::Glu act : {xmx::Glu::Silu, xmx::Glu::Gelu}) check_glu(q, f, 2048, 1024, act, big, jw, true);
+        jw.end_array();
+        jw.key(std::string("gemm_") + f.name).begin_array();
+        bench_gemm(q, f, {2048, 4096}, jw);
+        for (int64_t tile : {64, 128}) grouped16(q, f, tile, tile == 64, jw);
+        jw.end_array();
+      }
       if (bench) {
         jw.key(std::string("decode_") + f.name).begin_array();
         bench_decode(q, f, rows, jw);
@@ -506,7 +688,6 @@ int main(int argc, char** argv) {
         jw.end_array();
       }
     }
-    (void)gemm;
     jw.end_object();
     if (!json_path.empty()) std::ofstream(json_path) << jw.str() << "\n";
   } catch (const std::exception& e) {

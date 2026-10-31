@@ -239,7 +239,8 @@ namespace {
 template <int WM, int WN, bool Grouped = false, WeightFormat F = WeightFormat::Q4_0>
 struct Gemm16Kernel {
   static constexpr int NT = WM * WN, BT = WN * 4, AT = WM * 2;  // threads; weight / activation 8-tiles
-  static constexpr int DW = F == WeightFormat::Q4_0 ? 16 : F == WeightFormat::Q8_0 ? 32 : 64;  // dwords of a (tile, K half) piece
+  static constexpr bool kNew = fmt::is_new_format(F);  // the Qwen formats: dequantization in xmx_fmt.hpp (GemmDec)
+  static constexpr int DW = kNew ? fmt::GemmMetaOf<F>::DW : F == WeightFormat::Q4_0 ? 16 : F == WeightFormat::Q8_0 ? 32 : 64;  // dwords of a (tile, K half) piece
   static constexpr int kBPieces = BT * 2, kAPieces = AT * 2;     // per block: (tile, K half) pieces
   static constexpr int BP = (kBPieces + NT - 1) / NT, AP = (kAPieces + NT - 1) / NT;
   static constexpr uint32_t kBBuf = kBPieces * 256, kBuf = kBBuf + kAPieces * 256;
@@ -258,8 +259,13 @@ struct Gemm16Kernel {
   bool silu = false;  // the GLU epilogue's activation: silu(gate) * up instead of gelu_tanh(gate) * up
 
   void operator()(sycl::nd_item<2> it) const SYCL_ESIMD_KERNEL {
-    esimd::slm_init<2 * kBuf>();
+    constexpr uint32_t kTable = F == WeightFormat::IQ4_XS ? fmt::kIqTableBytes : 0;  // IQ4_XS: its byte-pair table after the two buffers
+    esimd::slm_init<2 * kBuf + kTable>();
     const int tid = int(it.get_local_linear_id()), wi = tid / WN, wj = tid % WN;
+    if constexpr (F == WeightFormat::IQ4_XS) {
+      fmt::Dec<F>::fill_table(tid, NT, 2 * kBuf);
+      esimd::barrier();  // the first store already reads the table
+    }
     const int tm = int(it.get_group(0)), tn = int(it.get_group(1));
     const uint8_t* bt = this->bt;
     const sycl::half* bs = this->bs;
@@ -279,6 +285,8 @@ struct Gemm16Kernel {
     }
     esimd::simd<uint32_t, DW> D[BP];
     esimd::simd<sycl::half, 8> S[BP];
+    typename fmt::GemmMetaOf<F>::type Mt[BP];
+    const uint8_t* const meta_g = reinterpret_cast<const uint8_t*>(bs);
     esimd::simd<sycl::half, 128> Araw[AP];
     auto load = [&](int b) SYCL_ESIMD_FUNCTION {
 #pragma unroll
@@ -286,7 +294,10 @@ struct Gemm16Kernel {
         const int p = tid + i * NT, g = tn * BT + p / 2, h = p % 2;
         if (p >= kBPieces) break;
         D[i] = esimd::block_load<uint32_t, DW>(reinterpret_cast<const uint32_t*>(bt + tile_at(b, g, kb) * (8 * DW) + h * (4 * DW)));
-        if constexpr (F != WeightFormat::F16) S[i] = esimd::block_load<sycl::half, 8>(bs + tile_at(b, g, kb) * 8);
+        if constexpr (kNew)
+          fmt::GemmDec<F>::load_meta(Mt[i], meta_g + int64_t(g) * (kb / fmt::GemmMetaOf<F>::REC_T) * fmt::geo(F).rec_bytes, b, h);
+        else if constexpr (F != WeightFormat::F16)
+          S[i] = esimd::block_load<sycl::half, 8>(bs + tile_at(b, g, kb) * 8);
       }
 #pragma unroll
       for (int i = 0; i < AP; ++i) {
@@ -295,13 +306,17 @@ struct Gemm16Kernel {
         Araw[i] = esimd::block_load<sycl::half, 128>(a + (int64_t(rt) * (2 * kb) + 2 * b + h) * 128);
       }
     };
-    auto store = [&](uint32_t buf) SYCL_ESIMD_FUNCTION {
+    auto store = [&](uint32_t buf, int bblk) SYCL_ESIMD_FUNCTION {
 #pragma unroll
       for (int i = 0; i < BP; ++i) {
         const int p = tid + i * NT;
         if (p >= kBPieces) break;
         if constexpr (F == WeightFormat::F16) {
           esimd::slm_block_store<uint32_t, 64>(buf + p * 256, D[i]);
+          continue;
+        }
+        if constexpr (kNew) {
+          esimd::slm_block_store<sycl::half, 128>(buf + p * 256, fmt::GemmDec<F>::dequant(D[i], Mt[i], bblk, p % 2, 2 * kBuf));
           continue;
         }
         esimd::simd<sycl::half, 16> sc2;
@@ -340,7 +355,7 @@ struct Gemm16Kernel {
 #pragma unroll
       for (int c = 0; c < 4; ++c) acc[r][c] = 0;
     load(0);
-    store(0);
+    store(0, 0);
     esimd::barrier();
     for (int b = 0; b < kbl; ++b) {
       const uint32_t cur = (b & 1) * kBuf, nxt = kBuf - cur;
@@ -361,7 +376,7 @@ struct Gemm16Kernel {
           B = Bn;
         }
       }
-      if (b + 1 < kb) store(nxt);
+      if (b + 1 < kb) store(nxt, b + 1);
       esimd::barrier();
     }
     const int row_tile0 = row0 / 8 + wi * 2;
@@ -426,28 +441,46 @@ void gemm16(sycl::queue& q, const Activations& a, const Weight& w, float* out, s
     case WeightFormat::Q8_0: return gemm16_f<WeightFormat::Q8_0>(q, a, w, out, glu, silu);
     case WeightFormat::F16: return gemm16_f<WeightFormat::F16>(q, a, w, out, glu, silu);
     case WeightFormat::Q4_0: return gemm16_f<WeightFormat::Q4_0>(q, a, w, out, glu, silu);
-    default: throw std::runtime_error("xmx: no fp16 GEMM for this weight format yet");
+    case WeightFormat::Q8_0I: return gemm16_f<WeightFormat::Q8_0I>(q, a, w, out, glu, silu);
+    case WeightFormat::Q4_K: return gemm16_f<WeightFormat::Q4_K>(q, a, w, out, glu, silu);
+    case WeightFormat::Q5_K: return gemm16_f<WeightFormat::Q5_K>(q, a, w, out, glu, silu);
+    case WeightFormat::Q6_K: return gemm16_f<WeightFormat::Q6_K>(q, a, w, out, glu, silu);
+    case WeightFormat::IQ4_XS: return gemm16_f<WeightFormat::IQ4_XS>(q, a, w, out, glu, silu);
+    default: throw std::runtime_error("xmx: no fp16 GEMM for this weight format");
   }
 }
 
-template <int WM>
+template <int WM, WeightFormat F>
 void gemm16_grouped(sycl::queue& q, const sycl::half* a, const ExpertTable& w, const int32_t* tiles, int64_t max_tiles, float* out,
                     sycl::half* glu, bool silu) {
   constexpr int WN = 4;
   if (w.n % (32 * WN)) throw std::runtime_error("xmx: fp16 GEMM tile does not divide the problem");
-  Gemm16Kernel<WM, WN, true> k{a, nullptr, nullptr, out, int32_t(w.k / 32), int32_t(w.n / 8), 0, int32_t(w.n), glu, tiles, w.tiles, w.scales};
+  Gemm16Kernel<WM, WN, true, F> k{a, nullptr, nullptr, out, int32_t(w.k / 32), int32_t(w.n / 8), 0, int32_t(w.n), glu, tiles, w.tiles, w.scales};
   k.silu = silu;
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(max_tiles) * WM, size_t(w.n / 32)), sycl::range<2>(WM, WN)), k);
 }
 
+template <WeightFormat F>
+void gemm16_grouped_f(sycl::queue& q, const sycl::half* a, const ExpertTable& w, const int32_t* tiles, int64_t max_tiles, int64_t tile_rows,
+                      float* out, sycl::half* glu, bool silu) {
+  switch (tile_rows) {
+    case 32: return gemm16_grouped<2, F>(q, a, w, tiles, max_tiles, out, glu, silu);
+    case 64: return gemm16_grouped<4, F>(q, a, w, tiles, max_tiles, out, glu, silu);
+    case 128: return gemm16_grouped<8, F>(q, a, w, tiles, max_tiles, out, glu, silu);
+    default: throw std::runtime_error("xmx: grouped GEMM row tile must be 32, 64 or 128");
+  }
+}
+
 void gemm16_grouped_d(sycl::queue& q, const sycl::half* a, const ExpertTable& w, const int32_t* tiles, int64_t max_tiles,
                       int64_t tile_rows, float* out, sycl::half* glu, bool silu = false) {
-  if (w.format != WeightFormat::Q4_0) throw std::runtime_error("xmx: no grouped fp16 GEMM for this weight format yet");
-  switch (tile_rows) {
-    case 32: return gemm16_grouped<2>(q, a, w, tiles, max_tiles, out, glu, silu);
-    case 64: return gemm16_grouped<4>(q, a, w, tiles, max_tiles, out, glu, silu);
-    case 128: return gemm16_grouped<8>(q, a, w, tiles, max_tiles, out, glu, silu);
-    default: throw std::runtime_error("xmx: grouped GEMM row tile must be 32, 64 or 128");
+  switch (w.format) {
+    case WeightFormat::Q4_0: return gemm16_grouped_f<WeightFormat::Q4_0>(q, a, w, tiles, max_tiles, tile_rows, out, glu, silu);
+    case WeightFormat::Q8_0I: return gemm16_grouped_f<WeightFormat::Q8_0I>(q, a, w, tiles, max_tiles, tile_rows, out, glu, silu);
+    case WeightFormat::Q4_K: return gemm16_grouped_f<WeightFormat::Q4_K>(q, a, w, tiles, max_tiles, tile_rows, out, glu, silu);
+    case WeightFormat::Q5_K: return gemm16_grouped_f<WeightFormat::Q5_K>(q, a, w, tiles, max_tiles, tile_rows, out, glu, silu);
+    case WeightFormat::Q6_K: return gemm16_grouped_f<WeightFormat::Q6_K>(q, a, w, tiles, max_tiles, tile_rows, out, glu, silu);
+    case WeightFormat::IQ4_XS: return gemm16_grouped_f<WeightFormat::IQ4_XS>(q, a, w, tiles, max_tiles, tile_rows, out, glu, silu);
+    default: throw std::runtime_error("xmx: no grouped fp16 GEMM for this weight format");
   }
 }
 

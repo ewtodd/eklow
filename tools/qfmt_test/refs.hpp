@@ -37,12 +37,13 @@ inline int block_bytes(gguf::Type t) {
 }
 inline uint64_t row_bytes(gguf::Type t, int64_t k) { return uint64_t(k / block_k(t)) * uint64_t(block_bytes(t)); }
 
-// Random valid blocks: random bytes, with fp16 scales (d, dmin) set to small positive normal values.
+// Random valid blocks: random bytes, with fp16 scales (d, dmin) set to small positive normal values (small enough that
+// a GLU of random data stays inside fp16).
 inline std::vector<uint8_t> random_rows(gguf::Type t, int64_t n, int64_t k, std::mt19937& rng) {
   const uint64_t rb = row_bytes(t, k);
   std::vector<uint8_t> out(size_t(rb * uint64_t(n)));
   for (auto& b : out) b = uint8_t(rng());
-  std::uniform_real_distribution<float> du(0.002f, 0.03f);
+  std::uniform_real_distribution<float> du(1e-4f, 4e-4f);
   const int bb = block_bytes(t);
   for (size_t at = 0; at < out.size(); at += size_t(bb)) {
     uint8_t* blk = out.data() + at;
@@ -201,6 +202,52 @@ inline QRow quantize_row(const float* x, int64_t k) {
   return r;
 }
 
+// The 256 weights of a K-quant / IQ4_XS superblock as the integers the matrix units multiply (q for Q4_K / Q5_K,
+// q - 32 for Q6_K, the table's int8 for IQ4_XS), and per 32-block j the scale dq[2 j] (d sc; Q6_K: of the first 16;
+// IQ4_XS: d (ls - 32)) and dq[2 j + 1] (the min dmin m; Q6_K: the scale of the second 16; IQ4_XS: unused), in float.
+inline void block_ints(gguf::Type t, const uint8_t* x, int* w, float* dq) {
+  if (t == gguf::Type::Q4_K || t == gguf::Type::Q5_K) {
+    const float d = h2f(x), dmin = h2f(x + 2);
+    const uint8_t* qs = x + (t == gguf::Type::Q5_K ? 48 : 16);
+    for (int e = 0; e < 256; ++e) {
+      const uint8_t byte = qs[32 * (e / 64) + e % 32];
+      int q = (e % 64) >= 32 ? byte >> 4 : byte & 15;
+      if (t == gguf::Type::Q5_K) q += ((x[16 + e % 32] >> (e / 32)) & 1) << 4;
+      w[e] = q;
+    }
+    for (int j = 0; j < 8; ++j) {
+      uint8_t sc, m;
+      get_scale_min_k4(j, x + 4, &sc, &m);
+      dq[2 * j] = d * float(sc);
+      dq[2 * j + 1] = dmin * float(m);
+    }
+  } else if (t == gguf::Type::Q6_K) {
+    const float d = h2f(x + 208);
+    const int8_t* sc = reinterpret_cast<const int8_t*>(x + 192);
+    for (int e = 0; e < 256; ++e) {
+      const int h = e / 128, r = e % 128, l = r % 32, s = r / 32;
+      const uint8_t qlb = x[64 * h + l + 32 * (s & 1)];
+      w[e] = ((s >= 2 ? qlb >> 4 : qlb & 15) | ((x[128 + 32 * h + l] >> (2 * s)) & 3) << 4) - 32;
+    }
+    for (int j = 0; j < 8; ++j) {
+      dq[2 * j] = d * float(sc[2 * j]);
+      dq[2 * j + 1] = d * float(sc[2 * j + 1]);
+    }
+  } else {
+    const float d = h2f(x);
+    const uint16_t sh = uint16_t(x[2] | x[3] << 8);
+    for (int e = 0; e < 256; ++e) {
+      const uint8_t byte = x[8 + 16 * (e / 32) + e % 16];
+      w[e] = kIq4[(e % 32) >= 16 ? byte >> 4 : byte & 15];
+    }
+    for (int j = 0; j < 8; ++j) {
+      const int ls = ((x[4 + j / 2] >> 4 * (j % 2)) & 0xf) | (((sh >> 2 * j) & 3) << 4);
+      dq[2 * j] = d * float(ls - 32);
+      dq[2 * j + 1] = 0;
+    }
+  }
+}
+
 // The decode GEMV's arithmetic for one output, from the format's own bytes: per 32-block (a tile) the integer dot of
 // the activations with the quantized weights, scaled in floats as the kernels do, summed in double.
 inline double emulate(gguf::Type t, const uint8_t* row, int64_t k, const QRow& a) {
@@ -219,50 +266,9 @@ inline double emulate(gguf::Type t, const uint8_t* row, int64_t k, const QRow& a
     return total;
   }
   for (int64_t sb = 0; sb < k / 256; ++sb) {
-    const uint8_t* x = row + sb * bb;
-    // the 256 weights as the integers the dpas sees (q: 4-5 bit values, q - 32 for Q6_K, the table's int8 for IQ4_XS)
     int w[256];
-    float dq[256 / 32 * 2];  // per tile: scale (and min / second half scale)
-    if (t == gguf::Type::Q4_K || t == gguf::Type::Q5_K) {
-      const float d = h2f(x), dmin = h2f(x + 2);
-      const uint8_t* qs = x + (t == gguf::Type::Q5_K ? 48 : 16);
-      for (int e = 0; e < 256; ++e) {
-        const uint8_t byte = qs[32 * (e / 64) + e % 32];
-        int q = (e % 64) >= 32 ? byte >> 4 : byte & 15;
-        if (t == gguf::Type::Q5_K) q += ((x[16 + e % 32] >> (e / 32)) & 1) << 4;
-        w[e] = q;
-      }
-      for (int j = 0; j < 8; ++j) {
-        uint8_t sc, m;
-        get_scale_min_k4(j, x + 4, &sc, &m);
-        dq[2 * j] = d * float(sc);
-        dq[2 * j + 1] = dmin * float(m);
-      }
-    } else if (t == gguf::Type::Q6_K) {
-      const float d = h2f(x + 208);
-      const int8_t* sc = reinterpret_cast<const int8_t*>(x + 192);
-      for (int e = 0; e < 256; ++e) {
-        const int h = e / 128, r = e % 128, l = r % 32, s = r / 32;
-        const uint8_t qlb = x[64 * h + l + 32 * (s & 1)];
-        w[e] = ((s >= 2 ? qlb >> 4 : qlb & 15) | ((x[128 + 32 * h + l] >> (2 * s)) & 3) << 4) - 32;
-      }
-      for (int j = 0; j < 8; ++j) {
-        dq[2 * j] = d * float(sc[2 * j]);
-        dq[2 * j + 1] = d * float(sc[2 * j + 1]);
-      }
-    } else {
-      const float d = h2f(x);
-      const uint16_t sh = uint16_t(x[2] | x[3] << 8);
-      for (int e = 0; e < 256; ++e) {
-        const uint8_t byte = x[8 + 16 * (e / 32) + e % 16];
-        w[e] = kIq4[(e % 32) >= 16 ? byte >> 4 : byte & 15];
-      }
-      for (int j = 0; j < 8; ++j) {
-        const int ls = ((x[4 + j / 2] >> 4 * (j % 2)) & 0xf) | (((sh >> 2 * j) & 3) << 4);
-        dq[2 * j] = d * float(ls - 32);
-        dq[2 * j + 1] = 0;
-      }
-    }
+    float dq[16];
+    block_ints(t, row + sb * bb, w, dq);
     for (int j = 0; j < 8; ++j) {
       const int64_t b = sb * 8 + j;
       const float sa = a.s[size_t(b)];
@@ -279,6 +285,41 @@ inline double emulate(gguf::Type t, const uint8_t* row, int64_t k, const QRow& a
     }
   }
   return total;
+}
+
+// The fp16 GEMM's weights: one row as the fp16 values (as floats) its dequantization produces, with the roundings
+// it does (xmx_fmt.hpp, GemmDec): scales rounded to fp16, products and differences rounded to fp16 in the order of
+// the kernel.
+inline float to_h(float v) { return float(sycl::half(v)); }
+inline void weights16_row(gguf::Type t, const uint8_t* row, int64_t k, float* out) {
+  const int bb = block_bytes(t);
+  if (t == gguf::Type::Q4_0 || t == gguf::Type::Q8_0) {
+    for (int64_t b = 0; b < k / 32; ++b) {
+      const uint8_t* x = row + b * bb;
+      const float d = h2f(x);
+      for (int j = 0; j < 32; ++j) {
+        const int qw = t == gguf::Type::Q8_0 ? int8_t(x[2 + j]) : (j < 16 ? x[2 + j] & 15 : x[2 + j - 16] >> 4) - 8;
+        out[b * 32 + j] = to_h(float(qw) * d);
+      }
+    }
+    return;
+  }
+  for (int64_t sb = 0; sb < k / 256; ++sb) {
+    int w[256];
+    float dq[16];
+    block_ints(t, row + sb * bb, w, dq);
+    for (int j = 0; j < 8; ++j) {
+      const float ds = to_h(dq[2 * j]), dm = to_h(dq[2 * j + 1]), ds2 = to_h(dq[2 * j + 1]);
+      for (int kk = 0; kk < 32; ++kk) {
+        const float q = float(w[j * 32 + kk]);
+        float v;
+        if (t == gguf::Type::Q4_K || t == gguf::Type::Q5_K) v = to_h(to_h(q * ds) - dm);
+        else if (t == gguf::Type::Q6_K) v = to_h(q * (kk < 16 ? ds : ds2));
+        else v = to_h(q * ds);
+        out[sb * 256 + j * 32 + kk] = v;
+      }
+    }
+  }
 }
 
 }  // namespace eklow::refs

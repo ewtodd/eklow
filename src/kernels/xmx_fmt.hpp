@@ -263,7 +263,7 @@ struct Dec<WeightFormat::IQ4_XS> {
   }
   // Fills the table: entry b = int8 T[b & 15] | int8 T[b >> 4] << 8 (the two weights of one packed byte). Thread t of
   // `nt` fills the 256-byte blocks t, t + nt, ...
-  SYCL_ESIMD_FUNCTION static void fill_table(int t, int nt) {
+  SYCL_ESIMD_FUNCTION static void fill_table(int t, int nt, uint32_t base = 0) {
     esimd::simd<uint32_t, 16> lo16;
 #pragma unroll
     for (int i = 0; i < 16; ++i) lo16[i] = uint32_t(uint8_t(kIq4Values[i]));
@@ -278,7 +278,7 @@ struct Dec<WeightFormat::IQ4_XS> {
         for (int c = 0; c < 4; ++c) if (blk == c) hi = uint32_t(uint8_t(kIq4Values[4 * c + m])) << 8;
         v.template select<16, 1>(m * 16) |= hi;
       }
-      esimd::slm_block_store<uint32_t, 64>(blk * 256, v);
+      esimd::slm_block_store<uint32_t, 64>(base + blk * 256, v);
     }
   }
 };
@@ -292,6 +292,215 @@ constexpr bool is_new_format(WeightFormat f) {
   return f == WeightFormat::Q8_0I || f == WeightFormat::Q4_K || f == WeightFormat::Q5_K || f == WeightFormat::Q6_K ||
          f == WeightFormat::IQ4_XS;
 }
+
+// ------------------------------------------------------------------------------------------------------------
+// The fp16 GEMM's dequantization (xmx.cpp's Gemm16Kernel): a thread turns one "piece" (one tile's 16 K, 8 columns) of
+// the format's bytes into the 128 fp16 of the B operand in VNNI order (element (k, n) of the piece at (k / 2) * 16
+// + n * 2 + k % 2) and the scale of the tile's sub-block. Scales are combined in fp16 as the Q4_0 path does:
+//   Q8_0I   int8 * d                          (one rounding)
+//   Q4_K    q * fp16(d sc) - fp16(dmin m)       (two roundings; the scale and min are rounded to fp16)
+//   Q5_K    as Q4_K with the 5-bit q
+//   Q6_K    (q - 32) * fp16(d sc)
+//   IQ4_XS  table value * fp16(d (ls - 32))
+// A nibble q enters as the fp16 1024 + q (0x6400 over the mantissa), so that the offset comes off exactly.
+
+// [s0, s0, s1, s1, ...] x 8: a column's scale at both of its elements of every K pair.
+SYCL_ESIMD_FUNCTION inline esimd::simd<sycl::half, 128> vnni_cols(esimd::simd<sycl::half, 8> s) {
+  esimd::simd<sycl::half, 16> s2;
+  s2.select<8, 2>(0) = s;
+  s2.select<8, 2>(1) = s;
+  return s2.replicate<8>();
+}
+
+// 16 dwords (8 nibbles each, [kg][n]) to the 64 dwords of fp16 pairs 1024 + q, in VNNI order.
+SYCL_ESIMD_FUNCTION inline esimd::simd<uint32_t, 64> nibbles_to_pairs(esimd::simd<uint32_t, 16> D) {
+  esimd::simd<uint32_t, 64> W;
+#pragma unroll
+  for (int g2 = 0; g2 < 2; ++g2)
+#pragma unroll
+    for (int q = 0; q < 4; ++q) {
+      const esimd::simd<uint32_t, 8> t = esimd::simd<uint32_t, 8>(D.select<8, 1>(g2 * 8)) >> (8 * q);
+      W.select<8, 1>((g2 * 4 + q) * 8) = (t & 0xF) | ((t << 12) & 0xF0000) | 0x64006400u;
+    }
+  return W;
+}
+
+// x shifted by s (right for s >= 0, left for s < 0).
+SYCL_ESIMD_FUNCTION inline esimd::simd<uint32_t, 8> shift_by(esimd::simd<uint32_t, 8> x, int s) {
+  if (s >= 0) return x >> s;
+  return x << (-s);
+}
+
+template <WeightFormat F>
+struct GemmDec;
+
+template <>
+struct GemmDec<WeightFormat::Q8_0I> {
+  static constexpr int DW = 32, REC_T = 1;
+  struct Meta {
+    esimd::simd<sycl::half, 8> s;
+  };
+  SYCL_ESIMD_FUNCTION static void load_meta(Meta& m, const uint8_t* rec_g, int b, int h) {
+    m.s = esimd::block_load<sycl::half, 8>(reinterpret_cast<const sycl::half*>(rec_g + b * 16));
+  }
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> dequant(esimd::simd<uint32_t, DW> D, Meta& m, int b, int h, uint32_t slm) {
+    // The s8 operand's dword (k4, n) holds k = 4 k4 .. 4 k4 + 3: its two words go to K pairs 2 k4 and 2 k4 + 1.
+    esimd::simd<uint16_t, 64> src = D.bit_cast_view<uint16_t>(), dst;
+#pragma unroll
+    for (int k4 = 0; k4 < 4; ++k4)
+#pragma unroll
+      for (int a = 0; a < 2; ++a) dst.select<8, 1>((2 * k4 + a) * 8) = src.select<8, 2>(k4 * 16 + a);
+    esimd::simd<int8_t, 128> b8 = dst.bit_cast_view<int8_t>();
+    esimd::simd<sycl::half, 128> w = b8;
+    return w * vnni_cols(m.s);
+  }
+};
+
+// Q4_K and Q5_K: the record's 128 bytes (scales) and for Q5_K the tile's 8 dwords of high bits.
+struct GemmMin {
+  static constexpr int DW = 16, REC_T = 8;
+  struct Meta {
+    esimd::simd<uint8_t, 128> r;
+    esimd::simd<uint32_t, 8> hw;  // Q5_K
+  };
+  // The tile's scale d sc and min dmin m as fp16 per column.
+  SYCL_ESIMD_FUNCTION static void scales(Meta& m, int j, esimd::simd<sycl::half, 8>& ds, esimd::simd<sycl::half, 8>& dm) {
+    esimd::simd<float, 8> d = m.r.select<16, 1>(0).bit_cast_view<sycl::half>();
+    esimd::simd<float, 8> dmin = m.r.select<16, 1>(16).bit_cast_view<sycl::half>();
+    esimd::simd<uint16_t, 8> sc, mn;
+    if (j < 4) {
+      sc = esimd::simd<uint16_t, 8>(m.r.select<8, 1>(32 + 8 * j)) & 63;
+      mn = esimd::simd<uint16_t, 8>(m.r.select<8, 1>(32 + 8 * (j + 4))) & 63;
+    } else {
+      const esimd::simd<uint16_t, 8> s8 = m.r.select<8, 1>(32 + 8 * (j + 4)), s0 = m.r.select<8, 1>(32 + 8 * (j - 4)), s4 = m.r.select<8, 1>(32 + 8 * j);
+      sc = (s8 & 15) | ((s0 >> 6) << 4);
+      mn = (s8 >> 4) | ((s4 >> 6) << 4);
+    }
+    esimd::simd<float, 8> scf = sc, mnf = mn;
+    ds = esimd::simd<sycl::half, 8>(d * scf);
+    dm = esimd::simd<sycl::half, 8>(dmin * mnf);
+  }
+};
+
+template <>
+struct GemmDec<WeightFormat::Q4_K> : GemmMin {
+  SYCL_ESIMD_FUNCTION static void load_meta(Meta& m, const uint8_t* rec_g, int b, int h) { m.r = esimd::block_load<uint8_t, 128>(rec_g + (b / 8) * 128); }
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> dequant(esimd::simd<uint32_t, DW> D, Meta& m, int b, int h, uint32_t slm) {
+    esimd::simd<sycl::half, 8> ds, dm;
+    scales(m, b % 8, ds, dm);
+    esimd::simd<uint32_t, 64> W = nibbles_to_pairs(D);
+    esimd::simd<sycl::half, 128> x = W.bit_cast_view<sycl::half>();
+    x = x - sycl::half(1024);
+    x = x * vnni_cols(ds);  // two roundings, in two statements (no fused multiply-add: the emulation does the same)
+    x = x - vnni_cols(dm);
+    return x;
+  }
+};
+
+template <>
+struct GemmDec<WeightFormat::Q5_K> : GemmMin {
+  SYCL_ESIMD_FUNCTION static void load_meta(Meta& m, const uint8_t* rec_g, int b, int h) {
+    const uint8_t* rec = rec_g + (b / 8) * 384;
+    m.r = esimd::block_load<uint8_t, 128>(rec);
+    m.hw = esimd::block_load<uint32_t, 8>(reinterpret_cast<const uint32_t*>(rec + 128 + (b % 8) * 32));
+  }
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> dequant(esimd::simd<uint32_t, DW> D, Meta& m, int b, int h, uint32_t slm) {
+    esimd::simd<sycl::half, 8> ds, dm;
+    scales(m, b % 8, ds, dm);
+    esimd::simd<uint32_t, 64> W = nibbles_to_pairs(D);
+    // The piece's high bits: bit 2 j + h of a column's word is the high bit of k = 16 h + j; K pair kp holds j = 2 kp and
+    // 2 kp + 1, which go to bits 4 and 20 of the pair's dword (bit 4 of the two fp16 mantissas).
+    const esimd::simd<uint32_t, 8> hs = m.hw >> h;
+#pragma unroll
+    for (int kp = 0; kp < 8; ++kp)
+      W.select<8, 1>(kp * 8) |= (shift_by(hs, 4 * kp - 4) & 0x10u) | (shift_by(hs, 4 * kp - 18) & 0x100000u);
+    esimd::simd<sycl::half, 128> x = W.bit_cast_view<sycl::half>();
+    x = x - sycl::half(1024);
+    x = x * vnni_cols(ds);  // two roundings, in two statements (no fused multiply-add: the emulation does the same)
+    x = x - vnni_cols(dm);
+    return x;
+  }
+};
+
+template <>
+struct GemmDec<WeightFormat::Q6_K> {
+  static constexpr int DW = 16, REC_T = 8;
+  struct Meta {
+    esimd::simd<int8_t, 16> sc;
+    esimd::simd<sycl::half, 8> d;
+    esimd::simd<uint32_t, 8> s2;
+  };
+  SYCL_ESIMD_FUNCTION static void load_meta(Meta& m, const uint8_t* rec_g, int b, int h) {
+    const uint8_t* rec = rec_g + (b / 8) * 656;
+    const int j = b % 8;
+    m.sc = esimd::block_load<int8_t, 16>(reinterpret_cast<const int8_t*>(rec + 16 * j));
+    m.d = esimd::block_load<sycl::half, 8>(reinterpret_cast<const sycl::half*>(rec + kQ6KD));
+    m.s2 = esimd::block_load<uint32_t, 8>(reinterpret_cast<const uint32_t*>(rec + kQ6KHigh + j * 64 + h * 32));
+  }
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> dequant(esimd::simd<uint32_t, DW> D, Meta& m, int b, int h, uint32_t slm) {
+    // The piece is the tile's sub-block 2 j + h: its int8 scale is sc[8 h + n].
+    esimd::simd<float, 8> scf = m.sc.select<8, 1>(8 * h), d = m.d;
+    const esimd::simd<sycl::half, 8> ds = esimd::simd<sycl::half, 8>(d * scf);
+    esimd::simd<uint32_t, 64> W = nibbles_to_pairs(D);
+    // The stored field is (q >> 4) ^ 2; flipping its high bit back gives q >> 4 at bits 4..5 of each fp16.
+    const esimd::simd<uint32_t, 8> hx = m.s2 ^ 0xAAAAAAAAu;
+#pragma unroll
+    for (int kp = 0; kp < 8; ++kp)
+      W.select<8, 1>(kp * 8) |= (shift_by(hx, 4 * kp - 4) & 0x30u) | (shift_by(hx, 4 * kp - 18) & 0x300000u);
+    esimd::simd<sycl::half, 128> x = W.bit_cast_view<sycl::half>();
+    x = x - sycl::half(1056);
+    return x * vnni_cols(ds);
+  }
+};
+
+template <>
+struct GemmDec<WeightFormat::IQ4_XS> {
+  static constexpr int DW = 16, REC_T = 8;
+  struct Meta {
+    esimd::simd<sycl::half, 8> ds;
+  };
+  SYCL_ESIMD_FUNCTION static void load_meta(Meta& m, const uint8_t* rec_g, int b, int h) {
+    const uint8_t* rec = rec_g + (b / 8) * 64;
+    const int j = b % 8;
+    esimd::simd<float, 8> d = esimd::block_load<sycl::half, 8>(reinterpret_cast<const sycl::half*>(rec));
+    esimd::simd<uint16_t, 8> sh = esimd::block_load<uint16_t, 8>(reinterpret_cast<const uint16_t*>(rec + kIqScalesH));
+    esimd::simd<uint8_t, 32> sl = esimd::block_load<uint8_t, 32>(rec + kIqScalesL);
+    esimd::simd<uint16_t, 8> l = sl.select<8, 1>((j / 2) * 8);
+    esimd::simd<uint16_t, 8> ls = ((l >> (4 * (j % 2))) & 15) | (((sh >> (2 * j)) & 3) << 4);
+    esimd::simd<float, 8> lsf = ls;
+    m.ds = esimd::simd<sycl::half, 8>(d * (lsf - 32.0f));
+  }
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> dequant(esimd::simd<uint32_t, DW> D, Meta& m, int b, int h, uint32_t slm) {
+    esimd::simd<uint32_t, 64> off = esimd::simd<uint32_t, 64>(D.bit_cast_view<uint8_t>()) << 2;
+    off += slm;
+    esimd::simd<uint32_t, 64> g;
+    g.select<32, 1>(0) = esimd::slm_gather<uint32_t, 32>(off.select<32, 1>(0));
+    g.select<32, 1>(32) = esimd::slm_gather<uint32_t, 32>(off.select<32, 1>(32));
+    esimd::simd<uint16_t, 64> src = g, dst;
+    // Byte (k4 * 8 + n) * 2 + a of the piece holds the codes of k = 4 k4 + 2 a and the next: its word goes to K pair 2 k4 + a.
+#pragma unroll
+    for (int k4 = 0; k4 < 4; ++k4)
+#pragma unroll
+      for (int a = 0; a < 2; ++a) dst.select<8, 1>((2 * k4 + a) * 8) = src.select<8, 2>(k4 * 16 + a);
+    esimd::simd<int8_t, 128> b8 = dst.bit_cast_view<int8_t>();
+    esimd::simd<sycl::half, 128> w = b8;
+    return w * vnni_cols(m.ds);
+  }
+};
+
+// The Meta type of a format in the GEMM: the new formats' own, a placeholder for the rest.
+template <WeightFormat F, bool New = is_new_format(F)>
+struct GemmMetaOf {
+  struct type {};
+  static constexpr int DW = 16;
+  static constexpr int REC_T = 1;
+};
+template <WeightFormat F>
+struct GemmMetaOf<F, true> {
+  using type = typename GemmDec<F>::Meta;
+  static constexpr int DW = GemmDec<F>::DW;
+  static constexpr int REC_T = GemmDec<F>::REC_T;
+};
 
 // The decode GEMVs on int8 activations (xmx_fmt_gemv.hpp, instantiated in xmx_gemv_<format>.cpp), and the runtime
 // dispatch over them (xmx_fmt.cpp).
