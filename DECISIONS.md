@@ -1296,7 +1296,8 @@ Q6_K 295, IQ4_XS 161; the head 2048 -> 248,320: 367, 364, 354, 358, 357, 218. Ev
 Q4_0's, so a decode token's time follows the bits per weight; the small matrices (an expert's 0.6-1.2 MB) are
 launch and latency bound at ~8-9 us a call whatever the format. The grouped GEMVs of the experts (256 experts,
 distinct ones read, P = 8 pairs, gate|up + SwiGLU): 196 (Q4_0), 243 (Q8_0), 178 (Q4_K), 194 (Q5_K), 208 (Q6_K), 122
-(IQ4_XS) GB/s, so per byte Q4_K costs 13% more than Q4_0 and per weight Q5_K +30%, Q6_K +47%, Q8_0 +66%. At 16 and 32 rows
+(IQ4_XS) GB/s, so per byte Q4_K costs 10% more than Q4_0 and per weight (bits / rate) Q5_K +23%, Q6_K +37%, Q8_0 +52%,
+IQ4_XS +52%. At 16 and 32 rows
 (a verify block) the K-quants' scale work shows: attn_qkv at 32 rows 98-107 GB/s against Q4_0's 134 and Q8_0's 176.
 - **IQ4_XS** is bound by its table: the 16-value int8 table is looked up per packed byte (a 256-entry table of int8
   pairs in shared local memory, one gather lane for two weights, 16-bit entries +3-4% over 32-bit). With the gather
@@ -1324,8 +1325,9 @@ its two DDR4 channels read 43 GB/s (8 threads and up; 25 on one). One cold exper
 requantize, down GEMV; 1.67-3.34 MB), best of 1-16 threads, one input: Q4_0 44 us (40 GB/s), Q4_K 45, IQ4_XS 42, Q5_K
 53, Q6_K 64, Q8_0 77 us (43.5 GB/s): every format reads at the DRAM rate, so time follows bytes (the pshufb lookup of
 IQ4_XS costs nothing here). With 8 and 16 inputs (tokens of a verify block that pick the same expert) it is arithmetic
-bound: 122-156 us and 233-290 us, 15-19 us a token against 44-77 for one: sharing the read makes a block of eight cost ~3
-singles. Q8_0 is the cheapest per token there (the sign trick has fewer ops than the K-quants' scale work).
+bound: 122-156 us and 233-290 us, 15-19 us a token against 42-77 for one: sharing the read makes a block of eight cost ~3
+singles. Q4_0 is the fastest there (233 us at 16 inputs), Q8_0 next (251: its sign trick has fewer ops than the K-quants'
+scale work), then Q4_K 267, IQ4_XS 278, Q6_K 280, Q5_K 290.
 
 **Correctness**: every kernel against ggml's own dequantization at the fp32 activations (1e-2 up to 32 rows, 2-5e-4
 above) and an exact emulation of the arithmetic on the card's own int8 activations (<= 1 float epsilon of the sum of
@@ -1336,8 +1338,8 @@ way by an ulp of the reciprocal, the same as the old 5.8e-4 at `attn_output` 16 
 unchanged (same numbers as main), `attn` all ok.
 
 **Which formats are cheap enough** (card and CPU costs alone): the card reads Q4_K, Q5_K, Q6_K and Q8_0 at Q4_0's
-rate, so an expert in Q4_K costs 13% more decode time than in Q4_0 at the same bytes and the CPU none; Q5_K and Q6_K
-cost their bytes (+22% and +46% on the CPU) plus 10-30% on the card's grouped GEMVs; Q8_0 is for the dense matrices
+rate, so an expert in Q4_K costs 10% more decode time than in Q4_0 at the same bytes and the CPU none; Q5_K and Q6_K
+cost about their bytes (+22% and +46% on the CPU, +23% and +37% on the card's grouped GEMVs); Q8_0 is for the dense matrices
 (1.9x the bytes of 4.5 bits) and is the fastest per byte on the card; IQ4_XS saves 6% of the bytes and costs 1.7x the
 card's decode time and 40% of its expert prefill, though the CPU reads it as fast as Q4_0. The dense matrices and
 the head are 1.5 GB of the ~20, read once a token at 300-360 GB/s whatever the format: their cost is their bytes.
