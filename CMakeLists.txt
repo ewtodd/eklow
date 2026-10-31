@@ -76,6 +76,12 @@ add_library(eklow_model STATIC
   src/kernels/fast.cpp
   src/kernels/ref.cpp
   src/kernels/xmx.cpp
+  src/kernels/xmx_fmt.cpp
+  src/kernels/xmx_gemv_iq4xs.cpp
+  src/kernels/xmx_gemv_q4k.cpp
+  src/kernels/xmx_gemv_q5k.cpp
+  src/kernels/xmx_gemv_q6k.cpp
+  src/kernels/xmx_gemv_q8.cpp
   src/model/embed_gemma2.cpp
   src/model/vision_gemma4v.cpp
   src/model/vision_gemma4v_fast.cpp
@@ -88,6 +94,11 @@ eklow_sycl(eklow_model)
 add_executable(eklow-kernel-test tools/kernel_test/main.cpp)
 target_link_libraries(eklow-kernel-test PRIVATE eklow_model)
 eklow_sycl(eklow-kernel-test)
+
+# The Qwen weight formats' kernels, checked against ggml's dequantization and timed (TASK qwen/mm).
+add_executable(eklow-qfmt-test tools/qfmt_test/main.cpp)
+target_link_libraries(eklow-qfmt-test PRIVATE eklow_model)
+eklow_sycl(eklow-qfmt-test)
 
 add_executable(eklow-embed tools/embed/main.cpp)
 target_link_libraries(eklow-embed PRIVATE eklow_model eklow_text)
@@ -176,6 +187,6 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-cpu-gemv-test RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-cpu-gemv-test RUNTIME DESTINATION bin)
 # The 26B's routing profile, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/gemma-4-26b-a4b-experts.json DESTINATION share/eklow)

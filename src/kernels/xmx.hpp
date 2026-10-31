@@ -25,11 +25,17 @@
 
 namespace eklow::xmx {
 
-// The fp16 GEMM's weight formats. Q4_0 is the language models' (every path takes it); Q8_0 and F16 (from F16,
-// BF16 or F32 files) only the fp16 GEMM, for EmbeddingGemma 2 and the vision encoders. Tiles of 8 columns x 32 K in
-// the same [N/8][K/32] order: Q8_0 256 bytes of int8 laid out as the fp16 B operand (each 16-K half, element (k, n)
-// at (k/2)*16 + n*2 + k%2) with an fp16 scale per column; F16 512 bytes, the B operand itself, no scales.
-enum class WeightFormat : uint8_t { Q4_0, Q8_0, F16 };
+// The weight formats. Q4_0 is the Gemma models' (every path takes it); Q8_0 and F16 (from F16, BF16 or F32 files)
+// only the fp16 GEMM, for EmbeddingGemma 2 and the vision encoders. Tiles of 8 columns x 32 K in the same
+// [N/8][K/32] order: Q8_0 256 bytes of int8 laid out as the fp16 B operand (each 16-K half, element (k, n) at
+// (k/2)*16 + n*2 + k%2) with an fp16 scale per column; F16 512 bytes, the B operand itself, no scales.
+//
+// The Qwen formats (DECISIONS 2026-10-31, "the matmuls"), all decode GEMVs on int8 activations and fp16 GEMMs, each
+// with the bytes per weight of ggml's own and the same values (src/kernels/xmx_fmt.hpp has the layouts): Q8_0I
+// (int8 tiles for the s8 dpas, 256 bytes, fp16 scales per tile as Q4_0's: 8.5 bits), Q4_K (4.5), Q5_K (5.5), Q6_K
+// (6.5625), IQ4_XS (4.25). The K-quants and IQ4_XS need K a multiple of 256; `scales` holds their per-superblock
+// records (the sub-block scales and mins, the high bits, d) as bytes.
+enum class WeightFormat : uint8_t { Q4_0, Q8_0, F16, Q8_0I, Q4_K, Q5_K, Q6_K, IQ4_XS };
 
 struct Weight {
   int64_t k = 0, n = 0;
@@ -56,6 +62,19 @@ Weight repack(sycl::queue& q, const ref::Weight& raw);
 // Rows [n0, n0 + n) of w (output columns), a view into its tiles; n0 and n a multiple of 8.
 Weight rows_of(const Weight& w, int64_t n0, int64_t n);
 void free_weight(sycl::queue& q, Weight& w);
+
+// The Qwen formats' repack (Q8_0 as Q8_0I, Q4_K, Q5_K, Q6_K, IQ4_XS: ggml tensor types, on the device) into the
+// layouts of src/kernels/xmx_fmt.hpp, the same bytes per weight as ggml's. K a multiple of 32 (Q8_0I) or 256
+// (the rest), N of 8; interleave as repack_q4_0's. format_of is false for types without such a layout.
+bool format_of(gguf::Type t, WeightFormat& f);
+const char* format_name(WeightFormat f);
+// The bytes of a repacked matrix's tiles and of its `scales` array (the fp16 scales of Q4_0 and Q8_0I, the
+// superblock records of the rest).
+uint64_t weight_tile_bytes(WeightFormat f, int64_t k, int64_t n);
+uint64_t weight_meta_bytes(WeightFormat f, int64_t k, int64_t n);
+Weight repack_format(sycl::queue& q, const ref::Weight& raw, WeightFormat f, bool interleave = false);
+// Into allocations the caller owns (w.k, w.n, w.format set; sizes as above); only enqueues.
+void repack_format_into(sycl::queue& q, const ref::Weight& raw, bool interleave, const Weight& w);
 
 // Rows above which matmul takes fp16 activations.
 constexpr int64_t kFp16Rows = 32;
@@ -100,10 +119,14 @@ void set_rows(Activations& a, int64_t m, int64_t k, bool fp16 = false);
 // queue must be in order); the caller waits.
 void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out);
 
+// The activation of the fused GLU kernels: Gemma's GeGLU (gelu_tanh(gate) * up) or Qwen's SwiGLU (silu(gate) * up).
+// The kernels named geglu serve both; the default is Gemma's, so existing callers are unchanged.
+enum class Glu : uint8_t { Gelu, Silu };
+
 // GeGLU: gelu_tanh(gate) * up for w a gate|up matrix repacked with interleave, into `out` (n/2
 // wide) in the form the next matmul takes. On fp16 activations it is the GEMM's epilogue; the
 // int8 path goes through `scratch` (fp32, m x n).
-void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activations& out, float* scratch);
+void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activations& out, float* scratch, Glu act = Glu::Gelu);
 
 // A layer's experts of one shape, as device tables of their tile and scale pointers (the experts
 // stay separate xmx::Weights; the grouped kernels index the tables by expert id).
@@ -113,6 +136,7 @@ struct ExpertTable {
   int64_t k = 0, n = 0, count = 0;
   const uint8_t** tiles = nullptr;
   const sycl::half** scales = nullptr;
+  WeightFormat format = WeightFormat::Q4_0;  // of every expert in the table
 };
 ExpertTable make_expert_table(sycl::queue& q, const std::vector<Weight>& experts);
 void free_expert_table(sycl::queue& q, ExpertTable& t);
@@ -123,7 +147,7 @@ void matmul_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, 
                     int64_t row_div, float* out);
 // The grouped gate_up (interleaved experts) then GeGLU into P-row int8 `out`, through `scratch` [P][n].
 void matmul_geglu_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, const int32_t* ids, int64_t P,
-                          int64_t row_div, Activations& out, float* scratch);
+                          int64_t row_div, Activations& out, float* scratch, Glu act = Glu::Gelu);
 
 // Decode MoE with the dense FFN's gate|up as three more "experts": the table's last three entries are
 // the dense gate|up's thirds (3 x n columns, each a contiguous range of tiles). Pairs 0..P-1 are the
@@ -131,7 +155,8 @@ void matmul_geglu_grouped(sycl::queue& q, const Activations& a, const ExpertTabl
 // GEMV, one GeGLU launch: the experts into `out` (P rows), the dense row t into `out_d` (3n wide).
 // scratch holds (P + 3 rows_d) rows of the third's width.
 void matmul_geglu_grouped_dense(sycl::queue& q, const Activations& a, const Activations& ad, const ExpertTable& w, const int32_t* ids,
-                                int64_t P, int64_t row_div, int64_t rows_d, Activations& out, Activations& out_d, float* scratch);
+                                int64_t P, int64_t row_div, int64_t rows_d, Activations& out, Activations& out_d, float* scratch,
+                                Glu act = Glu::Gelu);
 
 // Grouped fp16 GEMMs for prefill (the MoE's experts over all their tokens at once). `a` holds the
 // rows sorted by expert in the fp16 activation layout (act16_index, width w.k), in row tiles of
@@ -142,6 +167,6 @@ void matmul_geglu_grouped_dense(sycl::queue& q, const Activations& a, const Acti
 void matmul_grouped16(sycl::queue& q, const sycl::half* a, const ExpertTable& w, const int32_t* tiles, int64_t max_tiles,
                       int64_t tile_rows, float* out);
 void matmul_geglu_grouped16(sycl::queue& q, const sycl::half* a, const ExpertTable& w, const int32_t* tiles, int64_t max_tiles,
-                            int64_t tile_rows, sycl::half* out);
+                            int64_t tile_rows, sycl::half* out, Glu act = Glu::Gelu);
 
 }  // namespace eklow::xmx
