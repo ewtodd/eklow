@@ -41,6 +41,7 @@ endfunction()
 # Serving text layer: the tokenizer (and, later, the chat template and output parser). No device code.
 add_library(eklow_text STATIC
   src/text/chat_gemma4.cpp
+  src/text/chat_qwen36.cpp
   src/text/output_parser.cpp
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
