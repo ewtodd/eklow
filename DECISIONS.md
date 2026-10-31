@@ -1209,3 +1209,62 @@ setting them to -inf (`nth_element`'s pivots on that data). Top-k now keeps the 
 the logits, skipping the bans by comparing each id with the next one: 0.21 ms with or without bans, and the same picks
 as before (900 of 900 against main's sampler over greedy, top-k 64 and none, top-p, min-p and penalties, ties
 included).
+
+## 2026-10-31 — Qwen3.6-35B-A3B in place of Gemma 4, with DFlash 2
+
+The owner asked to drop Gemma 4 12B and 26B A4B for Qwen3.6-35B-A3B finetunes served with DFlash 2 speculative
+decoding, trying several; Ornith-1.5-35B-A3B (ornith-ai, revision 10fbf86f) first. Its model card claims large gains
+over stock Qwen3.6 on agentic coding (SWE-bench Verified 79 against 73.4, Terminal-Bench 2.1 67.8 against 52.5), but
+every number there is the vendor's own, its Qwen3.6 baselines included, and no independent comparison or
+contamination check existed on this date (one private 30-task test: 15 against 13). So both are served and measured
+here: stock `Qwen/Qwen3.6-35B-A3B` (995ad96e) and Ornith, the same architecture (their configs differ only in metadata,
+their tokenizers not at all), with eklow's fidelity checks and the owner's own evals, and the numbers published.
+EmbeddingGemma 2 stays (production embeddings use it), and with it Gemma's tokenizer and vision encoder.
+
+**The model** (llama.cpp's `qwen35moe`, which the oracle's pin ea0c4c2c runs, with DFlash 2 since PR 27342): 40 layers
+of hidden 2048; every 4th (3, 7, ..., 39) gated attention with 16 query heads and 2 K/V heads of 256, IMRoPE over 64
+dims at base 1e7, the output scaled by a sigmoid gate from the query projection; the other 30 Gated DeltaNet (16 key
+heads and 32 value heads of 128, a 4-tap causal conv, a 128 x 128 fp32 state per value head); every layer 256 routed
+experts of 512 (softmax, top 8, renormalized, SwiGLU) beside a shared expert of 512 under a sigmoid gate; an untied
+head over 248,320 tokens. 35B parameters, 3B active a token; the routed experts are 32.2B of them.
+
+**Memory at 2 x 262,144.** KV exists only for the 10 attention layers: 10 x 2 x 2 x 256 values a token, 5.6 GiB for
+both slots in int8 with fp16 scales (the 26B's was 6.4). The DeltaNet state is ~60 MiB a slot. The experts are 18.1 GB
+at Q4_0, so after ~1.5 GB of dense weights (Q8_0), the head (0.4 GB, Q6_K), the KV, the draft (~0.5 GB) and the 1 GiB
+margin, roughly 70-80 of each layer's 256 stay on the card, chosen by a routing profile as the 26B's were, and the
+rest (~13 GB) are computed by the CPU from pinned memory: on fiona's 30 GB that fits, tightly.
+
+**Weights.** No published GGUF uses only the types eklow's kernels read (Q4_0, Q8_0, Q6_K, F32): bartowski's "Q4_0"
+mixes in Q4_1, Q5_0 and Q6_K, the official GGUFs are K-quants. eklow makes its own with the oracle's converter and
+quantizer: routed experts Q4_0 under bartowski's importance matrix, the dense matrices Q8_0 (`EK8`) or Q4_0 (`EK4`,
+half the dense bytes a decode token reads), the head Q6_K; the KL of each against Q8_0 decides
+(`tools/weights/`, `qwen/weights` branch). The owner hosts the chosen files on Hugging Face (uploaded from
+son-of-anton, which holds the key).
+
+**DFlash 2** (Inco AI, August 2026; z-lab `dflash/model.py`): a 6-layer Qwen3 draft over the target's hidden states
+from layers 1, 6, 11, 16, 22, 27, 32, 37 (concatenated, projected by `fc`, normed, written as K/V into the draft's
+sliding cache once a token is committed), drafting a block of [last token, MASK x (B-1)] in one pass, non-causal within
+the block, with a two-tap grouped dynamic convolution around each layer's attention and MLP, and a selector that walks
+the top 16 candidates at each position with low-rank codebook scores (predecessor x hidden x successor). The target
+verifies the block; acceptance is rejection sampling against the selector's distribution. Ornith's own draft
+(ornith-ai/Ornith-1.5-35B-A3B-DFlash) is DFlash 1, not 2. Two DFlash 2 drafts fit: `incoai/Qwen3.6-35B-A3B-DFlash2`
+(51ef7b69, the authors', trained on stock Qwen3.6; block 8, window 2,048; 5.21 / 4.90 / 4.41 tokens accepted a verify
+on GSM8K / HumanEval / MT-Bench at temperature 1, SGLang) and `jzinno/Ornith-1.5-35B-A3B-DFlash2` (9b4852c0, a
+community draft trained on Ornith's outputs; block 16, window 4,096; ~4.0 greedy at 10 drafted tokens). The owner: use
+Inco's, and the community one if it is better; llama.cpp's acceptance for the four pairs is measured first as the
+reference eklow's implementation will be held to. Both drafts use sliding attention in every layer, so their cache
+stays a few tens of MB however long the context.
+
+**The DeltaNet on the card.** Each column of a value head's state updates independently given that token's k, q, gate
+and beta, so one recurrent kernel can serve prefill, decode and verify alike: a thread holds a slice of columns and
+walks its slot's tokens in order. By estimate ~0.2-0.3 us a token, 30 layers of a 2,048-token chunk ~15 ms against
+~400 ms for the rest of the chunk, so the chunked (WY) form is left until measurements ask for it (`qwen/gdn` measures).
+A verify block must leave the state as if only its accepted tokens had run: rather than copying states, a step keeps
+the inputs of tokens it leaves pending and the next step replays the accepted ones onto the committed state before its
+own tokens. Prefix reuse cannot truncate a recurrent state, so the server will keep snapshots of a slot's state (~60
+MiB, copied to pinned host memory in ~6 ms) where conversations diverge (the end of a prompt); Ornith's template
+re-renders earlier reasoning exactly as generated, which helps.
+
+**The card.** Development needs fiona's A770M for long stretches, and the owner chose to stop production for the
+duration: `eklow.service` (the 26B) stopped 2026-10-31 17:40. The work happens on `qwen/*` branches merged into
+`qwen/main`; main keeps the 26B until the new model serves, then the Gemma 4 chat code goes.
