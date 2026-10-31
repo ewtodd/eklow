@@ -286,6 +286,12 @@ struct Bench {
   }
 };
 
+// A layer's step by the fused kernel (with o written to the scratch, for the checks) or the three split ones.
+void run_step(Bench& b, const Weights& w, int layer, const Plan& p, Path path) {
+  if (path == Path::Fused || (path == Path::Auto && p.max_n <= kFusedMaxTokens)) step_fused(b.q, w, b.cache, layer, p, b.inputs(), b.act, b.scr.o);
+  else step(b.q, w, b.cache, layer, p, b.inputs(), b.scr, b.act, Path::Split);
+}
+
 bool g_fail = false;
 void check(bool ok, const char* what) {
   if (!ok) {
@@ -297,8 +303,23 @@ void check(bool ok, const char* what) {
 // ---------------------------------------------------------------------------------------------------------------------
 // accuracy and edge
 
-void accuracy(bool edge, bool quick) {
-  std::printf("%s\n", edge ? "edge cases (g near 0 and very negative, beta near 0 and 1, huge and zero rows)" : "accuracy against the double emulation");
+// The reference conv state (the last three raw rows) in the kernels' layout: [32 heads][3][384].
+std::vector<float> conv_layout(const std::vector<float>& rows) {
+  std::vector<float> out(size_t(kValueHeads) * 3 * kHeadChannels);
+  for (int h = 0; h < kValueHeads; ++h)
+    for (int r = 0; r < 3; ++r) {
+      const float* src = &rows[size_t(r) * kChannels];
+      float* dst = &out[(size_t(h) * 3 + size_t(r)) * kHeadChannels];
+      std::copy_n(src + (h % kKeyHeads) * kHead, kHead, dst);
+      std::copy_n(src + kQk + (h % kKeyHeads) * kHead, kHead, dst + kHead);
+      std::copy_n(src + 2 * kQk + h * kHead, kHead, dst + 2 * kHead);
+    }
+  return out;
+}
+
+void accuracy(bool edge, bool quick, Path path) {
+  std::printf("%s, %s\n", edge ? "edge cases (g near 0 and very negative, beta near 0 and 1, huge and zero rows)" : "accuracy against the double emulation",
+              path == Path::Split ? "split kernels only" : "fused kernel for steps of up to 16 tokens a slot, split kernels above");
   std::mt19937 rng(edge ? 7 : 1);
   const int layers = 3, layer = 1;
   std::vector<int> lens = quick ? std::vector<int>{600, 300, 37, 1} : std::vector<int>{4200, 2300, 37, 1};
@@ -345,7 +366,7 @@ void accuracy(bool edge, bool quick) {
     if (sl.empty()) break;
     b.upload_gather(src, ranges);
     Plan p = make_plan(b.q, sl);
-    step(b.q, w, b.cache, layer, p, b.inputs(), b.scr, b.act);
+    run_step(b, w, layer, p, path);
     b.q.wait();
     const std::vector<float> o = b.read_o(tok);
     std::vector<float> y, stp;
@@ -401,7 +422,10 @@ void accuracy(bool edge, bool quick) {
     std::vector<float> ssm, conv;
     b.read_state(s, layer, ssm, conv);
     for (size_t i = 0; i < ssm.size(); ++i) e_s.add(ssm[i], ref[size_t(s)].S[i], 1e-3);
-    conv_exact &= std::memcmp(conv.data(), ref[size_t(s)].conv.data(), conv.size() * 4) == 0;
+    {
+      const std::vector<float> want = conv_layout(ref[size_t(s)].conv);
+      conv_exact &= want.size() == conv.size() && std::memcmp(conv.data(), want.data(), conv.size() * 4) == 0;
+    }
     std::vector<float> s0, c0;
     b.read_state(s, 0, s0, c0);  // the other layers were never touched
     for (float v : s0) untouched &= v == 0.0f;
@@ -431,7 +455,8 @@ struct Twin {
   Bench b;
   std::vector<SlotBook> book = std::vector<SlotBook>(2, SlotBook{});
   const int layer = 1;
-  explicit Twin(std::mt19937& rng) : b(3, 2, 16, 128, rng, false) {
+  Path path;
+  Twin(std::mt19937& rng, Path pth) : b(3, 2, 16, 128, rng, false), path(pth) {
     reset_slot(b.q, b.cache, 0), reset_slot(b.q, b.cache, 1);
   }
   struct Out {
@@ -443,13 +468,14 @@ struct Twin {
     s1.tok0 = int32_t(r0.second);
     Plan p = make_plan(b.q, {s0, s1});
     b.upload_gather({&rows, &rows}, {r0, r1});
-    gdn::step(b.q, b.m.dev(), b.cache, layer, p, b.inputs(), b.scr, b.act);
+    run_step(b, b.m.dev(), layer, p, path);
     b.q.wait();
-    const int64_t n0 = int64_t(r0.second), n1 = int64_t(r1.second);
+    const int64_t n0 = int64_t(r0.second), n1 = int64_t(r1.second), a0 = s0.accept, a1 = s1.accept;
     Out out;
-    const std::vector<float> o = b.read_o(n0 + n1);
-    out.o0.assign(o.begin(), o.begin() + n0 * kInner);
-    out.o1.assign(o.begin() + n0 * kInner, o.end());
+    // scratch rows: slot 0's replayed tokens, its new ones, slot 1's replayed, its new
+    const std::vector<float> o = b.read_o(n0 + n1 + a0 + a1);
+    out.o0.assign(o.begin() + a0 * kInner, o.begin() + (a0 + n0) * kInner);
+    out.o1.assign(o.begin() + (n0 + a0 + a1) * kInner, o.begin() + (n0 + a0 + a1 + n1) * kInner);
     if (n0 + n1) {
       std::vector<float> y, st;
       dequant(b.q, b.act, n0 + n1, y, st);
@@ -461,8 +487,9 @@ struct Twin {
   }
 };
 
-void rollback(bool quick) {
-  std::printf("rollback: verify block + accept a == running just those a (bitwise)\n");
+void rollback(bool quick, Path path) {
+  std::printf("rollback: verify block + accept a == running just those a (bitwise), %s kernel%s\n", path == Path::Split ? "split" : "fused (split for prefixes over 16 tokens)",
+              path == Path::Split ? "s" : "");
   std::mt19937 rng(3);
   std::uniform_real_distribution<float> ud(0, 1);
   int cases = 0, bad = 0;
@@ -489,7 +516,7 @@ void rollback(bool quick) {
   for (int B : Bs)
     for (int a = 1; a <= B; ++a)
       for (int variant = 0; variant < 3; ++variant) {
-        Twin tw(rng);
+        Twin tw(rng, path);
         Rows rows;
         const int P = 5 + int(ud(rng) * 40), N3 = 1 + int(ud(rng) * 12);
         rows.resize(size_t(P + B + N3));
@@ -521,7 +548,7 @@ void rollback(bool quick) {
   // 2. chains of random verify blocks whose rejected tokens are garbage, against a twin that runs the accepted ones.
   const int rounds = quick ? 40 : 200;
   for (int chain = 0; chain < (quick ? 2 : 4); ++chain) {
-    Twin tw(rng);
+    Twin tw(rng, path);
     Rows truth;  // the accepted stream
     truth.resize(size_t(rounds) * 16 + 64);
     fill_rows(rng, truth, 0, truth.n(), false);
@@ -566,7 +593,7 @@ double ns(const sycl::event& e) {
 
 void timing(int layers, int reps) {
   std::printf("time: GPU time per step in us; one layer (the same layer repeated), then %d layers (distinct state)\n", layers);
-  std::printf("  %-8s %7s %7s %7s %8s | %8s %8s %8s %9s %9s\n", "shape", "prep", "scan", "norm", "layer", "prep", "scan", "norm", "sum", "wall");
+  std::printf("  %-14s %7s %7s %7s %8s | %8s %8s %8s %9s %9s\n", "shape", "prep", "scan", "norm", "layer", "prep", "scan", "norm", "sum", "wall");
   std::mt19937 rng(5);
   struct Cfg {
     const char* name;
@@ -580,7 +607,7 @@ void timing(int layers, int reps) {
   fill_dev(b.q, b.db, 4096 * int64_t(kValueHeads), 4, 2.0f);
   const Weights w = b.m.dev();
   {  // warm up: the card clocks down when idle, which doubles the first small kernels
-    Plan wp = make_plan(b.q, {SlotStep{0, 0, 2048, 0, 2048, {0, 0, 0}}, SlotStep{1, 2048, 2048, 0, 2048, {0, 0, 0}}});
+    Plan wp = make_plan(b.q, {SlotStep{0, 0, 2048, 0, 2048, 0, {0, 0}}, SlotStep{1, 2048, 2048, 0, 2048, 0, {0, 0}}});
     for (int rep = 0; rep < 3; ++rep)
       for (int l = 0; l < layers; ++l) gdn::step(b.q, w, b.cache, l, wp, b.inputs(), b.scr, b.act);
     b.q.wait();
@@ -590,7 +617,7 @@ void timing(int layers, int reps) {
     std::vector<SlotStep> sl;
     int tok = 0;
     for (size_t s = 0; s < c.ns.size(); ++s) {
-      sl.push_back(SlotStep{int32_t(s), tok, c.ns[s], 0, c.ns[s], {0, 0, 0}});
+      sl.push_back(SlotStep{int32_t(s), tok, c.ns[s], 0, c.ns[s], 0, {0, 0}});
       tok += c.ns[s];
     }
     Plan p = make_plan(b.q, sl);
@@ -626,8 +653,30 @@ void timing(int layers, int reps) {
       tw.push_back(double(m1.get_profiling_info<sycl::info::event_profiling::command_start>() - m0.get_profiling_info<sycl::info::event_profiling::command_end>()));
     }
     const double s1 = med(t1[0]) + med(t1[1]) + med(t1[2]), s30 = med(t30[0]) + med(t30[1]) + med(t30[2]);
-    std::printf("  %-8s %7.1f %7.1f %7.1f %8.1f | %8.1f %8.1f %8.1f %9.1f %9.1f\n", c.name, med(t1[0]) / 1e3, med(t1[1]) / 1e3, med(t1[2]) / 1e3, s1 / 1e3,
+    std::printf("  %-14s %7.1f %7.1f %7.1f %8.1f | %8.1f %8.1f %8.1f %9.1f %9.1f\n", c.name, med(t1[0]) / 1e3, med(t1[1]) / 1e3, med(t1[2]) / 1e3, s1 / 1e3,
                 med(t30[0]) / 1e3, med(t30[1]) / 1e3, med(t30[2]) / 1e3, s30 / 1e3, med(tw) / 1e3);
+    if (p.max_n <= kFusedMaxTokens) {
+      std::vector<double> f1, f30, fw;
+      for (int rep = 0; rep < r + 1; ++rep) {
+        double a1 = 0;
+        for (int i = 0; i < 4; ++i) {
+          auto e = step_fused(b.q, w, b.cache, 0, p, b.inputs(), b.act);
+          b.q.wait();
+          a1 = ns(e);
+        }
+        std::vector<sycl::event> ev;
+        auto m0 = b.q.single_task([] {});
+        for (int l = 0; l < layers; ++l) ev.push_back(step_fused(b.q, w, b.cache, l, p, b.inputs(), b.act));
+        auto m1 = b.q.single_task([] {});
+        b.q.wait();
+        if (rep == 0) continue;
+        double a30 = 0;
+        for (auto& e : ev) a30 += ns(e);
+        f1.push_back(a1), f30.push_back(a30);
+        fw.push_back(double(m1.get_profiling_info<sycl::info::event_profiling::command_start>() - m0.get_profiling_info<sycl::info::event_profiling::command_end>()));
+      }
+      std::printf("  %-14s %7s %7s %7s %8.1f | %8s %8s %8s %9.1f %9.1f\n", (std::string(c.name) + " fused").c_str(), "", "", "", med(f1) / 1e3, "", "", "", med(f30) / 1e3, med(fw) / 1e3);
+    }
     free_plan(b.q, p);
   }
 }
@@ -642,7 +691,7 @@ void snapshot(int layers) {
   fill_rows(rng, rows, 0, 40, false);
   b.upload_gather({&rows}, {{0, 40}});
   const Weights w = b.m.dev();
-  Plan p = make_plan(b.q, {SlotStep{0, 0, 40, 0, 40, {0, 0, 0}}});
+  Plan p = make_plan(b.q, {SlotStep{0, 0, 40, 0, 40, 0, {0, 0}}});
   for (int l = 0; l < layers; ++l) step(b.q, w, b.cache, l, p, b.inputs(), b.scr, b.act);
   b.q.wait();
   const size_t bytes = size_t(b.cache.snapshot_bytes());
@@ -691,9 +740,9 @@ int main(int argc, char** argv) {
     }
   }
   try {
-    if (only.empty() || only == "accuracy") accuracy(false, quick);
-    if (only.empty() || only == "edge") accuracy(true, quick);
-    if (only.empty() || only == "rollback") rollback(quick);
+    if (only.empty() || only == "accuracy") accuracy(false, quick, Path::Auto), accuracy(false, true, Path::Split);
+    if (only.empty() || only == "edge") accuracy(true, quick, Path::Auto), accuracy(true, true, Path::Split);
+    if (only.empty() || only == "rollback") rollback(quick, Path::Auto), rollback(quick, Path::Split);
     if (only.empty() || only == "snapshot") snapshot(layers);
     if (only.empty() || only == "time") timing(layers, reps);
   } catch (const std::exception& e) {
