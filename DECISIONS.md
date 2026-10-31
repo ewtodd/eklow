@@ -1230,16 +1230,22 @@ head over 248,320 tokens. 35B parameters, 3B active a token; the routed experts 
 
 **Memory at 2 x 262,144.** KV exists only for the 10 attention layers: 10 x 2 x 2 x 256 values a token, 5.6 GiB for
 both slots in int8 with fp16 scales (the 26B's was 6.4). The DeltaNet state is ~60 MiB a slot. The experts are 18.1 GB
-at Q4_0, so after ~1.5 GB of dense weights (Q8_0), the head (0.4 GB, Q6_K), the KV, the draft (~0.5 GB) and the 1 GiB
-margin, roughly 70-80 of each layer's 256 stay on the card, chosen by a routing profile as the 26B's were, and the
-rest (~13 GB) are computed by the CPU from pinned memory: on fiona's 30 GB that fits, tightly.
+at 4.5 bits a weight, so after ~1.5 GB of dense weights (at 8.5), the head (0.4 GB, Q6_K), the KV, the draft (~0.5 GB)
+and the 1 GiB margin, roughly 70-80 of each layer's 256 stay on the card, chosen by a routing profile as the 26B's
+were, and the rest (~13 GB) are computed by the CPU from pinned memory: on fiona's 30 GB that fits, tightly.
 
-**Weights.** No published GGUF uses only the types eklow's kernels read (Q4_0, Q8_0, Q6_K, F32): bartowski's "Q4_0"
-mixes in Q4_1, Q5_0 and Q6_K, the official GGUFs are K-quants. eklow makes its own with the oracle's converter and
-quantizer: routed experts Q4_0 under bartowski's importance matrix, the dense matrices Q8_0 (`EK8`) or Q4_0 (`EK4`,
-half the dense bytes a decode token reads), the head Q6_K; the KL of each against Q8_0 decides
-(`tools/weights/`, `qwen/weights` branch). The owner hosts the chosen files on Hugging Face (uploaded from
-son-of-anton, which holds the key).
+**Weights.** The format is chosen by quality per byte among those the card runs well, and eklow gets the kernels for
+it (the owner: what matters is what the hardware supports, not what eklow implements today). Decode reads every
+weight it uses once a token at up to 399 GB/s, so bits per weight decide its speed; the matrix units take int8 and
+int4 operands 32 deep, so formats with 32-weight sub-blocks and a scale (Q4_0, Q4_1, Q4_K, Q5_K, Q8_0) go straight
+into the int8 decode path, a min costing one more term from the activations' block sums; Q6_K (16-weight
+sub-blocks) and IQ4_XS (a 16-value table per nibble) need an unpack step first, which decode's spare arithmetic
+covers; prefill dequantizes any of them to fp16 in shared memory. K-quant kernels also let eklow serve the published
+Q4_K_M files of other finetunes as they are. The candidates (the published Q4_K_M, Q4_K_S, IQ4_XS and Q4_0, and
+mixes made with the oracle's converter and quantizer under bartowski's importance matrix) are measured by KL against
+Q8_0, with the experts' bytes (what fits on the card, what the CPU reads per cold expert) and the dense bytes (what a
+decode token reads) counted apart (`tools/weights/`, `qwen/weights` branch). If the winner is a file of our own,
+the owner hosts it on Hugging Face (uploaded from son-of-anton, which holds the key).
 
 **DFlash 2** (Inco AI, August 2026; z-lab `dflash/model.py`): a 6-layer Qwen3 draft over the target's hidden states
 from layers 1, 6, 11, 16, 22, 27, 32, 37 (concatenated, projected by `fc`, normed, written as K/V into the draft's
