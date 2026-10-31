@@ -141,16 +141,9 @@ def rnd_turn(rng):
     return m, tools
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("eklow_chat")
-    ap.add_argument("eklow_parse")
-    ap.add_argument("gguf")
-    ap.add_argument("model_dir")
-    ap.add_argument("variant", choices=["stock", "ornith"])
-    ap.add_argument("--random", type=int, default=20000)
-    ap.add_argument("--seed", type=int, default=5)
-    a = ap.parse_args()
+def build_runs(a):
+    """The random turns and the runs to check: (thinking, turn index, generated ids, tools) for each turn, and again
+    with thinking off for the turns without reasoning. `a` has eklow_chat, gguf, model_dir, variant, random, seed."""
     rng = random.Random(a.seed)
     turns = [rnd_turn(rng) for _ in range(a.random)]
     user = {"role": "user", "content": "go"}
@@ -214,6 +207,20 @@ def main():
                     rest.append((text[max(0, len(p) - pos):], is_input))
                 pos += len(text)
             runs.append((think, i, hf_ids(rest), tools))
+    return turns, runs, skipped
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("eklow_chat")
+    ap.add_argument("eklow_parse")
+    ap.add_argument("gguf")
+    ap.add_argument("model_dir")
+    ap.add_argument("variant", choices=["stock", "ornith"])
+    ap.add_argument("--random", type=int, default=20000)
+    ap.add_argument("--seed", type=int, default=5)
+    a = ap.parse_args()
+    turns, runs, skipped = build_runs(a)
     bad = 0
     n_calls = 0
     for think in (True, False):

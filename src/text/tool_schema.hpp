@@ -2,6 +2,8 @@
 // (output_parser_qwen.cpp) and for constraining one (serve/tool_grammar_qwen.cpp). The tools are OpenAI's
 // {"type": "function", "function": {"name", "parameters": {"properties", "required"}}} (a bare function object
 // works too); anything that does not look like a declaration is skipped, since the template tojson's whatever it is given.
+// Names, parameter names and enum strings are NFC-normalized, as the tokenizer does to the prompt that carries them: what
+// the model writes is NFC, so a name that is not could never be matched.
 #pragma once
 
 #include <string>

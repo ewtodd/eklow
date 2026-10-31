@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <cctype>
 
+#include "text/unicode.hpp"
+
 namespace eklow::text {
 
 namespace {
@@ -85,26 +87,31 @@ ToolSpecs::ToolSpecs(const json::Value& tools) {
     const json::Value* fn = tool.is_object() && tool.find("function") && tool.find("function")->is_object() ? tool.find("function") : &tool;
     if (!fn->is_object() || !fn->find("name") || !fn->find("name")->is_string()) continue;
     ToolSpec spec;
-    spec.name = fn->find("name")->as_string();
+    spec.name = unicode::nfc(fn->find("name")->as_string());
     const json::Value* params = fn->find("parameters");
     const json::Value* props = params && params->is_object() ? params->find("properties") : nullptr;
     if (props && props->is_object())
       for (const auto& [key, schema] : props->members()) {
         ParamSpec p;
-        p.name = key;
+        p.name = unicode::nfc(key);
         p.schema = schema;
         p.kinds = declared_kinds(schema);
-        if (const auto* e = schema.is_object() ? schema.find("enum") : nullptr; e && e->is_array()) p.enum_values = e->items();
+        if (const auto* e = schema.is_object() ? schema.find("enum") : nullptr; e && e->is_array()) {
+          p.enum_values = e->items();
+          for (auto& m : p.enum_values)
+            if (m.is_string()) m = json::Value::string(unicode::nfc(m.as_string()));
+        }
         spec.params.push_back(std::move(p));
       }
     if (const auto* req = params && params->is_object() ? params->find("required") : nullptr; req && req->is_array())
       for (const auto& r : req->items()) {
         if (!r.is_string()) continue;
-        if (ParamSpec* p = const_cast<ParamSpec*>(spec.param(r.as_string()))) {
+        const std::string rname = unicode::nfc(r.as_string());
+        if (ParamSpec* p = const_cast<ParamSpec*>(spec.param(rname))) {
           p->required = true;
         } else {
           ParamSpec p2;
-          p2.name = r.as_string();
+          p2.name = rname;
           p2.required = true;
           spec.params.push_back(std::move(p2));
         }
