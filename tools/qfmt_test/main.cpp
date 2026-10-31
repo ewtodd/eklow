@@ -271,6 +271,44 @@ void check_glu(sycl::queue& q, const FormatInfo& f, int64_t k, int64_t n2, xmx::
   xmx::free_weight(q, mat.w);
 }
 
+// rows_of views (a fused matrix sliced into its parts) against the same columns of the whole product.
+void check_rows_of(sycl::queue& q, const FormatInfo& f, json::Writer& jw) {
+  const int64_t k = 2048, n = 2048, n0 = 512, nv = 768;
+  Mat mat = make_mat(q, f, n, k, false);
+  xmx::Weight view = xmx::rows_of(mat.w, n0, nv);
+  xmx::Activations act = xmx::alloc_activations(q, 2048, k);
+  auto* xd = sycl::malloc_device<float>(size_t(2048 * k), q);
+  auto* yf = sycl::malloc_device<float>(size_t(2048 * n), q);
+  auto* yv = sycl::malloc_device<float>(size_t(2048 * nv), q);
+  for (int64_t m : {1, 8, 256}) {
+    const auto x = random_x(m, k);
+    q.memcpy(xd, x.data(), x.size() * 4).wait();
+    xmx::quantize(q, xd, m, act);
+    xmx::matmul(q, act, mat.w, yf);
+    xmx::matmul(q, act, view, yv);
+    q.wait();
+    std::vector<float> a(static_cast<size_t>(m * n)), b(static_cast<size_t>(m * nv));
+    q.memcpy(a.data(), yf, a.size() * 4);
+    q.memcpy(b.data(), yv, b.size() * 4).wait();
+    double num = 0, den = 0;
+    for (int64_t r = 0; r < m; ++r)
+      for (int64_t c = 0; c < nv; ++c) {
+        const double d = double(b[size_t(r * nv + c)]) - double(a[size_t(r * n + n0 + c)]);
+        num += d * d;
+        den += double(a[size_t(r * n + n0 + c)]) * double(a[size_t(r * n + n0 + c)]);
+      }
+    const double rel = std::sqrt(num / std::max(den, 1e-30));
+    std::printf("  %-8s rows_of(%lld, %lld) of %lldx%lld  rows %3lld  vs the whole %9.2e %s\n", f.name, (long long)n0, (long long)nv, (long long)k, (long long)n,
+                (long long)m, rel, rel < 1e-5 ? "" : "  <-- OUT OF BAND");
+    jw.begin_object().kv("format", f.name).kv("rows_of", n0).kv("rows", m).kv("rel_vs_whole", rel).end_object();
+  }
+  sycl::free(xd, q);
+  sycl::free(yf, q);
+  sycl::free(yv, q);
+  xmx::free_activations(q, act);
+  xmx::free_weight(q, mat.w);
+}
+
 // The grouped GEMVs against xmx::matmul per pair on the same experts (same arithmetic: ~1e-6), gate_up with SwiGLU.
 void check_grouped(sycl::queue& q, const FormatInfo& f, json::Writer& jw) {
   const int64_t k = 2048, n2 = 1024, nd = 2048, kd = 512, NE = 8;
@@ -388,6 +426,31 @@ void bench_decode(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t
     sycl::free(yd, q);
     xmx::free_activations(q, act);
   }
+}
+
+// The existing Q6_K head (fast::matmul_q6: fp32 activations, one sub-group a column) on the head's shape, for comparison with
+// the dpas GEMV on int8 activations.
+void bench_q6_head(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>& rows, json::Writer& jw) {
+  const int64_t k = 2048, n = 248320;
+  const auto host = refs::random_rows(f.type, n, k, g_rng);
+  auto* dev = sycl::malloc_device<uint8_t>(host.size(), q);
+  q.memcpy(dev, host.data(), host.size()).wait();
+  fast::Q6 w = fast::repack_q6k(q, ref::Weight{f.type, k, n, dev, refs::row_bytes(f.type, k)});
+  sycl::free(dev, q);
+  const int64_t max_m = *std::max_element(rows.begin(), rows.end());
+  auto* xd = sycl::malloc_device<float>(size_t(max_m * k), q);
+  auto* yd = sycl::malloc_device<float>(size_t(max_m * n), q);
+  for (int64_t m : rows) {
+    const auto x = random_x(m, k);
+    q.memcpy(xd, x.data(), x.size() * 4).wait();
+    const double t = best_time(q, 8, [&](int) { fast::matmul_q6(q, w, xd, m, yd); });
+    const double gbps = double(host.size()) / t / 1e9;
+    std::printf("  %-8s head, fast::matmul_q6 (fp32 x) %4lldx%-7lld rows %3lld  %9.4f ms %8.0f GB/s\n", f.name, (long long)k, (long long)n, (long long)m, t * 1e3, gbps);
+    jw.begin_object().kv("format", f.name).kv("shape", "head (fast::matmul_q6)").kv("rows", m).kv("ms", t * 1e3).kv("weight_gbps", gbps).end_object();
+  }
+  fast::free_q6(q, w);
+  sycl::free(xd, q);
+  sycl::free(yd, q);
 }
 
 // The grouped decode GEMVs over 256 experts: the engine's gate_up + SwiGLU and down, P pairs of 8 distinct-ish experts.
@@ -663,6 +726,7 @@ int main(int argc, char** argv) {
         }
         for (xmx::Glu act : {xmx::Glu::Silu, xmx::Glu::Gelu}) check_glu(q, f, 2048, 1024, act, rows, jw);
         check_grouped(q, f, jw);
+        check_rows_of(q, f, jw);
         jw.end_array();
       }
       if (gemm) {
@@ -684,6 +748,7 @@ int main(int argc, char** argv) {
       if (bench) {
         jw.key(std::string("decode_") + f.name).begin_array();
         bench_decode(q, f, rows, jw);
+        if (f.format == xmx::WeightFormat::Q6_K) bench_q6_head(q, f, rows, jw);
         bench_grouped(q, f, jw);
         jw.end_array();
       }

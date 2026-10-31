@@ -225,7 +225,7 @@ struct Dec<WeightFormat::Q6_K> {
 };
 
 // IQ4_XS: the byte-pair table lives in shared local memory at offset 0 (kIqTableBytes).
-constexpr int kIqTableBytes = 1024;
+constexpr int kIqTableBytes = 512;
 
 template <>
 struct Dec<WeightFormat::IQ4_XS> {
@@ -252,33 +252,32 @@ struct Dec<WeightFormat::IQ4_XS> {
   template <int U, int R>
   SYCL_ESIMD_FUNCTION static void tile(Acc<R>& acc, Chunk& c, const esimd::simd<uint8_t, 32 * R>& A, const esimd::simd<float, R>& sa) {
     esimd::simd<uint8_t, TB> P = c.t.template select<TB, 1>(U * TB);
-    esimd::simd<uint32_t, TB> off = esimd::simd<uint32_t, TB>(P) << 2;
-    esimd::simd<uint32_t, TB> g;
+    esimd::simd<uint32_t, TB> off = esimd::simd<uint32_t, TB>(P) << 1;
+    esimd::simd<uint16_t, TB> w16;
 #pragma unroll
-    for (int i = 0; i < TB / 32; ++i) g.template select<32, 1>(i * 32) = esimd::slm_gather<uint32_t, 32>(off.template select<32, 1>(i * 32));
-    esimd::simd<uint16_t, TB> w16 = g;
+    for (int i = 0; i < TB / 32; ++i) w16.template select<32, 1>(i * 32) = esimd::slm_gather<uint16_t, 32>(off.template select<32, 1>(i * 32));
     esimd::simd<uint8_t, 2 * TB> B = w16.template bit_cast_view<uint8_t>();
     esimd::simd<float, 8 * R> cf = dp<dpas_argument_type::s8, R, 2 * TB>(B, A);
     axpy<R>(acc, cf, c.s.template select<8, 1>(U * 8), sa);
   }
-  // Fills the table: entry b = int8 T[b & 15] | int8 T[b >> 4] << 8 (the two weights of one packed byte). Thread t of
-  // `nt` fills the 256-byte blocks t, t + nt, ...
+  // Fills the table of 256 words at `base`: entry b = int8 T[b & 15] | int8 T[b >> 4] << 8 (the two weights of one
+  // packed byte). Thread t of `nt` fills the 256-byte blocks t, t + nt.
   SYCL_ESIMD_FUNCTION static void fill_table(int t, int nt, uint32_t base = 0) {
-    esimd::simd<uint32_t, 16> lo16;
+    esimd::simd<uint16_t, 16> lo16;
 #pragma unroll
-    for (int i = 0; i < 16; ++i) lo16[i] = uint32_t(uint8_t(kIq4Values[i]));
-    esimd::simd<uint32_t, 64> lo = lo16.template replicate<4>();
-    for (int blk = t; blk < 4; blk += nt) {
-      esimd::simd<uint32_t, 64> v = lo;
+    for (int i = 0; i < 16; ++i) lo16[i] = uint16_t(uint8_t(kIq4Values[i]));
+    esimd::simd<uint16_t, 128> lo = lo16.template replicate<8>();
+    for (int blk = t; blk < 2; blk += nt) {
+      esimd::simd<uint16_t, 128> v = lo;
 #pragma unroll
-      for (int m = 0; m < 4; ++m) {
-        // 16-lane groups m of block blk have the high nibble 4 blk + m.
-        uint32_t hi = 0;
+      for (int m = 0; m < 8; ++m) {
+        // 16-entry groups m of block blk have the high nibble 8 blk + m.
+        uint16_t hi = 0;
 #pragma unroll
-        for (int c = 0; c < 4; ++c) if (blk == c) hi = uint32_t(uint8_t(kIq4Values[4 * c + m])) << 8;
+        for (int c = 0; c < 2; ++c) if (blk == c) hi = uint16_t(uint8_t(kIq4Values[8 * c + m])) << 8;
         v.template select<16, 1>(m * 16) |= hi;
       }
-      esimd::slm_block_store<uint32_t, 64>(base + blk * 256, v);
+      esimd::slm_block_store<uint16_t, 128>(base + blk * 256, v);
     }
   }
 };
@@ -471,12 +470,11 @@ struct GemmDec<WeightFormat::IQ4_XS> {
     m.ds = esimd::simd<sycl::half, 8>(d * (lsf - 32.0f));
   }
   SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> dequant(esimd::simd<uint32_t, DW> D, Meta& m, int b, int h, uint32_t slm) {
-    esimd::simd<uint32_t, 64> off = esimd::simd<uint32_t, 64>(D.bit_cast_view<uint8_t>()) << 2;
+    esimd::simd<uint32_t, 64> off = esimd::simd<uint32_t, 64>(D.bit_cast_view<uint8_t>()) << 1;
     off += slm;
-    esimd::simd<uint32_t, 64> g;
-    g.select<32, 1>(0) = esimd::slm_gather<uint32_t, 32>(off.select<32, 1>(0));
-    g.select<32, 1>(32) = esimd::slm_gather<uint32_t, 32>(off.select<32, 1>(32));
-    esimd::simd<uint16_t, 64> src = g, dst;
+    esimd::simd<uint16_t, 64> src, dst;
+    src.select<32, 1>(0) = esimd::slm_gather<uint16_t, 32>(off.select<32, 1>(0));
+    src.select<32, 1>(32) = esimd::slm_gather<uint16_t, 32>(off.select<32, 1>(32));
     // Byte (k4 * 8 + n) * 2 + a of the piece holds the codes of k = 4 k4 + 2 a and the next: its word goes to K pair 2 k4 + a.
 #pragma unroll
     for (int k4 = 0; k4 < 4; ++k4)
