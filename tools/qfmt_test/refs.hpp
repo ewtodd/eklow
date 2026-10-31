@@ -4,8 +4,6 @@
 // and the CPU's both compute it).
 #pragma once
 
-#include <sycl/sycl.hpp>
-
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -19,8 +17,48 @@ namespace eklow::refs {
 
 constexpr int8_t kIq4[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
-inline float h2f(const uint8_t* p) { return float(sycl::bit_cast<sycl::half>(uint16_t(p[0] | p[1] << 8))); }
-inline uint16_t f2h_bits(float v) { return sycl::bit_cast<uint16_t>(sycl::half(v)); }
+// IEEE binary16 by hand (round to nearest even), so that host-only tools need no SYCL.
+inline float half_to_float(uint16_t h) {
+  const uint32_t sign = uint32_t(h & 0x8000) << 16;
+  uint32_t exp = (h >> 10) & 0x1F, mant = h & 0x3FF, bits;
+  if (exp == 0) {
+    if (mant == 0) {
+      bits = sign;
+    } else {  // subnormal
+      exp = 127 - 15 + 1;
+      while (!(mant & 0x400)) mant <<= 1, --exp;
+      bits = sign | (exp << 23) | ((mant & 0x3FF) << 13);
+    }
+  } else if (exp == 31) {
+    bits = sign | 0x7F800000 | (mant << 13);
+  } else {
+    bits = sign | ((exp + 127 - 15) << 23) | (mant << 13);
+  }
+  float f;
+  std::memcpy(&f, &bits, 4);
+  return f;
+}
+inline uint16_t f2h_bits(float f) {
+  uint32_t x;
+  std::memcpy(&x, &f, 4);
+  const uint32_t sign = (x >> 16) & 0x8000, e8 = (x >> 23) & 0xFF, mant = x & 0x7FFFFF;
+  if (e8 == 0xFF) return uint16_t(sign | 0x7C00 | (mant ? 0x200 : 0));
+  const int32_t exp = int32_t(e8) - 127 + 15;
+  if (exp >= 31) return uint16_t(sign | 0x7C00);
+  if (exp <= 0) {
+    if (exp < -10) return uint16_t(sign);
+    const uint32_t m = mant | 0x800000, shift = uint32_t(14 - exp);
+    uint32_t half = m >> shift;
+    const uint32_t rem = m & ((1u << shift) - 1), mid = 1u << (shift - 1);
+    if (rem > mid || (rem == mid && (half & 1))) ++half;
+    return uint16_t(sign | half);
+  }
+  uint32_t half = (uint32_t(exp) << 10) | (mant >> 13);
+  const uint32_t rem = mant & 0x1FFF;
+  if (rem > 0x1000 || (rem == 0x1000 && (half & 1))) ++half;
+  return uint16_t(sign | half);
+}
+inline float h2f(const uint8_t* p) { return half_to_float(uint16_t(p[0] | p[1] << 8)); }
 
 // Weights per ggml block and bytes of it.
 inline int block_k(gguf::Type t) { return t == gguf::Type::Q8_0 || t == gguf::Type::Q4_0 ? 32 : 256; }
@@ -290,7 +328,7 @@ inline double emulate(gguf::Type t, const uint8_t* row, int64_t k, const QRow& a
 // The fp16 GEMM's weights: one row as the fp16 values (as floats) its dequantization produces, with the roundings
 // it does (xmx_fmt.hpp, GemmDec): scales rounded to fp16, products and differences rounded to fp16 in the order of
 // the kernel.
-inline float to_h(float v) { return float(sycl::half(v)); }
+inline float to_h(float v) { return half_to_float(f2h_bits(v)); }
 inline void weights16_row(gguf::Type t, const uint8_t* row, int64_t k, float* out) {
   const int bb = block_bytes(t);
   if (t == gguf::Type::Q4_0 || t == gguf::Type::Q8_0) {

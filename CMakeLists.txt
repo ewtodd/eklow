@@ -160,7 +160,7 @@ target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
 # CPU Q4_0 GEMVs for the 26B's cold experts (TASK: m6/cpu-experts): plain host code, AVX-VNNI,
 # so the flags are per source file and there is no -fsycl.
-add_library(eklow_cpu STATIC src/cpu/q4_gemv.cpp)
+add_library(eklow_cpu STATIC src/cpu/q4_gemv.cpp src/cpu/qgemv.cpp)
 target_include_directories(eklow_cpu PUBLIC src)
 target_compile_options(eklow_cpu PRIVATE -O3 -mavx2 -mfma -mf16c -mavxvnni)
 target_link_libraries(eklow_cpu PUBLIC Threads::Threads)
@@ -190,3 +190,9 @@ eklow_sycl(eklow-xmx-bench)
 install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-cpu-gemv-test RUNTIME DESTINATION bin)
 # The 26B's routing profile, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/gemma-4-26b-a4b-experts.json DESTINATION share/eklow)
+
+# The CPU GEMVs of the Qwen formats for the cold experts, checked and timed (TASK qwen/mm).
+add_executable(eklow-cpu-qgemv-test tools/cpu_qgemv_test/main.cpp)
+target_compile_options(eklow-cpu-qgemv-test PRIVATE -O2 -mavx2 -mf16c)
+target_link_libraries(eklow-cpu-qgemv-test PRIVATE eklow_cpu eklow_host)
+install(TARGETS eklow-cpu-qgemv-test RUNTIME DESTINATION bin)
