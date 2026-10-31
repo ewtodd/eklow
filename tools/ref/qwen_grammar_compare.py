@@ -76,7 +76,7 @@ def honoured_enum(schema):
         t = m if isinstance(m, str) else "null" if m is None else "true" if m is True else "false" if m is False else json.dumps(m)
         if "\n" in t or "</parameter>" in t:
             return None
-        texts.append(t)
+        texts.append(pc.NFC(t))  # the tokenizer (and the grammar) see NFC
     return texts
 
 
