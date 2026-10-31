@@ -1303,3 +1303,78 @@ q (each thread takes its own 1 KB a token; an Xe-core delivers 64 B a clock); wi
 Four columns a thread halve that traffic but leave one slot only 1,024 threads (slower for the common case). Untried,
 in order: carrying the decay's running product instead of rescaling the state every token, k and q in fp16, the chunked
 form on the matrix units.
+
+## 2026-10-31 — Qwen's weight formats on the card and the CPU: what each costs
+
+`qwen/mm`. Every format the `qwen/weights` candidates use now has kernels on both: Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS
+beside Q4_0, each at the bytes per weight of ggml's own (8.5, 4.5, 5.5, 6.5625, 4.25 bits; Q4_0 4.5). Raw output of
+every number below: `docs/bench/qwen-mm-*` and `xmx-fiona-2026-10-31.*`; the tools are `eklow-xmx-bench`,
+`eklow-qfmt-test` (card) and `eklow-cpu-qgemv-test` (CPU).
+
+**What the matrix units take** (`eklow-xmx-bench`, extended). Every integer operand pair runs and every one at the rate
+of its larger operand, s8 x anything 197.6 TOPS, s4 x s4 and u4 x u4 395.3: s8 / u8 activations against s8, u8, s4,
+u4, s2 and u2 weights (a 2-bit operand does not double the rate against s8). B's layout follows one rule, a dword
+holds 32 / bits consecutive k of one column, dword (k / G) * 8 + n, for all of them (the s8 x s4 finding generalizes;
+checked against a CPU reference for all 16 pairs). fp16 x bf16 mixed, and tf32, are refused by the compiler's
+static_asserts; the 16-wide execution size compiles and runs on DG2 (native is 8; not checked further). This is what
+makes the formats cheap: Q4_K and Q5_K feed the nibbles to the u4 dpas as they are (the minimum comes off with one
+more dpas against a tile of ones, which sums the activation block), Q5_K's fifth bit goes through a u2 dpas whose
+operand is two bit-masks of one stored word, and Q6_K's low 4 bits and high 2 bits through a u4 and an s2 dpas (the
+xor of the stored field makes q - 32 = low + 16 s2), each on one 16-weight half of the tile (the other half of the B
+operand zero), so no format unpacks to bytes. Only IQ4_XS needs a lookup.
+
+**Decode GEMV** (int8 activations per 32-block as before; `Weight` repacked per format at load into tiles of 8 columns
+x 32 K plus per-superblock records, `src/kernels/xmx_fmt.hpp`; one schedule for all: a work-group of T threads per
+8-column group splits K and merges in shared local memory; 1 row dpas with repeat count 1, 2-32 rows 8-row tiles).
+GB/s of weight read, one row (the card reads 399): attn_qkv 2048 -> 8192: Q4_0 279, Q8_0 303, Q4_K 269, Q5_K 286,
+Q6_K 295, IQ4_XS 161; the head 2048 -> 248,320: 367, 364, 354, 358, 357, 218. Every format but IQ4_XS reads at the same rate as
+Q4_0's, so a decode token's time follows the bits per weight; the small matrices (an expert's 0.6-1.2 MB) are
+launch and latency bound at ~8-9 us a call whatever the format. The grouped GEMVs of the experts (256 experts,
+distinct ones read, P = 8 pairs, gate|up + SwiGLU): 196 (Q4_0), 243 (Q8_0), 178 (Q4_K), 194 (Q5_K), 208 (Q6_K), 122
+(IQ4_XS) GB/s, so per byte Q4_K costs 10% more than Q4_0 and per weight (bits / rate) Q5_K +23%, Q6_K +37%, Q8_0 +52%,
+IQ4_XS +52%. At 16 and 32 rows
+(a verify block) the K-quants' scale work shows: attn_qkv at 32 rows 98-107 GB/s against Q4_0's 134 and Q8_0's 176.
+- **IQ4_XS** is bound by its table: the 16-value int8 table is looked up per packed byte (a 256-entry table of int8
+  pairs in shared local memory, one gather lane for two weights, 16-bit entries +3-4% over 32-bit). With the gather
+  taken out (wrong results) the kernel reads 238 / 341 GB/s (qkv / head) instead of 161 / 218. Register-indirect
+  `iselect` as the lookup is slower still (211 GB/s as an arithmetic ceiling, in registers with free memory), a
+  16-bit select tree 358, the gather 730; all the chunk's gathers issued together before the dpas: -8%. At 4.25 bits it
+  costs as much time as Q8_0 does at 8.5 on the grouped GEMVs.
+- The Q6_K head: the dpas GEMV (int8 activations) reads at 357 GB/s at 1-8 rows, `fast::matmul_q6` (fp32
+  activations, one sub-group a column) at 253 GB/s at one row, 150 at two, 46 at eight: 1.4 / 2.4 / 7.6x faster. The
+  price is int8 activations on the head (1e-2 of the output vs fp32 activations); not wired into the engine.
+
+**fp16 GEMM** (dequantized to fp16 in shared memory per format, `GemmDec` in `xmx_fmt.hpp`; scales rounded to fp16 as
+Q4_0's, so ~4e-4 of the fp32 product, against ~2e-4 for Q4_0): at 2,048 rows attn_qkv 54.5 (Q4_0), 51.2 (Q8_0), 49.8
+(Q4_K), 49.1 (Q5_K), 49.6 (Q6_K), 47.8 (IQ4_XS) TFLOPS; the grouped expert GEMMs (2,048 tokens x 8 of 256 experts,
+tile 128, gate|up + SwiGLU epilogue, TFLOPS on real pairs) 27.1, 24.8, 26.5, 23.9, 24.1, 16.4. The K-quants cost 8-9% of the
+GEMM at the big shapes, IQ4_XS 12% there and 40% on the experts. The 32-row-tile grouped kernel spills 256-1,216 bytes
+for the new formats (the Meta registers); tiles 64 and 128 do not.
+
+**SwiGLU**: `matmul_geglu`, `matmul_geglu_grouped`, `matmul_geglu_grouped_dense` and `matmul_geglu_grouped16` take a
+`Glu` (default Gemma's GeGLU, existing callers unchanged); the GEMM epilogue and the int8 requantizing kernels branch
+on it. Checked against the fp32 silu(gate) * up of the dequantized halves.
+
+**CPU** (fiona's i7-12700H, AVX-VNNI, ggml's bytes read in place; `src/cpu/qgemv.cpp`; the same int8 activations):
+its two DDR4 channels read 43 GB/s (8 threads and up; 25 on one). One cold expert's FFN (gate|up GEMV, SwiGLU,
+requantize, down GEMV; 1.67-3.34 MB), best of 1-16 threads, one input: Q4_0 44 us (40 GB/s), Q4_K 45, IQ4_XS 42, Q5_K
+53, Q6_K 64, Q8_0 77 us (43.5 GB/s): every format reads at the DRAM rate, so time follows bytes (the pshufb lookup of
+IQ4_XS costs nothing here). With 8 and 16 inputs (tokens of a verify block that pick the same expert) it is arithmetic
+bound: 122-156 us and 233-290 us, 15-19 us a token against 42-77 for one: sharing the read makes a block of eight cost ~3
+singles. Q4_0 is the fastest there (233 us at 16 inputs), Q8_0 next (251: its sign trick has fewer ops than the K-quants'
+scale work), then Q4_K 267, IQ4_XS 278, Q6_K 280, Q5_K 290.
+
+**Correctness**: every kernel against ggml's own dequantization at the fp32 activations (1e-2 up to 32 rows, 2-5e-4
+above) and an exact emulation of the arithmetic on the card's own int8 activations (<= 1 float epsilon of the sum of
+absolute terms, ~1e-6), on real tensors (Gemma 12B requantized by llama-quantize to each format) and random valid
+blocks, plus grouped, interleaved gate|up, `rows_of` views, and the grouped GEMMs against the dense path (bit-equal).
+An early emulation that quantized the activations on the host showed 2-4e-4 outliers: a quantization tie rounds either
+way by an ulp of the reciprocal, the same as the old 5.8e-4 at `attn_output` 16 rows. Gates: `bench.sh kernels`
+unchanged (same numbers as main), `attn` all ok.
+
+**Which formats are cheap enough** (card and CPU costs alone): the card reads Q4_K, Q5_K, Q6_K and Q8_0 at Q4_0's
+rate, so an expert in Q4_K costs 10% more decode time than in Q4_0 at the same bytes and the CPU none; Q5_K and Q6_K
+cost about their bytes (+22% and +46% on the CPU, +23% and +37% on the card's grouped GEMVs); Q8_0 is for the dense matrices
+(1.9x the bytes of 4.5 bits) and is the fastest per byte on the card; IQ4_XS saves 6% of the bytes and costs 1.7x the
+card's decode time and 40% of its expert prefill, though the CPU reads it as fast as Q4_0. The dense matrices and
+the head are 1.5 GB of the ~20, read once a token at 300-360 GB/s whatever the format: their cost is their bytes.

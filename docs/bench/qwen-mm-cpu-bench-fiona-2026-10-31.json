@@ -1,0 +1,734 @@
+{
+  "bench_Q4_0": [
+    {
+      "format": "Q4_0",
+      "inputs": 1,
+      "threads": 1,
+      "us": 148.25005859375,
+      "weight_gbps": 11.935725468068034,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 1,
+      "threads": 4,
+      "us": 54.9874609375,
+      "weight_gbps": 32.179554571745406,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 1,
+      "threads": 8,
+      "us": 46.6010625,
+      "weight_gbps": 37.97063639911644,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 1,
+      "threads": 12,
+      "us": 44.52905078125,
+      "weight_gbps": 39.73747405244662,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 1,
+      "threads": 16,
+      "us": 44.85871484375,
+      "weight_gbps": 39.4454456879416,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 8,
+      "threads": 1,
+      "us": 660.5392265625001,
+      "weight_gbps": 2.678829551438567,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 8,
+      "threads": 4,
+      "us": 200.47708203125,
+      "weight_gbps": 8.826305640882074,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 8,
+      "threads": 8,
+      "us": 136.41353515625002,
+      "weight_gbps": 12.971381453997372,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 8,
+      "threads": 12,
+      "us": 122.3265078125,
+      "weight_gbps": 14.465155849231115,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 8,
+      "threads": 16,
+      "us": 132.69066015625,
+      "weight_gbps": 13.335316878492852,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 16,
+      "threads": 1,
+      "us": 1318.6676835937499,
+      "weight_gbps": 1.3418634747897045,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 16,
+      "threads": 4,
+      "us": 382.09658984375,
+      "weight_gbps": 4.630954703687846,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 16,
+      "threads": 8,
+      "us": 268.14402734375,
+      "weight_gbps": 6.598961078971217,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 16,
+      "threads": 12,
+      "us": 249.76576953125002,
+      "weight_gbps": 7.084525647052722,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_0",
+      "inputs": 16,
+      "threads": 16,
+      "us": 232.66251171874998,
+      "weight_gbps": 7.605316331059794,
+      "expert_bytes": 1769472
+    }
+  ],
+  "bench_Q8_0": [
+    {
+      "format": "Q8_0",
+      "inputs": 1,
+      "threads": 1,
+      "us": 303.35480078125,
+      "weight_gbps": 11.017910352472608,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 1,
+      "threads": 4,
+      "us": 104.76110546874999,
+      "weight_gbps": 31.904359781665452,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 1,
+      "threads": 8,
+      "us": 81.8011875,
+      "weight_gbps": 40.859260142158696,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 1,
+      "threads": 12,
+      "us": 76.8401171875,
+      "weight_gbps": 43.497278795713704,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 1,
+      "threads": 16,
+      "us": 77.1598984375,
+      "weight_gbps": 43.3170088048692,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 8,
+      "threads": 1,
+      "us": 891.012703125,
+      "weight_gbps": 3.7511653742731257,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 8,
+      "threads": 4,
+      "us": 270.50302734375,
+      "weight_gbps": 12.356002196428745,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 8,
+      "threads": 8,
+      "us": 177.57346484374997,
+      "weight_gbps": 18.8222716887401,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 8,
+      "threads": 12,
+      "us": 145.14414453125,
+      "weight_gbps": 23.027701260662187,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 8,
+      "threads": 16,
+      "us": 137.5621484375,
+      "weight_gbps": 24.296916251773702,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 16,
+      "threads": 1,
+      "us": 1748.1323515625,
+      "weight_gbps": 1.911946768225291,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 16,
+      "threads": 4,
+      "us": 517.5906328125,
+      "weight_gbps": 6.45748935184223,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 16,
+      "threads": 8,
+      "us": 336.03394921875,
+      "weight_gbps": 9.946423591338446,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 16,
+      "threads": 12,
+      "us": 284.47553515625003,
+      "weight_gbps": 11.74911578306444,
+      "expert_bytes": 3342336
+    },
+    {
+      "format": "Q8_0",
+      "inputs": 16,
+      "threads": 16,
+      "us": 251.00429296874998,
+      "weight_gbps": 13.315851934118594,
+      "expert_bytes": 3342336
+    }
+  ],
+  "bench_Q4_K": [
+    {
+      "format": "Q4_K",
+      "inputs": 1,
+      "threads": 1,
+      "us": 181.52270703125,
+      "weight_gbps": 9.747937483630503,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 1,
+      "threads": 4,
+      "us": 62.31319531250001,
+      "weight_gbps": 28.396425365865397,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 1,
+      "threads": 8,
+      "us": 50.627152343750005,
+      "weight_gbps": 34.9510473744519,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 1,
+      "threads": 12,
+      "us": 44.903625000000005,
+      "weight_gbps": 39.40599450489799,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 1,
+      "threads": 16,
+      "us": 46.626554687500004,
+      "weight_gbps": 37.949876671337535,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 8,
+      "threads": 1,
+      "us": 738.46710546875,
+      "weight_gbps": 2.396141936311176,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 8,
+      "threads": 4,
+      "us": 216.16851171875,
+      "weight_gbps": 8.185614019039942,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 8,
+      "threads": 8,
+      "us": 155.46276562499997,
+      "weight_gbps": 11.38196656212998,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 8,
+      "threads": 12,
+      "us": 135.57742578124999,
+      "weight_gbps": 13.051376287782514,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 8,
+      "threads": 16,
+      "us": 145.38835546874998,
+      "weight_gbps": 12.170658332952485,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 16,
+      "threads": 1,
+      "us": 1477.46639453125,
+      "weight_gbps": 1.1976394228319442,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 16,
+      "threads": 4,
+      "us": 438.894828125,
+      "weight_gbps": 4.0316537963305485,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 16,
+      "threads": 8,
+      "us": 304.50759765624997,
+      "weight_gbps": 5.810928901673931,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 16,
+      "threads": 12,
+      "us": 273.02153125,
+      "weight_gbps": 6.481071261664458,
+      "expert_bytes": 1769472
+    },
+    {
+      "format": "Q4_K",
+      "inputs": 16,
+      "threads": 16,
+      "us": 267.19044921874996,
+      "weight_gbps": 6.622512163791175,
+      "expert_bytes": 1769472
+    }
+  ],
+  "bench_Q5_K": [
+    {
+      "format": "Q5_K",
+      "inputs": 1,
+      "threads": 1,
+      "us": 191.70855859374998,
+      "weight_gbps": 11.281123888594648,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 1,
+      "threads": 4,
+      "us": 69.61283984375,
+      "weight_gbps": 31.06737212350878,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 1,
+      "threads": 8,
+      "us": 54.393687500000006,
+      "weight_gbps": 39.75990780180145,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 1,
+      "threads": 12,
+      "us": 52.508125,
+      "weight_gbps": 41.187682858605214,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 1,
+      "threads": 16,
+      "us": 57.399667968749995,
+      "weight_gbps": 37.67770923653127,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 8,
+      "threads": 1,
+      "us": 917.1928828125,
+      "weight_gbps": 2.35794241377919,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 8,
+      "threads": 4,
+      "us": 248.72449999999998,
+      "weight_gbps": 8.695114474046587,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 8,
+      "threads": 8,
+      "us": 186.3029296875,
+      "weight_gbps": 11.608448689602682,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 8,
+      "threads": 12,
+      "us": 160.0964765625,
+      "weight_gbps": 13.508654571518376,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 8,
+      "threads": 16,
+      "us": 156.061796875,
+      "weight_gbps": 13.85789503456914,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 16,
+      "threads": 1,
+      "us": 1662.18087890625,
+      "weight_gbps": 1.3011147146771982,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 16,
+      "threads": 4,
+      "us": 512.76866015625,
+      "weight_gbps": 4.217668059785458,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 16,
+      "threads": 8,
+      "us": 348.1468515625,
+      "weight_gbps": 6.211999305160311,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 16,
+      "threads": 12,
+      "us": 317.69962109375,
+      "weight_gbps": 6.807335786408799,
+      "expert_bytes": 2162688
+    },
+    {
+      "format": "Q5_K",
+      "inputs": 16,
+      "threads": 16,
+      "us": 289.81765234374996,
+      "weight_gbps": 7.462236970420478,
+      "expert_bytes": 2162688
+    }
+  ],
+  "bench_Q6_K": [
+    {
+      "format": "Q6_K",
+      "inputs": 1,
+      "threads": 1,
+      "us": 178.624390625,
+      "weight_gbps": 14.446403377338326,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 1,
+      "threads": 4,
+      "us": 74.44187109375001,
+      "weight_gbps": 34.664362435896,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 1,
+      "threads": 8,
+      "us": 64.61739453125,
+      "weight_gbps": 39.93475779578266,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 1,
+      "threads": 12,
+      "us": 64.12544531249999,
+      "weight_gbps": 40.241124056521535,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 1,
+      "threads": 16,
+      "us": 63.64068359375,
+      "weight_gbps": 40.54764742114465,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 8,
+      "threads": 1,
+      "us": 821.3875664062499,
+      "weight_gbps": 3.141610739605134,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 8,
+      "threads": 4,
+      "us": 241.13258203125002,
+      "weight_gbps": 10.70149864552762,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 8,
+      "threads": 8,
+      "us": 168.04910546875,
+      "weight_gbps": 15.355511669057112,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 8,
+      "threads": 12,
+      "us": 150.75350390625002,
+      "weight_gbps": 17.117214082166466,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 8,
+      "threads": 16,
+      "us": 164.870765625,
+      "weight_gbps": 15.65153161154916,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 16,
+      "threads": 1,
+      "us": 1596.4123046875,
+      "weight_gbps": 1.6164245241802573,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 16,
+      "threads": 4,
+      "us": 463.67145703125,
+      "weight_gbps": 5.565319928300188,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 16,
+      "threads": 8,
+      "us": 314.33591796875,
+      "weight_gbps": 8.209306835423565,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 16,
+      "threads": 12,
+      "us": 287.09805859374995,
+      "weight_gbps": 8.988148553283795,
+      "expert_bytes": 2580480
+    },
+    {
+      "format": "Q6_K",
+      "inputs": 16,
+      "threads": 16,
+      "us": 279.48280078125003,
+      "weight_gbps": 9.23305474536063,
+      "expert_bytes": 2580480
+    }
+  ],
+  "bench_IQ4_XS": [
+    {
+      "format": "IQ4_XS",
+      "inputs": 1,
+      "threads": 1,
+      "us": 155.93586328125002,
+      "weight_gbps": 10.717021503807867,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 1,
+      "threads": 4,
+      "us": 55.739390625,
+      "weight_gbps": 29.981813243047092,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 1,
+      "threads": 8,
+      "us": 43.71359375,
+      "weight_gbps": 38.22993848452462,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 1,
+      "threads": 12,
+      "us": 42.28093359375,
+      "weight_gbps": 39.525333476719474,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 1,
+      "threads": 16,
+      "us": 43.733078125000006,
+      "weight_gbps": 38.21290592039706,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 8,
+      "threads": 1,
+      "us": 775.4514140625,
+      "weight_gbps": 2.155090531391186,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 8,
+      "threads": 4,
+      "us": 228.04640625000002,
+      "weight_gbps": 7.328192658155515,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 8,
+      "threads": 8,
+      "us": 156.27614453125,
+      "weight_gbps": 10.693685879010294,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 8,
+      "threads": 12,
+      "us": 141.32578125,
+      "weight_gbps": 11.824933746828306,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 8,
+      "threads": 16,
+      "us": 139.9238125,
+      "weight_gbps": 11.943413848875794,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 16,
+      "threads": 1,
+      "us": 1538.3939726562498,
+      "weight_gbps": 1.086306908180677,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 16,
+      "threads": 4,
+      "us": 455.1808671875,
+      "weight_gbps": 3.67143726915834,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 16,
+      "threads": 8,
+      "us": 315.956265625,
+      "weight_gbps": 5.289238359284396,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 16,
+      "threads": 12,
+      "us": 279.070109375,
+      "weight_gbps": 5.9883446627183226,
+      "expert_bytes": 1671168
+    },
+    {
+      "format": "IQ4_XS",
+      "inputs": 16,
+      "threads": 16,
+      "us": 277.81350000000003,
+      "weight_gbps": 6.01543121554568,
+      "expert_bytes": 1671168
+    }
+  ]
+}

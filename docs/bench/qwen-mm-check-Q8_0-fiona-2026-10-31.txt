@@ -1,0 +1,79 @@
+== Q8_0 (Q8_0)
+  Q8_0     real blk.0.ffn_gate.weight 3840x15360   rows   1  vs fp32  1.02e-02  vs emul  4.70e-07 ( 0.2 eps) 
+  Q8_0     real blk.0.ffn_gate.weight 3840x15360   rows   2  vs fp32  7.61e-03  vs emul  2.18e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.ffn_gate.weight 3840x15360   rows   5  vs fp32  9.07e-03  vs emul  4.69e-07 ( 0.2 eps) 
+  Q8_0     real blk.0.ffn_gate.weight 3840x15360   rows   8  vs fp32  1.22e-02  vs emul  5.91e-07 ( 0.2 eps) 
+  Q8_0     real blk.0.ffn_gate.weight 3840x15360   rows  16  vs fp32  9.59e-03  vs emul  5.20e-07 ( 0.2 eps) 
+  Q8_0     real blk.0.ffn_gate.weight 3840x15360   rows  32  vs fp32  9.73e-03  vs emul  5.37e-07 ( 0.3 eps) 
+  Q8_0     real blk.0.ffn_down.weight 15360x3840    rows   1  vs fp32  1.17e-02  vs emul  4.86e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.ffn_down.weight 15360x3840    rows   2  vs fp32  1.13e-02  vs emul  4.38e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.ffn_down.weight 15360x3840    rows   5  vs fp32  1.14e-02  vs emul  3.47e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.ffn_down.weight 15360x3840    rows   8  vs fp32  1.15e-02  vs emul  8.08e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.ffn_down.weight 15360x3840    rows  16  vs fp32  1.14e-02  vs emul  6.48e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.ffn_down.weight 15360x3840    rows  32  vs fp32  1.06e-02  vs emul  1.14e-06 ( 0.1 eps) 
+  Q8_0     real blk.5.attn_q.weight   3840x8192    rows   1  vs fp32  1.10e-02  vs emul  2.14e-07 ( 0.1 eps) 
+  Q8_0     real blk.5.attn_q.weight   3840x8192    rows   2  vs fp32  1.22e-02  vs emul  1.69e-07 ( 0.1 eps) 
+  Q8_0     real blk.5.attn_q.weight   3840x8192    rows   5  vs fp32  1.14e-02  vs emul  2.93e-07 ( 0.1 eps) 
+  Q8_0     real blk.5.attn_q.weight   3840x8192    rows   8  vs fp32  1.02e-02  vs emul  5.32e-07 ( 0.1 eps) 
+  Q8_0     real blk.5.attn_q.weight   3840x8192    rows  16  vs fp32  1.09e-02  vs emul  4.30e-07 ( 0.1 eps) 
+  Q8_0     real blk.5.attn_q.weight   3840x8192    rows  32  vs fp32  1.04e-02  vs emul  5.69e-07 ( 0.2 eps) 
+  Q8_0     real blk.0.attn_output.weight 4096x3840    rows   1  vs fp32  7.66e-03  vs emul  3.55e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.attn_output.weight 4096x3840    rows   2  vs fp32  9.81e-03  vs emul  2.76e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.attn_output.weight 4096x3840    rows   5  vs fp32  1.08e-02  vs emul  3.23e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.attn_output.weight 4096x3840    rows   8  vs fp32  1.04e-02  vs emul  3.10e-07 ( 0.1 eps) 
+  Q8_0     real blk.0.attn_output.weight 4096x3840    rows  16  vs fp32  1.11e-02  vs emul  4.53e-07 ( 0.2 eps) 
+  Q8_0     real blk.0.attn_output.weight 4096x3840    rows  32  vs fp32  1.18e-02  vs emul  5.60e-07 ( 0.1 eps) 
+  Q8_0     expert gate|up             2048x1024    rows   1  vs fp32  8.81e-03  vs emul  2.10e-07 ( 0.1 eps) 
+  Q8_0     expert gate|up             2048x1024    rows   2  vs fp32  1.53e-02  vs emul  3.59e-07 ( 0.2 eps) 
+  Q8_0     expert gate|up             2048x1024    rows   5  vs fp32  1.02e-02  vs emul  3.55e-07 ( 0.2 eps) 
+  Q8_0     expert gate|up             2048x1024    rows   8  vs fp32  1.06e-02  vs emul  6.00e-07 ( 0.3 eps) 
+  Q8_0     expert gate|up             2048x1024    rows  16  vs fp32  1.10e-02  vs emul  3.98e-07 ( 0.2 eps) 
+  Q8_0     expert gate|up             2048x1024    rows  32  vs fp32  1.09e-02  vs emul  7.04e-07 ( 0.3 eps) 
+  Q8_0     expert down                 512x2048    rows   1  vs fp32  1.38e-02  vs emul  2.87e-07 ( 0.4 eps) 
+  Q8_0     expert down                 512x2048    rows   2  vs fp32  9.27e-03  vs emul  1.72e-07 ( 0.2 eps) 
+  Q8_0     expert down                 512x2048    rows   5  vs fp32  1.17e-02  vs emul  1.93e-07 ( 0.2 eps) 
+  Q8_0     expert down                 512x2048    rows   8  vs fp32  1.07e-02  vs emul  3.59e-07 ( 0.3 eps) 
+  Q8_0     expert down                 512x2048    rows  16  vs fp32  1.07e-02  vs emul  2.69e-07 ( 0.2 eps) 
+  Q8_0     expert down                 512x2048    rows  32  vs fp32  1.20e-02  vs emul  8.10e-07 ( 0.5 eps) 
+  Q8_0     attn_qkv / attn_q          2048x8192    rows   1  vs fp32  1.18e-02  vs emul  1.74e-07 ( 0.1 eps) 
+  Q8_0     attn_qkv / attn_q          2048x8192    rows   2  vs fp32  1.34e-02  vs emul  3.85e-07 ( 0.1 eps) 
+  Q8_0     attn_qkv / attn_q          2048x8192    rows   5  vs fp32  8.94e-03  vs emul  3.27e-07 ( 0.1 eps) 
+  Q8_0     attn_qkv / attn_q          2048x8192    rows   8  vs fp32  1.15e-02  vs emul  4.20e-07 ( 0.2 eps) 
+  Q8_0     attn_qkv / attn_q          2048x8192    rows  16  vs fp32  9.34e-03  vs emul  4.18e-07 ( 0.2 eps) 
+  Q8_0     attn_qkv / attn_q          2048x8192    rows  32  vs fp32  1.08e-02  vs emul  4.01e-07 ( 0.2 eps) 
+  Q8_0     attn_gate                  2048x4096    rows   1  vs fp32  1.13e-02  vs emul  2.39e-07 ( 0.1 eps) 
+  Q8_0     attn_gate                  2048x4096    rows   2  vs fp32  8.09e-03  vs emul  3.10e-07 ( 0.2 eps) 
+  Q8_0     attn_gate                  2048x4096    rows   5  vs fp32  1.11e-02  vs emul  2.22e-07 ( 0.1 eps) 
+  Q8_0     attn_gate                  2048x4096    rows   8  vs fp32  9.29e-03  vs emul  3.21e-07 ( 0.1 eps) 
+  Q8_0     attn_gate                  2048x4096    rows  16  vs fp32  9.79e-03  vs emul  3.41e-07 ( 0.2 eps) 
+  Q8_0     attn_gate                  2048x4096    rows  32  vs fp32  1.03e-02  vs emul  4.99e-07 ( 0.2 eps) 
+  Q8_0     ssm_out / attn_output      4096x2048    rows   1  vs fp32  1.22e-02  vs emul  1.20e-07 ( 0.1 eps) 
+  Q8_0     ssm_out / attn_output      4096x2048    rows   2  vs fp32  1.42e-02  vs emul  3.92e-07 ( 0.1 eps) 
+  Q8_0     ssm_out / attn_output      4096x2048    rows   5  vs fp32  1.27e-02  vs emul  5.19e-07 ( 0.1 eps) 
+  Q8_0     ssm_out / attn_output      4096x2048    rows   8  vs fp32  1.07e-02  vs emul  4.60e-07 ( 0.2 eps) 
+  Q8_0     ssm_out / attn_output      4096x2048    rows  16  vs fp32  1.03e-02  vs emul  5.27e-07 ( 0.2 eps) 
+  Q8_0     ssm_out / attn_output      4096x2048    rows  32  vs fp32  9.91e-03  vs emul  3.96e-07 ( 0.1 eps) 
+  Q8_0     attn_k / attn_v            2048x512     rows   1  vs fp32  1.48e-02  vs emul  4.60e-07 ( 0.1 eps) 
+  Q8_0     attn_k / attn_v            2048x512     rows   2  vs fp32  1.28e-02  vs emul  2.02e-07 ( 0.1 eps) 
+  Q8_0     attn_k / attn_v            2048x512     rows   5  vs fp32  9.31e-03  vs emul  2.86e-07 ( 0.1 eps) 
+  Q8_0     attn_k / attn_v            2048x512     rows   8  vs fp32  1.07e-02  vs emul  5.56e-07 ( 0.3 eps) 
+  Q8_0     attn_k / attn_v            2048x512     rows  16  vs fp32  1.23e-02  vs emul  6.05e-07 ( 0.3 eps) 
+  Q8_0     attn_k / attn_v            2048x512     rows  32  vs fp32  1.19e-02  vs emul  6.15e-07 ( 0.3 eps) 
+  Q8_0     SwiGLU   gate|up 2048x1024   rows   1  vs fp32  1.70e-02 
+  Q8_0     SwiGLU   gate|up 2048x1024   rows   2  vs fp32  2.05e-02 
+  Q8_0     SwiGLU   gate|up 2048x1024   rows   5  vs fp32  1.54e-02 
+  Q8_0     SwiGLU   gate|up 2048x1024   rows   8  vs fp32  1.48e-02 
+  Q8_0     SwiGLU   gate|up 2048x1024   rows  16  vs fp32  1.86e-02 
+  Q8_0     SwiGLU   gate|up 2048x1024   rows  32  vs fp32  1.77e-02 
+  Q8_0     GeGLU    gate|up 2048x1024   rows   1  vs fp32  1.78e-02 
+  Q8_0     GeGLU    gate|up 2048x1024   rows   2  vs fp32  1.64e-02 
+  Q8_0     GeGLU    gate|up 2048x1024   rows   5  vs fp32  1.59e-02 
+  Q8_0     GeGLU    gate|up 2048x1024   rows   8  vs fp32  2.04e-02 
+  Q8_0     GeGLU    gate|up 2048x1024   rows  16  vs fp32  1.96e-02 
+  Q8_0     GeGLU    gate|up 2048x1024   rows  32  vs fp32  1.88e-02 
+  Q8_0     grouped P= 8  gate_up vs matmul  1.47e-07  down  8.04e-08  SwiGLU(int8) vs fp32  9.67e-03 
+  Q8_0     grouped P=16  gate_up vs matmul  1.33e-07  down  7.65e-08  SwiGLU(int8) vs fp32  8.00e-03 
+  Q8_0     grouped P=32  gate_up vs matmul  1.57e-07  down  8.74e-08  SwiGLU(int8) vs fp32  8.71e-03 
+  Q8_0     rows_of(512, 768) of 2048x2048  rows   1  vs the whole  1.06e-07 
+  Q8_0     rows_of(512, 768) of 2048x2048  rows   8  vs the whole  0.00e+00 
+  Q8_0     rows_of(512, 768) of 2048x2048  rows 256  vs the whole  0.00e+00 
