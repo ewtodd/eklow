@@ -85,4 +85,11 @@ void selector_lattice(sycl::queue& q, const float* unary, const float* gate, con
   });
 }
 
+void silu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+    const float g = gate[id[0]];
+    out[id[0]] = g / (1.0f + sycl::exp(-g)) * up[id[0]];
+  });
+}
+
 }  // namespace eklow::ref

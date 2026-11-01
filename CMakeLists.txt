@@ -204,10 +204,15 @@ install(TARGETS eklow-cpu-qgemv-test RUNTIME DESTINATION bin)
 
 # DFlash 2 drafting and speculative decoding (TASK qwen/dflash): the draft's kernels and model, the acceptance of a
 # drafted block, and their checks. Appended here so as not to touch the lists above.
-target_sources(eklow_model PRIVATE src/kernels/ref_dflash.cpp)
+target_sources(eklow_model PRIVATE src/kernels/ref_dflash.cpp src/model/dflash2.cpp)
 target_sources(eklow_serve PRIVATE src/serve/spec.cpp)
 
 # The acceptance's statistical test: host code over the sampler only.
 add_executable(eklow-spec-test tools/dflash_test/spec_test.cpp src/serve/sampler.cpp src/serve/spec.cpp)
 target_include_directories(eklow-spec-test PRIVATE src)
 install(TARGETS eklow-spec-test RUNTIME DESTINATION bin)
+
+add_executable(eklow-dflash-test tools/dflash_test/main.cpp)
+target_link_libraries(eklow-dflash-test PRIVATE eklow_model eklow_serve)
+eklow_sycl(eklow-dflash-test)
+install(TARGETS eklow-dflash-test RUNTIME DESTINATION bin)

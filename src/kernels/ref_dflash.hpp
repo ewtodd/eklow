@@ -37,4 +37,7 @@ void topk_rows(sycl::queue& q, const float* x, int64_t rows, int64_t n, int64_t 
 void selector_lattice(sycl::queue& q, const float* unary, const float* gate, const float* pred, const float* succ, int64_t P,
                       int64_t k, int64_t rank, float* out);
 
+// out = silu(gate) * up, silu(x) = x / (1 + exp(-x)) (SwiGLU)
+void silu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out);
+
 }  // namespace eklow::ref
