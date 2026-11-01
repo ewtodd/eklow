@@ -101,7 +101,40 @@ inline void row_dot(const uint8_t* row, int64_t nb, const In* in, float* out) {
       for (int r = 0; r < R; ++r)
         acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot_s(w, ld(in[r].q + b * 32))), _mm256_set1_ps(d * in[r].s[b]), acc[r]);
     }
-  } else if constexpr (T == QType::Q4_K || T == QType::Q5_K) {
+  } else if constexpr (T == QType::Q4_K) {
+    // The sub-block scales and minimums of a superblock become vectors once (shared by the R inputs); each input's 8 scale
+    // products go through the stack and come back as broadcast loads, and its minimum terms accumulate as a vector, so the
+    // per-sub-block work is the dpbusd, a conversion and an fma (the scalar form spent ~3x that on the scales).
+    __m256 cacc[R];
+    for (int r = 0; r < R; ++r) cacc[r] = _mm256_setzero_ps();
+    for (int64_t sb = 0; sb < nb; ++sb) {
+      const uint8_t* blk = row + sb * 144;
+      const float d = f16(blk), dmin = f16(blk + 2);
+      alignas(32) int sc[8], mn[8];
+      for (int j = 0; j < 8; ++j) scale_min(j, blk + 4, sc[j], mn[j]);
+      const __m256 wsc = _mm256_mul_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_load_si256(reinterpret_cast<const __m256i*>(sc))));
+      const __m256 wmn = _mm256_mul_ps(_mm256_set1_ps(dmin), _mm256_cvtepi32_ps(_mm256_load_si256(reinterpret_cast<const __m256i*>(mn))));
+      alignas(32) float ds[R][8];
+      for (int r = 0; r < R; ++r) {
+        const __m256 sv = _mm256_loadu_ps(in[r].s + sb * 8);
+        _mm256_store_ps(ds[r], _mm256_mul_ps(wsc, sv));
+        const __m256 sumf = _mm256_cvtepi32_ps(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(in[r].sum + sb * 8)));
+        cacc[r] = _mm256_fmadd_ps(_mm256_mul_ps(wmn, sv), sumf, cacc[r]);
+      }
+      const uint8_t* qs = blk + 16;
+      for (int i = 0; i < 4; ++i) {
+        const __m256i q = ld(qs + 32 * i);
+        const __m256i lo = _mm256_and_si256(q, m0f), hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m0f);
+        for (int r = 0; r < R; ++r) {
+          const int8_t* a = in[r].q + sb * 256 + 64 * i;
+          const __m256i dl = dot_u(lo, ld(a)), dh = dot_u(hi, ld(a + 32));
+          acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dl), _mm256_broadcast_ss(&ds[r][2 * i]), acc[r]);
+          acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dh), _mm256_broadcast_ss(&ds[r][2 * i + 1]), acc[r]);
+        }
+      }
+    }
+    for (int r = 0; r < R; ++r) corr[r] = hsum(cacc[r]);
+  } else if constexpr (T == QType::Q5_K) {
     constexpr bool five = T == QType::Q5_K;
     constexpr int bytes = five ? 176 : 144;
     for (int64_t sb = 0; sb < nb; ++sb) {
