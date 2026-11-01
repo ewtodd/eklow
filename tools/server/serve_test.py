@@ -189,6 +189,12 @@ def basic(a):
     check("prefix reuse: the next turn is mostly cached", c2 >= j1["usage"]["prompt_tokens"] - 10, f"cached {c2} of {j2['usage']['prompt_tokens']}, first prompt {j1['usage']['prompt_tokens']}")
     j3 = chat(url, conv, max_tokens=5, temperature=0, reasoning_effort="none")
     check("prefix reuse: the same prompt again is cached", j3["usage"]["prompt_tokens_details"]["cached_tokens"] >= j1["usage"]["prompt_tokens"] - 10, str(j3["usage"]))
+    # A document and then a question, then another question: the paragraph break before the question is a snapshot point.
+    doc = "\n\n".join(f"Paragraph {i}: the harbour at dusk, number {i * 7}, smells of tar and salt and old rope." for i in range(120))
+    d1 = chat(url, [{"role": "user", "content": doc + "\n\nHow many paragraphs mention rope?"}], max_tokens=20, temperature=0, reasoning_effort="none")
+    d2 = chat(url, [{"role": "user", "content": doc + "\n\nWhich paragraph is the last one?"}], max_tokens=20, temperature=0, reasoning_effort="none")
+    check("document then another question: the document is cached", d2["usage"]["prompt_tokens_details"]["cached_tokens"] >= d1["usage"]["prompt_tokens"] - 40,
+          f"cached {d2['usage']['prompt_tokens_details']['cached_tokens']} of {d2['usage']['prompt_tokens']}")
     if a.save:
         for i, m in enumerate(GREEDY):
             j = chat(url, m, max_tokens=400, temperature=0)

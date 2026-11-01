@@ -41,7 +41,7 @@ in
     draftBlock = lib.mkOption {
       type = lib.types.nullOr (lib.types.ints.between 2 16);
       default = null;
-      description = "Tokens of a verify block (the last sampled one and the drafted ones); null: the draft's trained block.";
+      description = "Tokens of a verify block (the last sampled one and the drafted ones); null: 4, or the draft's trained block if smaller (a block costs ~8.5 ms a row beyond the first on this card; 4 measured best).";
     };
 
     chatTemplate = lib.mkOption {

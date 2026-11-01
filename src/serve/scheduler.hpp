@@ -56,7 +56,7 @@ class Request {
   // shares, even when it drops this turn's reasoning), where the last message starts (an edited or retried message), and where
   // the first message after the system one starts (the system prompt and tools a whole family of conversations share).
   std::vector<int64_t> snapshot_points;
-  bool speculate = true;           // false: plain decode even with a draft (for measuring)
+  int draft_block = -1;            // -1: the server's block size; 0: plain decode even with a draft; 2 to 16: this one (for measuring)
   std::string tag;                 // names the request in the log (the completion id)
 
   // Reader side: waits up to `wait` for the next event.

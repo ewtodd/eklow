@@ -66,7 +66,7 @@ struct ChatRequest {
   bool in_thinking = false;  // the prompt ends inside the reasoning
   std::shared_ptr<const text::ToolSpecs> tool_specs;  // the request's tools, for reading and constraining calls
   std::vector<int64_t> snapshot_points;  // see Request::snapshot_points
-  bool speculate = true;     // eklow extension: "speculative": false decodes plain even when the server has a draft
+  int draft_block = -1;      // eklow extension: "speculative": false decodes plain even when the server has a draft; an integer is a block size
 };
 
 // Renders the conversation with Qwen3.6's template and tokenizes it (request text without special tokens). Image and

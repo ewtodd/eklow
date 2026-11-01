@@ -209,6 +209,13 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
           r.snapshot_points.push_back(s);
           break;
         }
+      // A document pasted into the last message and then a question: the next question shares the text up to the last paragraph
+      // breaks (a token ending in "\n\n"; the pre-tokenizer cuts after a newline run whatever follows, so the prefix tokenizes the same).
+      if (starts.size() >= 2) {
+        int found = 0;
+        for (int64_t i = starts.back() - 4; i > starts[starts.size() - 2] + 3 && found < 2; --i)
+          if (tok.bytes(r.prompt[size_t(i)]).find("\n\n") != std::string::npos) r.snapshot_points.push_back(i + 1), ++found;
+      }
       std::sort(r.snapshot_points.begin(), r.snapshot_points.end());
       r.snapshot_points.erase(std::unique(r.snapshot_points.begin(), r.snapshot_points.end()), r.snapshot_points.end());
       if (r.snapshot_points.front() == 0) r.snapshot_points.erase(r.snapshot_points.begin());
@@ -238,7 +245,11 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
       }
     else throw bad("stop must be a string or an array of strings");
   }
-  if (const json::Value* v = field(body, "speculative"); v && !v->is_null()) r.speculate = v->truthy();
+  if (const json::Value* v = field(body, "speculative"); v && !v->is_null()) {
+    if (v->is_int()) r.draft_block = int(std::max<double>(0, std::min<double>(16, number(*v, "speculative"))));
+    else r.draft_block = v->truthy() ? -1 : 0;
+    if (r.draft_block == 1) r.draft_block = 0;
+  }
   if (const json::Value* v = field(body, "stream"); v) r.stream = v->truthy();
   if (const json::Value* so = field(body, "stream_options"); so && so->is_object())
     if (const json::Value* u = so->find("include_usage")) r.include_usage = u->truthy();

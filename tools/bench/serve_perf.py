@@ -82,6 +82,8 @@ def depth(a):
         for i in range(a.repeats):
             body = {"model": a.model, "messages": [{"role": "user", "content": text + "\n\n" + QUESTIONS[i % len(QUESTIONS)]}],
                     "max_tokens": 256, "temperature": 1.0, "top_p": 0.95, "seed": 7}
+            if a.block:
+                body["speculative"] = a.block
             p, cached, n, ttft, dec, per = stream(a.url, body)
             print(f"request | prompt {p} ({cached} cached), completion {n} | ttft {ttft:.2f} s, "
                   f"prefill {(p - cached) / ttft:.1f} tok/s, decode {dec:.1f} tok/s" + (f", {per:.2f} tokens/verify" if per else ""), flush=True)
@@ -164,6 +166,19 @@ def accept(a):
               f"{statistics.mean(pers):.3f} tokens a verify (mean over requests), decode per stream median {statistics.median(r[4] for r in res):.1f} tok/s", flush=True)
 
 
+def blocks(a):
+    """One stream at a time, the same N GSM8K requests with each block size B (the request's "speculative": B; 0 is plain
+    decode): decode tok/s over the requests' streams and the tokens a verify block gave."""
+    reqs = [json.loads(l) for l in open(a.requests) if l.strip()][: a.n]
+    for b in [int(x) for x in a.blocks.split(",")]:
+        res = [stream(a.url, dict(q, model=a.model, max_tokens=a.max_tokens, speculative=b if b else False)) for q in reqs]
+        toks = sum(r[2] for r in res)
+        t = sum(r[2] / r[4] for r in res if r[4] > 0)  # seconds, taking the tokens after the first as the decode rate says
+        pers = [r for r in res if r[5]]
+        tail = f", {sum(r[2] for r in pers) / sum(r[2] / r[5] for r in pers):.2f} tokens/verify" if pers else ""
+        print(f"block {b:2d}: {toks} tokens, decode {toks / t:.1f} tok/s (median stream {statistics.median(r[4] for r in res):.1f}){tail}", flush=True)
+
+
 ap = argparse.ArgumentParser()
 ap.add_argument("--url", required=True)
 ap.add_argument("--model", required=True)
@@ -173,6 +188,7 @@ p.add_argument("--docs", required=True)
 p.add_argument("--depths", default="8192,32768,131072,252000")
 p.add_argument("--repeats", type=int, default=5)
 p.add_argument("--plain", type=int, default=0, help="further requests per depth with \"speculative\": false")
+p.add_argument("--block", type=int, default=0, help="the draft's block size for these requests (0: the server's)")
 p = sub.add_parser("gsm")
 p.add_argument("--requests", required=True)
 p.add_argument("--concurrency", default="1,2")
@@ -180,6 +196,11 @@ p = sub.add_parser("reuse")
 p.add_argument("--docs", required=True)
 p.add_argument("--conv-depth", type=int, default=10000)
 p.add_argument("--doc-depth", type=int, default=100000)
+p = sub.add_parser("blocks")
+p.add_argument("--requests", required=True)
+p.add_argument("--n", type=int, default=6)
+p.add_argument("--max-tokens", type=int, default=600)
+p.add_argument("--blocks", default="0,4,6,8,12,16")
 p = sub.add_parser("accept")
 p.add_argument("--prompts", required=True)
 p.add_argument("--datasets", default="gsm8k,humaneval,mt-bench")
@@ -187,4 +208,4 @@ p.add_argument("--n", type=int, default=16)
 p.add_argument("--temperature", type=float, default=1.0)
 p.add_argument("--concurrency", type=int, default=2)
 a = ap.parse_args()
-{"depth": depth, "gsm": gsm, "reuse": reuse, "accept": accept}[a.cmd](a)
+{"depth": depth, "gsm": gsm, "reuse": reuse, "accept": accept, "blocks": blocks}[a.cmd](a)

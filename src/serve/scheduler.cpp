@@ -267,7 +267,6 @@ void Scheduler::step() {
   for (size_t s = 0; s < seqs_.size(); ++s)
     if (seqs_[s].req && seqs_[s].req->cancelled()) finish(int(s), "stop");
   const bool spec = c_.draft != nullptr;
-  const int B = c_.draft_block;
   const int64_t W = spec ? c_.draft->window() : 0;
   int64_t cap_left = eng_.config().max_capture_rows;  // rows of capture a step may ask for
   int64_t budget = c_.max_batch;
@@ -287,25 +286,30 @@ void Scheduler::step() {
   for (size_t s = 0; s < seqs_.size(); ++s)
     if (seqs_[s].req && seqs_[s].next_token >= 0) gen.push_back(int(s));
   std::vector<DraftBlock> blocks(seqs_.size());
-  std::vector<char> speculate(seqs_.size(), 0);
+  // The block of a request: the server's, or its own (a request may ask for another, or 0 for plain decode).
+  auto block_of = [&](const Seq& q) { return q.req->draft_block < 0 ? c_.draft_block : q.req->draft_block; };
+  std::vector<int> speculate(seqs_.size(), 0);  // per slot: the block size B it verifies this step (0: a decode token)
   if (spec) {
     Timer timer(mu_, stats_.draft_s);
-    std::vector<model::Dflash2::Request> reqs;
-    std::vector<int> who;
-    for (int s : gen) {
-      const Seq& q = seqs_[size_t(s)];
-      const int64_t pos = int64_t(q.tokens.size());
-      // A block needs room in the context, and the draft's context must end where the block starts.
-      if (q.req->speculate && pos + B <= c_.max_ctx && c_.draft->context_end(s) == pos) reqs.push_back({s, q.next_token, pos}), who.push_back(s);
-    }
-    const size_t per = size_t(std::max(1, 32 / B));  // rows of a draft pass: 32 at most
-    for (size_t i0 = 0; i0 < reqs.size(); i0 += per) {
-      const std::vector<model::Dflash2::Request> sub(reqs.begin() + std::ptrdiff_t(i0), reqs.begin() + std::ptrdiff_t(std::min(reqs.size(), i0 + per)));
-      const std::vector<Lattice> lats = c_.draft->lattices(sub, B);
-      for (size_t k = 0; k < sub.size(); ++k) {
-        Seq& q = seqs_[size_t(who[i0 + k])];
-        blocks[size_t(who[i0 + k])] = walk(lats[k], std::max(0.0f, q.req->sampling.temperature), q.draft_rng);
-        speculate[size_t(who[i0 + k])] = 1;
+    // Slots with one block size draft in one pass (32 rows at most).
+    for (int B = 2; B <= 16; ++B) {
+      std::vector<model::Dflash2::Request> reqs;
+      std::vector<int> who;
+      for (int s : gen) {
+        const Seq& q = seqs_[size_t(s)];
+        const int64_t pos = int64_t(q.tokens.size());
+        // A block needs room in the context, and the draft's context must end where the block starts.
+        if (block_of(q) == B && pos + B <= c_.max_ctx && c_.draft->context_end(s) == pos) reqs.push_back({s, q.next_token, pos}), who.push_back(s);
+      }
+      const size_t per = size_t(std::max(1, 32 / B));
+      for (size_t i0 = 0; i0 < reqs.size(); i0 += per) {
+        const std::vector<model::Dflash2::Request> sub(reqs.begin() + std::ptrdiff_t(i0), reqs.begin() + std::ptrdiff_t(std::min(reqs.size(), i0 + per)));
+        const std::vector<Lattice> lats = c_.draft->lattices(sub, B);
+        for (size_t k = 0; k < sub.size(); ++k) {
+          Seq& q = seqs_[size_t(who[i0 + k])];
+          blocks[size_t(who[i0 + k])] = walk(lats[k], std::max(0.0f, q.req->sampling.temperature), q.draft_rng);
+          speculate[size_t(who[i0 + k])] = B;
+        }
       }
     }
   }
@@ -315,7 +319,7 @@ void Scheduler::step() {
     c.slot = s, c.start_pos = int64_t(q.tokens.size()), c.accept = q.pending_accept;
     c.tokens.push_back(q.next_token);
     Item it{Item::Decode, s, 1, {}};
-    if (speculate[size_t(s)]) {
+    if (const int B = speculate[size_t(s)]) {
       it.kind = Item::Verify, it.block = std::move(blocks[size_t(s)]), it.rows = B;
       c.tokens.insert(c.tokens.end(), it.block.tokens.begin(), it.block.tokens.end());
       c.verify = true, c.logits_rows = B, c.capture_rows = B;

@@ -15,7 +15,8 @@
 // fit in the card's free memory after the KV cache, the workspace, the embedding model and the draft, less
 // --card-margin-mib (1024) for what the first requests allocate and the driver keeps.
 // --draft (a DFlash 2 draft GGUF) turns on speculative decoding: a verify block of --draft-block tokens (default the
-// draft's trained block, at most 16) per step, accepted losslessly (the sampler's every feature, the tool grammar included).
+// draft's trained block or 4 if less, at most 16) per step, accepted losslessly (the sampler's every feature, the tool
+// grammar included). A request may choose its own block with "speculative": N (0 or false: plain decode).
 // --chat-template says which of Qwen3.6's two templates the model's repo uses when the GGUF's is not one eklow knows (the
 // official Ornith GGUFs carry Unsloth's edit): stock drops earlier turns' reasoning, ornith keeps it.
 // --snapshot-mib is the pinned host memory kept for snapshots of the DeltaNet state, which make a conversation's or a
@@ -478,7 +479,9 @@ int main(int argc, char** argv) {
     if (!draft_path.empty()) {
       draft_file = std::make_unique<gguf::File>(gguf::File::open(draft_path));
       draft_cfg = model::Dflash2Config::from_gguf(*draft_file);
-      if (draft_block == 0) draft_block = std::min(draft_cfg.block_size, 16);
+      // The draft's trained block is 8 or 16, but a verify block costs ~8.5 ms a row beyond the first (the cold experts on the CPU),
+      // so on this card 4 beats 8 by 6% on GSM8K and 33% on prose (DECISIONS 2026-11-01): the default is the lesser of the two.
+      if (draft_block == 0) draft_block = std::min(draft_cfg.block_size, 4);
     }
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     engine::Config ec;
@@ -486,7 +489,7 @@ int main(int argc, char** argv) {
     ec.max_ctx = (ctx + attn::kPage - 1) / attn::kPage * attn::kPage;
     ec.max_batch = batch;
     ec.max_chunk = chunk;
-    ec.max_logits = int64_t(slots) * (std::max(draft_block, 1) + 1);
+    ec.max_logits = int64_t(slots) * 17;  // a verify block of up to 16 rows each
     ec.int8_kv = kv_int8;
     ec.expert_profile = expert_profile;
     ec.experts_on_card = expert_profile.empty() ? -1 : experts_on_card;
@@ -497,7 +500,7 @@ int main(int argc, char** argv) {
       // The draft reads the target's hidden states at its layers; a step captures the rows of its verify blocks and of the
       // last `window` rows of a prompt.
       ec.capture_layers = draft_cfg.target_layers;
-      ec.max_capture_rows = chunk + int64_t(slots) * draft_block;
+      ec.max_capture_rows = chunk + int64_t(slots) * 16;
       ec.max_pending = std::max(ec.max_pending, draft_block);
       // The draft's weights, rings and scratch (0.76 GiB) and the token table it embeds blocks with (0.5 GiB), kept from the experts.
       ec.draft_reserve_bytes = uint64_t(1.3 * 1073741824.0);
@@ -567,7 +570,7 @@ int main(int argc, char** argv) {
       const model::Dflash2Target target{ref::Weight{emb->type, int64_t(emb->ne[0]), int64_t(emb->ne[1]), draft_embd.get(), emb->nbytes / emb->ne[1]}, eng.head_weight()};
       model::Dflash2::Options opt;
       opt.slots = slots;
-      opt.max_block = draft_block;
+      opt.max_block = 16;  // a request may ask for a larger block than the default
       draft = std::make_unique<model::Dflash2>(q, *draft_file, target, opt);
       std::fprintf(stderr, "eklow-server: DFlash 2 draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card (and the target's token table, %.0f MiB); free card memory now %.2f GiB\n",
                    draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0, double(emb->nbytes) / 1048576.0,
@@ -637,7 +640,7 @@ int main(int argc, char** argv) {
       r->in_thinking = cr.in_thinking;
       r->tool_specs = cr.tool_specs;
       r->snapshot_points = cr.snapshot_points;
-      r->speculate = cr.speculate;
+      r->draft_block = cr.draft_block;
       r->tag = serve::new_completion_id();
       try {
         sched.submit(r);
