@@ -1378,3 +1378,38 @@ cost about their bytes (+22% and +46% on the CPU, +23% and +37% on the card's gr
 (1.9x the bytes of 4.5 bits) and is the fastest per byte on the card; IQ4_XS saves 6% of the bytes and costs 1.7x the
 card's decode time and 40% of its expert prefill, though the CPU reads it as fast as Q4_0. The dense matrices and
 the head are 1.5 GB of the ~20, read once a token at 300-360 GB/s whatever the format: their cost is their bytes.
+
+## 2026-10-31 — Qwen3.6's text layer
+
+`qwen/text` (merged): the tokenizer (`src/text/tokenizer_qwen.*`), both chat templates (`chat_qwen36.*`: stock
+Qwen3.6's and Ornith's, chosen by the template's exact text, anything else refused), the output parser
+(`output_parser_qwen.*`) and the tool-call grammar (`src/serve/tool_grammar_qwen.*`), held to Hugging Face as the
+Gemma ones were (transformers 5.17, tokenizers 0.23.2). The rule from the Gemma port stays: request text never becomes
+an added token, special or not (`<think>` or `<tool_call>` typed by a user are characters).
+
+- **Tokenizer**: added tokens, NFC, the pre-tokenizer's regex written by hand over code points, byte-level BPE. Against
+  `tokenizers`: 648,044 strings / 14.4M tokens encoded and 1.36M decodes, 0 differences; every code point in 17
+  contexts (18.9M strings), 0. 26-31M tokens/s on one core. Hugging Face's NFC is Unicode 9 (the Rust crate's data),
+  not 16: with Python's full tables 371 of 10.2M probes differed. The generator leaves out what the installed
+  `tokenizers` does not know (120 combining classes, 21 decompositions, 21 compositions), so eklow matches Hugging
+  Face; regenerate if `tokenizers` moves (`tools/ref/qwen_classes_check.py` shows it). The GGUF marks 33 tokens
+  special against tokenizer.json's 26 (7 audio / TTS ones, plus 243 unused `[PAD...]`): those are plain text in encode,
+  nothing in decode, and never sampled.
+- **Templates**: 39,177 cases per variant (5,177 written for the branches, 34,000 random), 0 differences, and 7.8M
+  tokens of ids, 0. Ornith's repo ships stock's `tokenizer_config.json` byte for byte, stock template inside, while its
+  own is `chat_template.jinja`, which transformers uses; llama.cpp's converter takes the former, so **an Ornith GGUF
+  converted as-is carries stock's template** (it drops earlier reasoning that Ornith's keeps). And the official Ornith
+  GGUFs (`ornith-ai/Ornith-1.5-35B-A3B-GGUF`) carry a third, Unsloth's edit of Ornith's (a `developer` role, two
+  system messages merged, arguments by mapping test). So the server takes the template variant as an option when the
+  file's is not one eklow knows, and renders the model repo's own template.
+- **Parser**: generation starts in the reasoning (the prompt ends `<think>\n`), then content, then
+  `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...</function>\n</tool_call>` calls. Values go
+  back to JSON by the request's schema, after vLLM's `qwen3_coder` parser with three differences: a string parameter's
+  "null" stays the string, 5.0 stays 5.0, a value that does not parse as its type stays text (vLLM makes a bad boolean
+  False). 40,000 rendered turns (60,078 runs, 72,022 calls) parse back exactly. One hole no parser can close: a string
+  value containing `</parameter>` followed by `</function>` or `<parameter=`.
+- **Grammar**: a byte automaton keeping calls in the template's shape: declared tools and parameters (each once,
+  required ones before `</function>`), free text for string parameters, JSON of the declared kinds for the rest, enums
+  exact. 20,432 valid calls accepted token by token as Hugging Face tokenizes them, 12,000 mutated ones refused at
+  their first bad token, 40,000 random walks closed into calls the parser accepts; bans equal refusals on 828 of 828
+  (state, special token) pairs.
