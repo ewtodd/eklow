@@ -67,7 +67,7 @@ intel-llvm.stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "Serving engine for Gemma 4 on an Intel Arc A770M";
+    description = "Serving engine for Qwen3.6-35B-A3B on an Intel Arc A770M";
     license = lib.licenses.asl20;
     platforms = [ "x86_64-linux" ];
   };
