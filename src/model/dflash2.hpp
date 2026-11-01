@@ -165,10 +165,18 @@ class Dflash2 {
   void truncate(int slot, int64_t pos);
   int64_t context_end(int slot) const { return end_[size_t(slot)]; }
 
-  // Adds the context rows of positions pos0 .. pos0 + n - 1, which must continue the slot's context (pos0 <=
-  // context_end). feats is the target's layer outputs on the card, fp32 [n][n_feat] (layers 1, 6, ... in order, each
+  // Adds the context rows of positions pos0 .. pos0 + n - 1, which continue the slot's context (pos0 <= context_end; a
+  // later pos0 restarts the context there). feats is the target's layer outputs on the card, fp32 [n][n_feat] (layers 1, 6, ... in order, each
   // n_embd wide). Rows further back than a later block can see (the window) are not computed.
   void inject(int slot, const float* feats, int64_t pos0, int64_t n);
+
+  // The engine's form: n rows of a step in its order, each with its slot and position (host arrays). Consecutive rows of
+  // one slot at consecutive positions form a run, injected as inject(slot, ...) does. The caller passes the rows that
+  // are committed: after a verify block with a accepted tokens that is the block's first a + 1 rows (the anchor and the
+  // accepted drafts), so the draft's context never holds a rejected token; the rows of the rest are not read. A run
+  // may start past the slot's context end (a prefill that captured only its last window rows): the context then starts
+  // there.
+  void inject_rows(const float* feats, const int32_t* slots, const int64_t* positions, int64_t n);
 
   struct Request {
     int slot;

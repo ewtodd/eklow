@@ -1378,3 +1378,36 @@ cost about their bytes (+22% and +46% on the CPU, +23% and +37% on the card's gr
 (1.9x the bytes of 4.5 bits) and is the fastest per byte on the card; IQ4_XS saves 6% of the bytes and costs 1.7x the
 card's decode time and 40% of its expert prefill, though the CPU reads it as fast as Q4_0. The dense matrices and
 the head are 1.5 GB of the ~20, read once a token at 300-360 GB/s whatever the format: their cost is their bytes.
+
+## 2026-10-31 — the DFlash 2 draft on the card, and lossless acceptance
+
+`qwen/dflash`. `src/model/dflash2.*` (config, weights from the draft GGUF, `Dflash2Ref` the fp32 reference forward,
+`Dflash2` the serving forward in `dflash2_fast.cpp`), `src/kernels/ref_dflash.*` and `dflash.*`, `src/serve/spec.*`
+(walk over the selector's lattice, greedy and rejection-sampling verify), `tools/dflash_test/` (`eklow-dflash-test`
+torch|fast|accept|matmul|time, `eklow-spec-test`, `ref_torch.py`). Shared files touched: `attn::attend` gets head 128 with
+4 query heads per K/V head (fp16 ring only: three lines), `Sampler` gets `distribution()` (sample() draws the same
+tokens as before: 55,000 of 55,000 equal to the previous implementation).
+
+**Checks.** Reference vs z-lab's model.py in PyTorch fp32 on real target features (eklow-oracle on stock Q8_0, a 523-token
+chat, layers 1, 6, ..., 37; BF16 draft file): hidden rel error 3-6e-6, lattice 1e-6, 8 of 8 greedy paths equal, for Inco's
+draft at B = 8 and 16, jzinno's at B = 16, and with the window cut to 64 and 100 (ring and window logic). model.py's
+draft predicts the text well (7 of 7 tokens at several positions), which also confirms the layer indices: the GGUF's
+`target_layers` are the layer outputs plus one (llama.cpp reads layer inputs). Serving vs reference: the matmuls on int8
+activations equal the reference on the same rounded activations to 2e-7; the whole forward is chaotic at int8 (a 1e-7
+perturbation of the input moves the logits ~5%, the same as serving vs exact), so judged by what the draft does: mean
+tokens agreeing with the text, 100 blocks of 8: exact fp32 3.570, serving 3.580; B = 16 Inco 4.393 vs 4.518, jzinno 4.143
+vs 4.143, window 100 2.375 vs 2.375; whole greedy drafts equal in 41-97% of blocks, the rest differ at near-ties.
+**Acceptance:** chi-square over 11 sampler configurations (temperature, top-k, top-p, min-p, penalties, bans, grammar,
+all of them) with a poor and a near-target drafter: all pass; two deliberately broken verifies (accept-all, no residual)
+fail every time; greedy sequences equal plain greedy in 20,000 of 20,000 per case.
+
+**Timings** (A770M, Inco Q8_0, 780 MiB on the card with two slots): context injection 3.7 us a row at 1,024-2,048 rows,
+0.4-0.5 ms for 1-16 rows; a block of B = 8 5.6 ms (layers 3.1, head 1.6, selector 0.8), B = 16 6.3 ms; two slots at B = 8
+6.4 ms, at B = 16 11.5 ms (the head's 32-row GEMV 5.8).
+
+**Where model.py and llama.cpp differ.** llama.cpp drafts n_max tokens from a block of n_max + 1 (the block size is the
+caller's), applies an optional p_min cut on the walk, and runs its sliding window in a unified KV cache; the target-layer
+ids in its GGUF are +1. Same math otherwise (the conv taps, the lattice layout, ties to the first candidate).
+**Not done:** a token-for-token comparison with llama.cpp's draft (its draft graph needs a target context and the
+private `llama_get_embeddings_nextn`); BF16/F16 draft files only run in the reference (xmx::matmul_geglu cannot form
+fp16 outputs for few rows).

@@ -247,12 +247,23 @@ void Dflash2::truncate(int slot, int64_t pos) {
   first_[size_t(slot)] = std::min(first_[size_t(slot)], end_[size_t(slot)]);
 }
 
+void Dflash2::inject_rows(const float* feats, const int32_t* slots, const int64_t* positions, int64_t n) {
+  const int64_t F = c_.n_feat();
+  for (int64_t i = 0; i < n;) {
+    int64_t j = i + 1;
+    while (j < n && slots[j] == slots[i] && positions[j] == positions[j - 1] + 1) ++j;
+    inject(slots[i], feats + i * F, positions[i], j - i);
+    i = j;
+  }
+}
+
 void Dflash2::inject(int slot, const float* feats, int64_t pos0, int64_t n) {
   Impl& s = *p_;
   const int E = c_.n_embd, Hkv = c_.n_head_kv, D = c_.head_dim, F = c_.n_feat();
   if (slot < 0 || slot >= opt_.slots) throw std::runtime_error("dflash2: no such slot");
-  if (pos0 > end_[size_t(slot)] || pos0 < 0) throw std::runtime_error("dflash2: inject does not continue the slot's context");
+  if (pos0 < 0) throw std::runtime_error("dflash2: negative position");
   if (n <= 0) return;
+  if (pos0 > end_[size_t(slot)]) end_[size_t(slot)] = first_[size_t(slot)] = pos0;  // a gap: the context restarts here
   const int64_t next = pos0 + n;
   const int64_t from = std::max<int64_t>(pos0, next - window_ + 1);  // the oldest row a block at `next` or later can see
   if (from > pos0 && end_[size_t(slot)] <= pos0) first_[size_t(slot)] = from;

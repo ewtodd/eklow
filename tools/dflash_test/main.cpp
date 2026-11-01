@@ -6,6 +6,7 @@
 //   eklow-dflash-test time    --draft GGUF --target GGUF: timings on the card
 // The inputs are what ref_torch.py read: ORACLE_DIR holds eklow-oracle's l_out-N.f32 for the draft's target layers.
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -350,6 +351,56 @@ int cmd_accept(const Args& a) {
   return 0;
 }
 
+// Timings on the card: context injection (per row, at several row counts), and a block at B = 8 and 16 with its phases
+// (layers, the head, the selector: top 16, codebook rows, lattice, copy back), one slot and two.
+int cmd_time(const Args& a) {
+  sycl::queue q(rt::pick_device(), sycl::property::queue::in_order{});
+  const auto draft = gguf::File::open(a.draft), target = gguf::File::open(a.target);
+  const auto cfg = model::Dflash2Config::from_gguf(draft);
+  const model::OwnedTarget owned(q, target);
+  model::Dflash2::Options opt;
+  opt.slots = 2;
+  opt.max_block = 16;
+  model::Dflash2 d(q, draft, owned.view(), opt);
+  const int F = cfg.n_feat();
+  const int64_t rows = 2048;
+  std::vector<float> h(size_t(rows) * F);
+  std::mt19937 g(3);
+  for (auto& x : h) x = std::normal_distribution<float>(0, 1)(g);
+  float* feats = sycl::malloc_device<float>(h.size(), q);
+  q.memcpy(feats, h.data(), h.size() * 4).wait();
+  auto ms = [&](auto&& f, int reps) {
+    f();
+    q.wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < reps; ++i) f();
+    q.wait();
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / reps;
+  };
+  std::printf("draft %s on the card: %.0f MiB, window %d\n", a.draft.c_str(), double(d.bytes()) / 1048576.0, d.window());
+  for (int64_t n : {1, 4, 8, 16, 32, 256, 1024, 2048}) {
+    d.reset(0);
+    const double t = ms([&] { d.reset(0), d.inject(0, feats, 0, n); }, n >= 256 ? 5 : 20);
+    std::printf("inject %4lld rows: %8.3f ms, %7.1f us a row\n", (long long)n, t, 1000 * t / double(n));
+  }
+  for (int B : {8, 16}) {
+    for (int nb : {1, 2}) {
+      for (int s = 0; s < nb; ++s) d.reset(s), d.inject(s, feats, 0, 700);
+      std::vector<model::Dflash2::Request> reqs;
+      for (int s = 0; s < nb; ++s) reqs.push_back({s, 1000 + s, 700});
+      model::Profile pr;
+      const int reps = 20;
+      d.lattices(reqs, B);
+      for (int i = 0; i < reps; ++i) d.lattices(reqs, B, &pr);
+      const double total = ms([&] { d.lattices(reqs, B); }, reps);
+      std::printf("block B=%2d, %d slot%s: %.3f ms (profiled phases: embed %.3f, layers %.3f, head %.3f, selector %.3f ms)\n", B, nb, nb > 1 ? "s" : "", total,
+                  pr.embed_ms / reps, pr.layers_ms / reps, pr.head_ms / reps, pr.select_ms / reps);
+    }
+  }
+  sycl::free(feats, q);
+  return 0;
+}
+
 // Matmuls of the draft's weights on the matrix units against the reference's, on real activations: with int8 activations
 // the result should equal the reference on the same rounded activations to fp32 rounding.
 int cmd_matmul(const Args& a) {
@@ -404,6 +455,7 @@ int main(int argc, char** argv) {
     if (a.cmd == "fast") return cmd_fast(a);
     if (a.cmd == "matmul") return cmd_matmul(a);
     if (a.cmd == "accept") return cmd_accept(a);
+    if (a.cmd == "time") return cmd_time(a);
     throw std::runtime_error("unknown command " + a.cmd);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-dflash-test: %s\n", e.what());
