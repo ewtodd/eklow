@@ -5,6 +5,7 @@ source "$(dirname "$0")/lib.sh"
 D=$WORK/published/$1; mkdir -p "$D"
 get() {   # get REPO REV FILE
     local f=$3 meta size sha
+    exec 9>"$D/$f.lock"; flock 9   # one downloader per file (prefetching beside kl-published.sh)
     meta=$(curl -fsS "https://huggingface.co/api/models/$1/revision/$2?blobs=true" | jq -r --arg f "$f" '.siblings[]|select(.rfilename==$f)|"\(.size) \(.lfs.sha256)"')
     read -r size sha <<<"$meta"
     [ "$(stat -c %s "$D/$f" 2>/dev/null || echo 0)" = "$size" ] || curl -fsSL --retry 8 --retry-delay 5 -C - -o "$D/$f" "https://huggingface.co/$1/resolve/$2/$f"
