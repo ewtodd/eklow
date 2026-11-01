@@ -42,7 +42,9 @@ struct Kind {
   bool int8;
 };
 constexpr Kind kKinds[] = {{"sliding", 256, 8, 1024, false}, {"global", 512, 1, 0, false},
-                           {"sliding8", 256, 8, 1024, true}, {"global8", 512, 1, 0, true}};
+                           {"sliding8", 256, 8, 1024, true}, {"global8", 512, 1, 0, true},
+                           // Qwen3.6's attention layers: 16 query heads over 2 K/V heads of 256, paged, no window
+                           {"qwen", 256, 2, 0, false}, {"qwen8", 256, 2, 0, true}};
 
 std::vector<int64_t> list(const std::string& s) {
   std::vector<int64_t> out;
