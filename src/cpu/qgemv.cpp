@@ -187,7 +187,16 @@ void rows_t(const uint8_t* rows, int64_t k, int64_t lo, int64_t hi, const In* in
   const uint64_t rb = qrow_bytes(T, k);
   const int64_t nb = k / qtype_block(T);
   float o[R];
+  // Software prefetch of the rows ahead: the L2 streamer stops at each 4 KB page and a task is a few dozen rows, so on pinned
+  // 4 KB-paged memory the hardware prefetcher alone leaves the cores waiting at every page start.
+  constexpr int64_t kAhead = 3;
+  for (int64_t r = lo; r < std::min(hi, lo + kAhead); ++r) {
+    const char* p = reinterpret_cast<const char*>(rows + uint64_t(r) * rb);
+    for (uint64_t off = 0; off < rb; off += 64) _mm_prefetch(p + off, _MM_HINT_T0);
+  }
   for (int64_t r = lo; r < hi; ++r) {
+    const char* ahead = reinterpret_cast<const char*>(rows + uint64_t(r + kAhead) * rb);
+    for (uint64_t off = 0; off < rb; off += 64) _mm_prefetch(ahead + off, _MM_HINT_T0);
     row_dot<T, R>(rows + uint64_t(r) * rb, nb, in, o);
     for (int j = 0; j < R; ++j) y[j][r] = o[j];
   }
@@ -200,6 +209,14 @@ void range_t(const uint8_t* rows, int64_t k, int64_t lo, int64_t hi, const Q8Blo
     In in[4];
     for (int i = 0; i < 4; ++i) in[i] = {x[j + i]->q.data(), x[j + i]->s.data(), x[j + i]->sum.data()};
     rows_t<T, 4>(rows, k, lo, hi, in, y + j);
+  }
+  if (nx - j >= 2) {  // 2 or 3 left: one pass over the weights, not one each
+    const int r = nx - j;
+    In in[3];
+    for (int i = 0; i < r; ++i) in[i] = {x[j + i]->q.data(), x[j + i]->s.data(), x[j + i]->sum.data()};
+    if (r == 2) rows_t<T, 2>(rows, k, lo, hi, in, y + j);
+    else rows_t<T, 3>(rows, k, lo, hi, in, y + j);
+    return;
   }
   for (; j < nx; ++j) {
     In in[1] = {{x[j]->q.data(), x[j]->s.data(), x[j]->sum.data()}};

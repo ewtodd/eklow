@@ -149,7 +149,8 @@ class Engine {
   uint64_t cold_pairs() const { return cold_pairs_; }
   struct ColdStats {
     double wait_s = 0, cpu_s = 0;
-    uint64_t layers = 0, late_layers = 0;
+    double gu_s = 0, glu_s = 0, dn_s = 0;  // cold_compute's phases
+    uint64_t layers = 0, late_layers = 0, experts = 0;  // experts: distinct cold experts computed on the CPU
   };
   const ColdStats& cold_stats() const { return cold_; }
   struct StreamStats {
