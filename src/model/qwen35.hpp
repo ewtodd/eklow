@@ -28,7 +28,7 @@
 #include <vector>
 
 #include "kernels/ref.hpp"
-#include "model/gemma4.hpp"  // DumpSink
+#include "model/dump.hpp"
 #include "model/gguf.hpp"
 
 namespace eklow::model {

@@ -80,6 +80,7 @@ add_library(eklow_model STATIC
   src/kernels/attention.cpp
   src/kernels/fast.cpp
   src/kernels/gdn.cpp
+  src/kernels/qwen_fast.cpp
   src/kernels/ref.cpp
   src/kernels/xmx.cpp
   src/kernels/xmx_fmt.cpp
@@ -154,25 +155,9 @@ target_link_libraries(eklow-grammar-test PRIVATE eklow_grammar)
 add_executable(eklow-grammar-test-qwen tools/grammar_test/qwen.cpp)
 target_link_libraries(eklow-grammar-test-qwen PRIVATE eklow_grammar)
 
-# Serving: sampler and scheduler over the engine, and the OpenAI-compatible server.
-add_library(eklow_serve STATIC
-  src/serve/openai.cpp
-  src/serve/sampler.cpp
-  src/serve/scheduler.cpp
-)
-target_link_libraries(eklow_serve PUBLIC eklow_engine eklow_grammar)
-eklow_sycl(eklow_serve)
-
-add_executable(eklow-server tools/server/main.cpp)
-target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
-target_link_libraries(eklow-server PRIVATE eklow_serve Threads::Threads)
-eklow_sycl(eklow-server)
-
-# The prompt of a chat request (images as rows counted, not encoded), for checking against llama.cpp's without the card.
-add_executable(eklow-prompt tools/prompt/main.cpp)
-target_link_libraries(eklow-prompt PRIVATE eklow_serve)
-eklow_sycl(eklow-prompt)
-
+# Serving (src/serve, eklow-server, eklow-prompt): left out of the build until the server is rewired for the qwen35moe engine (the next task):
+# its scheduler and request layer are written against the Gemma engine's chunks (images, the sliding rings, softcapped logits).
+# add_library(eklow_serve STATIC src/serve/openai.cpp src/serve/sampler.cpp src/serve/scheduler.cpp) ... add_executable(eklow-server tools/server/main.cpp) ... add_executable(eklow-prompt tools/prompt/main.cpp)
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
@@ -205,7 +190,7 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-grammar-test-qwen eklow-cpu-gemv-test RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-grammar-test eklow-grammar-test-qwen eklow-cpu-gemv-test RUNTIME DESTINATION bin)
 # The 26B's routing profile, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/gemma-4-26b-a4b-experts.json DESTINATION share/eklow)
 

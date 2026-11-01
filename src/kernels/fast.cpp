@@ -221,7 +221,7 @@ void matmul_q6(sycl::queue& q, const Q6& w, const float* x, int64_t rows, float*
 }
 
 void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_expert, int64_t n_used, const float* down_scale,
-               int32_t* ids, float* weights) {
+               int32_t* ids, float* weights, int64_t ld) {
   constexpr int kLanes = 32;
   if (n_expert % kLanes || n_expert / kLanes > 8) throw std::runtime_error("fast::moe_route: unsupported expert count");
   const int32_t NE = int32_t(n_expert), NU = int32_t(n_used);
@@ -230,7 +230,7 @@ void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_exp
   q.parallel_for(sycl::nd_range<1>(size_t(n_tok * kLanes), kLanes), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kLanes)]] {
     const int32_t t = int32_t(it.get_group(0)), l = int32_t(it.get_local_id(0));
     auto sg = it.get_sub_group();
-    const float* lg = logits + t * NE;
+    const float* lg = logits + int64_t(t) * (ld ? ld : NE);
     float p[8];
     float mx = -1e30f;
     for (int i = 0; i < 8; ++i) {
@@ -263,7 +263,7 @@ void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_exp
     const float denom = sycl::fmax(wsum, 6.103515625e-5f);
     if (l < NU) {
       ids[t * NU + l] = sel[l];
-      weights[t * NU + l] = wsel[l] / denom * down_scale[sel[l]];
+      weights[t * NU + l] = wsel[l] / denom * (down_scale ? down_scale[sel[l]] : 1.0f);
     }
   });
 }

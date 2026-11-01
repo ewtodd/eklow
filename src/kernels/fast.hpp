@@ -59,7 +59,7 @@ void matmul_q6(sycl::queue& q, const Q6& w, const float* x, int64_t rows, float*
 // device). ids[t][n_used] int32 and weights[t][n_used] fp32, by descending probability. n_expert a
 // multiple of 32, at most 256; n_used at most 16.
 void moe_route(sycl::queue& q, const float* logits, int64_t n_tok, int64_t n_expert, int64_t n_used, const float* down_scale,
-               int32_t* ids, float* weights);
+               int32_t* ids, float* weights, int64_t ld = 0);  // ld: floats between tokens' logits (0: n_expert); down_scale may be null (1)
 // out[t][:] = sum_i weights[t][i] * y[row(t, i)][:], summed in the order i = 0..n_used-1; row(t, i)
 // is t * n_used + i, or rows[t * n_used + i] when given (the grouped GEMM's sorted order), where a
 // negative row is a pair left out (a cold expert). `extra`, when given, holds the cold experts' share

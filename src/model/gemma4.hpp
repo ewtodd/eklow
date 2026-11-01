@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "kernels/ref.hpp"
+#include "model/dump.hpp"
 #include "model/gguf.hpp"
 
 namespace eklow::model {
@@ -81,13 +82,6 @@ class Gemma4Weights {
   std::vector<void*> allocations_;
 };
 
-// Receives intermediate tensors under llama.cpp's graph names (attn_norm-0, Qcur_normed-0, ...,
-// l_out-47, result_norm) with ggml shapes (ne[0] fastest). `wants` is asked before each tensor is
-// copied off the card.
-struct DumpSink {
-  std::function<bool(const std::string&)> wants;
-  std::function<void(const std::string& name, const std::vector<float>& data, const std::vector<int64_t>& ne)> put;
-};
 
 // The reference forward over one sequence (positions 0..tokens-1); returns logits for the last
 // `logits_rows` positions, [row][vocab]. When `routing` is non-null, the selected expert ids are
