@@ -41,9 +41,14 @@ endfunction()
 # Serving text layer: the tokenizer (and, later, the chat template and output parser). No device code.
 add_library(eklow_text STATIC
   src/text/chat_gemma4.cpp
+  src/text/chat_qwen36.cpp
   src/text/output_parser.cpp
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
+  src/text/output_parser_qwen.cpp
+  src/text/tokenizer_qwen.cpp
+  src/text/tool_schema.cpp
+  src/text/unicode.cpp
 )
 target_link_libraries(eklow_text PUBLIC eklow_host)
 
@@ -135,11 +140,14 @@ target_link_libraries(eklow-engine-bench PRIVATE eklow_engine)
 eklow_sycl(eklow-engine-bench)
 
 # The tool-call grammar: host code over the vocabulary, tested against the output parser.
-add_library(eklow_grammar STATIC src/serve/tool_grammar.cpp)
+add_library(eklow_grammar STATIC src/serve/tool_grammar.cpp src/serve/tool_grammar_qwen.cpp)
 target_link_libraries(eklow_grammar PUBLIC eklow_text)
 
 add_executable(eklow-grammar-test tools/grammar_test/main.cpp)
 target_link_libraries(eklow-grammar-test PRIVATE eklow_grammar)
+
+add_executable(eklow-grammar-test-qwen tools/grammar_test/qwen.cpp)
+target_link_libraries(eklow-grammar-test-qwen PRIVATE eklow_grammar)
 
 # Serving: sampler and scheduler over the engine, and the OpenAI-compatible server.
 add_library(eklow_serve STATIC
@@ -192,7 +200,7 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-cpu-gemv-test RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-grammar-test-qwen eklow-cpu-gemv-test RUNTIME DESTINATION bin)
 # The 26B's routing profile, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/gemma-4-26b-a4b-experts.json DESTINATION share/eklow)
 
