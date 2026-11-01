@@ -4,7 +4,7 @@
 //
 //   eklow-prompt --model GGUF --request JSON [--chat-template stock|ornith] --out DIR
 //
-// Writes DIR/tokens.json ({"ids": [...], "snapshot_at": N, "in_thinking": bool}).
+// Writes DIR/tokens.json ({"ids": [...], "snapshot_points": [...], "in_thinking": bool}).
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -53,9 +53,11 @@ int main(int argc, char** argv) {
     json::Writer w(false);
     w.begin_object().key("ids").begin_array();
     for (int32_t id : r.prompt) w.value(int64_t(id));
-    w.end_array().kv("snapshot_at", r.snapshot_at).kv("in_thinking", r.in_thinking).end_object();
+    w.end_array().key("snapshot_points").begin_array();
+    for (int64_t p : r.snapshot_points) w.value(p);
+    w.end_array().kv("in_thinking", r.in_thinking).end_object();
     std::ofstream(out + "/tokens.json") << w.str() << "\n";
-    std::printf("%zu tokens, generation prompt at %lld, template %s\n", r.prompt.size(), (long long)r.snapshot_at, text::qwen36_template_name(tmpl));
+    std::printf("%zu tokens, snapshot points %zu (last at %lld), template %s\n", r.prompt.size(), r.snapshot_points.size(), (long long)(r.snapshot_points.empty() ? -1 : r.snapshot_points.back()), text::qwen36_template_name(tmpl));
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-prompt: %s\n", e.what());

@@ -192,14 +192,28 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
     const std::string open = "<think>\n";
     r.in_thinking = text.size() >= open.size() && text.compare(text.size() - open.size(), open.size(), open) == 0;
   }
-  // The generation prompt starts at the last <|im_start|> (template text, so a real token): the conversation before it is
-  // what the next turn shares even when it drops this turn's reasoning (stock's template).
-  if (const int32_t im_start = tok.id("<|im_start|>"); im_start >= 0)
-    for (size_t i = r.prompt.size(); i-- > 0;)
-      if (r.prompt[i] == im_start) {
-        r.snapshot_at = int64_t(i);
-        break;
-      }
+  // Where the next request is likely to diverge, as the starts of messages (<|im_start|> is template text, so always the real
+  // token): the generation prompt (the conversation before it is what the next turn shares even when it drops this turn's
+  // reasoning, stock's template), the last message (an edited or retried one), and the first after the system message (the
+  // system prompt and tools that a family of conversations shares).
+  if (const int32_t im_start = tok.id("<|im_start|>"); im_start >= 0) {
+    std::vector<int64_t> starts;
+    for (size_t i = 0; i < r.prompt.size(); ++i)
+      if (r.prompt[i] == im_start) starts.push_back(int64_t(i));
+    const std::vector<int32_t> system = tok.encode("system", false);
+    if (!starts.empty()) {
+      r.snapshot_points.push_back(starts.back());
+      if (starts.size() >= 2) r.snapshot_points.push_back(starts[starts.size() - 2]);
+      for (int64_t s : starts)
+        if (system.size() == 1 && s + 1 < int64_t(r.prompt.size()) && r.prompt[size_t(s) + 1] != system[0]) {
+          r.snapshot_points.push_back(s);
+          break;
+        }
+      std::sort(r.snapshot_points.begin(), r.snapshot_points.end());
+      r.snapshot_points.erase(std::unique(r.snapshot_points.begin(), r.snapshot_points.end()), r.snapshot_points.end());
+      if (r.snapshot_points.front() == 0) r.snapshot_points.erase(r.snapshot_points.begin());
+    }
+  }
   if (int64_t(r.prompt.size()) >= d.max_ctx) throw context_exceeded(int64_t(r.prompt.size()), d.max_ctx);
 
   if (const json::Value* v = field(body, "temperature"); v && !v->is_null()) r.sampling.temperature = float(number(*v, "temperature"));
@@ -224,6 +238,7 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
       }
     else throw bad("stop must be a string or an array of strings");
   }
+  if (const json::Value* v = field(body, "speculative"); v && !v->is_null()) r.speculate = v->truthy();
   if (const json::Value* v = field(body, "stream"); v) r.stream = v->truthy();
   if (const json::Value* so = field(body, "stream_options"); so && so->is_object())
     if (const json::Value* u = so->find("include_usage")) r.include_usage = u->truthy();
@@ -244,7 +259,10 @@ std::string ChatResponse::usage_json(const Event& e) const {
   json::Writer w(false);
   w.begin_object().kv("prompt_tokens", e.prompt_tokens).kv("completion_tokens", e.completion_tokens);
   w.kv("total_tokens", e.prompt_tokens + e.completion_tokens);
-  w.key("prompt_tokens_details").begin_object().kv("cached_tokens", e.cached_tokens).end_object().end_object();
+  w.key("prompt_tokens_details").begin_object().kv("cached_tokens", e.cached_tokens).end_object();
+  // eklow's own: what speculative decoding did for the request (absent without a draft).
+  if (e.verifies > 0) w.key("speculation").begin_object().kv("verifies", e.verifies).kv("drafted", e.drafted).kv("accepted", e.accepted).end_object();
+  w.end_object();
   return w.str();
 }
 

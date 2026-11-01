@@ -239,6 +239,15 @@ void Scheduler::enforce_budget() {
   stats_.snapshots = n, stats_.snapshot_bytes = int64_t(snap_bytes_);
 }
 
+// Whether a snapshot at `pos` of a prefilling request is wanted: one of the request's points (the starts of its messages that the next
+// request may share), or a multiple of snapshot_every before the last of them, if none is there yet.
+bool Scheduler::wants_snapshot(const Seq& q, int64_t pos) const {
+  if (c_.snapshot_bytes == 0 || pos < c_.snapshot_min || has_snapshot(q, pos)) return false;
+  const auto& pts = q.req->snapshot_points;
+  if (std::find(pts.begin(), pts.end(), pos) != pts.end()) return true;
+  return pos % c_.snapshot_every == 0 && pos < (pts.empty() ? int64_t(q.req->prompt.size()) : pts.back());
+}
+
 // Snapshots the slot's recurrent state at the end of what it holds (nothing pending).
 void Scheduler::take_snapshot(int slot) {
   Seq& q = seqs_[size_t(slot)];
@@ -287,7 +296,7 @@ void Scheduler::step() {
       const Seq& q = seqs_[size_t(s)];
       const int64_t pos = int64_t(q.tokens.size());
       // A block needs room in the context, and the draft's context must end where the block starts.
-      if (pos + B <= c_.max_ctx && c_.draft->context_end(s) == pos) reqs.push_back({s, q.next_token, pos}), who.push_back(s);
+      if (q.req->speculate && pos + B <= c_.max_ctx && c_.draft->context_end(s) == pos) reqs.push_back({s, q.next_token, pos}), who.push_back(s);
     }
     const size_t per = size_t(std::max(1, 32 / B));  // rows of a draft pass: 32 at most
     for (size_t i0 = 0; i0 < reqs.size(); i0 += per) {
@@ -327,11 +336,11 @@ void Scheduler::step() {
     const int64_t fed = int64_t(q.fed), P = int64_t(q.req->prompt.size());
     int64_t n = std::min<int64_t>({c_.max_chunk, budget, P - fed});
     if (c_.snapshot_bytes > 0) {
-      const int64_t at = q.req->snapshot_at;
       int64_t cut = P;
-      if (at >= c_.snapshot_min && at > fed && !has_snapshot(q, at)) cut = std::min(cut, at);
+      for (int64_t p : q.req->snapshot_points)
+        if (p > fed && wants_snapshot(q, p)) cut = std::min(cut, p);
       const int64_t g = (fed / c_.snapshot_every + 1) * c_.snapshot_every;
-      if (g < (at >= 0 ? at : P) && !has_snapshot(q, g)) cut = std::min(cut, g);
+      if (wants_snapshot(q, g)) cut = std::min(cut, g);
       n = std::min(n, cut - fed);
     }
     int64_t cap = 0;
@@ -392,10 +401,7 @@ void Scheduler::step() {
         q.fed += c.tokens.size();
         inject(c, cap0, c.capture_rows);
         const int64_t pos = int64_t(q.tokens.size());
-        const int64_t at = q.req->snapshot_at;
-        if (c_.snapshot_bytes > 0 && pos >= c_.snapshot_min && !has_snapshot(q, pos) &&
-            (pos == at || (pos % c_.snapshot_every == 0 && pos < (at >= 0 ? at : int64_t(q.req->prompt.size())))))
-          take_snapshot(it.slot);
+        if (wants_snapshot(q, pos)) take_snapshot(it.slot);
         if (it.rows == 0) break;
         // Special tokens the output parser cannot take where it stands are never sampled (QwenOutputParser::banned).
         const std::vector<int32_t>* banned = &q.parser->banned();
@@ -538,6 +544,7 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
   e.prompt_tokens = int64_t(q.req->prompt.size());
   e.cached_tokens = q.cached;
   e.completion_tokens = q.generated;
+  e.verifies = q.verifies, e.drafted = q.drafted, e.accepted = q.accepted;
   if (c_.on_finish) {
     const auto now = std::chrono::steady_clock::now();
     RequestLog l;

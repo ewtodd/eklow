@@ -628,7 +628,8 @@ int main(int argc, char** argv) {
       r->stop = cr.stop;
       r->in_thinking = cr.in_thinking;
       r->tool_specs = cr.tool_specs;
-      r->snapshot_at = cr.snapshot_at;
+      r->snapshot_points = cr.snapshot_points;
+      r->speculate = cr.speculate;
       r->tag = serve::new_completion_id();
       try {
         sched.submit(r);

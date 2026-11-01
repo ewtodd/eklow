@@ -41,6 +41,7 @@ struct Event {
   std::string finish_reason;  // with done: "stop", "length" or "tool_calls"
   std::string error;          // with done: the request failed
   int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;  // with done
+  int64_t verifies = 0, drafted = 0, accepted = 0;  // with done: speculation (verify blocks, tokens drafted, of them accepted)
 };
 
 class Request {
@@ -51,7 +52,11 @@ class Request {
   std::vector<std::string> stop;   // strings that end the content (not included)
   bool in_thinking = false;        // the prompt ends inside the reasoning
   std::shared_ptr<const text::ToolSpecs> tool_specs;  // the request's tools (null: none); calls are constrained to them
-  int64_t snapshot_at = -1;        // where the generation prompt starts (-1: unknown): a snapshot is taken there
+  // Positions where a snapshot is taken in prefill (ascending): where the generation prompt starts (the prefix the next turn
+  // shares, even when it drops this turn's reasoning), where the last message starts (an edited or retried message), and where
+  // the first message after the system one starts (the system prompt and tools a whole family of conversations share).
+  std::vector<int64_t> snapshot_points;
+  bool speculate = true;           // false: plain decode even with a draft (for measuring)
   std::string tag;                 // names the request in the log (the completion id)
 
   // Reader side: waits up to `wait` for the next event.
@@ -170,6 +175,7 @@ class Scheduler {
   void note_positions();
   // Snapshots.
   bool has_snapshot(const Seq& q, int64_t position) const;
+  bool wants_snapshot(const Seq& q, int64_t pos) const;
   void take_snapshot(int slot);
   void drop_snapshots_beyond(Seq& q, int64_t position);
   void enforce_budget();
