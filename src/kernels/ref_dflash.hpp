@@ -40,4 +40,13 @@ void selector_lattice(sycl::queue& q, const float* unary, const float* gate, con
 // out = silu(gate) * up, silu(x) = x / (1 + exp(-x)) (SwiGLU)
 void silu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out);
 
+// out = x as the serving kernels see it before a matmul: rows of `cols` quantized to int8 per 32-block (scale max|x| / 127,
+// q = round(x / scale), xmx::quantize's rule) and back, or (fp16) rounded to fp16. For comparing the serving forward with
+// the reference on the activations it really uses.
+void round_acts(sycl::queue& q, const float* x, int64_t rows, int64_t cols, bool fp16, float* out);
+
+// x[i] *= 1 + eps * u_i with u_i a fixed pseudo-random number in [-1, 1): a perturbation of the size of fp32 rounding,
+// to measure how a computation amplifies it.
+void jitter(sycl::queue& q, float* x, int64_t n, float eps);
+
 }  // namespace eklow::ref

@@ -28,6 +28,7 @@
 #include <memory>
 #include <random>
 #include <span>
+#include <string>
 #include <vector>
 
 #include "kernels/attention.hpp"
@@ -78,13 +79,19 @@ class Dflash2Weights {
 
 // What a block pass returns beside the lattice, for checks.
 struct BlockDebug {
-  std::vector<float> hidden;  // [B-1][n_embd] after the final norm
+  int stage_layer = 0;                      // the layer whose intermediates `stages` records
+  std::vector<float> hidden;                // [B-1][n_embd] after the final norm
+  std::vector<std::vector<float>> layers;   // the residual stream [B][n_embd] after each layer
+  std::vector<std::pair<std::string, std::vector<float>>> stages;  // stage_layer's intermediates by name
+  std::vector<std::vector<float>> parts;    // per layer, [B][..]: the context-free pieces named in dflash2.cpp (attention output, ...)
 };
 
 class Dflash2Ref {
  public:
   // `window` 0: the draft's own. max_pos bounds the positions (RoPE tables are built to it).
-  Dflash2Ref(sycl::queue& q, const Dflash2Config& c, const Dflash2Weights& w, int64_t max_pos, int window = 0);
+  // With `emulate_acts` every matmul's input is rounded the way the serving forward quantizes it (int8 per 32-block up to 32
+  // rows, fp16 above), so that the two can be compared to rounding error.
+  Dflash2Ref(sycl::queue& q, const Dflash2Config& c, const Dflash2Weights& w, int64_t max_pos, int window = 0, bool emulate_acts = false, float jitter = 0);
   ~Dflash2Ref();
   // Adds the context rows of positions pos0 .. pos0 + n - 1 (feats: host fp32 [n][n_feat]); they replace whatever the
   // cache held there (the keys of an earlier block, which are dropped).
@@ -98,9 +105,95 @@ class Dflash2Ref {
   const Dflash2Config& c_;
   const Dflash2Weights& w_;
   int window_;
+  bool emulate_;
+  float jitter_;
   int64_t max_pos_;
   std::vector<float*> k_, v_;  // per layer [max_pos][n_head_kv][head_dim]
   float *cos_ = nullptr, *sin_ = nullptr;
+};
+
+// What the draft reads of the target, on the card: the token embedding table as stored (any type ref::embed takes) and
+// the output head in a format xmx::matmul takes (Q8_0I, Q6_K, ...). Views: the engine owns them.
+struct Dflash2Target {
+  ref::Weight tok_embd;
+  xmx::Weight head;
+};
+
+// A Dflash2Target loaded from a GGUF holding the target's `token_embd.weight` and `output.weight` (the target file, or
+// tools/dflash_test/extract_head.py's extract of it), for tools and tests.
+class OwnedTarget {
+ public:
+  OwnedTarget(sycl::queue& q, const gguf::File& target);
+  OwnedTarget(const OwnedTarget&) = delete;
+  ~OwnedTarget();
+  Dflash2Target view() const { return {tok_embd, head}; }
+
+ private:
+  sycl::queue& q_;
+  ref::Weight tok_embd{};
+  xmx::Weight head{};
+  void* raw_ = nullptr;
+};
+
+// Where a draft block's time goes (Dflash2::draft with a Profile waits between phases, so it is slower).
+struct Profile {
+  double embed_ms = 0, layers_ms = 0, head_ms = 0, select_ms = 0, host_ms = 0;
+  double inject_fc_ms = 0, inject_kv_ms = 0, inject_write_ms = 0;
+};
+
+// The serving forward. Slots are independent sequences, each with a ring cache of the draft's window; a block (or
+// several, one per slot) runs as one pass of up to 32 rows through the layers.
+class Dflash2 {
+ public:
+  struct Options {
+    int slots = 1;
+    int max_block = 16;      // the largest B asked of draft()
+    int max_inject = 1024;   // rows a context injection runs through the matmuls at once
+    int window = 0;          // 0: the draft's own
+  };
+  // `draft` must stay open (its tensors are read at construction only). Formats: whatever xmx::format_of takes (Q8_0 is
+  // the draft's shipped one); BF16 and F16 files only run in Dflash2Ref.
+  Dflash2(sycl::queue& q, const gguf::File& draft, const Dflash2Target& target, const Options& opt);
+  ~Dflash2();
+  Dflash2(const Dflash2&) = delete;
+  const Dflash2Config& config() const { return c_; }
+  int window() const { return window_; }
+
+  // A slot's context is the committed tokens' positions [first, end): reset empties it, truncate(slot, pos) drops the rows from
+  // pos on (positions the next inject or block write over).
+  void reset(int slot);
+  void truncate(int slot, int64_t pos);
+  int64_t context_end(int slot) const { return end_[size_t(slot)]; }
+
+  // Adds the context rows of positions pos0 .. pos0 + n - 1, which must continue the slot's context (pos0 <=
+  // context_end). feats is the target's layer outputs on the card, fp32 [n][n_feat] (layers 1, 6, ... in order, each
+  // n_embd wide). Rows further back than a later block can see (the window) are not computed.
+  void inject(int slot, const float* feats, int64_t pos0, int64_t n);
+
+  struct Request {
+    int slot;
+    int32_t anchor;  // the last sampled token, at position pos
+    int64_t pos;     // must equal the slot's context_end
+  };
+  // The lattices of one block of B tokens per request (anchor, then B - 1 masks): all requests in one pass (B the same,
+  // at most max_block, requests * B at most 32 rows).
+  std::vector<serve::Lattice> lattices(const std::vector<Request>& reqs, int B, Profile* profile = nullptr, BlockDebug* debug = nullptr);
+  // A drafted block: the walk over the lattice (serve::walk) at `temperature` (0: greedy).
+  std::vector<serve::DraftBlock> draft(const std::vector<Request>& reqs, int B, float temperature, std::mt19937_64& rng, Profile* profile = nullptr);
+  serve::DraftBlock draft(int slot, int32_t anchor, int64_t pos, int B, float temperature, std::mt19937_64& rng, Profile* profile = nullptr);
+
+  // The device memory the draft holds (weights, caches, scratch).
+  uint64_t bytes() const { return bytes_; }
+
+ private:
+  struct Impl;
+  std::unique_ptr<Impl> p_;
+  sycl::queue& q_;
+  Dflash2Config c_;
+  int window_;
+  Options opt_;
+  std::vector<int64_t> end_, first_;
+  uint64_t bytes_ = 0;
 };
 
 }  // namespace eklow::model

@@ -127,8 +127,8 @@ Dflash2Weights Dflash2Weights::upload(const gguf::File& f, const gguf::File& tar
 // ---------------------------------------------------------------------------------------------------------------
 // The reference forward.
 
-Dflash2Ref::Dflash2Ref(sycl::queue& q, const Dflash2Config& c, const Dflash2Weights& w, int64_t max_pos, int window)
-    : q_(q), c_(c), w_(w), window_(window ? window : c.window), max_pos_(max_pos) {
+Dflash2Ref::Dflash2Ref(sycl::queue& q, const Dflash2Config& c, const Dflash2Weights& w, int64_t max_pos, int window, bool emulate_acts, float jitter)
+    : q_(q), c_(c), w_(w), window_(window ? window : c.window), emulate_(emulate_acts), jitter_(jitter), max_pos_(max_pos) {
   const size_t kv = size_t(max_pos) * size_t(c.n_head_kv * c.head_dim);
   for (int l = 0; l < c.n_layer; ++l) {
     k_.push_back(sycl::malloc_device<float>(kv, q));
@@ -161,19 +161,33 @@ void Dflash2Ref::inject(std::span<const float> feats, int64_t pos0, int64_t n) {
   };
   float *x = dev(size_t(n * F)), *h = dev(size_t(n * E)), *kb = dev(size_t(n * Hkv * D)), *vb = dev(size_t(n * Hkv * D));
   q_.memcpy(x, feats.data(), feats.size() * sizeof(float)).wait();
-  ref::matmul(q_, w_.fc, x, n, h);
+  float* tmp = emulate_ ? dev(size_t(n) * F) : nullptr;
+  // matmul on x [n][k], rounded like the serving forward's activations when emulating
+  auto mm = [&](const ref::Weight& w, const float* in, float* out) {
+    if (emulate_) {
+      ref::round_acts(q_, in, n, w.k, n > xmx::kFp16Rows, tmp);
+      in = tmp;
+    }
+    ref::matmul(q_, w, in, n, out);
+  };
+  mm(w_.fc, x, h);
   ref::rmsnorm(q_, h, w_.hidden_norm, n, E, c_.eps, h);
   for (int l = 0; l < c_.n_layer; ++l) {
     const auto& L = w_.layers[size_t(l)];
-    ref::matmul(q_, L.wk, h, n, kb);
-    ref::matmul(q_, L.wv, h, n, vb);
+    mm(L.wk, h, kb);
+    mm(L.wv, h, vb);
     ref::rmsnorm(q_, kb, L.k_norm, n * Hkv, D, c_.eps, kb);
     ref::rope_neox(q_, kb, n, Hkv, D, D, cos_ + pos0 * (D / 2), sin_ + pos0 * (D / 2));
+    if (emulate_) {  // the serving cache holds fp16
+      ref::round_acts(q_, kb, n * Hkv, D, true, kb);
+      ref::round_acts(q_, vb, n * Hkv, D, true, vb);
+    }
     q_.memcpy(k_[size_t(l)] + pos0 * Hkv * D, kb, size_t(n * Hkv * D) * sizeof(float));
     q_.memcpy(v_[size_t(l)] + pos0 * Hkv * D, vb, size_t(n * Hkv * D) * sizeof(float));
   }
   q_.wait();
   for (float* p : {x, h, kb, vb}) sycl::free(p, q_);
+  if (tmp) sycl::free(tmp, q_);
 }
 
 serve::Lattice Dflash2Ref::block(int32_t anchor, int64_t pos, int B, BlockDebug* debug) {
@@ -205,48 +219,89 @@ serve::Lattice Dflash2Ref::block(int32_t anchor, int64_t pos, int B, BlockDebug*
   float *qb = fdev(size_t(B) * H * D), *kb = fdev(size_t(B) * Hkv * D), *vb = fdev(size_t(B) * Hkv * D), *ab = fdev(size_t(B) * H * D);
   float *ob = fdev(size_t(B) * E), *ob2 = fdev(size_t(B) * E), *g = fdev(size_t(B) * c_.n_ff), *u = fdev(size_t(B) * c_.n_ff);
   ref::embed(q_, w_.tok_embd, tok, B, 1.0f, x);
+  if (jitter_ != 0) ref::jitter(q_, x, int64_t(B) * E, jitter_);
+  float* rnd = fdev(size_t(B) * c_.n_ff);
+  auto mm = [&](const ref::Weight& w, const float* in, int64_t rows, float* out) {
+    if (emulate_) {
+      ref::round_acts(q_, in, rows, w.k, rows > xmx::kFp16Rows, rnd);
+      in = rnd;
+    }
+    ref::matmul(q_, w, in, rows, out);
+  };
   const float scale = 1.0f / std::sqrt(float(D));
   const int64_t rope_off = pos * (D / 2);
   for (int l = 0; l < c_.n_layer; ++l) {
     const auto& L = w_.layers[size_t(l)];
+    auto stage = [&](const char* name, const float* p, size_t n) {
+      if (!debug || l != debug->stage_layer) return;
+      std::vector<float> h(n);
+      q_.memcpy(h.data(), p, n * sizeof(float)).wait();
+      debug->stages.emplace_back(name, std::move(h));
+    };
     ref::rmsnorm(q_, x, L.attn_norm, B, E, c_.eps, n1);
-    ref::matmul(q_, L.conv_attn, n1, B, dyn);
+    stage("n1", n1, size_t(B) * E);
+    mm(L.conv_attn, n1, B, dyn);
+    stage("dyn", dyn, size_t(B) * nc);
     ref::grouped_conv(q_, n1, dyn, L.base_attn, 0, B, B, E, c_.conv_kernel, c_.conv_group, cv);
-    ref::matmul(q_, L.wq, cv, B, qb);
-    ref::matmul(q_, L.wk, cv, B, kb);
-    ref::matmul(q_, L.wv, cv, B, vb);
+    stage("conv", cv, size_t(B) * E);
+    mm(L.wq, cv, B, qb);
+    mm(L.wk, cv, B, kb);
+    mm(L.wv, cv, B, vb);
     ref::rmsnorm(q_, qb, L.q_norm, int64_t(B) * H, D, c_.eps, qb);
     ref::rmsnorm(q_, kb, L.k_norm, int64_t(B) * Hkv, D, c_.eps, kb);
     ref::rope_neox(q_, qb, B, H, D, D, cos_ + rope_off, sin_ + rope_off);
     ref::rope_neox(q_, kb, B, Hkv, D, D, cos_ + rope_off, sin_ + rope_off);
+    stage("q", qb, size_t(B) * H * D);
+    stage("k", kb, size_t(B) * Hkv * D);
+    stage("v", vb, size_t(B) * Hkv * D);
+    float attn_scale = scale;
+    if (emulate_) {  // the cache is fp16, and attention takes q * scale as fp16
+      ref::round_acts(q_, kb, int64_t(B) * Hkv, D, true, kb);
+      ref::round_acts(q_, vb, int64_t(B) * Hkv, D, true, vb);
+      ref::scale(q_, qb, scale, int64_t(B) * H * D);
+      ref::round_acts(q_, qb, int64_t(B) * H, D, true, qb);
+      attn_scale = 1.0f;
+    }
     q_.memcpy(k_[size_t(l)] + pos * Hkv * D, kb, size_t(B) * Hkv * D * sizeof(float));
     q_.memcpy(v_[size_t(l)] + pos * Hkv * D, vb, size_t(B) * Hkv * D * sizeof(float));
-    ref::attention_ranges(q_, qb, k_[size_t(l)], v_[size_t(l)], 0, B, H, Hkv, D, lo, hi, scale, ab);
-    ref::matmul(q_, L.wo, ab, B, ob);
+    ref::attention_ranges(q_, qb, k_[size_t(l)], v_[size_t(l)], 0, B, H, Hkv, D, lo, hi, attn_scale, ab);
+    if (debug) {
+      debug->parts.emplace_back(size_t(B) * H * D);
+      q_.memcpy(debug->parts.back().data(), ab, size_t(B) * H * D * sizeof(float)).wait();
+    }
+    mm(L.wo, ab, B, ob);
     ref::grouped_conv(q_, ob, dyn, L.base_attn, 1, B, B, E, c_.conv_kernel, c_.conv_group, ob2);
     ref::add(q_, x, ob2, int64_t(B) * E, x);
+    stage("x_mid", x, size_t(B) * E);
     ref::rmsnorm(q_, x, L.ffn_norm, B, E, c_.eps, n1);
-    ref::matmul(q_, L.conv_ffn, n1, B, dyn);
+    mm(L.conv_ffn, n1, B, dyn);
     ref::grouped_conv(q_, n1, dyn, L.base_ffn, 0, B, B, E, c_.conv_kernel, c_.conv_group, cv);
-    ref::matmul(q_, L.gate, cv, B, g);
-    ref::matmul(q_, L.up, cv, B, u);
+    stage("conv2", cv, size_t(B) * E);
+    mm(L.gate, cv, B, g);
+    mm(L.up, cv, B, u);
     ref::silu_mul(q_, g, u, int64_t(B) * c_.n_ff, g);
-    ref::matmul(q_, L.down, g, B, ob);
+    stage("glu", g, size_t(B) * c_.n_ff);
+    mm(L.down, g, B, ob);
+    stage("down", ob, size_t(B) * E);
     ref::grouped_conv(q_, ob, dyn, L.base_ffn, 1, B, B, E, c_.conv_kernel, c_.conv_group, ob2);
     ref::add(q_, x, ob2, int64_t(B) * E, x);
+    if (debug) {
+      debug->layers.emplace_back(size_t(B) * E);
+      q_.memcpy(debug->layers.back().data(), x, size_t(B) * E * sizeof(float)).wait();
+    }
   }
   ref::rmsnorm(q_, x, w_.out_norm, B, E, c_.eps, x);
   // Positions 1..B-1: logits through the target's head, the top K, the hidden projection, the codebooks' rows.
   const float* hid = x + E;
   float* logits = fdev(size_t(P) * c_.n_vocab);
-  ref::matmul(q_, w_.head, hid, P, logits);
+  mm(w_.head, hid, P, logits);
   int32_t* cand = sycl::malloc_device<int32_t>(size_t(P) * K, q_);
   int32_t* pred_ids = sycl::malloc_device<int32_t>(size_t(P) * K, q_);
   frees.insert(frees.end(), {cand, pred_ids});
   float* unary = fdev(size_t(P) * K);
   ref::topk_rows(q_, logits, P, c_.n_vocab, K, cand, unary);
   float* gate = fdev(size_t(P) * R);
-  ref::matmul(q_, w_.sel_hidden, hid, P, gate);
+  mm(w_.sel_hidden, hid, P, gate);
   // Predecessor ids: position 0's anchor (the first of its K slots), position i's the candidates of position i - 1.
   std::vector<int32_t> hcand(size_t(P) * K), hpred(size_t(P) * K, anchor);
   q_.memcpy(hcand.data(), cand, hcand.size() * sizeof(int32_t)).wait();
