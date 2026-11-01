@@ -11,11 +11,18 @@ get() {   # get REPO REV FILE
     [ "$(sha256sum "$D/$f" | cut -d' ' -f1)" = "$sha" ] || { echo "MISMATCH $f" >&2; exit 1; }
     echo "$sha  $f  ($1 @ $2)" >> "$D/SHA256SUMS"; echo "ok $f"
 }
-: > "$D/SHA256SUMS"
+
 case $1 in
 stock) R=bartowski/Qwen_Qwen3.6-35B-A3B-GGUF; V=5c2410d715; P=Qwen_Qwen3.6-35B-A3B ;;
 ornith) R=bartowski/Ornith-1.5-35B-A3B-GGUF; V=64b0493d34; P=Ornith-1.5-35B-A3B ;;
 esac
-for q in Q4_K_M Q4_K_S IQ4_XS Q4_0; do get "$R" "$V" "$P-$q.gguf"; done
-[ "$1" = ornith ] && get ornith-ai/Ornith-1.5-35B-A3B-GGUF 12393612fd4f730ff5aadc23e9b8f9648aa49ceb Ornith-1.5-35B-Q4_K_M.gguf
+shift
+LIST=${*:-Q4_K_M Q4_K_S IQ4_XS Q4_0}   # names as in the file names; "official" = Ornith's own Q4_K_M
+for q in $LIST; do
+    if [ "$q" = official ]; then
+        get ornith-ai/Ornith-1.5-35B-A3B-GGUF 12393612fd4f730ff5aadc23e9b8f9648aa49ceb Ornith-1.5-35B-Q4_K_M.gguf
+    else
+        get "$R" "$V" "$P-$q.gguf"
+    fi
+done
 true

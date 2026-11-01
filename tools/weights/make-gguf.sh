@@ -31,57 +31,64 @@ fetch() {
 
 convert() {
     [ -s "$BF16" ] && { echo "$BF16 exists"; return; }
-    python3 "$LLAMA_SRC/convert_hf_to_gguf.py" "$HF" --outtype bf16 --no-mtp --outfile "$BF16.part"
+    # The converter prefers tokenizer_config.json's chat_template over chat_template.jinja (what transformers
+    # uses). Ornith's repo ships stock Qwen3.6's tokenizer_config.json byte for byte, so convert from a view of
+    # the checkpoint whose tokenizer_config.json has no chat_template: the converter then reads the .jinja.
+    local src=$HF
+    if [ -f "$HF/chat_template.jinja" ]; then
+        src=$WORK/hf/$M-conv; rm -rf "$src"; mkdir -p "$src"
+        for f in "$HF"/*; do ln -s "$f" "$src/"; done
+        rm "$src/tokenizer_config.json"
+        jq 'del(.chat_template)' "$HF/tokenizer_config.json" > "$src/tokenizer_config.json"
+    fi
+    python3 "$LLAMA_SRC/convert_hf_to_gguf.py" "$src" --outtype bf16 --no-mtp --outfile "$BF16.part"
     mv "$BF16.part" "$BF16"
+    python3 -I "$(dirname "$0")/template_check.py" "$BF16" "$HF/chat_template.jinja"
 }
 
-# Tensor types by name (llama-quantize --tensor-type matches a regex anywhere in the tensor name):
-#  EK8: routed experts Q4_0 (imatrix); all other matrices Q8_0 (the Q8_0 base type); output Q6_K;
-#       token_embd Q8_0. llama-quantize leaves norms, ssm_a, ssm_dt, ssm_conv1d and the router as converted;
-#       the shared expert's gate (ffn_gate_inp_shexp, one row) is pinned to F32 like the router.
-#  EK4: EK8 plus Q4_0 (imatrix) for GDN attn_qkv, attn_gate, ssm_out, attention attn_q, attn_output and
-#       the shared expert (ffn_{gate,up,down}_shexp); attn_k, attn_v, ssm_alpha, ssm_beta stay Q8_0.
-EK8_ARGS=(
-    --tensor-type 'ffn_(gate|up|down)_exps=q4_0'
-    --tensor-type 'ffn_gate_inp_shexp=f32'
-    --output-tensor-type q6_k --token-embedding-type q8_0
-)
-EK4_ARGS=(
-    "${EK8_ARGS[@]}"
-    --tensor-type 'attn_qkv=q4_0' --tensor-type 'attn_gate=q4_0' --tensor-type 'ssm_out=q4_0'
-    --tensor-type 'attn_q=q4_0' --tensor-type 'attn_output=q4_0'
-    --tensor-type 'ffn_(gate|up|down)_shexp=q4_0'
-)
+# Tensor types by name (llama-quantize --tensor-type matches a regex anywhere in the tensor name, and the FIRST
+# matching option wins, so a mix is built from its expert type and its dense type, never by appending):
+#  routed experts (ffn_{gate,up,down}_exps): EXPERT type, with the importance matrix
+#  "dense" matrices (GDN attn_qkv, attn_gate, ssm_out; attention attn_q, attn_output; shared expert
+#       ffn_{gate,up,down}_shexp): DENSE type (q8_0 = the Q8_0 base type, no option needed)
+#  attn_k, attn_v, ssm_alpha, ssm_beta, token_embd: Q8_0; output: Q6_K; norms, ssm_a, ssm_dt, ssm_conv1d and the
+#       router as the converter wrote them (F32); the shared expert's gate (ffn_gate_inp_shexp, one row) F32.
+#  name   experts   dense
+#  EK8    q4_0      q8_0    what eklow's kernels read today
+#  EK4    q4_0      q4_0
+#  EKD6   q4_0      q6_k
+#  EKK8   q4_k      q8_0
+#  EKK6   q4_k      q6_k
+#  EKI8   iq4_xs    q8_0
+declare -A MIX_EXPERT=( [EK8]=q4_0 [EK4]=q4_0 [EKD6]=q4_0 [EKK8]=q4_k [EKK6]=q4_k [EKI8]=iq4_xs )
+declare -A MIX_DENSE=(  [EK8]=q8_0 [EK4]=q4_0 [EKD6]=q6_k  [EKK8]=q8_0 [EKK6]=q6_k [EKI8]=q8_0 )
+MIXES=${MIXES:-EK8 EK4 EKD6 EKK8 EKK6 EKI8}
 
-# Mixes added 2026-10-31 (owner: quality per byte over every format the A770M can run, not only Q4_0):
-#  EKK8: routed experts Q4_K (imatrix), everything else as EK8 (dense Q8_0)
-#  EKK6: routed experts Q4_K, the dense matrices of EK4's list Q6_K, the rest as EK8
-#  EKI8: routed experts IQ4_XS (imatrix), dense Q8_0
-EKK8_ARGS=( "${EK8_ARGS[@]}" --tensor-type 'ffn_(gate|up|down)_exps=q4_k' )
-EKK6_ARGS=(
-    "${EKK8_ARGS[@]}"
-    --tensor-type 'attn_qkv=q6_k' --tensor-type 'attn_gate=q6_k' --tensor-type 'ssm_out=q6_k'
-    --tensor-type 'attn_q=q6_k' --tensor-type 'attn_output=q6_k'
-    --tensor-type 'ffn_(gate|up|down)_shexp=q6_k'
-)
-EKI8_ARGS=( "${EK8_ARGS[@]}" --tensor-type 'ffn_(gate|up|down)_exps=iq4_xs' )
-MIXES=${MIXES:-EK8 EK4 EKK8 EKK6 EKI8}
-
-mix_one() {   # mix_one NAME: quantize $BF16 with NAME's arguments (Q8_0 is the plain base)
-    local name=$1 out=$OUT/$M-$1.gguf args=()
-    [ -s "$out" ] && return
-    if [ "$name" != Q8_0 ]; then
-        local v=${name}_ARGS[@]; args=(--imatrix "$IM" "${!v}")
+mix_args() {   # mix_args NAME -> ARGS
+    local e=${MIX_EXPERT[$1]} d=${MIX_DENSE[$1]}
+    ARGS=(--imatrix "$IM" --tensor-type "ffn_(gate|up|down)_exps=$e" --tensor-type 'ffn_gate_inp_shexp=f32'
+          --output-tensor-type q6_k --token-embedding-type q8_0)
+    if [ "$d" != q8_0 ]; then
+        for t in attn_qkv attn_gate ssm_out attn_q attn_output 'ffn_(gate|up|down)_shexp'; do
+            ARGS+=(--tensor-type "$t=$d")
+        done
     fi
-    "$LLAMA_CPU/llama-quantize" "${args[@]}" "$BF16" "$out.part" Q8_0 "$THREADS"
+}
+
+mix_one() {   # mix_one NAME: quantize $BF16 as NAME (Q8_0 is the plain base)
+    local name=$1 out=$OUT/$M-$1.gguf ARGS=()
+    [ -s "$out" ] && return
+    [ "$name" = Q8_0 ] || mix_args "$name"
+    "$LLAMA_CPU/llama-quantize" "${ARGS[@]}" "$BF16" "$out.part" Q8_0 "$THREADS"
     mv "$out.part" "$out"
 }
 
-quant() { for x in Q8_0 $MIXES; do mix_one "$x"; done; }
+BASE=${BASE-Q8_0}   # BASE= (empty) skips the plain Q8_0
+quant() { for x in $BASE $MIXES; do mix_one "$x"; done; }
 
 check() {
-    for x in Q8_0 $MIXES; do
-        python3 -I "$(dirname "$0")/tensor_types.py" "$OUT/$M-$x.gguf" || true
+    for x in $BASE $MIXES; do
+        [ -s "$OUT/$M-$x.gguf" ] && { python3 -I "$(dirname "$0")/tensor_types.py" "$OUT/$M-$x.gguf" || true; }
     done
     (cd "$OUT" && sha256sum "$M"-*.gguf | tee SHA256SUMS)
 }
