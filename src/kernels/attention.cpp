@@ -3,6 +3,8 @@
 #include <sycl/ext/intel/esimd.hpp>
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -761,11 +763,16 @@ struct SegPV {
             const esimd::simd<int8_t, 128> q8 = Braw.template bit_cast_view<int8_t>();
             B = esimd::simd<sycl::half, 128>(q8) * pat;
           } else {
-            B = Braw.template bit_cast_view<sycl::half>();
             if (nv < 16) {
-              const esimd::simd<int16_t, 128> e(0, 1);
-              B.merge(esimd::simd<sycl::half, 128>(0), (e / 16) * 2 + e % 2 >= int16_t(nv));
+              // Row r of the tile (8 dwords) holds positions 2r and 2r+1 of each dimension: clear the halves past
+              // nv with a scalar mask a row, which needs no more registers than the tile.
+#pragma unroll
+              for (int r = 0; r < 8; ++r) {
+                const uint32_t keep = (2 * r < nv ? 0xFFFFu : 0u) | (2 * r + 1 < nv ? 0xFFFF0000u : 0u);
+                Braw.template select<8, 1>(8 * r) = Braw.template select<8, 1>(8 * r) & keep;
+              }
             }
+            B = Braw.template bit_cast_view<sycl::half>();
           }
         }
         esimd::slm_block_store<sycl::half, 128>(buf + tid * 256, B);
@@ -826,6 +833,7 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
   const int32_t H2 = int32_t(c.n_head_kv), tph = (rows + 7) / 8, R = (rows + 255) / 256 * 256, H = int32_t(n_head);
   const int32_t* last = tok.hi ? tok.hi : tok.pos;
   sycl::half* P = grow(q, scratch.p, scratch.p_halves, size_t(R) * kSeg);
+  std::vector<sycl::event> evs[3];
   const SegStats st(grow(q, scratch.stat, scratch.stat_floats, SegStats::floats(R, D)), R);
   for (int32_t h = 0; h < H2; ++h) {
     for (int32_t s0 = kfirst; s0 < kend; s0 += kSeg) {
@@ -833,8 +841,8 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
       SegQK<D, G, Q8> qk{qt, tok.slot, last, c.table, c.k, c.ks, P, st.mt, st.lt, st.mrun, int32_t(c.pages),
                          H2, base,     rows,    tph,     R,   s0,   kend, first, h};
       qk.lo_of = tok.lo;
-      q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(nk * 4)), sycl::range<3>(1, 16, 4)), qk);
-      q.parallel_for(sycl::range<1>(size_t(R)), [=](sycl::id<1> id) {
+      evs[0].push_back(q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(nk * 4)), sycl::range<3>(1, 16, 4)), qk));
+      evs[1].push_back(q.parallel_for(sycl::range<1>(size_t(R)), [=](sycl::id<1> id) {
         const int32_t row = int32_t(id[0]);
         const float m_old = first ? kNegBig : st.mrun[row], l_old = first ? 0.0f : st.lrun[row];
         float mn = m_old;
@@ -847,14 +855,22 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
           l += b * st.lt[t * R + row];
         }
         st.mrun[row] = mn, st.lrun[row] = l, st.alpha[row] = a;
-      });
+      }));
       SegPV<D, Q8> pv{P, st.beta, st.alpha, st.orun, tok.slot, c.table, c.v, c.vs, int32_t(c.pages), H2, base, rows, R, s0, kend, nb, first, h};
-      q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(D / 32)), sycl::range<3>(1, 16, 4)), pv);
+      evs[2].push_back(q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(D / 32)), sycl::range<3>(1, 16, 4)), pv));
     }
     q.parallel_for(sycl::range<2>(size_t(rows), size_t(D)), [=](sycl::id<2> id) {
       const int32_t row = int32_t(id[0]), d = int32_t(id[1]);
       out[((base + row / G) * H + h * G + row % G) * D + d] = st.orun[row * D + d] / st.lrun[row];
     });
+  }
+  if (std::getenv("SEGPROF")) {
+    q.wait();
+    using namespace sycl::info;
+    double t[3] = {0, 0, 0};
+    for (int i = 0; i < 3; ++i)
+      for (auto& e : evs[i]) t[i] += double(e.get_profiling_info<event_profiling::command_end>() - e.get_profiling_info<event_profiling::command_start>()) * 1e-6;
+    std::fprintf(stderr, "seg: qk %.2f ms, comb %.2f, pv %.2f (%zu segments)\n", t[0], t[1], t[2], evs[0].size());
   }
 }
 
