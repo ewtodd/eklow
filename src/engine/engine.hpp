@@ -51,10 +51,10 @@ struct Config {
   // Prefill with cold experts: those with at least stream_min_rows (token, expert) pairs in a step are copied to the card by
   // the copy engine (at most stream_slots of them a layer), repacked there and computed by the grouped GEMMs, while the CPU takes
   // the other cold pairs. 0 slots: the CPU takes all of them. The costs pick how many candidates to stream.
-  int stream_slots = 40;
+  int stream_slots = 80;
   int stream_min_rows = 16;
-  double stream_copy_us = 300;  // one expert from pinned memory to the card
-  double stream_cpu_us = 22;    // one cold pair on the CPU, 16 threads
+  double stream_copy_us = 270;  // one expert (1.8 MB of Q4_K) from pinned memory to the card
+  double stream_cpu_us = 10;    // one cold pair on the CPU, 16 threads, with its expert shared by many tokens (measured: 10 beat 7 and 14 at 2,048-token chunks)
   // Tokens a slot may leave pending after a verify chunk (at most gdn::kMaxPendingLimit).
   int max_pending = 16;
   // Hidden states the draft reads: the outputs (l_out) of these layers for the rows a chunk asks for (Chunk::capture_rows),

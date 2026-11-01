@@ -355,7 +355,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
   ab_ = dev(B * 2 * gdn::kValueHeads);
   rlog_ = dev(B * NE);
   sg_ = dev(B * 32);
-  rg_ = dev(std::min<int64_t>(B, 4) * (NE + 32));
+  rg_ = dev(std::min<int64_t>(B, 16) * (NE + 32));
   moe_ = dev(B * E);
   gx_ = dev(xmx::kFp16Rows * E);
   moe_gu_ = dev(xmx::kFp16Rows * 2 * Fe);
@@ -1078,7 +1078,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   const bool small = P <= xmx::kFp16Rows;  // decode's grouped GEMVs: up to 4 tokens
   // Decode calls the pool every few hundred microseconds and wants its workers spinning; prefill's phases
   // last milliseconds and the spinning only takes the cores from the hot kernels' host thread.
-  if (pool_) pool_->set_spin_us(small ? 400 : 0);
+  if (pool_) pool_->set_spin_us(T <= 16 ? 400 : 0);
   const auto t_step = std::chrono::steady_clock::now();
 
   // The embedding rows of the step's tokens, gathered on the host from the mapping.
@@ -1152,7 +1152,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     if (L.recurrent) {
       dense(act_, L.in, qz_);
       mark("qkvz");
-      if (T <= 4) fast::matmul_f32_small(q_, L.w_ab, 2 * gdn::kValueHeads, E, h_, T, ab_);
+      if (T <= 16) fast::matmul_f32_small(q_, L.w_ab, 2 * gdn::kValueHeads, E, h_, T, ab_);
       else fast::matmul_f32(q_, L.w_ab, 2 * gdn::kValueHeads, E, h_, T, ab_);
       const gdn::Inputs in{qz_, qz_ + gdn::kChannels, ab_, ab_ + gdn::kValueHeads, L.in.n, L.in.n, 2 * gdn::kValueHeads, 2 * gdn::kValueHeads};
       mark("alpha_beta");
@@ -1189,7 +1189,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     const bool next_h = next_norm && (layers_[size_t(l) + 1].recurrent || (dump && dump->wants("attn_norm-" + std::to_string(l + 1))));
     const float* sgate;
     int64_t ld_sg;
-    if (small) {
+    if (T <= 16) {
       fast::matmul_f32_small(q_, L.w_rg, NE + 32, E, h_, T, rg_);
       mark("router");
       if (dump && dump->wants("ffn_moe_logits" + s)) {

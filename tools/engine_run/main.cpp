@@ -6,7 +6,7 @@
 //                    [--verify-last N --verify-block B --accept A,...] [--max-ctx N] [--kv-int8]
 //                    [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N]
 //                    [--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US] [--head-fp32] [--embed-on-card]
-//                    [--record-routing FILE] [--capture-check]
+//                    [--record-routing FILE] [--capture-check] [--snapshot-test]
 //
 // The prompt is fed in prefill chunks of --chunk tokens (default: one chunk), then --verify-last tokens as verify blocks of
 // --verify-block tokens whose acceptance follows the pattern --accept (a count per block, cycled; the unaccepted tokens are fed
@@ -14,6 +14,7 @@
 // Logits come from the step in which a position was accepted. With verify blocks only the logits are written (the tensors of a
 // re-fed token would appear twice).
 // --record-routing writes the (layer, expert) selection counts of the whole run as a routing profile (DECISIONS: data/*-experts.json).
+// --snapshot-test: prefill all but 16 tokens, snapshot, decode the 16, restore and decode them again (identical logits, the cost of both).
 // --capture-check asks every chunk for its hidden-state capture and compares layer 1's with l_out-1 in the dumps.
 #include <algorithm>
 #include <chrono>
@@ -58,7 +59,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   std::vector<int64_t> accept_pattern = {3};
   int64_t logits_last = 1, chunk = 0, decode_last = 0, verify_last = 0, verify_block = 8, max_ctx = 0;
-  bool kv_int8 = false, head_fp32 = false, embed_on_card = false, capture_check = false;
+  bool kv_int8 = false, head_fp32 = false, embed_on_card = false, capture_check = false, snapshot_test = false;
   engine::Config ec;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -82,6 +83,7 @@ int main(int argc, char** argv) {
     else if (a == "--head-fp32") head_fp32 = true;
     else if (a == "--embed-on-card") embed_on_card = true;
     else if (a == "--capture-check") capture_check = true;
+    else if (a == "--snapshot-test") snapshot_test = true;
     else if (a == "--record-routing") record_routing = next();
     else if (a == "--expert-profile") ec.expert_profile = next();
     else if (a == "--experts-on-card") ec.experts_on_card = std::atoll(next().c_str());
@@ -181,6 +183,37 @@ int main(int argc, char** argv) {
         }
     };
 
+    // Prefix reuse: snapshot the slot before its last 16 tokens, decode them, restore the snapshot and decode them again.
+    if (snapshot_test) {
+      const int64_t m = std::min<int64_t>(16, n - 1);
+      eng.release(0);
+      for (int64_t s = 0; s < n - m; s += chunk) {
+        const int64_t e = std::min(n - m, s + chunk);
+        eng.step({engine::Chunk{0, s, std::vector<int32_t>(tokens.begin() + s, tokens.begin() + e), 0}});
+      }
+      auto ts = std::chrono::steady_clock::now();
+      const engine::Engine::Snapshot snap = eng.snapshot(0);
+      const double t_snap = since(ts);
+      auto tail = [&] {
+        std::vector<float> all;
+        for (int64_t s = n - m; s < n; ++s) {
+          const std::vector<float> l = eng.step({engine::Chunk{0, s, {tokens[size_t(s)]}, 1}});
+          all.insert(all.end(), l.begin(), l.end());
+        }
+        return all;
+      };
+      const std::vector<float> a = tail();
+      ts = std::chrono::steady_clock::now();
+      eng.restore(0, snap, n - m);
+      const double t_rest = since(ts);
+      const std::vector<float> b = tail();
+      double worst = 0;
+      for (size_t i = 0; i < a.size(); ++i) worst = std::max(worst, double(std::fabs(a[i] - b[i])));
+      std::printf("snapshot of %.1f MiB at position %lld: %.2f ms; restore %.2f ms; the %lld tokens decoded again: max logit difference %.3g (%s)\n",
+                  double(snap.bytes) / 1048576.0, (long long)snap.position, 1e3 * t_snap, 1e3 * t_rest, (long long)m, worst, worst == 0 ? "identical" : "DIFFERENT");
+      if (worst != 0) throw std::runtime_error("restored state decodes differently");
+      return 0;
+    }
     t0 = std::chrono::steady_clock::now();
     int64_t steps = 0, pos = 0, dumped_rows = 0;
     double first_step = 0;
