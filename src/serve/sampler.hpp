@@ -35,7 +35,20 @@ class Sampler {
   // Counts a token of the completion for the penalties.
   void accept(int32_t id) { ++counts_[id]; }
 
+  // The distribution sample() draws from, as (id, probability) pairs summing to 1 (greedy: the one token), with
+  // `extra` counted for the penalties as if accepted (speculative decoding's rows, src/serve/spec.hpp).
+  void distribution(std::span<const float> logits, const std::vector<int32_t>* allowed, const std::vector<int32_t>* banned,
+                    std::span<const int32_t> extra, std::vector<std::pair<int32_t, double>>& out);
+  // A uniform draw in [0, 1) from the sampler's generator, for the acceptance tests of speculative decoding.
+  double uniform() { return std::uniform_real_distribution<double>(0, 1)(rng_); }
+  bool greedy() const { return p_.temperature <= 0; }
+
  private:
+  // Fills cand_ with the survivors by descending logit and prob_ with their probabilities before the final
+  // renormalization (greedy: the one token, probability 1); returns how many survive.
+  size_t prepare(std::span<const float> logits, const std::vector<int32_t>* allowed, const std::vector<int32_t>* banned,
+                 std::span<const int32_t> extra);
+  std::vector<double> prob_;
   SamplingParams p_;
   std::mt19937_64 rng_;
   std::unordered_map<int32_t, int32_t> counts_;

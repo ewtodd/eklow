@@ -9,11 +9,19 @@ namespace eklow::serve {
 
 Sampler::Sampler(const SamplingParams& p) : p_(p), rng_(p.seed) {}
 
-int32_t Sampler::sample(std::span<const float> logits, const std::vector<int32_t>* allowed, const std::vector<int32_t>* banned) {
+size_t Sampler::prepare(std::span<const float> logits, const std::vector<int32_t>* allowed, const std::vector<int32_t>* banned,
+                        std::span<const int32_t> extra) {
   const int32_t V = int32_t(logits.size());
+  // Speculative tokens (a draft's, assumed accepted) count for the penalties like accepted ones, without being kept.
+  std::unordered_map<int32_t, int32_t> extra_counts;
+  for (int32_t t : extra) ++extra_counts[t];
+  const bool no_counts = counts_.empty() && extra_counts.empty();
   auto adjusted = [&](int32_t id) {
     float l = logits[size_t(id)];
-    if (auto it = counts_.find(id); it != counts_.end()) l -= p_.presence_penalty + p_.frequency_penalty * float(it->second);
+    int32_t c = 0;
+    if (auto it = counts_.find(id); it != counts_.end()) c += it->second;
+    if (auto it = extra_counts.find(id); it != extra_counts.end()) c += it->second;
+    if (c > 0) l -= p_.presence_penalty + p_.frequency_penalty * float(c);
     return l;
   };
   auto by_logit = [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); };
@@ -40,7 +48,7 @@ int32_t Sampler::sample(std::span<const float> logits, const std::vector<int32_t
         ban = next_ban(id);
         continue;
       }
-      const std::pair<float, int32_t> c{counts_.empty() ? logits[size_t(id)] : adjusted(id), id};
+      const std::pair<float, int32_t> c{no_counts ? logits[size_t(id)] : adjusted(id), id};
       if (cand_.size() < keep) {
         cand_.push_back(c);
         std::push_heap(cand_.begin(), cand_.end(), by_logit);
@@ -57,10 +65,15 @@ int32_t Sampler::sample(std::span<const float> logits, const std::vector<int32_t
         ban = next_ban(id);
         continue;
       }
-      cand_.push_back({counts_.empty() ? logits[size_t(id)] : adjusted(id), id});
+      cand_.push_back({no_counts ? logits[size_t(id)] : adjusted(id), id});
     }
   }
-  if (p_.temperature <= 0) return std::min_element(cand_.begin(), cand_.end(), by_logit)->second;
+  if (p_.temperature <= 0) {
+    std::swap(cand_[0], *std::min_element(cand_.begin(), cand_.end(), by_logit));
+    cand_.resize(1);
+    prob_.assign(1, 1.0);
+    return 1;
+  }
 
   // top-k first: it bounds the sort that top-p needs (selection, then sorting only the k).
   const size_t k = p_.top_k > 0 ? std::min(size_t(p_.top_k), cand_.size()) : cand_.size();
@@ -68,7 +81,8 @@ int32_t Sampler::sample(std::span<const float> logits, const std::vector<int32_t
   cand_.resize(k);
   std::sort(cand_.begin(), cand_.end(), by_logit);
   // Softmax at the temperature, in double.
-  std::vector<double> prob(k);
+  std::vector<double>& prob = prob_;
+  prob.resize(k);
   const double top = cand_[0].first;
   double sum = 0;
   for (size_t i = 0; i < k; ++i) sum += prob[i] = std::exp((double(cand_[i].first) - top) / double(p_.temperature));
@@ -87,14 +101,29 @@ int32_t Sampler::sample(std::span<const float> logits, const std::vector<int32_t
       }
     }
   }
+  return n;
+}
+
+int32_t Sampler::sample(std::span<const float> logits, const std::vector<int32_t>* allowed, const std::vector<int32_t>* banned) {
+  const size_t n = prepare(logits, allowed, banned, {});
+  if (p_.temperature <= 0) return cand_[0].second;
   double total = 0;
-  for (size_t i = 0; i < n; ++i) total += prob[i];
+  for (size_t i = 0; i < n; ++i) total += prob_[i];
   double r = std::uniform_real_distribution<double>(0, total)(rng_);
   for (size_t i = 0; i < n; ++i) {
-    r -= prob[i];
+    r -= prob_[i];
     if (r <= 0) return cand_[i].second;
   }
   return cand_[n - 1].second;
+}
+
+void Sampler::distribution(std::span<const float> logits, const std::vector<int32_t>* allowed, const std::vector<int32_t>* banned,
+                           std::span<const int32_t> extra, std::vector<std::pair<int32_t, double>>& out) {
+  const size_t n = prepare(logits, allowed, banned, extra);
+  double total = 0;
+  for (size_t i = 0; i < n; ++i) total += prob_[i];
+  out.clear();
+  for (size_t i = 0; i < n; ++i) out.push_back({cand_[i].second, prob_[i] / total});
 }
 
 }  // namespace eklow::serve
