@@ -10,7 +10,11 @@ TS=$G/stock/stock-EKK8.gguf
 # Ornith: EKK8 when it exists, else its EK8 (Q4_0 experts); the target file name is in each .cmd file
 TO=$G/ornith/ornith-EKK8.gguf; [ -s "$TO" ] || TO=$G/ornith/ornith-EK8.gguf
 INCO=$DR/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf; JZ=$DR/Ornith-1.5-35B-A3B-DFlash2-jzinno-Q8_0.gguf
-run() { bash "$here/dflash2-llamacpp.sh" "$@"; }
+run() {   # skip a finished run (resume after a restart): 6 summaries, 2 for the decode ones
+    local s=$DATA/results/dflash/${4}.summary want=6; [[ $4 = decode-* ]] && want=2
+    [ "$(grep -c acceptance_mean "$s" 2>/dev/null || true)" -ge "$want" ] && { echo "skip $4"; return; }
+    rm -f "$DATA/results/dflash/$4.jsonl" "$s"; bash "$here/dflash2-llamacpp.sh" "$@" || echo "run $4 exited $? (the exit trap kills the server, so this is usual)"
+}
 # native pairs first, then the crossed ones; the draft's own block size first
 [ -s "$DATA/results/dflash/stock-inco-b8.summary" ] || run "$TS" "$INCO" 8  stock-inco-b8   # done in results/
 run "$TO" "$JZ"  16  ornith-jzinno-b16
