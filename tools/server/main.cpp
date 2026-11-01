@@ -140,6 +140,10 @@ std::string engine_line(const serve::Scheduler::Stats& a, const serve::Scheduler
   if (b.verifies > a.verifies)
     out += fmt(" | draft %.2f tokens/verify, %.1f%% of %lld drafted accepted", double(b.accepted - a.accepted + b.verifies - a.verifies) / double(b.verifies - a.verifies),
                100.0 * double(b.accepted - a.accepted) / double(std::max<int64_t>(b.drafted - a.drafted, 1)), (long long)(b.drafted - a.drafted));
+  if (b.steps > a.steps && b.verifies > a.verifies)
+    out += fmt(" | per step: engine %.1f ms, draft %.1f, sample %.1f, inject %.1f, snapshot %.1f", 1e3 * (b.engine_s - a.engine_s) / double(b.steps - a.steps),
+               1e3 * (b.draft_s - a.draft_s) / double(b.steps - a.steps), 1e3 * (b.sample_s - a.sample_s) / double(b.steps - a.steps),
+               1e3 * (b.inject_s - a.inject_s) / double(b.steps - a.steps), 1e3 * (b.snapshot_s - a.snapshot_s) / double(b.steps - a.steps));
   if (b.snapshots > 0 || b.snapshots_taken > a.snapshots_taken)
     out += fmt(" | snapshots %lld (%.0f MiB), %lld taken, %lld restored", (long long)b.snapshots, double(b.snapshot_bytes) / 1048576.0,
                (long long)(b.snapshots_taken - a.snapshots_taken), (long long)(b.restores - a.restores));

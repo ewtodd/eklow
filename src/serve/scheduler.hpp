@@ -91,7 +91,7 @@ struct SchedulerConfig {
   // to a slot's live sequence), the spacing of those taken during a long prefill, and the shortest prefix worth one.
   uint64_t snapshot_bytes = 0;
   int64_t snapshot_every = 16384;
-  int64_t snapshot_min = 512;
+  int64_t snapshot_min = 256;
 };
 
 class Scheduler {
@@ -112,6 +112,9 @@ class Scheduler {
     int64_t verifies = 0, drafted = 0, accepted = 0;   // verify blocks, tokens drafted, of them accepted
     int64_t snapshots = 0, snapshot_bytes = 0;         // held now (bytes: pinned host memory)
     int64_t snapshots_taken = 0, restores = 0;         // since the start
+    // Wall seconds of the engine thread in each part of a step, since the start: drafting, the engine step (the logits come
+    // back to the host in it), acceptance and sampling, the draft's context injection, snapshots.
+    double draft_s = 0, engine_s = 0, sample_s = 0, inject_s = 0, snapshot_s = 0;
   };
   Stats stats() const;
 

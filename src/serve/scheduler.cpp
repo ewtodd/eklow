@@ -1,6 +1,7 @@
 #include "serve/scheduler.hpp"
 
 #include <algorithm>
+#include <optional>
 #include <span>
 #include <stdexcept>
 
@@ -11,6 +12,19 @@ namespace eklow::serve {
 namespace {
 
 double seconds(std::chrono::steady_clock::duration d) { return std::chrono::duration<double>(d).count(); }
+
+// Adds the wall time of its scope to a counter.
+struct Timer {
+  Timer(std::mutex& mu, double& total) : mu_(mu), total_(total), t0_(std::chrono::steady_clock::now()) {}
+  ~Timer() {
+    const double s = seconds(std::chrono::steady_clock::now() - t0_);
+    std::lock_guard lk(mu_);
+    total_ += s;
+  }
+  std::mutex& mu_;
+  double& total_;
+  std::chrono::steady_clock::time_point t0_;
+};
 
 // What a drafted row's constraint needs: the output parser and the tool grammar as they stand after the row's prefix.
 struct RowState {
@@ -229,6 +243,7 @@ void Scheduler::enforce_budget() {
 void Scheduler::take_snapshot(int slot) {
   Seq& q = seqs_[size_t(slot)];
   const int64_t pos = eng_.length(slot);
+  Timer timer(mu_, stats_.snapshot_s);
   if (c_.snapshot_bytes == 0 || pos < c_.snapshot_min || has_snapshot(q, pos) || pos != int64_t(q.tokens.size())) return;
   Snap s{pos, eng_.snapshot(slot), ++tick_};
   std::lock_guard lk(mu_);
@@ -265,6 +280,7 @@ void Scheduler::step() {
   std::vector<DraftBlock> blocks(seqs_.size());
   std::vector<char> speculate(seqs_.size(), 0);
   if (spec) {
+    Timer timer(mu_, stats_.draft_s);
     std::vector<model::Dflash2::Request> reqs;
     std::vector<int> who;
     for (int s : gen) {
@@ -340,7 +356,10 @@ void Scheduler::step() {
   }
   if (chunks.empty()) return;
 
-  const std::vector<float> logits = eng_.step(chunks);
+  const std::vector<float> logits = [&] {
+    Timer timer(mu_, stats_.engine_s);
+    return eng_.step(chunks);
+  }();
   const engine::Engine::Capture& capture = eng_.capture();
   {
     std::lock_guard lk(mu_);
@@ -355,6 +374,7 @@ void Scheduler::step() {
   // Context rows for the draft: `count` rows of a chunk from its first captured row onward.
   auto inject = [&](const engine::Chunk& c, int64_t first_cap_row, int64_t count) {
     if (!spec || count <= 0) return;
+    Timer timer(mu_, stats_.inject_s);
     c_.draft->inject(c.slot, capture.data + first_cap_row * capture.width, int64_t(capture.ids[size_t(first_cap_row)].pos), count);
   };
   auto logits_row = [&](size_t r) { return std::span<const float>(logits.data() + r * V, V); };
@@ -379,6 +399,7 @@ void Scheduler::step() {
         if (it.rows == 0) break;
         // Special tokens the output parser cannot take where it stands are never sampled (QwenOutputParser::banned).
         const std::vector<int32_t>* banned = &q.parser->banned();
+        Timer timer(mu_, stats_.sample_s);
         const int32_t t = q.grammar && q.grammar->active() ? q.sampler->sample(logits_row(row0), &q.grammar->allowed(), banned)
                                                            : q.sampler->sample(logits_row(row0), nullptr, banned);
         const std::string why = on_token(it.slot, t);
@@ -390,6 +411,7 @@ void Scheduler::step() {
         q.pending_accept = -1;
         inject(c, cap0, c.capture_rows);
         const std::vector<int32_t>* banned = &q.parser->banned();
+        Timer timer(mu_, stats_.sample_s);
         const int32_t t = q.grammar && q.grammar->active() ? q.sampler->sample(logits_row(row0), &q.grammar->allowed(), banned)
                                                            : q.sampler->sample(logits_row(row0), nullptr, banned);
         const std::string why = on_token(it.slot, t);
@@ -424,7 +446,9 @@ void Scheduler::step() {
           RowState& st = *states[size_t(r)];
           return RowConstraint{st.grammar && st.grammar->active() ? &st.grammar->allowed() : nullptr, &st.parser.banned()};
         };
+        std::optional<Timer> timer(std::in_place, mu_, stats_.sample_s);
         const VerifyResult res = verify(*q.sampler, block, [&](int r) { return logits_row(row0 + size_t(r)); }, constraint);
+        timer.reset();
         {
           std::lock_guard lk(mu_);
           ++stats_.verifies;
