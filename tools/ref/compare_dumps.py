@@ -24,6 +24,7 @@ def main():
     ap.add_argument("ref")
     ap.add_argument("test")
     ap.add_argument("--prefix", default="")
+    ap.add_argument("--last", type=int, default=0, help="compare the logits of only the last N positions")
     a = ap.parse_args()
     ri, rt = load(a.ref)
     ti, tt = load(a.test)
@@ -45,7 +46,7 @@ def main():
     if ti["n_tokens"] == n and ti["n_vocab"] == V:
         # Either side may hold only its last logits_rows positions; compare the overlap.
         rr, tr = ri.get("logits_rows", n), ti.get("logits_rows", n)
-        rows = min(rr, tr)
+        rows = min(rr, tr, a.last) if a.last else min(rr, tr)
         lr = np.fromfile(Path(a.ref) / "logits.f32", dtype=np.float32).reshape(rr, V)[rr - rows:].astype(np.float64)
         lt = np.fromfile(Path(a.test) / "logits.f32", dtype=np.float32).reshape(tr, V)[tr - rows:].astype(np.float64)
         n = rows

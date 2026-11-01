@@ -48,8 +48,13 @@ int main(int argc, char** argv) {
       }
     } else {
       std::map<gguf::Type, bool> seen;
-      for (const auto& t : f.tensors())
-        if (t.ne.size() >= 2 && !seen[t.type]) seen[t.type] = true, chosen.push_back(&t);
+      using T = gguf::Type;  // the types ref::matmul has kernels for
+      for (const auto& t : f.tensors()) {
+        const bool known = t.type == T::F32 || t.type == T::F16 || t.type == T::BF16 || t.type == T::Q4_0 ||
+                           t.type == T::Q8_0 || t.type == T::Q6_K || t.type == T::Q4_K || t.type == T::Q5_K ||
+                           t.type == T::IQ4_XS;
+        if (known && t.ne.size() >= 2 && !seen[t.type]) seen[t.type] = true, chosen.push_back(&t);
+      }
     }
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     std::ostringstream index;

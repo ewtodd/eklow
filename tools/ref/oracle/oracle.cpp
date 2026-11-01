@@ -11,7 +11,7 @@
 //   index.json      one entry per dumped tensor: name, ggml shape (ne[0] fastest), file
 //   NAME.f32        the tensor as float32, in ggml order
 //   logits.f32      n_vocab logits for every position (or the last --logits-last), row by row
-// --tensors takes name prefixes matched against llama.cpp's graph tensor names (default: l_out-,
+// --tensors takes name prefixes (a trailing $ makes it an exact name) matched against llama.cpp's graph tensor names (default: l_out-,
 // result_norm, result_output); --list prints every graph tensor name and shape once. --ngl offloads
 // layers to a GPU backend when the linked llama.cpp has one (default 0: CPU only).
 //
@@ -56,9 +56,15 @@ struct Dump {
   std::vector<uint8_t> buf;
 };
 
+// A prefix ending in '$' must match the whole name (attn_norm-3$ is layer 3 and not 30..39).
 bool wanted(const Dump& d, const char* name) {
-  for (const auto& p : d.prefixes)
-    if (std::strncmp(name, p.c_str(), p.size()) == 0) return true;
+  for (const auto& p : d.prefixes) {
+    if (!p.empty() && p.back() == '$') {
+      if (p.compare(0, p.size() - 1, name) == 0) return true;
+    } else if (std::strncmp(name, p.c_str(), p.size()) == 0) {
+      return true;
+    }
+  }
   return false;
 }
 

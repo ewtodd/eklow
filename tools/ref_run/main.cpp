@@ -5,7 +5,7 @@
 //                 [--tensors PREFIX,...] [--logits-last N] [--routing FILE]
 //
 // --tokens-json reads the ids from an oracle's tokens.json, so both runs see the same tokens.
-// --tensors: graph names by prefix (default l_out-,result_norm); --logits-last: only the last N
+// --tensors: graph names by prefix, a trailing $ for an exact name (default l_out-,result_norm); --logits-last: only the last N
 // positions' logits (default all).
 // --routing: also record each token's selected expert ids (MoE models) to FILE as raw int32
 // little-endian, layer by layer and token by token, with a FILE.json sidecar.
@@ -104,8 +104,13 @@ int main(int argc, char** argv) {
     index.key("tensors").begin_array();
     model::DumpSink sink;
     sink.wants = [&](const std::string& name) {
-      for (const auto& p : prefixes)
-        if (name.compare(0, p.size(), p) == 0) return true;
+      for (const auto& p : prefixes) {
+        if (!p.empty() && p.back() == '$') {  // exact name, as in eklow-oracle
+          if (name == p.substr(0, p.size() - 1)) return true;
+        } else if (name.compare(0, p.size(), p) == 0) {
+          return true;
+        }
+      }
       return false;
     };
     sink.put = [&](const std::string& name, const std::vector<float>& data, const std::vector<int64_t>& ne) {
