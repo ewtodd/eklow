@@ -15,6 +15,7 @@
 #include <functional>
 #include <map>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -135,6 +136,12 @@ class Engine {
   // With a profile set, step waits after each section of the forward pass and adds its wall time under the section's name.
   void set_profile(std::map<std::string, double>* p) { profile_ = p; }
 
+  // The output head as the matrix units run it (Config::head_dpas), for the DFlash 2 draft to project its block with the same
+  // weights instead of a copy (0.4 GiB of the card).
+  const xmx::Weight& head_weight() const {
+    if (!c_.head_dpas) throw std::runtime_error("engine: the head is on the fp32-activation path");
+    return head_w_;
+  }
   const model::Qwen35Config& model() const { return cfg_; }
   int n_slots() const { return c_.n_slots; }
   const Config& config() const { return c_; }
