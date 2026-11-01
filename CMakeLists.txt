@@ -93,6 +93,7 @@ add_library(eklow_model STATIC
   src/model/vision_gemma4v_fast.cpp
   src/kernels/vision_attn.cpp
   src/model/gemma4.cpp
+  src/model/qwen35.cpp
 )
 target_link_libraries(eklow_model PUBLIC eklow_host eklow_image eklow_rt)
 eklow_sycl(eklow_model)
@@ -121,6 +122,10 @@ eklow_sycl(eklow-attn-test)
 add_executable(eklow-gdn-test tools/gdn_test/main.cpp)
 target_link_libraries(eklow-gdn-test PRIVATE eklow_model)
 eklow_sycl(eklow-gdn-test)
+
+add_executable(eklow-dequant-test tools/dequant_test/main.cpp)
+target_link_libraries(eklow-dequant-test PRIVATE eklow_model)
+eklow_sycl(eklow-dequant-test)
 
 add_executable(eklow-ref-run tools/ref_run/main.cpp)
 target_link_libraries(eklow-ref-run PRIVATE eklow_model)
