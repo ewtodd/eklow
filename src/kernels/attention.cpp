@@ -953,7 +953,7 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
   };
   // The global layers' long chunks: attention in segments, each chunk on its own; the step's other chunks
   // (decode tokens beside a prefill) each through the split kernel, their tiles being a contiguous run.
-  if constexpr (D == 512) {
+  if constexpr (D == 512 || (D == 256 && G == 8)) {
     bool any = false;
     for (size_t i = 0; i < list.chunks.size(); i += 6) any |= list.chunks[i + 1] >= kSegMinTokens;
     if (any && c.window == 0 && c.table) {
@@ -1008,9 +1008,9 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
   else throw std::runtime_error("attention: no kernel for head_dim " + std::to_string(c.head_dim) + ", group " + std::to_string(group));
 }
 
-void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim) {
+void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim, int64_t group) {
   grow(q, s.q, s.q_halves, size_t(max_tiles * kRows * head_dim));
-  if (head_dim != 512) return;
+  if (head_dim != 512 && !(head_dim == 256 && group == 8)) return;
   const int64_t R = (max_chunk_rows + 255) / 256 * 256;
   grow(q, s.p, s.p_halves, size_t(R * kSeg));
   grow(q, s.stat, s.stat_floats, SegStats::floats(R, head_dim));

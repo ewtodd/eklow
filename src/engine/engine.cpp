@@ -375,7 +375,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
   tiles_ = sycl::malloc_device<int32_t>(size_t(6 * max_tiles_), q_);
   if (!tiles_) throw std::runtime_error("engine: out of device memory");
   owned_.push_back(tiles_);
-  attn::reserve(q_, attn_scratch_, max_tiles_, c_.max_chunk * group_, Hkv, D);
+  attn::reserve(q_, attn_scratch_, max_tiles_, c_.max_chunk * group_, Hkv, D, group_);
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * D));
   act_sh_ = xmx::alloc_activations(q_, B, Fs);
   act_exp_ffn_ = xmx::alloc_activations(q_, xmx::kFp16Rows, Fe);
