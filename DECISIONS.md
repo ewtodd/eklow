@@ -1413,3 +1413,36 @@ an added token, special or not (`<think>` or `<tool_call>` typed by a user are c
   exact. 20,432 valid calls accepted token by token as Hugging Face tokenizes them, 12,000 mutated ones refused at
   their first bad token, 40,000 random walks closed into calls the parser accepts; bans equal refusals on 828 of 828
   (state, special token) pairs.
+
+## 2026-10-31 — Qwen3.6's reference forward, and what the engine is held to
+
+`qwen/ref` (merged): `src/model/qwen35.*`, `eklow-ref-run` on qwen35moe, and the reference kernels it needs
+(`ref.*`: the causal conv, l2 norm, the gated delta rule, the gated norm, SwiGLU, the MoE's gathers; `ref::matmul`
+dequantizes Q4_K, Q5_K and IQ4_XS as ggml does, bit-identical to the gguf package on real tensors for Q4_0, Q4_K, Q6_K,
+Q8_0). A layer's weights (~450 MB) go to the card as the layer runs: the file is larger than the card.
+`eklow-oracle` runs qwen35moe unchanged; `nix/oracle-cuda.nix` builds it against llama.cpp CUDA for e-desktop's 4090.
+
+Layout facts (llama.cpp's graph and converter): attention layers are those with (l + 1) % 4 == 0; `attn_q` interleaves
+256 query and 256 gate columns head by head; DeltaNet value head h reads key head h % 16; the GGUF's norms carry the
++1 except `ssm_norm`; "attn_post_norm" is the pre-MoE norm (`x2 = x + attn(rmsnorm(x)); x = x2 + moe(m) + shared(m)`,
+m = rmsnorm(x2) * post_attention_norm), no norm on sub-layer outputs; RoPE is NeoX over the first 64 of 256 dims at
+base 1e7 (IMRoPE with equal position components); the MoE renormalizes its top 8 by their sum (floored at 2^-14), the
+shared expert is scaled by sigmoid(m . ffn_gate_inp_shexp) and added.
+
+Checks (prompts tokenized by the oracle: `long`, DESIGN.md as a user turn with thinking on, 2,573 tokens; `chat`, 27):
+- A tiny random qwen35moe in F32 (4 layers, the real tensor names): every tensor of every layer within 1e-7..5e-6 of
+  llama.cpp CPU, logits 27/27 at KL 1.7e-11: no head order, norm or rope convention is off.
+- The real files: layer 0's dense tensors within fp32 rounding of llama.cpp CPU (4e-7..5e-6 at `long`, where its CPU
+  matmuls run in float); the first difference is the routed experts (8e-3, ggml's int8 activations), and `l_out` then
+  grows smoothly to ~9e-2 at the last layer, with no step at a layer-type boundary.
+- Logits, last 256 positions of `long` / all of `chat` (stock EK8): llama.cpp CPU against CUDA 231/256 top-1, mean KL
+  9.7e-2 (median 6.8e-3) / 26/27; CPU against the reference 243/256, 1.18e-1 (4.1e-3) / 26/27, 3.5e-4; CUDA against the
+  reference 228/256, 1.51e-1. Ornith EK8, a less certain model on the same text: 203 / 214 / 203 of 256. The mean is a
+  few positions' (the digits of dates in DESIGN.md, 1-9 nats of entropy, where another set of experts flips a digit).
+
+So, as with the 26B, llama.cpp's two backends are no closer to each other than either is to the reference, and the
+fp32 reference is the engine's ground truth. The gate for the engine against it (from the CPU-CUDA distance, stock
+EK8): `long` top-1 >= 225/256, mean KL <= 1.2e-1, median <= 1e-2; `chat` top-1 >= 25/27, mean KL <= 2e-3; Ornith
+`long` >= 195/256, mean KL <= 2e-1. Judge by top-1 and median: three positions move the mean ~5x. Dumps on fiona:
+`~/eklow-oracle-qwen36/`, `~/eklow-ref-qwen36/` (`NOTES.txt` has the files' sha256). The reference takes 19 s on
+`chat` and 139-163 s on `long`.
