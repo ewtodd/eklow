@@ -16,7 +16,9 @@
 #include "core/json_value.hpp"
 #include "serve/sampler.hpp"
 #include "serve/scheduler.hpp"
-#include "text/tokenizer.hpp"
+#include "text/chat_qwen36.hpp"
+#include "text/tokenizer_qwen.hpp"
+#include "text/tool_schema.hpp"
 
 namespace eklow::serve {
 
@@ -51,26 +53,25 @@ std::vector<uint8_t> image_bytes(const std::string& url);
 struct ChatDefaults {
   SamplingParams sampling;  // what a request leaves out
   int64_t max_ctx;          // positions per slot
-  ImageEncoder encode_image = {};  // null: the server has no vision encoder and refuses image parts
+  text::QwenTemplate chat_template = text::QwenTemplate::Stock;
 };
 
 struct ChatRequest {
   std::string model;
   std::vector<int32_t> prompt;
-  std::vector<ImageInput> images;  // the prompt's image spans (their positions hold ids below zero naming the rows)
   SamplingParams sampling;
   int64_t max_tokens = 0;
   std::vector<std::string> stop;
   bool stream = false, include_usage = false, thinking = false, tools = false;
-  bool in_thinking = false;  // the prompt ends inside the thought channel
-  std::vector<std::string> tool_names;
+  bool in_thinking = false;  // the prompt ends inside the reasoning
+  std::shared_ptr<const text::ToolSpecs> tool_specs;  // the request's tools, for reading and constraining calls
+  int64_t snapshot_at = -1;  // where the generation prompt starts: the prefix the next turn shares
 };
 
-// Renders the conversation with Gemma 4's template and tokenizes it (request text without special
-// tokens). An image part becomes what llama.cpp's server and mtmd make of it: the prompt is split at the image,
-// <|image>, the image's rows and <image|> go in, with no newline of their own. Throws ApiError for what the server
-// cannot do or the request gets wrong.
-ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, const ChatDefaults& d);
+// Renders the conversation with Qwen3.6's template and tokenizes it (request text without special tokens). Image and
+// other media parts are refused (the vision encoder is not ported). Throws ApiError for what the server cannot do or the
+// request gets wrong.
+ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, const ChatDefaults& d);
 
 std::string new_completion_id();
 

@@ -1,30 +1,39 @@
-// eklow-server: Gemma 4 on the A770M behind an OpenAI-compatible HTTP API.
+// eklow-server: Qwen3.6-35B-A3B (stock or a finetune such as Ornith) with DFlash 2 speculative decoding on the A770M,
+// behind an OpenAI-compatible HTTP API.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
-//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [[--stream-min-rows N]]
-//                [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
+//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
+//                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]]
+//                [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
 //                [--log-interval S]
 //
-// --ctx is the context of each slot (positions), Gemma's full 262,144 by default; --batch the
-// tokens of one engine step and --chunk the prefill tokens of one sequence in a step (2,048: twice the rows per
-// expert GEMM of 1,024 and half the steps, +14% prefill at 32k for ~0.4 GB of sliding rings, 4 experts a layer at
-// 2 x 262k; DECISIONS 2026-10-27). The global layers' K/V are int8 by default, which is what lets 2 x 262k
-// fit beside the weights; --kv-fp16 decodes a little faster at depth but cannot hold 2 x 262k.
-// --expert-profile (the 26B): the experts of each layer that the routing profile says are busiest stay on
-// the card and the rest are computed on the CPU. How many (--experts-on-card) is, by default, as many as fit
-// in the card's free memory after the KV cache, the workspace and the embedding model, less
+// --ctx is the context of each slot (positions), 262,144 by default; --batch the tokens of one engine step and --chunk
+// the prefill tokens of one sequence in a step (2,048). The attention layers' K/V are int8 by default, which is what lets
+// 2 x 262k fit beside the weights; --kv-fp16 decodes a little faster at depth but cannot hold 2 x 262k.
+// --expert-profile: the experts of each layer that the routing profile says are busiest stay on the card and the rest are
+// computed on the CPU (the model's 256 experts a layer do not fit). How many (--experts-on-card) is, by default, as many as
+// fit in the card's free memory after the KV cache, the workspace, the embedding model and the draft, less
 // --card-margin-mib (1024) for what the first requests allocate and the driver keeps.
-// --mmproj (the 26B's projector GGUF) lets chat requests carry images (OpenAI image_url parts with base64 data: URLs),
-// --embed-mmproj (EmbeddingGemma 2's) lets an embeddings input be an array of text and image_url parts; --image-tokens is
-// the budget of rows per image (llama.cpp's image_max_tokens, 70 to 1,120, 280 by default). Each image is encoded on its
-// request's thread with the scheduler held, one at a time per encoder, and counts in the prompt tokens.
+// --draft (a DFlash 2 draft GGUF) turns on speculative decoding: a verify block of --draft-block tokens (default the
+// draft's trained block, at most 16) per step, accepted losslessly (the sampler's every feature, the tool grammar included).
+// --chat-template says which of Qwen3.6's two templates the model's repo uses when the GGUF's is not one eklow knows (the
+// official Ornith GGUFs carry Unsloth's edit): stock drops earlier turns' reasoning, ornith keeps it.
+// --snapshot-mib is the pinned host memory kept for snapshots of the DeltaNet state, which make a conversation's or a
+// document's prefix reusable (taken before each prompt's generation prompt, every --snapshot-every tokens of a long
+// prefill, and at the end of a generation); 0 keeps none, and then only a slot's live sequence is reused.
+// Image parts in chat are refused (the vision encoder is not ported); --embed-mmproj (EmbeddingGemma 2's) lets an
+// embeddings input be an array of text and image_url parts, --image-tokens being its budget of rows per image
+// (llama.cpp's image_max_tokens, 70 to 1,120, 280 by default). Each image is encoded on its request's thread with the
+// scheduler held, one at a time per encoder, and counts in the prompt tokens.
+// Sampling defaults come from the GGUF's general.sampling.* (temperature, top_k, top_p, min_p), each overridable per request.
 // Endpoints: POST /v1/chat/completions (streamed or whole), GET /v1/models, GET /health; with an
 // embedding model, POST /v1/embeddings, GET /v1/models and GET /health on its own port (the house
 // runs chat and embeddings as separate upstreams).
 // The log (stdout, unholy's form, each line prefixed with the local time): a line per chat request as it ends
-// (finish reason; prompt, cached and completion tokens; queue, time to first token, prefill and decode tok/s), a
-// line per embedding request, a line per rejected request, and every --log-interval seconds (10; 0 for none) while
-// there is traffic the engine's rates, running and waiting requests, the slots' positions and the prefix hit rate.
+// (finish reason; prompt, cached and completion tokens; queue, time to first token, prefill and decode tok/s; with a
+// draft, the tokens a verify gave), a line per embedding request, a line per rejected request, and every --log-interval
+// seconds (10; 0 for none) while there is traffic the engine's rates, running and waiting requests, the slots' positions,
+// the prefix hit rate, the draft's acceptance and the snapshots held.
 #include <httplib.h>
 
 #include <algorithm>
@@ -46,13 +55,15 @@
 #include "engine/engine.hpp"
 #include "image/gemma4_image.hpp"
 #include "model/embed_gemma2.hpp"
+#include "model/dflash2.hpp"
 #include "model/gguf.hpp"
 #include "model/vision_gemma4v.hpp"
 #include "rt/device.hpp"
 #include "serve/openai.hpp"
 #include "serve/scheduler.hpp"
-#include "text/chat_gemma4.hpp"
+#include "text/chat_qwen36.hpp"
 #include "text/tokenizer.hpp"
+#include "text/tokenizer_qwen.hpp"
 
 using namespace eklow;
 
@@ -85,20 +96,22 @@ std::string fmt(const char* f, A... a) {
   return buf;
 }
 
-// A chat request as it ended: why, its tokens, and its times (prefill over the uncached part of the prompt).
+// A chat request as it ended: why, its tokens, and its times (prefill over the uncached part of the prompt). With a
+// draft, the tokens each verify block gave (the accepted drafted ones and the one after them) and the share accepted.
 std::string request_line(const serve::RequestLog& l) {
   std::string out = "request " + l.tag + ": " + l.reason;
   if (!l.error.empty()) out += " (" + l.error + ")";
   out += fmt(" | prompt %lld", (long long)l.prompt_tokens);
-  if (l.cached_tokens > 0 && l.image_tokens > 0) out += fmt(" (%lld cached, %lld image)", (long long)l.cached_tokens, (long long)l.image_tokens);
-  else if (l.cached_tokens > 0) out += fmt(" (%lld cached)", (long long)l.cached_tokens);
-  else if (l.image_tokens > 0) out += fmt(" (%lld image)", (long long)l.image_tokens);
+  if (l.cached_tokens > 0) out += fmt(" (%lld cached)", (long long)l.cached_tokens);
   out += fmt(", completion %lld | queue %.2f s", (long long)l.completion_tokens, l.queue_s);
   if (l.ttft_s >= 0) {
     out += fmt(", ttft %.2f s", l.ttft_s);
     if (l.prefill_s > 0) out += fmt(", prefill %.1f tok/s", double(l.prompt_tokens - l.cached_tokens) / l.prefill_s);
     if (l.completion_tokens > 1 && l.decode_s > 0) out += fmt(", decode %.1f tok/s", double(l.completion_tokens - 1) / l.decode_s);
   }
+  if (l.verifies > 0)
+    out += fmt(" | draft %.2f tokens/verify, %lld of %lld accepted", double(l.accepted + l.verifies) / double(l.verifies), (long long)l.accepted,
+               (long long)l.drafted);
   return out;
 }
 
@@ -113,7 +126,8 @@ struct EmbedStats {
 
 // The server over the interval from `a` to `b` (unholy's, after vLLM's periodic stats line): prefill and generated
 // tokens a second, requests running and waiting, the positions the slots hold (of slots x ctx; cached: in slots with
-// no request, kept for prefix reuse), the share of admitted prompt tokens already in their slot, and embeddings.
+// no request, kept for prefix reuse), the share of admitted prompt tokens already in their slot, the draft's tokens a
+// verify and its acceptance, the snapshots held, and embeddings.
 std::string engine_line(const serve::Scheduler::Stats& a, const serve::Scheduler::Stats& b, const EmbedCounts& ea, const EmbedCounts& eb,
                         double dt, int64_t capacity) {
   std::string out = fmt("engine: prompt %.1f tok/s, generation %.1f tok/s | running %lld, waiting %lld",
@@ -123,6 +137,12 @@ std::string engine_line(const serve::Scheduler::Stats& a, const serve::Scheduler
              (long long)b.positions, (long long)capacity, (long long)b.idle_positions);
   if (b.prompt_tokens > a.prompt_tokens)
     out += fmt(" | prefix hit %.1f%%", 100.0 * double(b.cached_tokens - a.cached_tokens) / double(b.prompt_tokens - a.prompt_tokens));
+  if (b.verifies > a.verifies)
+    out += fmt(" | draft %.2f tokens/verify, %.1f%% of %lld drafted accepted", double(b.accepted - a.accepted + b.verifies - a.verifies) / double(b.verifies - a.verifies),
+               100.0 * double(b.accepted - a.accepted) / double(std::max<int64_t>(b.drafted - a.drafted, 1)), (long long)(b.drafted - a.drafted));
+  if (b.snapshots > 0 || b.snapshots_taken > a.snapshots_taken)
+    out += fmt(" | snapshots %lld (%.0f MiB), %lld taken, %lld restored", (long long)b.snapshots, double(b.snapshot_bytes) / 1048576.0,
+               (long long)(b.snapshots_taken - a.snapshots_taken), (long long)(b.restores - a.restores));
   if (eb.inputs > ea.inputs)
     out += fmt(" | embeddings %lld requests, %lld inputs, %.1f tok/s", (long long)(eb.requests - ea.requests), (long long)(eb.inputs - ea.inputs),
                double(eb.tokens - ea.tokens) / dt);
@@ -358,15 +378,17 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model_path, alias = "gemma-4-12b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", mmproj_path, embed_mmproj_path;
+  std::string model_path, alias = "qwen3.6-35b-a3b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", embed_mmproj_path;
+  std::string draft_path, chat_template;
   int image_tokens = 280;
-  int port = 8081, slots = 2, embed_port = 8082;
+  int port = 8081, slots = 2, embed_port = 8082, draft_block = 0;
   int64_t ctx = 262144, batch = 2048, chunk = 2048;
   bool kv_int8 = true;
   std::string expert_profile;
   int64_t experts_on_card = -2;  // as many as fit, once there is a profile
   int64_t card_margin_mib = 1024;
-  int stream_slots = 40, stream_min_rows = 16;
+  int64_t snapshot_mib = 4096, snapshot_every = 16384;
+  int stream_slots = -1, stream_min_rows = -1;  // -1: the engine's
   double log_interval = 10;  // seconds between the engine's log lines while there is traffic; 0: none
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -384,10 +406,14 @@ int main(int argc, char** argv) {
     else if (a == "--card-margin-mib") card_margin_mib = std::atoll(next().c_str());
     else if (a == "--stream-slots") stream_slots = std::atoi(next().c_str());
     else if (a == "--stream-min-rows") stream_min_rows = std::atoi(next().c_str());
+    else if (a == "--draft") draft_path = next();
+    else if (a == "--draft-block") draft_block = std::atoi(next().c_str());
+    else if (a == "--chat-template") chat_template = next();
+    else if (a == "--snapshot-mib") snapshot_mib = std::atoll(next().c_str());
+    else if (a == "--snapshot-every") snapshot_every = std::atoll(next().c_str());
     else if (a == "--embed-model") embed_path = next();
     else if (a == "--embed-port") embed_port = std::atoi(next().c_str());
     else if (a == "--embed-alias") embed_alias = next();
-    else if (a == "--mmproj") mmproj_path = next();
     else if (a == "--embed-mmproj") embed_mmproj_path = next();
     else if (a == "--image-tokens") image_tokens = std::atoi(next().c_str());
     else if (a == "--kv-int8") kv_int8 = true;
@@ -395,8 +421,9 @@ int main(int argc, char** argv) {
     else if (a == "--log-interval") log_interval = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
-                           "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N]] [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] "
-                           "[--image-tokens N] [--log-interval S]\n");
+                           "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
+                           "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] "
+                           "[--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S]\n");
       return 2;
     }
   }
@@ -408,30 +435,70 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "eklow-server: --image-tokens must be 70 to 1120\n");
     return 2;
   }
-  if (!mmproj_path.empty() && (chunk < image_tokens || batch < image_tokens + slots)) {
-    // An image's rows go in one chunk (its sliding layers see all of it at once), and a step holds the decode tokens too.
-    std::fprintf(stderr, "eklow-server: --image-tokens %d needs --chunk >= %d and --batch >= %d\n", image_tokens, image_tokens, image_tokens + slots);
+  if (!chat_template.empty() && chat_template != "stock" && chat_template != "ornith") {
+    std::fprintf(stderr, "eklow-server: --chat-template must be stock or ornith\n");
+    return 2;
+  }
+  if (draft_block < 0 || draft_block > 16 || draft_block == 1) {
+    std::fprintf(stderr, "eklow-server: --draft-block must be 2 to 16\n");
+    return 2;
+  }
+  if (snapshot_every < 1024) {
+    std::fprintf(stderr, "eklow-server: --snapshot-every must be at least 1024\n");
     return 2;
   }
   try {
     auto t0 = std::chrono::steady_clock::now();
     auto file = gguf::File::open(model_path);
-    if (const gguf::Value* t = file.find("tokenizer.chat_template"); !t || !text::is_gemma4_template(t->as_string()))
-      throw std::runtime_error(model_path + ": not Gemma 4's chat template");
-    const text::Tokenizer tok = text::Tokenizer::from_gguf(file);
+    // Which of Qwen3.6's two templates renders the conversation: the flag, else the GGUF's own when it is one of the two
+    // published files exactly (a third, such as Unsloth's edit in the official Ornith GGUFs, needs the flag).
+    text::QwenTemplate tmpl = text::QwenTemplate::Stock;
+    if (!chat_template.empty()) {
+      tmpl = chat_template == "ornith" ? text::QwenTemplate::Ornith : text::QwenTemplate::Stock;
+    } else {
+      const gguf::Value* t = file.find("tokenizer.chat_template");
+      const auto known = t ? text::qwen36_template_of(t->as_string()) : std::nullopt;
+      if (!known)
+        throw std::runtime_error(model_path + ": its chat template is not one of Qwen3.6's two that eklow renders (stock, ornith); say which the model uses with --chat-template");
+      tmpl = *known;
+    }
+    const text::QwenTokenizer tok = text::QwenTokenizer::from_gguf(file);
+    // The sampling defaults the model's card gives, from the GGUF (llama.cpp's general.sampling.*).
+    serve::SamplingParams sampling;
+    if (const gguf::Value* v = file.find("general.sampling.temp")) sampling.temperature = float(v->as_float());
+    if (const gguf::Value* v = file.find("general.sampling.top_k")) sampling.top_k = int32_t(v->as_int());
+    if (const gguf::Value* v = file.find("general.sampling.top_p")) sampling.top_p = float(v->as_float());
+    if (const gguf::Value* v = file.find("general.sampling.min_p")) sampling.min_p = float(v->as_float());
+    std::unique_ptr<gguf::File> draft_file;
+    model::Dflash2Config draft_cfg{};
+    if (!draft_path.empty()) {
+      draft_file = std::make_unique<gguf::File>(gguf::File::open(draft_path));
+      draft_cfg = model::Dflash2Config::from_gguf(*draft_file);
+      if (draft_block == 0) draft_block = std::min(draft_cfg.block_size, 16);
+    }
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     engine::Config ec;
     ec.n_slots = slots;
     ec.max_ctx = (ctx + attn::kPage - 1) / attn::kPage * attn::kPage;
     ec.max_batch = batch;
     ec.max_chunk = chunk;
-    ec.max_logits = slots;
-    ec.int8_global_kv = kv_int8;
+    ec.max_logits = int64_t(slots) * (std::max(draft_block, 1) + 1);
+    ec.int8_kv = kv_int8;
     ec.expert_profile = expert_profile;
     ec.experts_on_card = expert_profile.empty() ? -1 : experts_on_card;
     ec.card_margin_bytes = uint64_t(card_margin_mib) << 20;
-    ec.stream_slots = stream_slots;
-    ec.stream_min_rows = stream_min_rows;
+    if (stream_slots >= 0) ec.stream_slots = stream_slots;
+    if (stream_min_rows >= 0) ec.stream_min_rows = stream_min_rows;
+    if (draft_file) {
+      // The draft reads the target's hidden states at its layers; a step captures the rows of its verify blocks and of the
+      // last `window` rows of a prompt.
+      ec.capture_layers = draft_cfg.target_layers;
+      ec.max_capture_rows = chunk + int64_t(slots) * draft_block;
+      ec.max_pending = std::max(ec.max_pending, draft_block);
+    } else {
+      ec.capture_layers.clear();
+      ec.draft_reserve_bytes = 0;
+    }
     // The embedding model: its own queue on the card, so its work does not wait behind steps. It goes on
     // first, with room for its longest input, so that the experts' placement sees what it leaves.
     std::unique_ptr<gguf::File> embed_file;
@@ -446,23 +513,12 @@ int main(int argc, char** argv) {
       embed_model = std::make_unique<model::EmbedGemma2>(*embed_q, *embed_file);
       embed_model->reserve(8192);  // the longest input: no allocation at request time
     }
-    // The vision encoders, each on a queue of its own and loaded before the engine places its experts, so that their
+    // EmbeddingGemma 2's vision encoder, on a queue of its own and loaded before the engine places its experts, so that its
     // weights are counted in what is left of the card. An encode's activations are allocated and freed per image.
-    std::unique_ptr<gguf::File> vision_file, embed_vision_file;
-    std::unique_ptr<sycl::queue> vision_q, embed_vision_q;
-    std::unique_ptr<model::VisionGemma4V> vision, embed_vision;
-    std::unique_ptr<ImageService> images, embed_images;
-    if (!mmproj_path.empty()) {
-      vision_file = std::make_unique<gguf::File>(gguf::File::open(mmproj_path));
-      vision_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
-      vision = std::make_unique<model::VisionGemma4V>(*vision_q, *vision_file);
-      // The encoder's activations for the budget, held for good: reserved before the experts are placed so that they are
-      // counted, and no allocation at request time (~280 MiB at 280 rows, DECISIONS 2026-10-27 vision); the rows an
-      // encode returns are the caller's and fit the card margin.
-      vision->reserve(image_tokens);
-      std::fprintf(stderr, "eklow-server: vision projector %s, %.0f MiB on the card for %d-row images\n", mmproj_path.c_str(), double(vision->bytes()) / 1048576.0, image_tokens);
-      images = std::make_unique<ImageService>(*vision_q, *vision, image_tokens);
-    }
+    std::unique_ptr<gguf::File> embed_vision_file;
+    std::unique_ptr<sycl::queue> embed_vision_q;
+    std::unique_ptr<model::VisionGemma4V> embed_vision;
+    std::unique_ptr<ImageService> embed_images;
     if (!embed_mmproj_path.empty()) {
       if (!embed_model) throw std::runtime_error("--embed-mmproj needs --embed-model");
       embed_vision_file = std::make_unique<gguf::File>(gguf::File::open(embed_mmproj_path));
@@ -478,27 +534,42 @@ int main(int argc, char** argv) {
       embed_images = std::make_unique<ImageService>(*embed_vision_q, *embed_vision, image_tokens);
     }
     engine::Engine eng(q, file, ec);
-    if (vision && vision->n_embd() != eng.model().n_embd)
-      throw std::runtime_error(mmproj_path + ": projects to " + std::to_string(vision->n_embd()) + " but the model's width is " +
-                               std::to_string(eng.model().n_embd));
     const double GiB = 1073741824.0;
-    std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights, %.2f GiB of KV cache (%d slots of %lld), %.1f s\n",
+    std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights, %.2f GiB of KV cache and state (%d slots of %lld), %.1f s\n",
                  alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / GiB,
                  eng.cache_bytes() / GiB, slots, (long long)ec.max_ctx,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-    if (eng.model().n_expert > 0)
-      std::fprintf(stderr,
-                   "eklow-server: experts on the card: N = %lld of %lld per layer%s (one expert of every layer is %.0f MiB; free card memory before them "
-                   "%.2f GiB, margin %.2f GiB, free after %.2f GiB)\n",
-                   (long long)eng.experts_on_card(), (long long)eng.model().n_expert, eng.experts_on_card() < eng.model().n_expert ? ", the rest on the CPU" : "",
-                   eng.expert_set_bytes() / 1048576.0, eng.free_at_placement() / GiB, double(ec.card_margin_bytes) / GiB,
+    std::fprintf(stderr,
+                 "eklow-server: experts on the card: N = %lld of %lld per layer%s (one expert of every layer is %.0f MiB; free card memory before them "
+                 "%.2f GiB, margin %.2f GiB, free after %.2f GiB)\n",
+                 (long long)eng.experts_on_card(), (long long)eng.model().n_expert, eng.experts_on_card() < eng.model().n_expert ? ", the rest on the CPU" : "",
+                 eng.expert_set_bytes() / 1048576.0, eng.free_at_placement() / GiB, double(ec.card_margin_bytes) / GiB,
+                 rt::free_memory(q.get_device()).value_or(0) / GiB);
+    if (eng.experts_on_card() < eng.model().n_expert && eng.stream_slots() > 0)
+      std::fprintf(stderr, "eklow-server: prefill streams busy cold experts to the card: %d slots, %.2f GiB of cold experts pinned in host memory\n",
+                   eng.stream_slots(), eng.pinned_bytes() / GiB);
+    // The draft goes on after the engine, into the memory the engine kept for it.
+    std::unique_ptr<model::OwnedTarget> draft_target;
+    std::unique_ptr<model::Dflash2> draft;
+    if (draft_file) {
+      draft_target = std::make_unique<model::OwnedTarget>(q, file);
+      model::Dflash2::Options opt;
+      opt.slots = slots;
+      opt.max_block = draft_block;
+      draft = std::make_unique<model::Dflash2>(q, *draft_file, draft_target->view(), opt);
+      std::fprintf(stderr, "eklow-server: DFlash 2 draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card with the target's head and embeddings; free card memory now %.2f GiB\n",
+                   draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0,
                    rt::free_memory(q.get_device()).value_or(0) / GiB);
-    if (eng.model().n_expert > 0 && eng.stream_slots() > 0)
-      std::fprintf(stderr, "eklow-server: prefill streams busy cold experts to the card: %d slots (%.0f MiB on the card), %.2f GiB of cold experts pinned in host memory\n",
-                   eng.stream_slots(), eng.stream_slot_bytes() / 1048576.0, eng.pinned_bytes() / GiB);
-
-    serve::Scheduler sched(eng, tok, {batch, chunk, ec.max_ctx, [](const serve::RequestLog& l) { log_line(request_line(l)); }});
-    if (images) images->bind(&sched);
+    }
+    serve::SchedulerConfig sc{batch, chunk, ec.max_ctx, [](const serve::RequestLog& l) { log_line(request_line(l)); }};
+    sc.draft = draft.get();
+    sc.draft_block = draft_block;
+    sc.snapshot_bytes = uint64_t(std::max<int64_t>(snapshot_mib, 0)) << 20;
+    sc.snapshot_every = snapshot_every;
+    serve::Scheduler sched(eng, tok, sc);
+    std::fprintf(stderr, "eklow-server: chat template %s, sampling defaults temperature %g, top-k %d, top-p %g, min-p %g; snapshots of %.0f MiB each, up to %lld MiB\n",
+                 text::qwen36_template_name(tmpl), double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p),
+                 double(eng.snapshot_bytes()) / 1048576.0, (long long)snapshot_mib);
     if (embed_images) embed_images->bind(&sched);
     std::thread engine_thread([&] { sched.run(g_stop); });
     EmbedStats embed_stats;
@@ -523,8 +594,7 @@ int main(int argc, char** argv) {
           was_active = active, prev = cur, eprev = ecur, t_prev = now;
         }
       });
-    serve::ChatDefaults defaults{serve::SamplingParams{}, ec.max_ctx};
-    if (images) defaults.encode_image = [&](std::span<const uint8_t> bytes) { return (*images)(bytes); };
+    serve::ChatDefaults defaults{sampling, ec.max_ctx, tmpl};
 
     httplib::Server http;
     http.new_task_queue = [] { return new httplib::ThreadPool(16); };
@@ -549,12 +619,12 @@ int main(int argc, char** argv) {
       }
       auto r = std::make_shared<serve::Request>();
       r->prompt = std::move(cr.prompt);
-      r->images = std::move(cr.images);
       r->sampling = cr.sampling;
       r->max_tokens = cr.max_tokens;
       r->stop = cr.stop;
       r->in_thinking = cr.in_thinking;
-      r->tools = cr.tool_names;
+      r->tool_specs = cr.tool_specs;
+      r->snapshot_at = cr.snapshot_at;
       r->tag = serve::new_completion_id();
       try {
         sched.submit(r);

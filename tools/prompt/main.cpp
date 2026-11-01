@@ -1,11 +1,10 @@
-// eklow-prompt: the prompt eklow-server would build for a chat request, without the card: the token ids with image
-// rows as -1 (the oracle's tokens.json form, so that tools/ref/compare tooling and eklow-engine-run read it), and
-// where each image sits and how many rows it gets.
+// eklow-prompt: the prompt eklow-server would build for a chat request, without the card: the token ids (the oracle's
+// tokens.json form, so that tools/ref/compare tooling and eklow-engine-run read it) and where the generation prompt
+// starts (the position eklow-server takes a snapshot at).
 //
-//   eklow-prompt --model GGUF --request JSON [--image-tokens N] --out DIR
+//   eklow-prompt --model GGUF --request JSON [--chat-template stock|ornith] --out DIR
 //
-// Writes DIR/tokens.json ({"ids": [...], "images": [{"pos", "n"}, ...]}). The rows per image are
-// what the encoder would give (the patch grid pooled 3 x 3), counted from image::prepare as eklow-server does.
+// Writes DIR/tokens.json ({"ids": [...], "snapshot_at": N, "in_thinking": bool}).
 #include <cstdio>
 #include <fstream>
 #include <iterator>
@@ -13,60 +12,50 @@
 
 #include "core/json.hpp"
 #include "core/json_value.hpp"
-#include "image/gemma4_image.hpp"
 #include "model/gguf.hpp"
 #include "serve/openai.hpp"
-#include "text/tokenizer.hpp"
+#include "text/chat_qwen36.hpp"
+#include "text/tokenizer_qwen.hpp"
 
 using namespace eklow;
 
 int main(int argc, char** argv) {
-  std::string model, request, out;
-  int tokens = 280;
+  std::string model, request, out, tmpl_name;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
     if (a == "--model") model = next();
     else if (a == "--request") request = next();
     else if (a == "--out") out = next();
-    else if (a == "--image-tokens") tokens = std::atoi(next().c_str());
+    else if (a == "--chat-template") tmpl_name = next();
     else {
-      std::fprintf(stderr, "usage: eklow-prompt --model GGUF --request JSON [--image-tokens N] --out DIR\n");
+      std::fprintf(stderr, "usage: eklow-prompt --model GGUF --request JSON [--chat-template stock|ornith] --out DIR\n");
       return 2;
     }
   }
   try {
     if (model.empty() || request.empty() || out.empty()) throw std::runtime_error("need --model, --request and --out");
     const auto file = gguf::File::open(model);
-    const text::Tokenizer tok = text::Tokenizer::from_gguf(file);
+    const text::QwenTokenizer tok = text::QwenTokenizer::from_gguf(file);
+    text::QwenTemplate tmpl = text::QwenTemplate::Stock;
+    if (!tmpl_name.empty()) {
+      tmpl = tmpl_name == "ornith" ? text::QwenTemplate::Ornith : text::QwenTemplate::Stock;
+    } else {
+      const gguf::Value* t = file.find("tokenizer.chat_template");
+      const auto known = t ? text::qwen36_template_of(t->as_string()) : std::nullopt;
+      if (!known) throw std::runtime_error("the model's chat template is not one eklow knows: say --chat-template stock|ornith");
+      tmpl = *known;
+    }
     std::ifstream in(request);
     const json::Value body = json::parse(std::string(std::istreambuf_iterator<char>(in), {}));
-    image::Spec spec;
-    spec.patch = 48, spec.cut = 16, spec.min_patches = std::min(70, tokens), spec.max_patches = tokens;
-    serve::ChatDefaults d{serve::SamplingParams{}, int64_t(1) << 30};
-    d.encode_image = [&](std::span<const uint8_t> bytes) {
-      const image::Patches p = image::prepare(image::decode(bytes), spec);
-      serve::EncodedImage e;
-      e.n = int64_t(p.cols / 3) * (p.rows / 3);
-      e.rows = std::make_shared<std::vector<float>>();
-      uint64_t h = 0xcbf29ce484222325ull ^ uint64_t(tokens);
-      for (uint8_t b : bytes) h = (h ^ b) * 0x100000001b3ull;
-      e.hash = h;
-      return e;
-    };
+    serve::ChatDefaults d{serve::SamplingParams{}, int64_t(1) << 30, tmpl};
     const serve::ChatRequest r = serve::parse_chat(body, tok, d);
     json::Writer w(false);
     w.begin_object().key("ids").begin_array();
-    for (int32_t id : r.prompt) w.value(int64_t(id < 0 ? -1 : id));
-    w.end_array().key("images").begin_array();
-    for (const auto& im : r.images) w.begin_object().kv("pos", im.start).kv("n", im.n).end_object();
-    w.end_array().end_object();
+    for (int32_t id : r.prompt) w.value(int64_t(id));
+    w.end_array().kv("snapshot_at", r.snapshot_at).kv("in_thinking", r.in_thinking).end_object();
     std::ofstream(out + "/tokens.json") << w.str() << "\n";
-    std::printf("%zu tokens, %zu images (%lld rows)\n", r.prompt.size(), r.images.size(), [&] {
-      long long n = 0;
-      for (const auto& im : r.images) n += im.n;
-      return n;
-    }());
+    std::printf("%zu tokens, generation prompt at %lld, template %s\n", r.prompt.size(), (long long)r.snapshot_at, text::qwen36_template_name(tmpl));
     return 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-prompt: %s\n", e.what());
