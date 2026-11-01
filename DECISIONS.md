@@ -1479,3 +1479,42 @@ ids in its GGUF are +1. Same math otherwise (the conv taps, the lattice layout, 
 **Not done:** a token-for-token comparison with llama.cpp's draft (its draft graph needs a target context and the
 private `llama_get_embeddings_nextn`); BF16/F16 draft files only run in the reference (xmx::matmul_geglu cannot form
 fp16 outputs for few rows).
+
+## 2026-11-01 — the serving engine for Qwen3.6-35B-A3B
+
+`qwen/engine` (merged): `src/engine/engine.*` rewritten for qwen35moe; the Gemma 4 chat engine and its reference
+(`src/model/gemma4.*`) are gone (EmbeddingGemma 2, the vision encoder and Gemma's text code stay). Steps of prefill
+chunks, decode tokens and verify blocks (B <= 16 tokens with every logits row, the DeltaNet tokens left pending until the
+slot's next chunk says how many were accepted, the K/V past them dropped); capture of layers 1, 6, 11, 16, 22, 27, 32,
+37's outputs for the draft; `settle`, `snapshot` / `restore` of a slot's recurrent state for prefix reuse. Weights in
+their file's formats (EKK8: Q4_K experts, Q8_0 dense, Q6_K head through the dpas GEMV); experts placed rank by rank by a
+routing profile (`data/qwen36-experts.json`, `data/ornith-1.5-experts.json`) in the card's free memory less the 1 GiB
+margin and a 1.2 GiB reservation for the draft; the cold ones on the CPU from pinned memory, the busiest streamed for
+prefill. `eklow.service` stayed stopped; `server` is out of the build until the next task rewires it.
+
+**Fidelity** (`checkq.sh`, against the fp32 reference on the 2,573-token prompt's last 256 positions, six ways: chunks of
+1,024 and 2,048, the last 64 decoded, verify blocks of 8 accepting 3, mixed acceptances, blocks of 16 accepting 5): stock
+EK8 238-245/256, median KL 2.2-4.5e-3; stock EKK8 237-246, 1.7-3.5e-3; Ornith EK8 201-221, 2.2-3.6e-2; `chat` 27/27,
+27/27, 25/27 (mean KL 8.6e-4, 9.8e-4, 1.4e-2). Verify with replay is within the noise of plain decode. An apparent 10x
+gap between EKK8's and EK8's `chat` KL (2.2e-3 against 2.2e-4) came from an earlier build and from placement: on 27
+tokens the KL moves 10x with how many experts sit on the card (EK8 1.5e-4 to 1.6e-3 over 0-96 of them), in both files.
+
+**At the production shape** (2 x 262,144, int8 KV): 6.46 GiB of weights and 5.84 GiB of KV and DeltaNet state on the
+card, 7.16 GiB free before the experts, **71 of 256 experts a layer on the card**, ~12.2 GiB of cold experts in pinned host
+memory. `eklow-engine-bench`, no profiling (prefill: 4,096 tokens after the depth; decode per sequence):
+
+| | stock EKK8 | stock EK8 | the 26B in production |
+|---|---|---|---|
+| prefill from empty (2,048) | 1,297 tok/s | 1,402 | |
+| prefill at 8k / 32k / 128k | 1,071 / 848 / 393 | 1,189 / 808 / 408 | 1,865 / 1,794 / 1,177 |
+| decode, one slot, at 0 / 8k / 32k / 128k | 41.3 / 39.6 / 36.8 / 31.4 | 41.7 / 40.3 / 39.1 / 31.9 | 36.6 at 8k, 34.0 at 32k, 30.5 at 128k |
+| decode, two slots, per sequence | 32.4 / 32.1 / 28.6 / 24.5 | 33.0 / 32.9 / 29.8 / 24.6 | |
+| verify block of 8 / 16 at 8k, one slot | 70.9 / 112.8 ms | 67.6 / 106.4 ms | |
+
+Decode matches or beats the 26B; prefill is behind it everywhere and a third of it at 128k. Where the time goes
+(`--profile`): decode is launches plus the round trip to the CPU's cold experts (half the pairs are cold at 71 a layer:
+9.3 ms of CPU a step, and the card waits 9.4 ms for routing); a verify block of 8 costs 2.8 decode steps and is bound by
+the CPU (43.8 ms of cold experts; the card finished first in 38 of 40 layers), with `moe_sum` 35% of the card's part;
+prefill is the streamed experts' copy and repack (41% from empty, 36% at 8k) and, deeper, the attention layers' prefill
+attention (37% at 32k, 63% at 128k: the two-GEMM segments, DECISIONS 2026-10-27, exist only for head 512, and Qwen's
+heads are 256). Those four are the levers.
