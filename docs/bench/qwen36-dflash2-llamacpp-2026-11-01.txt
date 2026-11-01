@@ -22,6 +22,18 @@ machine (the CPU did other work in places): compare acceptance, treat tok/s as i
 
 | run (pair-block / sampling) | gsm8k acceptance (tok/s, truncated) | humaneval acceptance (tok/s, truncated) | mt-bench acceptance (tok/s, truncated) |
 |---|---|---|---|
+| decode-ornith-inco-b8/greedy | 5.79 (421, 0/8) |  |  |
+| decode-ornith-inco-b8/temp | 5.21 (405, 0/8) |  |  |
+| decode-ornith-jzinno-b16/greedy | 7.27 (348, 0/8) |  |  |
+| decode-ornith-jzinno-b16/temp | 6.68 (332, 0/8) |  |  |
+| decode-ornith-nodraft/greedy | n/a (184, 0/8) |  |  |
+| decode-ornith-nodraft/temp | n/a (187, 0/8) |  |  |
+| decode-stock-inco-b8/greedy | 5.74 (427, 1/8) |  |  |
+| decode-stock-inco-b8/temp | 5.24 (419, 2/8) |  |  |
+| decode-stock-jzinno-b16/greedy | 5.95 (308, 2/8) |  |  |
+| decode-stock-jzinno-b16/temp | 5.83 (304, 0/8) |  |  |
+| decode-stock-nodraft/greedy | n/a (184, 2/8) |  |  |
+| decode-stock-nodraft/temp | n/a (186, 2/8) |  |  |
 | ornith-inco-b16/greedy | 6.77 (31, 0/32) | 6.82 (30, 3/32) | 4.96 (23, 1/32) |
 | ornith-inco-b16/temp | 6.43 (31, 1/32) | 6.04 (27, 4/32) | 4.59 (20, 4/32) |
 | ornith-inco-b8/greedy | 5.48 (73, 1/32) | 5.42 (71, 5/32) | 4.24 (60, 3/32) |
@@ -41,6 +53,11 @@ machine (the CPU did other work in places): compare acceptance, treat tok/s as i
 | stock-jzinno-b8/temp | 4.59 (69, 3/32) | 3.76 (56, 8/32) | 3.87 (57, 3/32) |
 
 Server commands (one per run; file names under ~/eklow-qwen-data):
+  decode-ornith-inco-b8: llama-cuda/bin/llama-server -m gguf/ornith/ornith-EK8.gguf --host 127.0.0.1 --port 8090 -np 1 -c 6144 --fit on --spec-draft-model gguf/drafts/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ngl 99
+  decode-ornith-jzinno-b16: llama-cuda/bin/llama-server -m gguf/ornith/ornith-EK8.gguf --host 127.0.0.1 --port 8090 -np 1 -c 6144 --fit on --spec-draft-model gguf/drafts/Ornith-1.5-35B-A3B-DFlash2-jzinno-Q8_0.gguf --spec-type draft-dflash --spec-draft-n-max 15 --spec-draft-ngl 99
+  decode-ornith-nodraft: llama-cuda/bin/llama-server -m gguf/ornith/ornith-EK8.gguf --host 127.0.0.1 --port 8090 -np 1 -c 6144 --fit on
+  decode-stock-inco-b8: llama-cuda/bin/llama-server -m gguf/stock/stock-EKK8.gguf --host 127.0.0.1 --port 8090 -np 1 -c 6144 --fit on --spec-draft-model gguf/drafts/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ngl 99
+  decode-stock-jzinno-b16: llama-cuda/bin/llama-server -m gguf/stock/stock-EKK8.gguf --host 127.0.0.1 --port 8090 -np 1 -c 6144 --fit on --spec-draft-model gguf/drafts/Ornith-1.5-35B-A3B-DFlash2-jzinno-Q8_0.gguf --spec-type draft-dflash --spec-draft-n-max 15 --spec-draft-ngl 99
   decode-stock-nodraft: llama-cuda/bin/llama-server -m gguf/stock/stock-EKK8.gguf --host 127.0.0.1 --port 8090 -np 1 -c 6144 --fit on
   ornith-inco-b16: llama-cuda/bin/llama-server -m gguf/ornith/ornith-EK8.gguf --host 127.0.0.1 --port 8090 -np 4 -c 24576 --fit on --spec-draft-model work/gguf/drafts/variants/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0-block16.gguf --spec-type draft-dflash --spec-draft-n-max 15 --spec-draft-ngl 99
   ornith-inco-b8: llama-cuda/bin/llama-server -m gguf/ornith/ornith-EK8.gguf --host 127.0.0.1 --port 8090 -np 4 -c 24576 --fit on --spec-draft-model gguf/drafts/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ngl 99
