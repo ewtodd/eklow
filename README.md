@@ -59,18 +59,25 @@ slot and snapshot that leave the least to prefill.
 
 ## Performance
 
-Measured on that machine (2026-11-01), through `eklow-server` with the production shape: stock Qwen3.6 in EKK8, two slots
-of 262,144 tokens, int8 K/V, 2,048-token prefill chunks, Inco's DFlash 2 draft (Q8_0) in blocks of 4, 4 GiB of snapshots,
-EmbeddingGemma 2 loaded: 55 of 256 experts a layer on the card (the draft, the token table it embeds with and the
-embedding model take the rest; `eklow-engine-bench` without them holds 71), 13.25 GiB of cold experts pinned. The method
-is unholy's (`tools/bench/serve_perf.py`, unique text cut to Qwen token depths; raw output in `docs/bench/serve-perf-qwen-*`),
-against the 26B's numbers of 2026-10-27 in the last column:
+Measured on that machine (2026-11-01), through `eklow-server` with the production shape: each model in EKK8, two
+slots of 262,144 tokens, int8 K/V, 2,048-token prefill chunks, Inco's DFlash 2 draft (Q8_0) in blocks of 4 with its
+token table on the host, 4 GiB of snapshots, EmbeddingGemma 2 loaded: 59 of 256 experts a layer on the card, 12.99 GiB
+of cold experts pinned. The method is unholy's (`tools/bench/serve_perf.py`, unique text cut to Qwen token depths; raw
+output in `docs/bench/release/{stock,ornith}/`), against the 26B's numbers of 2026-10-27:
 
-| | Qwen3.6-35B-A3B, plain decode | with DFlash 2 | Gemma 4 26B A4B (before) |
+| | stock Qwen3.6-35B-A3B | Ornith-1.5-35B-A3B | Gemma 4 26B A4B (before) |
 |---|---|---|---|
-| prefill, one request, unique text (time to first token) | 1001 tok/s at 8k (8.1 s), 977 at 32k, 602 at 128k (218 s), 392 at 252k (643 s) | | 1865 tok/s at 8k, 1794 at 32k, 1177 at 128k, 765 at 252k (338 s) |
-| decode, one stream, at 8k / 32k / 128k / 252k | 33.9 / 31.5 / 28.1 / 23.6 tok/s | 44.1 / 40.5 / 33.1 / 24.3 tok/s (2.7-2.8 tokens a verify) | 36.6 / 34.0 / 30.5 / 26.5 tok/s |
-| GSM8K chat (48 requests, thinking on, 1024 tokens each), 1 / 2 at a time | 37.0 / 53.2 tok/s aggregate | 53.5 / 62.8 tok/s (3.5 tokens a verify) | 33.4 / 40.2 tok/s |
+| prefill, one request, unique text, at 8k / 32k / 128k / 252k | 1,124 / 1,151 / 749 / 564 tok/s | 1,039 / 1,043 / 726 / 546 tok/s | 1,865 / 1,794 / 1,177 / 765 tok/s |
+| time to first token at 252k | 447 s | 461 s | 338 s |
+| decode, one stream, with the draft, at 8k / 32k / 128k / 252k | 44.7 / 44.0 / 38.2 / 30.1 tok/s | 44.3 / 40.4 / 33.0 / 30.4 tok/s | 36.6 / 34.0 / 30.5 / 26.5 tok/s |
+| decode without the draft | 34.3 / 33.2 / 28.1 / 25.2 tok/s | 32.8 / 31.1 / 27.1 / 24.1 tok/s | |
+| GSM8K chat (48 requests, thinking on, up to 1,024 tokens), 1 / 2 at a time, with the draft | 57.0 / 67.2 tok/s aggregate | 54.6 / 61.5 tok/s | 33.4 / 40.2 tok/s |
+| the same without the draft | 34.8 / 48.9 tok/s | 33.5 / 46.4 tok/s | |
+
+Decode is the median of five requests on a cached document, with 2.7-3.1 tokens a verify on the Pile's prose and 3.5 on
+GSM8K. The two models run at the same speed (they share the architecture and the files' mix); Ornith answers the
+GSM8K questions in ~280 tokens where stock's thinking runs to the 1,024-token cap, so its 48 requests take a third of
+the time.
 
 The draft pays where the text is predictable: on reasoning and code a block of 4 gives 3.5 tokens a verify and 1.5x plain
 decode; on the Pile's prose 2.7 and 1.3x at 8k, nothing at 252k, where the verify's attention costs what the draft saves.
@@ -82,17 +89,21 @@ same pair (blocks of 8, temperature 1, top-p 0.95, top-k 20, thinking on, 16 req
 `docs/bench/serve-accept-*`): GSM8K 5.75 tokens a verify (llama.cpp 5.24), HumanEval 5.43 (4.98), MT-Bench 5.02 (4.53),
 and with blocks of 4: 3.54 / 3.48 / 3.34.
 
-Prefix reuse (`docs/bench/serve-perf-qwen-reuse-*`): a 10k-token conversation (a system prompt of reference text, thinking on) takes 9.2 s
-cold. Its next turn, with stock's template (which drops the earlier turn's reasoning, so the shared prefix ends before
-the generation prompt), prefills 105 of 10,057 tokens in 0.61 s; with Ornith's (which keeps it, so the whole first
-answer is shared) 20 of 10,403 in 0.26 s. A question on a 100k-token document already read takes 0.28-0.31 s instead of
-146-159 s. When a sampled answer is not what the template renders back (the model sampled " D" + "amas", the
-tokenizer says " Damas"), the end-of-generation snapshot no longer matches and the next turn falls back to the one before
-the generation prompt (Ornith's third turn: 677 tokens, 1.3 s); the server logs where such a sequence and a prompt part. Needle in a haystack through the server, two requests at once and
-embeddings beside them: the passphrase found at 88k and at 167k tokens (`docs/bench/serve-needle-qwen-*`).
+Prefix reuse (`docs/bench/serve-perf-qwen-reuse-*`): a 10k-token conversation (a system prompt of reference text,
+thinking on) takes 9.2 s cold. Its next turn, with stock's template (which drops the earlier turn's reasoning, so the
+shared prefix ends before the generation prompt), prefills 105 of 10,057 tokens in 0.61 s; with Ornith's (which keeps
+it, so the whole first answer is shared) 20 of 10,403 in 0.26 s. A question on a 100k-token document already read takes
+0.28-0.31 s instead of 146-159 s. When a sampled answer is not what the template renders back (the model sampled " D" +
+"amas", the tokenizer says " Damas"), the end-of-generation snapshot no longer matches and the next turn falls back to
+the one before the generation prompt (Ornith's third turn: 677 tokens, 1.3 s); the server logs where such a sequence
+and a prompt part. Needle in a haystack through the server, two requests at once and embeddings beside them: the
+passphrase found at 88k and at 167k tokens (`docs/bench/serve-needle-qwen-*`).
 
-Prefill is behind the 26B's everywhere (a half at 252k): the streamed experts' copy and repack and, deeper, the attention
-layers' prefill attention are the levers (DECISIONS 2026-11-01); `qwen/perf` works on them. With the draft decode is faster than the 26B's to 128k and 8% behind at 252k; plain it is 7-11% behind.
+With the draft, decode is faster than the 26B's at every depth (22% at 8k, 14% at 252k); plain it is 2-8% behind.
+Prefill is 60-74% of the 26B's: Qwen3.6's experts are 18 GB, only 59 of each layer's 256 fit on the card beside 2 x
+262k of K/V, and most of a chunk's expert work is cold, streamed over PCIe or computed by the CPU at its memory wall
+(DECISIONS 2026-11-01, "the MoE's speed"). The attention layers' long prefill runs in key segments as two GEMMs, as the
+26B's global layers did.
 
 Embeddings do not wait for a prefill: 91-238 ms during the needle test's 88k and 167k prefills.
 
