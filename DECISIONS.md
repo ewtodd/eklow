@@ -1555,7 +1555,7 @@ repacked pinned copy would remove the repack and the raw slots but needs a secon
 **Not done / left**: (a) the iGPU of the 12700H (96 EU, int8 dp4a, same DDR) as a second compute device for the
 non-streamed pairs; (b) a SYCL command graph or fused kernels for the decode layer's ~25 launches (the card's critical chain
 between two CPU phases is ~0.25 ms a layer, 10 ms a step); (c) a smaller hot KV footprint for more experts on the card, which
-is the only thing that shortens verify (each rank of 40 experts' bytes is ~1.8 MB x 40 less CPU read per ...); (d) the
+is the only thing that shortens verify (each rank is 40 experts, ~71 MB, and one fewer distinct cold expert a layer); (d) the
 profile `--profile` of a verify block with timeline per layer.
 
 `engineq` after (no profile; before = the 2026-11-01 table): prefill 1,315 (1,297) / 8k 1,135 (1,071) / 32k 867 (848) / 128k
