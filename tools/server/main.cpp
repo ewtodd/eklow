@@ -3,7 +3,7 @@
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
 //                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
-//                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF]
+//                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF [--image-max-tokens N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
 //                [--log-interval S]
 //
@@ -67,6 +67,7 @@
 #include "model/dflash2.hpp"
 #include "model/gguf.hpp"
 #include "model/vision_gemma4v.hpp"
+#include "model/vision_qwen3vl.hpp"
 #include "rt/device.hpp"
 #include "serve/openai.hpp"
 #include "serve/scheduler.hpp"
@@ -257,11 +258,12 @@ using RowsFn = std::function<HostRows(std::span<const uint8_t>)>;
 
 class QwenImageService {
  public:
-  QwenImageService(RowsFn fn, int64_t n_embd) : fn_(std::move(fn)), n_embd_(n_embd) {}
+  // `salt` is mixed into the hash that names an image in prefix reuse (the encoder's token budget: rows differ with it).
+  QwenImageService(RowsFn fn, int64_t n_embd, uint64_t salt = 0) : fn_(std::move(fn)), n_embd_(n_embd), salt_(salt) {}
   void bind(serve::Scheduler* s) { sched_ = s; }
 
   serve::EncodedImage operator()(std::span<const uint8_t> bytes) {
-    uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a over the bytes
+    uint64_t h = 0xcbf29ce484222325ull ^ salt_;  // FNV-1a over the bytes
     for (uint8_t b : bytes) h = (h ^ b) * 0x100000001b3ull;
     {
       std::lock_guard lk(cache_mu_);
@@ -305,6 +307,7 @@ class QwenImageService {
   };
   RowsFn fn_;
   int64_t n_embd_;
+  uint64_t salt_;
   serve::Scheduler* sched_ = nullptr;
   std::mutex enc_mu_, cache_mu_;
   std::list<Entry> cache_;
@@ -477,6 +480,7 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 int main(int argc, char** argv) {
   std::string model_path, alias = "qwen3.6-35b-a3b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", embed_mmproj_path;
   std::string draft_path, chat_template, mmproj_path, image_rows_dir;
+  int image_max_tokens = 1024;  // chat images: rows an image becomes at most (llama.cpp's image_max_tokens; 8 to 4096)
   int64_t vision_reserve_mib = 0;
   int image_tokens = 280;
   int port = 8081, slots = 2, embed_port = 8082, draft_block = 0;
@@ -515,6 +519,7 @@ int main(int argc, char** argv) {
     else if (a == "--embed-mmproj") embed_mmproj_path = next();
     else if (a == "--mmproj") mmproj_path = next();
     else if (a == "--image-rows-dir") image_rows_dir = next();
+    else if (a == "--image-max-tokens") image_max_tokens = std::atoi(next().c_str());
     else if (a == "--vision-reserve-mib") vision_reserve_mib = std::atoll(next().c_str());
     else if (a == "--image-tokens") image_tokens = std::atoi(next().c_str());
     else if (a == "--kv-int8") kv_int8 = true;
@@ -524,7 +529,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
                            "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
                            "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] "
-                           "[--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S]\n");
+                           "[--mmproj GGUF [--image-max-tokens N]] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S]\n");
       return 2;
     }
   }
@@ -609,6 +614,8 @@ int main(int argc, char** argv) {
     // scratch come out of the experts' share and not of the margin that long requests allocate into.
     std::unique_ptr<gguf::File> mmproj_file;
     std::unique_ptr<QwenImageService> chat_images;
+    std::unique_ptr<sycl::queue> vision_q;
+    std::unique_ptr<model::VisionQwen3VL> vision;
     const model::Qwen35Config qcfg = model::Qwen35Config::from_gguf(file);
     if (!mmproj_path.empty() || !image_rows_dir.empty()) {
       RowsFn fn;
@@ -621,11 +628,31 @@ int main(int argc, char** argv) {
         if (!pd || pd->as_int() != qcfg.n_embd)
           throw std::runtime_error(mmproj_path + ": projects to " + (pd ? std::to_string(pd->as_int()) : std::string("?")) + " but the model's width is " + std::to_string(qcfg.n_embd));
       }
-      if (!image_rows_dir.empty()) fn = rows_from_dir(image_rows_dir, qcfg.n_embd);
-      else throw std::runtime_error("--mmproj: the vision encoder is not wired into the server yet (qwen/vision); --image-rows-dir serves llama.cpp's rows for known pictures");
-      chat_images = std::make_unique<QwenImageService>(std::move(fn), qcfg.n_embd);
+      uint64_t salt = 0;
+      if (!image_rows_dir.empty()) {
+        fn = rows_from_dir(image_rows_dir, qcfg.n_embd);
+      } else {
+        // The encoder goes on before the engine, with room for its largest image, so that the experts' placement sees what it leaves.
+        if (image_max_tokens < 8 || image_max_tokens > 4096 || image_max_tokens > std::min(batch, chunk))
+          throw std::runtime_error("--image-max-tokens must be 8 to 4096 and at most the prefill chunk (an image is prefilled whole)");
+        vision_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
+        vision = std::make_unique<model::VisionQwen3VL>(*vision_q, *mmproj_file);
+        vision->reserve(image_max_tokens);
+        const image::QwenSpec spec = vision->spec(image_max_tokens);
+        salt = uint64_t(image_max_tokens) * 0x9e3779b97f4a7c15ull;
+        fn = [&q = *vision_q, v = vision.get(), spec](std::span<const uint8_t> bytes) {
+          model::QwenImageRows r = v->encode(bytes, spec);
+          HostRows h;
+          h.nx = r.grid_w, h.ny = r.grid_h;
+          h.rows.resize(size_t(r.rows.n * r.rows.dim));
+          q.memcpy(h.rows.data(), r.rows.data.get(), h.rows.size() * sizeof(float)).wait();
+          return h;
+        };
+        std::fprintf(stderr, "eklow-server: vision encoder %s, up to %d rows an image, %.0f MiB on the card while encoding\n", mmproj_path.c_str(), image_max_tokens,
+                     double(vision->card_bytes(image_max_tokens)) / 1048576.0);
+      }
+      chat_images = std::make_unique<QwenImageService>(std::move(fn), qcfg.n_embd, salt);
       ec.vision_reserve_bytes = uint64_t(std::max<int64_t>(vision_reserve_mib, 0)) << 20;
-      std::fprintf(stderr, "eklow-server: image input on%s%s, %lld MiB kept for the encoder\n", mmproj_path.empty() ? "" : " with ", mmproj_path.c_str(), (long long)vision_reserve_mib);
     }
     // The embedding model: its own queue on the card, so its work does not wait behind steps. It goes on
     // first, with room for its longest input, so that the experts' placement sees what it leaves.

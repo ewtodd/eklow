@@ -17,11 +17,14 @@
 // --snapshot-test: prefill all but 16 tokens, snapshot, decode the 16, restore and decode them again (identical logits, the cost of both).
 // --images-dir DIR: the prompt holds images, as eklow-oracle --mmproj wrote them: DIR/tokens.json lists them ("images": pos, n, nx, ny;
 // their ids in "ids" are -1) and DIR/image_K.f32 holds their rows. They are fed as image spans with Qwen's 3D positions (a prefill chunk
-// never cuts one); the logits are of every position, image rows included.
+// never cuts one); the logits are of every position, image rows included. With --mmproj GGUF --image-files A,B,... (the pictures
+// the oracle was given, in order; --image-max-tokens as the oracle's --image-tokens) the rows are eklow's encoder's instead of the
+// oracle's, and their grids must equal the oracle's.
 // --capture-check asks every chunk for its hidden-state capture and compares layer 1's with l_out-1 in the dumps.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <span>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
@@ -38,6 +41,7 @@
 #include "engine/engine.hpp"
 #include "model/gguf.hpp"
 #include "model/image_rows.hpp"
+#include "model/vision_qwen3vl.hpp"
 #include "rt/device.hpp"
 
 using namespace eklow;
@@ -59,7 +63,8 @@ double since(std::chrono::steady_clock::time_point t0) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, out, tokens_json, tokens_arg, record_routing, images_dir;
+  std::string model, out, tokens_json, tokens_arg, record_routing, images_dir, mmproj, image_files;
+  int image_max_tokens = 256;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   std::vector<int64_t> accept_pattern = {3};
   int64_t logits_last = 1, chunk = 0, decode_last = 0, verify_last = 0, verify_block = 8, max_ctx = 0;
@@ -90,6 +95,9 @@ int main(int argc, char** argv) {
     else if (a == "--snapshot-test") snapshot_test = true;
     else if (a == "--record-routing") record_routing = next();
     else if (a == "--images-dir") images_dir = next();
+    else if (a == "--mmproj") mmproj = next();
+    else if (a == "--image-files") image_files = next();
+    else if (a == "--image-max-tokens") image_max_tokens = std::atoi(next().c_str());
     else if (a == "--expert-profile") ec.expert_profile = next();
     else if (a == "--experts-on-card") ec.experts_on_card = std::atoll(next().c_str());
     else if (a == "--cpu-threads") ec.cpu_threads = std::atoi(next().c_str());
@@ -184,6 +192,25 @@ int main(int argc, char** argv) {
     auto f = gguf::File::open(model);
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     engine::Engine eng(q, f, ec);
+    if (!mmproj.empty()) {
+      const gguf::File vf = gguf::File::open(mmproj);
+      model::VisionQwen3VL enc(q, vf);
+      const auto spec = enc.spec(image_max_tokens);
+      const auto files = split(image_files, ',');
+      if (files.size() != imgs.size()) throw std::runtime_error("--image-files: one picture per image of the prompt");
+      for (size_t k = 0; k < imgs.size(); ++k) {
+        std::ifstream pf(files[k], std::ios::binary);
+        const std::string bytes((std::istreambuf_iterator<char>(pf)), {});
+        const auto r = enc.encode(std::span<const uint8_t>(reinterpret_cast<const uint8_t*>(bytes.data()), bytes.size()), spec);
+        if (r.grid_w != imgs[k].nx || r.grid_h != imgs[k].ny) throw std::runtime_error("image " + std::to_string(k) + ": eklow's grid differs from the oracle's");
+        std::vector<float> rows(size_t(r.rows.n * r.rows.dim));
+        q.memcpy(rows.data(), r.rows.data.get(), rows.size() * 4).wait();
+        double num = 0, den = 0;
+        for (size_t i = 0; i < rows.size(); ++i) num += double(rows[i] - imgs[k].rows[i]) * double(rows[i] - imgs[k].rows[i]), den += double(imgs[k].rows[i]) * double(imgs[k].rows[i]);
+        std::printf("image %zu: %lld x %lld rows from eklow's encoder, relative L2 distance from the oracle's %.3e\n", k, (long long)r.grid_w, (long long)r.grid_h, std::sqrt(num / den));
+        imgs[k].rows = std::move(rows);
+      }
+    }
     const int64_t V = eng.model().n_vocab, E = eng.model().n_embd;
     std::printf("loaded in %.1f s on %s: %s\n", since(t0), q.get_device().get_info<sycl::info::device::name>().c_str(), eng.placement_line().c_str());
 
