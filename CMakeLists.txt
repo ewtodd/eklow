@@ -53,6 +53,7 @@ target_link_libraries(eklow_text PUBLIC eklow_host)
 # Images for Gemma 4's vision encoders: decoding (stb_image, vendored) and preparation. No device code.
 add_library(eklow_image STATIC
   src/image/gemma4_image.cpp
+  src/image/qwen3vl_image.cpp
   src/image/stb_image.cpp
 )
 target_include_directories(eklow_image PUBLIC src third_party)
@@ -90,6 +91,8 @@ add_library(eklow_model STATIC
   src/model/embed_gemma2.cpp
   src/model/vision_gemma4v.cpp
   src/model/vision_gemma4v_fast.cpp
+  src/model/vision_qwen3vl.cpp
+  src/model/vision_qwen3vl_fast.cpp
   src/kernels/vision_attn.cpp
   src/model/qwen35.cpp
 )
@@ -112,6 +115,10 @@ eklow_sycl(eklow-embed)
 add_executable(eklow-vision tools/vision/main.cpp)
 target_link_libraries(eklow-vision PRIVATE eklow_model)
 eklow_sycl(eklow-vision)
+
+add_executable(eklow-vision-qwen tools/vision/qwen_main.cpp)
+target_link_libraries(eklow-vision-qwen PRIVATE eklow_model)
+eklow_sycl(eklow-vision-qwen)
 
 add_executable(eklow-attn-test tools/attn_test/main.cpp)
 target_link_libraries(eklow-attn-test PRIVATE eklow_model)
@@ -196,7 +203,7 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test-qwen eklow-cpu-gemv-test RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test-qwen eklow-cpu-gemv-test RUNTIME DESTINATION bin)
 # The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
 
