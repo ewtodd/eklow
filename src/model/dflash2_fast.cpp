@@ -69,6 +69,7 @@ struct Dflash2::Impl {
   // block pass buffers
   float *x, *n1, *cvb, *dyn, *qkv, *Qh, *Kh, *Vh, *att, *ob, *gu, *logits, *hid, *gate, *unary, *pred, *succ, *lat;
   int32_t *cand, *pred_ids, *tscr_ids, *meta, *packed;
+  uint8_t* emb_rows = nullptr;  // host_table: a row of the token table per block (its anchor), then the mask's
   float* tscr_vals;
   // injection buffers
   float *ih, *ikv, *iK, *iV;
@@ -229,6 +230,7 @@ Dflash2::Dflash2(sycl::queue& q, const gguf::File& draft, const Dflash2Target& t
   s.tscr_vals = s.dev<float>(R * chunks * 16);
   s.meta = s.dev<int32_t>(6 * R);
   s.packed = s.dev<int32_t>(8192);
+  if (target.host_table) s.emb_rows = s.dev<uint8_t>(size_t(opt.slots + 1) * target.tok_embd.row_bytes);
   const size_t I = size_t(opt.max_inject);
   s.ih = s.dev<float>(I * E);
   s.ikv = s.dev<float>(I * size_t(c_.n_layer) * 2 * Hkv * D);
@@ -314,7 +316,7 @@ std::vector<serve::Lattice> Dflash2::lattices(const std::vector<Request>& reqs, 
     if (r.slot < 0 || r.slot >= opt_.slots || r.pos != end_[size_t(r.slot)]) throw std::runtime_error("dflash2: a block must start at its slot's context end");
     for (int t = 0; t < B; ++t) {
       const int i = b * B + t;
-      meta[size_t(i)] = t == 0 ? r.anchor : c_.mask_token;
+      meta[size_t(i)] = s.emb_rows ? (t == 0 ? b : nb) : (t == 0 ? r.anchor : c_.mask_token);  // host_table: a row of emb_rows
       meta[size_t(R + i)] = int32_t(r.pos + t);
       meta[size_t(2 * R + i)] = r.slot;
       meta[size_t(3 * R + i)] = int32_t(std::max<int64_t>({0, first_[size_t(r.slot)], r.pos + t - window_ + 1}));
@@ -330,7 +332,18 @@ std::vector<serve::Lattice> Dflash2::lattices(const std::vector<Request>& reqs, 
   q_.memcpy(s.packed, packed.data(), packed.size() * sizeof(int32_t));
   const attn::Tokens tokens{slot, pos, R, lo, hi};
   const float scale = 1.0f / std::sqrt(float(D));
-  ref::embed(q_, s.target.tok_embd, tok, R, 1.0f, s.x);
+  if (s.emb_rows) {
+    const ref::Weight& te = s.target.tok_embd;
+    if (nb > opt_.slots) throw std::runtime_error("dflash2: more blocks than slots");
+    for (int b = 0; b < nb; ++b) q_.memcpy(s.emb_rows + size_t(b) * te.row_bytes, te.data + size_t(reqs[size_t(b)].anchor) * te.row_bytes, te.row_bytes);
+    q_.memcpy(s.emb_rows + size_t(nb) * te.row_bytes, te.data + size_t(c_.mask_token) * te.row_bytes, te.row_bytes);
+    ref::Weight small = te;
+    small.n = nb + 1;
+    small.data = s.emb_rows;
+    ref::embed(q_, small, tok, R, 1.0f, s.x);
+  } else {
+    ref::embed(q_, s.target.tok_embd, tok, R, 1.0f, s.x);
+  }
   lap(profile ? profile->embed_ms : t0);
   for (int l = 0; l < c_.n_layer; ++l) {
     const auto& L = s.layers[size_t(l)];
