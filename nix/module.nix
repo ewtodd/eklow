@@ -33,8 +33,8 @@ in
       default = null;
       example = lib.literalExpression "/models/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf";
       description = ''
-        A DFlash 2 draft GGUF (arch "dflash"; Inco AI's for stock Qwen3.6, jzinno's for Ornith) for speculative decoding,
-        accepted losslessly; null decodes plain. About 1.7 GiB of the card is kept for it when set.
+        A DFlash 2 draft GGUF (arch "dflash"; Inco AI's serves stock Qwen3.6 and Ornith-1.5 alike, DECISIONS 2026-11-01) for
+        speculative decoding, accepted losslessly; null decodes plain. Its weights and cache take ~0.8 GiB of the card.
       '';
     };
 
