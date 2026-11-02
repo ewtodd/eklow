@@ -152,9 +152,9 @@ def basic(a):
     z = chat(url, sm, max_tokens=60, temperature=1.0, seed=43, reasoning_effort="none")["choices"][0]["message"]["content"]
     check("seed: same seed, same output", x == y, f"{x!r} vs {y!r}")
     check("seed: another seed, another output", x != z)
-    # Image parts are refused with a clear error.
+    # A broken image part is refused with a clear error: no projector (--mmproj), or bytes that are no picture.
     status, j = post(url, {"messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}, {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}}]}]})
-    check("image part refused", status == 400 and "not supported" in json.dumps(j), f"{status} {j}")
+    check("bad image part refused", status == 400 and ("not supported" in json.dumps(j) or "not a JPEG" in json.dumps(j)), f"{status} {j}")
     # A developer message is a system one; both give the same prompt.
     d1 = chat(url, [{"role": "developer", "content": "Answer in French."}, {"role": "user", "content": "Say hello."}], max_tokens=1, temperature=0)["usage"]["prompt_tokens"]
     d2 = chat(url, [{"role": "system", "content": "Answer in French."}, {"role": "user", "content": "Say hello."}], max_tokens=1, temperature=0)["usage"]["prompt_tokens"]
