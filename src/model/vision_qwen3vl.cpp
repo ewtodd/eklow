@@ -113,7 +113,7 @@ QwenImageRows VisionQwen3VL::encode(const image::Rgb& pic) {
   const int unit = patch_ * merge_;
   if (pic.width <= 0 || pic.height <= 0 || pic.width % unit || pic.height % unit)
     throw std::invalid_argument("vision encoder: the picture's sides must be multiples of 32 pixels");
-  if (pic.width / patch_ > 2 * n_pos_ || pic.height / patch_ > 2 * n_pos_) throw std::invalid_argument("vision encoder: the image is too large");
+  if (int64_t(pic.width / patch_) * (pic.height / patch_) > 65536) throw std::invalid_argument("vision encoder: the image is too large (more than 16,384 tokens)");
   if (pic.pixels.size() != size_t(pic.width) * size_t(pic.height) * 3) throw std::invalid_argument("vision encoder: bad picture");
   return reference_ ? encode_ref(pic) : encode_fast(pic);
 }

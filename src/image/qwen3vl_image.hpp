@@ -21,6 +21,10 @@ struct QwenSpec {
   float mean[3] = {0.5f, 0.5f, 0.5f}, stddev[3] = {0.5f, 0.5f, 0.5f};
 };
 
+// The size prepare_qwen3vl will make of a width x height picture, in pixels (multiples of 32): the image's tokens are
+// (width / 32) x (height / 32), known before the picture is decoded or resized.
+Size qwen3vl_size(int width, int height, const QwenSpec& spec = {});
+
 // The picture the encoder takes: a whole number of 32-pixel tiles on both sides.
 Rgb prepare_qwen3vl(const Rgb& picture, const QwenSpec& spec = {});
 

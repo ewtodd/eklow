@@ -198,7 +198,14 @@ bool VisionQwen3VL::load_fast(const gguf::File& f) {
       if (u.blob) sycl::free(u.blob, q_);
     throw;
   }
-  F.pos = reinterpret_cast<const float*>(pt->data);
+  // The position table in pinned memory: copied to the card for each image (a pageable copy from the mapped file took ~8 ms).
+  {
+    auto* h = static_cast<float*>(sycl::malloc_host(pt->nbytes, q_));
+    if (!h) throw std::runtime_error("vision encoder: out of pinned host memory");
+    owned_.push_back(h);
+    std::memcpy(h, pt->data, pt->nbytes);
+    F.pos = h;
+  }
   if (!resident_) {
     try {
       F.copy = std::make_unique<rt::CopyEngine>(q_);

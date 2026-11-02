@@ -4,10 +4,13 @@
 
 namespace eklow::image {
 
+Size qwen3vl_size(int width, int height, const QwenSpec& s) {
+  if (width <= 0 || height <= 0) throw std::invalid_argument("qwen3vl_size: empty picture");
+  return fit(width, height, s.patch * s.merge, s.min_tokens, s.max_tokens);
+}
+
 Rgb prepare_qwen3vl(const Rgb& picture, const QwenSpec& s) {
-  const int unit = s.patch * s.merge;
-  if (picture.width <= 0 || picture.height <= 0) throw std::invalid_argument("prepare_qwen3vl: empty picture");
-  const Size t = fit(picture.width, picture.height, unit, s.min_tokens, s.max_tokens);
+  const Size t = qwen3vl_size(picture.width, picture.height, s);
   return resize_padded(picture, t.width, t.height);
 }
 
