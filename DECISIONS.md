@@ -1518,3 +1518,31 @@ the CPU (43.8 ms of cold experts; the card finished first in 38 of 40 layers), w
 prefill is the streamed experts' copy and repack (41% from empty, 36% at 8k) and, deeper, the attention layers' prefill
 attention (37% at 32k, 63% at 128k: the two-GEMM segments, DECISIONS 2026-10-27, exist only for head 512, and Qwen's
 heads are 256). Those four are the levers.
+
+## 2026-11-01 — prefill attention at depth for Qwen3.6: the segment path for head 256, group 8
+
+The 26B's two-GEMM segment path (2026-10-27, "global prefill attention as two GEMMs") now also serves Qwen3.6's 10
+attention layers (16 query heads over 2 K/V heads of 256, int8 or fp16 pages): `attn::reserve` takes the group, and
+`run` takes the segment branch for D = 256, G = 8 when a chunk has 64 tokens or more; shorter chunks and decode keep the
+flash kernels. The engine's change is the one `reserve` argument: its scratch (128 MB for a 2,048-token chunk) is
+allocated before the experts are placed, so the placement's free-memory reading counts it.
+
+- `eklow-attn-test` `qwen8` / `qwen`, 2,048-row chunk (was flash): 13.4 -> 27.6-28.3 TFLOPS at 16k, 64k, 128k and 256k
+  keys; two slots' chunks at once 27.6-27.7. 4,096-key segments (kSeg, shared with head 512, whose numbers did not
+  move: 27.4) against 2,048: 27.6 vs 25.6 at 16k, 27.7 vs 23.8 at 128k, so 4,096 for both heads (twice the
+  probabilities' memory: 128 MB). P.V's fp16 tail mask as scalar dword masks per row removed a spill. SegQK still
+  reports 32 bytes of spill, with no measurable cost.
+- `bench.sh engineq` (2 x 262,144, int8 KV, 2,048-token chunks), prefill at depth 8k / 32k / 128k, tok/s:
+  1,091 / 851 / 390 -> 1,180 / 1,032 / 539 (+8% / +21% / +38%); the 128k chunk's attention is ~3.9 s of 8.2 s. Decode at
+  0 / 8k / 32k / 128k: 24.5 / 25.4 / 25.6 / 31.5 ms -> 24.3 / 24.9 / 25.4 / 31.2 ms; verify blocks unchanged. Cold-expert
+  waits (5-7 s of the 128k prefill) are now the larger share and are the MoE worker's.
+- Decode attention of these layers (split-K): the first level's blocks were fine (main kernel 585 us of 685 at 128k
+  keys, ~460 GB/s of K/V), the cost was the fold between the split levels, 92 us of 750 at 128k: its work-items now run
+  the dimensions fastest (128-byte reads of the partials) and folds by 8 from 8 splits up, level by level between the two
+  partial buffers (fold and merge 12 us each). `qwen8` decode 128k 755 -> 690 us, 256k 1,196 -> 1,124 us, 16k 275 -> 126 us
+  (391 / 478 GB/s of K/V counting the merges); a step's saving ~0.7 ms of 31 at 128k (10 layers), so the decode step at
+  depth is the experts', not the attention's. Splits' count and blocks per split (kPerSplitMax 8 vs 4..16) were not
+  better elsewhere.
+- Gates: `bench.sh attn` every kind ok; `checkq ekk8` long 248/256 (1,024 chunks), mean KL 3.5e-2, median 2.0e-3, chat
+  27/27, 9.8e-4; `checkq oek8` long 216/256, mean KL 1.08e-1, chat 25/27; `kernels` unchanged. Raw output in
+  `docs/bench/*-fiona-2026-11-01.txt` (the "before" 128k profile's attn row overflowed; its engineq rows are good).

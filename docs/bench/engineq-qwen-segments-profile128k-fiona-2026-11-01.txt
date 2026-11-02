@@ -1,0 +1,90 @@
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.33 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 69 of 256 per layer on the card (free 7.02 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.33 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.62 s,   1263.6 tok/s
+    cold experts: 0.41 s waiting on the card's routing, 1.15 s computing on the CPU, 71.1% of pairs cold, 40 of 40 layers with the card finished first; streamed 2544 experts in 40 layers (84.1% of the cold pairs)
+    stream_copy_repack     653.8 ms  41.2%
+    moe_sum                158.1 ms  10.0%
+    moe_gate_up            132.3 ms   8.3%
+    stream_gemm            113.6 ms   7.2%
+    moe_down                84.3 ms   5.3%
+    gdn                     81.0 ms   5.1%
+    shexp                   63.1 ms   4.0%
+    router                  61.1 ms   3.8%
+    qkvz                    60.7 ms   3.8%
+    attn                    32.5 ms   2.0%
+    moe_group               28.4 ms   1.8%
+    ssm_out                 22.9 ms   1.4%
+    post_attn               21.9 ms   1.4%
+    tail                    20.3 ms   1.3%
+    qkv                     15.4 ms   1.0%
+    attn_out                11.1 ms   0.7%
+    moe_gather              10.8 ms   0.7%
+    alpha_beta               9.8 ms   0.6%
+    attn_heads               4.4 ms   0.3%
+    head                     1.3 ms   0.1%
+    moe_route                0.9 ms   0.1%
+    embed                    0.5 ms   0.0%
+prefill at depth 131072:    8.23 s for 4096 tokens,    497.9 tok/s
+    cold experts: 5.27 s waiting on the card's routing, 2.83 s computing on the CPU, 65.4% of pairs cold, 80 of 80 layers with the card finished first; streamed 5936 experts in 80 layers (77.4% of the cold pairs)
+    attn                  3896.6 ms  47.4%
+    stream_copy_repack    2184.7 ms  26.6%
+    moe_sum                329.1 ms   4.0%
+    moe_gate_up            306.1 ms   3.7%
+    stream_gemm            263.1 ms   3.2%
+    gdn                    211.3 ms   2.6%
+    router                 200.2 ms   2.4%
+    moe_down               184.7 ms   2.2%
+    qkvz                   158.3 ms   1.9%
+    shexp                  121.7 ms   1.5%
+    moe_group               66.6 ms   0.8%
+    ssm_out                 57.1 ms   0.7%
+    post_attn               54.6 ms   0.7%
+    tail                    52.1 ms   0.6%
+    qkv                     35.5 ms   0.4%
+    attn_out                31.1 ms   0.4%
+    moe_gather              26.5 ms   0.3%
+    alpha_beta              23.9 ms   0.3%
+    attn_heads              11.6 ms   0.1%
+    moe_route                2.6 ms   0.0%
+    embed                    1.5 ms   0.0%
+    head                     1.4 ms   0.0%
+decode, 1 slot, at 131072:   33.42 ms/step (31.67 ms enqueueing),   29.9 tok/s per sequence
+    cold experts per step: 15.85 ms waiting on the card's routing, 9.75 ms computing on the CPU, 49.2% of pairs on the CPU; 31.5 of 40.0 cold layers had the card finished before the CPU
+    attn                   414.5 ms  20.7%
+    tail                   356.9 ms  17.8%
+    qkvz                   248.8 ms  12.4%
+    moe_gate_up            217.4 ms  10.8%
+    shexp                  127.5 ms   6.4%
+    moe_down                87.3 ms   4.4%
+    head                    82.1 ms   4.1%
+    ssm_out                 81.6 ms   4.1%
+    qkv                     70.1 ms   3.5%
+    gdn                     64.2 ms   3.2%
+    moe_route               61.4 ms   3.1%
+    post_attn               49.4 ms   2.5%
+    attn_out                45.3 ms   2.3%
+    router                  42.8 ms   2.1%
+    alpha_beta              31.6 ms   1.6%
+    attn_heads              19.9 ms   1.0%
+    embed                    3.6 ms   0.2%
+verify blocks of  8 at   8192:   80.12 ms/step,   53.0 accepted tokens/s (4.2 tokens accepted a block)
+    cold experts per step: 16.18 ms waiting on the card's routing, 46.13 ms computing on the CPU, 54.6% of pairs on the CPU; 38.8 of 40.0 cold layers had the card finished before the CPU
+    moe_sum                659.0 ms  36.1%
+    moe_gate_up            231.1 ms  12.7%
+    moe_down               137.5 ms   7.5%
+    moe_group              134.3 ms   7.4%
+    qkvz                   105.5 ms   5.8%
+    attn                    95.2 ms   5.2%
+    ssm_out                 91.0 ms   5.0%
+    shexp                   73.6 ms   4.0%
+    router                  48.7 ms   2.7%
+    alpha_beta              38.3 ms   2.1%
+    gdn                     37.3 ms   2.0%
+    attn_out                35.2 ms   1.9%
+    qkv                     31.2 ms   1.7%
+    head                    30.9 ms   1.7%
+    moe_route               22.9 ms   1.3%
+    post_attn               18.1 ms   1.0%
+    tail                    17.0 ms   0.9%
+    moe_gather              12.4 ms   0.7%
+    attn_heads               4.5 ms   0.2%
+    embed                    1.5 ms   0.1%
