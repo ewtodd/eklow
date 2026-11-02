@@ -42,6 +42,7 @@ struct EncodedImage {
   uint64_t hash = 0;
   int64_t n = 0;
   std::shared_ptr<const std::vector<float>> rows;
+  int64_t nx = 0, ny = 0;  // the grid of rows (Qwen3.6's M-RoPE positions); n = nx * ny
 };
 // The bytes of an image (JPEG, PNG, GIF or BMP) to its rows. Throws ApiError for a picture it cannot read.
 using ImageEncoder = std::function<EncodedImage(std::span<const uint8_t> bytes)>;
@@ -54,6 +55,10 @@ struct ChatDefaults {
   SamplingParams sampling;  // what a request leaves out
   int64_t max_ctx;          // positions per slot
   text::QwenTemplate chat_template = text::QwenTemplate::Stock;
+  // Image input: encodes an image_url part's picture (null: image parts are refused with a 400). It may block (it holds the
+  // scheduler for the encode) and is called on the request's thread, once per image, in conversation order.
+  const ImageEncoder* images = nullptr;
+  int64_t max_image_rows = INT64_MAX;  // an image's rows are prefilled in one chunk: the shorter of the batch and the chunk
 };
 
 struct ChatRequest {
@@ -67,11 +72,13 @@ struct ChatRequest {
   std::shared_ptr<const text::ToolSpecs> tool_specs;  // the request's tools, for reading and constraining calls
   std::vector<int64_t> snapshot_points;  // see Request::snapshot_points
   int draft_block = -1;      // eklow extension: "speculative": false decodes plain even when the server has a draft; an integer is a block size
+  std::vector<ImageInput> images;  // the prompt's image spans (their ids in `prompt` are image_row_id's), in order
 };
 
-// Renders the conversation with Qwen3.6's template and tokenizes it (request text without special tokens). Image and
-// other media parts are refused (the vision encoder is not ported). Throws ApiError for what the server cannot do or the
-// request gets wrong.
+// Renders the conversation with Qwen3.6's template and tokenizes it (request text without special tokens). An image_url
+// part becomes the template's <|vision_start|><|image_pad|><|vision_end|>, and the pad is expanded to the image's rows (as
+// llama.cpp's mtmd: the start token, the rows, the end token); with no encoder in `d`, and for video and audio parts, the
+// request is refused. Throws ApiError for what the server cannot do or the request gets wrong.
 ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, const ChatDefaults& d);
 
 std::string new_completion_id();

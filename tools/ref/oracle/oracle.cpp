@@ -269,7 +269,10 @@ int run_images(llama_model* model, const std::string& mmproj, const std::vector<
   const int n_embd = llama_model_n_embd_inp(model), n_vocab = llama_vocab_n_tokens(vocab);
   std::ofstream lf(dir + "/logits.f32", std::ios::binary);
   std::ostringstream ids, pieces, imgs;
-  int pos = 0, n_images = 0;
+  // pos: the sequence index (what the dumps are indexed by); npos: the next position the model sees (an M-RoPE image takes
+  // max(nx, ny) of them, not one a row).
+  int pos = 0, npos = 0, n_images = 0;
+  const bool mrope = mtmd_decode_use_mrope(mctx);
   auto add_logits = [&](int n) {
     for (int j = 0; j < n; ++j)
       if (pos + j >= first_logit)
@@ -284,7 +287,7 @@ int run_images(llama_model* model, const std::string& mmproj, const std::vector<
       llama_batch b = llama_batch_init(int32_t(n), 0, 1);
       for (size_t j = 0; j < n; ++j) {
         b.token[j] = t[j];
-        b.pos[j] = pos + int(j);
+        b.pos[j] = npos + int(j);
         b.n_seq_id[j] = 1;
         b.seq_id[j][0] = 0;
         b.logits[j] = true;
@@ -299,6 +302,7 @@ int run_images(llama_model* model, const std::string& mmproj, const std::vector<
       add_logits(int(n));
       llama_batch_free(b);
       pos += int(n);
+      npos += int(n);
     } else if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
       if (mtmd_encode_chunk(mctx, c) != 0) {
         std::fprintf(stderr, "oracle: mtmd_encode_chunk failed\n");
@@ -311,30 +315,37 @@ int run_images(llama_model* model, const std::string& mmproj, const std::vector<
       const mtmd_image_tokens* it = mtmd_input_chunk_get_tokens_image(c);
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wdeprecated-declarations"
-      imgs << (n_images ? ", " : "") << "{\"pos\": " << pos << ", \"n\": " << n << ", \"nx\": " << mtmd_image_tokens_get_nx(it)
+      imgs << (n_images ? ", " : "") << "{\"pos\": " << pos << ", \"npos\": " << npos << ", \"n\": " << n << ", \"nx\": " << mtmd_image_tokens_get_nx(it)
            << ", \"ny\": " << mtmd_image_tokens_get_ny(it) << "}";
 #pragma GCC diagnostic pop
-      llama_batch b = llama_batch_init(n, n_embd, 1);
-      std::memcpy(b.embd, embd, size_t(n) * n_embd * sizeof(float));
       for (int j = 0; j < n; ++j) {
-        b.pos[j] = pos + j;
-        b.n_seq_id[j] = 1;
-        b.seq_id[j][0] = 0;
-        b.logits[j] = true;
         ids << (pos + j ? ", " : "") << -1;
         pieces << (pos + j ? ", " : "") << "\"<image>\"";
       }
-      b.n_tokens = n;
+      // The rows as embeddings with the positions mtmd gives them (M-RoPE: t, row, column, 0 a row), one ubatch,
+      // non-causal where mtmd asks for it (llama.cpp's mask is the raster order within an image when t is shared).
+      std::vector<mtmd_decoder_pos> rel(static_cast<size_t>(n));
+      if (mrope) mtmd_helper_image_get_decoder_pos(it, npos, rel.data());
+      llama_batch_ext* bx = llama_batch_ext_init(ctx);
+      for (int j = 0; j < n; ++j) {
+        const llama_embd e = {embd + size_t(j) * n_embd, 1, size_t(n_embd)};
+        const int32_t idx = llama_batch_ext_add_embd(bx, 0, e);
+        llama_pos p[4] = {npos + j, npos + j, npos + j, 0};
+        if (mrope) p[0] = llama_pos(rel[size_t(j)].t), p[1] = llama_pos(rel[size_t(j)].y), p[2] = llama_pos(rel[size_t(j)].x), p[3] = 0;
+        llama_batch_ext_set_pos(bx, idx, p);
+        llama_batch_ext_set_output_logits(bx, idx, true);
+      }
       llama_set_causal_attn(ctx, !mtmd_decode_use_non_causal(mctx, c));
-      const int r = llama_decode(ctx, b);
+      const int r = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, bx);
       llama_set_causal_attn(ctx, true);
+      llama_batch_ext_free(bx);
       if (r != 0) {
-        std::fprintf(stderr, "oracle: llama_decode failed on an image\n");
+        std::fprintf(stderr, "oracle: llama_process failed on an image (%d)\n", r);
         return 1;
       }
       add_logits(n);
-      llama_batch_free(b);
       pos += n;
+      npos += int(mtmd_input_chunk_get_n_pos(c));
       ++n_images;
     } else {
       std::fprintf(stderr, "oracle: only text and images are supported\n");

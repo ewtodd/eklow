@@ -363,7 +363,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
   rows_ = dev(c_.max_logits * E);
   logits_ = dev(c_.max_logits * cfg_.n_vocab);
   tmp_ = dev(B * 8192);
-  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}}) {
+  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}, {&rpos_, 3 * B}}) {
     *p = sycl::malloc_device<int32_t>(size_t(n), q_);
     if (!*p) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(*p);
@@ -452,7 +452,7 @@ void Engine::load_experts() {
     const std::optional<uint64_t> fm = rt::free_memory(q_.get_device());
     if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
     free_at_placement_ = *fm;
-    const uint64_t keep = c_.card_margin_bytes + c_.draft_reserve_bytes;
+    const uint64_t keep = c_.card_margin_bytes + c_.draft_reserve_bytes + c_.vision_reserve_bytes;
     const uint64_t budget = *fm > keep ? *fm - keep : 0;
     if (budget >= uint64_t(want) * expert_set_bytes_) {
       n_hot = want;
@@ -613,10 +613,10 @@ std::string Engine::placement_line() const {
   const int64_t NE = cfg_.n_expert;
   std::snprintf(buf, sizeof buf,
                 "%.2f GiB of weights on the card, %.2f GiB of KV and DeltaNet state; experts %s/%s: %lld of %lld per layer on the card "
-                "(free %.2f GiB before them, margin %.2f, draft %.2f), %d streaming slots, %.2f GiB of cold experts in pinned host memory; head %s",
+                "(free %.2f GiB before them, margin %.2f, draft %.2f, vision %.2f), %d streaming slots, %.2f GiB of cold experts in pinned host memory; head %s",
                 double(weight_bytes_) / gib, double(cache_bytes_) / gib, gguf::type_name(t_gu_), gguf::type_name(t_dn_), (long long)n_hot_,
                 (long long)NE, double(free_at_placement_) / gib, double(c_.card_margin_bytes) / gib, double(c_.draft_reserve_bytes) / gib,
-                n_stream_, double(pinned_bytes_) / gib, c_.head_dpas ? "dpas GEMV" : "fp32 activations");
+                double(c_.vision_reserve_bytes) / gib, n_stream_, double(pinned_bytes_) / gib, c_.head_dpas ? "dpas GEMV" : "fp32 activations");
   return buf;
 }
 
@@ -1040,6 +1040,15 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     if (c.capture_rows < 0 || c.capture_rows > n || (c.capture_rows > 0 && !cap_)) throw std::runtime_error("engine: bad capture_rows");
     for (int32_t t : c.tokens)
       if (t < 0 || t >= V) throw std::runtime_error("engine: token id out of range");
+    {
+      int64_t at_row = 0;
+      for (const model::ImageRows& im : c.images) {
+        if (im.n <= 0 || im.offset < at_row || im.offset + im.n > n || !im.rows || im.nx <= 0 || im.ny <= 0 || im.nx * im.ny != im.n)
+          throw std::runtime_error("engine: bad image span (rows, grid, order or place)");
+        at_row = im.offset + im.n;
+      }
+      if (c.rope_delta < 0 || c.start_pos - c.rope_delta < 0) throw std::runtime_error("engine: bad rope_delta");
+    }
     if (at + n > c_.max_ctx) throw std::runtime_error("engine: sequence longer than max_ctx");
     n_tok += n;
     n_logits += std::min(n, std::max<int64_t>(c.logits_rows, 0));
@@ -1049,7 +1058,8 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   if (n_logits > c_.max_logits) throw std::runtime_error("engine: too many logits rows");
   if (n_cap > c_.max_capture_rows) throw std::runtime_error("engine: too many capture rows");
 
-  std::vector<int32_t> tok, slot, pos, logit_rows, cap_rows;
+  std::vector<int32_t> tok, slot, pos, logit_rows, cap_rows, rpos;  // rpos: [3][T] once built
+  std::vector<int32_t> rpos_t, rpos_h, rpos_w;
   std::vector<gdn::SlotStep> gsteps;
   attn::TileList tiles(D);
   capture_.ids.clear();
@@ -1065,6 +1075,28 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       tok.push_back(c.tokens[size_t(j)]);
       slot.push_back(c.slot);
       pos.push_back(int32_t(c.start_pos + j));
+    }
+    // The rotary positions (time, row, column) of the chunk's tokens: text at its sequence index less the images' saving so far,
+    // an image's rows on its grid.
+    {
+      int64_t delta = c.rope_delta;
+      size_t k = 0;
+      for (int64_t j = 0; j < n;) {
+        if (k < c.images.size() && j == c.images[k].offset) {
+          const model::ImageRows& im = c.images[k];
+          const int64_t p = c.start_pos + j - delta;
+          for (int64_t r = 0; r < im.n; ++r) {
+            rpos_t.push_back(int32_t(p)), rpos_h.push_back(int32_t(p + r / im.nx)), rpos_w.push_back(int32_t(p + r % im.nx));
+          }
+          delta += im.n - im.n_pos();
+          j += im.n;
+          ++k;
+        } else {
+          const int32_t p = int32_t(c.start_pos + j - delta);
+          rpos_t.push_back(p), rpos_h.push_back(p), rpos_w.push_back(p);
+          ++j;
+        }
+      }
     }
     tiles.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_, Hkv, 0);
     for (int64_t r = std::max<int64_t>(0, n - c.logits_rows); r < n; ++r) logit_rows.push_back(int32_t(base + r));
@@ -1098,6 +1130,10 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   q_.memcpy(tok_, tok.data(), size_t(T) * 4);
   q_.memcpy(slot_, slot.data(), size_t(T) * 4);
   q_.memcpy(pos_, pos.data(), size_t(T) * 4);
+  rpos.insert(rpos.end(), rpos_t.begin(), rpos_t.end());
+  rpos.insert(rpos.end(), rpos_h.begin(), rpos_h.end());
+  rpos.insert(rpos.end(), rpos_w.begin(), rpos_w.end());
+  q_.memcpy(rpos_, rpos.data(), size_t(3 * T) * 4);
   const std::vector<int32_t> packed = tiles.packed();
   q_.memcpy(tiles_, packed.data(), packed.size() * 4);
   q_.memcpy(page_table_, page_table_host_.data(), page_table_host_.size() * 4);
@@ -1148,6 +1184,10 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   // alpha / beta matmul): by the fused kernel at the end of the layer before, or here for the first.
   if (c_.embed_on_card) ref::embed(q_, embd_card_, tok_, T, 1.0f, x_);
   else ref::embed(q_, ref::Weight{embd_->type, E, T, emb_dev_, embd_row_bytes_}, iota_, T, 1.0f, x_);
+  // Image rows replace the lookups (unscaled: Qwen's embeddings are not scaled either).
+  for (size_t i = 0, base = 0; i < chunks.size(); base += chunks[i].tokens.size(), ++i)
+    for (const model::ImageRows& im : chunks[i].images)
+      q_.memcpy(x_ + (int64_t(base) + im.offset) * E, im.rows, size_t(im.n * E) * sizeof(float));
   emit("model.input_embed", x_, {E, T});
   qwenk::add_norm_quant(q_, nullptr, x_, layers_[0].attn_norm, cfg_.eps, T, E, nullptr, &act_, h_);
   mark("embed");
@@ -1172,7 +1212,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     } else {
       dense(act_, L.in, qz_);
       mark("qkv");
-      qwenk::attn_heads(q_, qz_, T, H, Hkv, D, cfg_.n_rot, L.q_norm, L.k_norm, cfg_.eps, pos_, inv_freq_, qb_, kb_, vb_, gt_);
+      qwenk::attn_heads(q_, qz_, T, H, Hkv, D, cfg_.n_rot, L.q_norm, L.k_norm, cfg_.eps, rpos_, cfg_.rope_sections, inv_freq_, qb_, kb_, vb_, gt_);
       mark("attn_heads");
       const KvLayer& kv = kv_[size_t(L.attn_idx)];
       const attn::Cache cache{kv.k, kv.v, page_table_, max_pages_, 0, Hkv, D, kv.ks, kv.vs};

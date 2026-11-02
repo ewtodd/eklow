@@ -27,6 +27,7 @@
 #include "kernels/xmx.hpp"
 #include "model/dump.hpp"
 #include "model/gguf.hpp"
+#include "model/image_rows.hpp"
 #include "model/qwen35.hpp"
 #include "rt/copy_engine.hpp"
 
@@ -48,6 +49,9 @@ struct Config {
   uint64_t card_margin_bytes = 1ull << 30;
   // Card memory kept free for the DFlash 2 draft (its weights and ring cache), subtracted from what the experts may take.
   uint64_t draft_reserve_bytes = uint64_t(1.2 * 1073741824.0);
+  // Card memory kept free for the vision encoder (its weights and scratch for the largest image), subtracted like the draft's. An
+  // encoder already resident when the engine is made is in the free memory the placement reads; this is for one loaded after it.
+  uint64_t vision_reserve_bytes = 0;
   int cpu_threads = 0;  // the cold experts' pool, caller included; 0: 16
   // Prefill with cold experts: those with at least stream_min_rows (token, expert) pairs in a step are copied to the card by
   // the copy engine (at most stream_slots of them a layer), repacked there and computed by the grouped GEMMs, while the CPU takes
@@ -84,6 +88,18 @@ struct Chunk {
   int accept = -1;
   // The last capture_rows rows of the chunk are captured (Config::capture_layers' hidden states).
   int64_t capture_rows = 0;
+  // Images (Qwen3.6's vision rows). Spans of tokens whose input rows are given (host fp32, unscaled) in place of embedding lookups;
+  // the tokens there are ignored. A span lies within the chunk, in order, never split across chunks, with its grid (nx, ny)
+  // set; the DeltaNet layers see its rows like any others and attention over them is causal (llama.cpp's mtmd runs Qwen3-VL
+  // images causally, its mask being the raster order when the rows share a time position).
+  //
+  // Positions. The K/V cache index of a token is its index in the slot's sequence (start_pos + j). The rotary position of the
+  // 10 attention layers is another thing, as llama.cpp's M-RoPE has it: a text token's three components (time, row, column)
+  // all equal its position, and an image takes max(nx, ny) positions for its n rows: row i of the span starting at position
+  // p has (p, p + i / nx, p + i % nx), and the text after it continues from p + max(nx, ny). rope_delta is the sequence index
+  // minus the rotary position at start_pos (0 until an image has passed; the spans of this chunk add to it as they go).
+  std::vector<model::ImageRows> images = {};
+  int64_t rope_delta = 0;
 };
 
 class Engine {
@@ -262,7 +278,7 @@ class Engine {
         *kb_ = nullptr, *vb_ = nullptr, *ab_ = nullptr, *rlog_ = nullptr, *sg_ = nullptr, *rg_ = nullptr, *moe_ = nullptr, *gx_ = nullptr,
         *moe_gu_ = nullptr, *sh_gu_ = nullptr, *rows_ = nullptr, *logits_ = nullptr, *tmp_ = nullptr;
   xmx::Activations act_, act_sh_, act_exp_ffn_;
-  int32_t *tok_ = nullptr, *slot_ = nullptr, *pos_ = nullptr, *tiles_ = nullptr;
+  int32_t *tok_ = nullptr, *slot_ = nullptr, *pos_ = nullptr, *rpos_ = nullptr, *tiles_ = nullptr;  // pos_: K/V index; rpos_: [3][tokens] rotary
   int64_t max_tiles_ = 0;
   int32_t *moe_ids_ = nullptr, *moe_row_ = nullptr, *moe_tiles_ = nullptr, *moe_scratch_ = nullptr, *rows_idx_ = nullptr;
   float* moe_w_ = nullptr;

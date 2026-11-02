@@ -38,8 +38,9 @@ bool has_prefix(const std::vector<uint8_t>& b, std::string_view sig, size_t at =
 
 // OpenAI's messages as the template takes them: tool-call arguments parsed from their JSON strings, the `developer`
 // role as `system` (the official Ornith GGUFs' template maps it so; Qwen's own would refuse it), and content arrays
-// checked to hold text parts only (Qwen's vision encoder is not ported; the template itself reads text parts).
-json::Value template_messages(const json::Value& msgs) {
+// checked to hold text and image parts only: an image_url part is decoded into `images` (in conversation order; null: refused)
+// and becomes the template's {"type": "image"}.
+json::Value template_messages(const json::Value& msgs, std::vector<std::vector<uint8_t>>* images) {
   json::Value out = json::Value::array();
   for (const auto& m : msgs.items()) {
     if (!m.is_object()) throw bad("each message must be an object");
@@ -47,15 +48,29 @@ json::Value template_messages(const json::Value& msgs) {
     if (const json::Value* role = field(m, "role"); role && role->is_string() && role->as_string() == "developer")
       c.set("role", json::Value::string("system"));
     if (const json::Value* content = field(m, "content"); content && content->is_array()) {
+      json::Value parts = json::Value::array();
       for (const auto& part : content->items()) {
         const json::Value* type = field(part, "type");
         const std::string t = type && type->is_string() ? type->as_string() : "";
+        if (t == "image_url" && images) {
+          const json::Value* iu = field(part, "image_url");
+          const json::Value* url = iu && iu->is_object() ? iu->find("url") : (iu && iu->is_string() ? iu : nullptr);
+          if (!url || !url->is_string()) throw bad("an image_url part needs image_url.url");
+          images->push_back(image_bytes(url->as_string()));
+          json::Value p = json::Value::object();
+          p.set("type", json::Value::string("image"));
+          parts.items().push_back(std::move(p));
+          continue;
+        }
         if (t == "image_url" || t == "image" || t == "input_image" || t == "video" || t == "video_url" || t == "input_audio" || t == "audio_url")
           // Worded as clients expect, so that they drop images rather than retry them.
           throw ApiError(400, "invalid_request_error", "unsupported_content",
-                         t + " is not supported: this model is served as text only (Qwen3.6's vision encoder is not ported)");
-        if (t != "text") throw ApiError(400, "invalid_request_error", "unsupported_content", "unsupported content[].type: only text parts are supported");
+                         t + (t == "image_url" ? " is not supported: image input is off (this server was started without a vision projector, --mmproj)"
+                                                : " is not supported: this model takes text and image_url parts only"));
+        if (t != "text") throw ApiError(400, "invalid_request_error", "unsupported_content", "unsupported content[].type: only text and image_url parts are supported");
+        parts.items().push_back(part);
       }
+      c.set("content", std::move(parts));
     }
     if (const json::Value* calls = field(m, "tool_calls"); calls && calls->is_array()) {
       json::Value fixed = json::Value::array();
@@ -177,8 +192,9 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
   opt.enable_thinking = r.thinking;
   opt.preserve_thinking = preserve;
   std::vector<text::ChatPart> parts;
+  std::vector<std::vector<uint8_t>> image_data;
   try {
-    parts = text::render_qwen36(d.chat_template, template_messages(*msgs), tools, opt);
+    parts = text::render_qwen36(d.chat_template, template_messages(*msgs, d.images ? &image_data : nullptr), tools, opt);
   } catch (const text::ChatError& e) {
     throw bad(std::string("the chat template rejects the conversation: ") + e.what());
   }
@@ -187,6 +203,34 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
   for (const auto& p : parts)
     if (!p.text.empty()) pieces.push_back({p.text, !p.input});
   r.prompt = tok.encode(pieces);
+  if (d.images) {
+    // Each <|image_pad|> the template wrote (request text cannot make the token) stands for the next image: the rows
+    // replace it between <|vision_start|> and <|vision_end|>, which the template wrote around it.
+    const int32_t pad = tok.id("<|image_pad|>");
+    size_t pads = 0;
+    for (int32_t id : r.prompt) pads += pad >= 0 && id == pad;
+    if (pads != image_data.size())
+      throw bad("the chat template placed " + std::to_string(pads) + " images for " + std::to_string(image_data.size()) + " image parts (images in system or tool messages are not supported)");
+    std::vector<EncodedImage> enc;
+    for (const auto& bytes : image_data) {
+      enc.push_back((*d.images)(bytes));
+      if (enc.back().n <= 0 || enc.back().nx * enc.back().ny != enc.back().n || !enc.back().rows) throw ApiError(500, "server_error", "", "the image encoder returned no rows");
+      if (enc.back().n > d.max_image_rows)
+        throw bad("an image takes " + std::to_string(enc.back().n) + " rows, more than a prefill chunk of " + std::to_string(d.max_image_rows));
+    }
+    std::vector<int32_t> expanded;
+    size_t k = 0;
+    for (int32_t id : r.prompt) {
+      if (id != pad) {
+        expanded.push_back(id);
+        continue;
+      }
+      const EncodedImage& e = enc[k++];
+      r.images.push_back({int64_t(expanded.size()), e.n, e.nx, e.ny, e.rows});
+      for (int64_t row = 0; row < e.n; ++row) expanded.push_back(image_row_id(e.hash, row));
+    }
+    r.prompt = std::move(expanded);
+  }
   {
     const std::string text = text::join(parts);
     const std::string open = "<think>\n";
@@ -214,11 +258,17 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
       if (starts.size() >= 2) {
         int found = 0;
         for (int64_t i = starts.back() - 4; i > starts[starts.size() - 2] + 3 && found < 2; --i)
-          if (tok.bytes(r.prompt[size_t(i)]).find("\n\n") != std::string::npos) r.snapshot_points.push_back(i + 1), ++found;
+          if (r.prompt[size_t(i)] >= 0 && tok.bytes(r.prompt[size_t(i)]).find("\n\n") != std::string::npos) r.snapshot_points.push_back(i + 1), ++found;
       }
       std::sort(r.snapshot_points.begin(), r.snapshot_points.end());
       r.snapshot_points.erase(std::unique(r.snapshot_points.begin(), r.snapshot_points.end()), r.snapshot_points.end());
       if (r.snapshot_points.front() == 0) r.snapshot_points.erase(r.snapshot_points.begin());
+      // Never inside an image (its rows are prefilled together).
+      std::erase_if(r.snapshot_points, [&](int64_t p) {
+        for (const ImageInput& im : r.images)
+          if (p > im.start && p < im.start + im.n) return true;
+        return false;
+      });
     }
   }
   if (int64_t(r.prompt.size()) >= d.max_ctx) throw context_exceeded(int64_t(r.prompt.size()), d.max_ctx);

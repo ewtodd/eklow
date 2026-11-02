@@ -35,6 +35,7 @@ namespace eklow::model {
 
 struct Qwen35Config {
   int n_layer, n_embd, n_head, n_head_kv, head_dim, n_vocab, n_rot;
+  int rope_sections[3] = {0, 0, 0};  // IMRoPE: the frequency pairs taken by the t, row and column position components, interleaved (llama.cpp ggml_rope_multi)
   float rope_base, eps, expert_weights_scale = 0.0f;
   int n_expert, n_expert_used, n_ff_exp, n_ff_shexp;
   int ssm_conv, ssm_inner, ssm_head_dim, ssm_k_heads, ssm_v_heads;

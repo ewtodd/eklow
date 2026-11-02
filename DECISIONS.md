@@ -1714,3 +1714,61 @@ Not done: the model's answers about images (the text side is `qwen/imgserve2`'s)
 `image::qwen3vl_size(w, h, spec)` -> pixels, tokens = (W/32) x (H/32); `QwenImageRows r = enc.encode(bytes, spec)` (or
 `encode(prepare_qwen3vl(decode(bytes), spec))`) -> `r.rows` (`DeviceRows`: fp32 `[n][2048]` on the card, shared_ptr) and
 `r.grid_w, r.grid_h` (merged patches; n = w * h); `reserve(max_tokens)`, `card_bytes(max_tokens)`, `release()` as VisionGemma4V's.
+
+## 2026-11-02 — image input for Qwen3.6 through the engine and the server
+
+`qwen/imgserve2`. The language-model side of images (the encoder is `qwen/vision`'s, DECISIONS above), checked against
+llama.cpp at the oracle's revision on Ornith-1.5 (EKK8) with bartowski's mmproj.
+
+**What llama.cpp does** (mtmd.cpp, mtmd-helper, llama-kv-cache.cpp, ggml-cpu rope): the media marker becomes
+`<|vision_start|>`, the rows, `<|vision_end|>` (the template's `<|vision_start|><|image_pad|><|vision_end|>` gives the same
+ids). An image of nx x ny rows takes n = nx * ny K/V cells but max(nx, ny) positions; row i has the three rotary
+components (p, p + i / nx, p + i % nx) and the text after continues at p + max(nx, ny); text tokens are (p, p, p). IMRoPE
+sections [11, 11, 10, 0] interleave the 32 rotary pairs: pair j takes the time component when j % 3 == 0, the row's when
+j % 3 == 1, the column's when j % 3 == 2. Qwen3-VL images are decoded causally (`mtmd_decode_use_non_causal` is false for
+it; the rows share a time position, and the mask then falls back to raster order), the DeltaNet layers just see the rows.
+
+**Engine.** `Chunk::images` (spans with their grid, rows from the host, never split across chunks) and `Chunk::rope_delta`
+(sequence index minus rotary position at the chunk's start); K/V index stays the sequence index (`pos_`), the rotary
+positions go to `attn_heads` as `rpos_` [3][tokens] with the config's sections. Text-only steps are bit-identical to before
+(checkq ekk8: long 248/244/245/244/245/242 of 256, medians 1.9-3.6e-3, chat 27/27 at 9.5e-4). `Config::vision_reserve_bytes`
+for an encoder loaded after the engine (one loaded before is in the free memory the placement reads).
+
+**Draft.** As llama.cpp's DFlash path: the draft's positions are the target's rotary ones (time component), image rows are
+not injected, and a block is drafted at the rotary position. Our draft restarts its context at the gap an image leaves
+(`Dflash2::inject` with a later position), where llama.cpp's windowed cache keeps the text before the image; acceptance
+after an image is therefore from the text after it (2.4-2.75 tokens per verify, blocks of 4, in the server tests below).
+
+**Server.** `image_url` parts (base64 data: URLs, JPEG/PNG/GIF/BMP; http(s), file: and WebP refused) become the
+template's image item; each `<|image_pad|>` is expanded to the image's rows, named in the prompt by ids below zero
+derived from the image's hash, its budget and the row (`image_row_id`), so prefix reuse and snapshots tell images apart;
+snapshot points never fall inside an image, a prefix never ends inside one, a prefill chunk never splits one (an image
+needs `--chunk`/`--batch` >= its rows). Images are encoded on the request's thread with the scheduler held, the last six by
+hash cached. `--mmproj GGUF` turns it on (checked: qwen3vl_merger, projection width = the model's), `--image-max-tokens`
+(1,024 by default, 8-4,096, at most the chunk) is the encoder's budget, `--vision-reserve-mib` for a late encoder;
+without `--mmproj` an image part gets a 400. The encoder is loaded before the engine, so its weights and scratch (267 MiB
+at 1,024 rows) come out of the experts' share (N = 144 of 256 on a 32k-context two-slot test server). The module has
+`mmproj` and `imageMaxTokens`. `--image-rows-dir` serves llama.cpp's own rows for known pictures (test source).
+
+**Checks against llama.cpp** (`tools/ref/image_logits_compare.py`; text positions after the first image; llama.cpp's own
+oracle with M-RoPE positions for the image chunks; 256-row budget): prompts `one` (1 image, 16 positions after it), `two`
+(2 images, 27) and `turn` (an image in an earlier turn, 42). Token ids and image spans of eklow-prompt equal the oracle's
+in all three (254, 401, 291 tokens).
+
+| top-1 / median KL after the image | llama.cpp CPU vs CUDA (the band) | engine, CPU's rows | engine, eklow's encoder |
+|---|---|---|---|
+| one | 13/16, 1.0e-2 | 16/16, 8.5e-3 | 15/16, 1.0e-2 |
+| two | 21/27, 5.9e-2 | 23/27, 5.2e-2 | 21/27, 6.5e-2 |
+| turn | 38/42, 2.8e-2 | 34/42, 9.5e-3 | 36/42, 1.0e-2 |
+
+Chunks of 300, 20 tokens decoded after the prompt, and verify blocks of 8 (accepting 3) after it stay in the same range
+(turn 36/42 and 38/42, medians 7.8e-3 to 9.5e-3). The 4090 run needed the userspace driver of the loaded kernel module
+(595.112.07; the 595.104.02 in the task text no longer matches). The CPU oracle against itself (a rerun with other
+threading) lands in the same range, so these are the noise of this model on short texts.
+
+**Server tests** (Ornith EKK8 + Inco's draft, 2 slots, 32k, through the HTTP API): descriptions of the NYT front page
+(correct headline, date, Aldrin photo) and of a llama.cpp logo, a comparison of two images, a second turn that cites
+the picture's colours, one text-only follow-up after an image turn, two image requests at once on the two slots, tall and
+wide pictures told apart. Prefix reuse with images: a second turn of a 480-token prompt cached 461, a repeat 315 of 322
+(prompts under snapshot_min = 256 tokens reuse nothing, as for text). Encoding 0.12-0.31 s at 120-800 rows.
+Errors: http(s) 400, undecodable bytes 400, no `--mmproj` 400 (`image input is off`).
