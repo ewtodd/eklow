@@ -1,26 +1,25 @@
 # STATUS
 
-Live state, written as a handoff (2026-11-01). Design and targets: `DESIGN.md`; history and evidence:
+Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; history and evidence:
 `DECISIONS.md` (every entry from 2026-10-31 on is the Qwen3.6 port); what it is and the headline numbers: `README.md`.
 
-## Now (2026-11-01)
+## Now (2026-11-02)
 
 - **eklow serves Qwen3.6-35B-A3B finetunes** (llama.cpp's `qwen35moe`: 30 Gated DeltaNet and 10 gated-attention
-  layers, 256 routed experts of 512 + one shared, 8 used) with **DFlash 2** speculative decoding, in place of Gemma 4
-  12B / 26B A4B, whose code is gone (EmbeddingGemma 2 stays, with Gemma's tokenizer and vision encoder). Two targets so
-  far, same architecture: stock `Qwen/Qwen3.6-35B-A3B` and `ornith-ai/Ornith-1.5-35B-A3B`. All of it is on the branch
-  `qwen/main`; `main` (and fiona's deployed eklow) still has the 26B until the switch.
-- **Production on fiona is stopped**: the owner agreed to stop `eklow.service` (the 26B) for the port on 2026-10-31
-  17:40. A deploy or reboot starts it again (the service is enabled): check `systemctl is-active eklow` before any card
-  work, stop it, and say so. Clients that pick `eklow/gemma-4-26b-a4b` get nothing meanwhile.
-- **The switch, still to do**: fiona will serve **Ornith-1.5** (the owner's choice, 2026-11-02), once image input
-  works (the owner's priority: the 26B took images): Qwen3.6's vision encoder (`qwen/vision`) and images through the
-  engine and the server (`qwen/imgserve2`) are being built. Then `qwen/main` goes into `main` and is pushed, and
-  `/etc/nixos` gets the new eklow config (model, draft, projector, profile; maitred's `eklow/ornith-1.5-35b-a3b`)
-  together with the eklow input update, so a deploy never evaluates the new options against the old eklow; the change
-  waits as a patch in e-desktop `~/eklow-qwen-data/etc-nixos-ornith-switch.patch`. The owner deploys and tests the model
-  in production; no further evals (`check-source` stopped after stock's GSM8K: 293/300, 97.7% +- 1.7%,
-  `docs/bench/check-source/stock/`).
+  layers, 256 routed experts of 512 + one shared, 8 used) with **DFlash 2** speculative decoding and **image input**
+  (Qwen3-VL's encoder behind `--mmproj`), in place of Gemma 4 12B / 26B A4B, whose code is gone (EmbeddingGemma 2
+  stays, with Gemma's tokenizer and vision encoder). Two targets so far, same architecture: stock
+  `Qwen/Qwen3.6-35B-A3B` and `ornith-ai/Ornith-1.5-35B-A3B`. `qwen/main` went into `main` on 2026-11-02.
+- **The switch**: fiona will serve **Ornith-1.5** (the owner's choice, 2026-11-02) with Inco's draft and the
+  projector at 2 x 262k, int8 KV (55 of 256 experts a layer on the card). `/etc/nixos` has the new eklow config
+  (model, draft, projector, profile; maitred's `eklow/ornith-1.5-35b-a3b`) together with the eklow input update; the
+  owner deploys and tests the model in production; no further evals (`check-source` stopped after stock's GSM8K:
+  293/300, 97.7% +- 1.7%, `docs/bench/check-source/stock/`). Until the deploy, `eklow.service` is stopped (since
+  2026-10-31 17:40, by agreement): a reboot starts the old 26B again.
+- **The last check before the switch** (2026-11-02, `main`'s tree on fiona): `checkq ekk8` inside the gate (242-248
+  of 256 top-1, chat 27/27); the server at the production shape with Ornith, the draft, the projector and EmbeddingGemma
+  2 passed `serve_test.py basic` and `image_test.py` (a screenshot, a newspaper page as PNG with alpha and as a
+  paletted GIF, a second turn reusing 1,130 of 1,153 tokens, two same-size pictures not confused, the refusals).
 - **fiona's card**: the A770M is kept out of runtime suspend (`/etc/nixos` 432377be, deployed 2026-11-01): on xe a
   resume from it sometimes failed (forcewake timeouts, only while the card idled) and once lost the card until a reboot.
 
@@ -70,9 +69,9 @@ draft, chi-square p = 0.985); acceptance at block 8 5.75 / 5.43 / 5.02 on GSM8K 
 
 ## Where things are
 
-- Source of truth: `github.com/ewtodd/eklow` (working copy `~/Software/eklow` on e-desktop, now on `qwen/main`). The
+- Source of truth: `github.com/ewtodd/eklow` (working copy `~/Software/eklow` on e-desktop, on `main`). The
   work runs on `qwen/<topic>` branches in worktrees `~/Software/eklow-wt/q*` (fiona mirrors `~/eklow-wt-q*`), merged
-  into `qwen/main`. `fiona:~/eklow-qmain` is a build of `qwen/main` (2026-11-01).
+  into `qwen/main` and from there into `main`. `fiona:~/eklow-qmain` is a build of `main` as merged (2026-11-02).
 - Toolchain: the fleet's nixpkgs (c3f15ff4): intel-llvm 7.1.1, level-zero 1.32.0, intel-compute-runtime 26.31. The
   oracle is llama.cpp at `ea0c4c2c` (`flake.nix`), which has qwen35moe and DFlash 2.
 - fiona: A770M on PCIe 4.0 x8 (~11 GB/s), Iris Xe (titles, llama.cpp), i7-12700H (AVX-VNNI; its two DDR4 channels read
@@ -105,8 +104,7 @@ draft, chi-square p = 0.985); acceptance at block 8 5.75 / 5.43 / 5.02 on GSM8K 
 
 ## Open, in order
 
-1. **Image input, then the switch** (above): the vision encoder and images through the engine and server, then `main`,
-   `/etc/nixos`, the owner's deploy of Ornith-1.5.
+1. **The owner's deploy of Ornith-1.5** (above), then what production shows.
 2. **Prefill**: 60-74% of the 26B's (the experts are 18 GB and only 59-71 of 256 a layer fit beside 2 x 262k of KV;
    72% of a chunk's expert work is cold). The CPU's share is at its memory wall and streaming near its optimum
    (DECISIONS 2026-11-01, "the MoE's speed"). Levers: context for experts (2 x 128k frees ~2.9 GiB, ~30 more experts a
