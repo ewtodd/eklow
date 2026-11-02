@@ -1,0 +1,5 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+Timeout is disabled as parsing_timeout is None or <= 0, you must provide                         the logic for timeout interuption yourself to prevent code getting stuck.
+Timeout is disabled as timeout_seconds is None or <= 0, you must provide                         the logic for timeout interuption yourself to prevent code getting stuck.
+  10/10
+RESULT math500 level=medium seed=1234 items=10 exact=0.6000 math_verify=1.0000 serving=EKK8 (Q4_K experts, Q8_0 dense, Q6_K head) / int8 small batches, fp16 large / int8

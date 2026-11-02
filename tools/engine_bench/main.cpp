@@ -1,33 +1,31 @@
-// eklow-engine-bench: the engine's speed on synthetic prompts (random token ids; the work does not
-// depend on them).
+// eklow-engine-bench: the Qwen3.6 engine's speed on synthetic prompts (random token ids, or the ids of a real text: the work
+// depends on them only through the routing).
 //
-//   eklow-engine-bench --model GGUF [--prefill 1024,4096,16384] [--chunk 2048]
-//                      [--depth 0,4096,16384] [--decode-ctx 0,4096,16384] [--decode-steps 64]
-//                      [--slots N] [--profile] [--kv-int8] [--json FILE] [--tokens-json FILE]
-//                      [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [[--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US]
+//   eklow-engine-bench --model GGUF [--prefill 1024,4096,16384] [--chunk 2048] [--depth 0,4096,16384]
+//                      [--decode-ctx 0,4096,16384] [--decode-slots 1,2] [--decode-steps 64] [--verify 8,16] [--verify-ctx 8192]
+//                      [--verify-steps 24] [--slots N] [--max-ctx N] [--profile] [--kv-int8] [--no-capture] [--json FILE]
+//                      [--tokens-json FILE] [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N]
+//                      [--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US] [--head-fp32] [--embed-on-card]
 //
-// --tokens-json: draw the prompts from a real text's token ids (cycled from a random offset) instead of
-// random ids. It matters for the 26B with cold experts: random tokens route almost uniformly, where
-// real text concentrates on the busiest experts, so the CPU's share is several times higher.
-//
-// Prefill: a fresh sequence of N tokens in chunks of --chunk; tokens per second over the whole
-// prompt. Depth (llama-bench's -d): the sequence first filled to D tokens untimed, then two chunks
-// timed; the rate of prefill at that depth. Decode: every slot prefilled to CTX tokens, then --decode-steps steps of one token per
-// slot; tokens per second per sequence. --profile adds the card's time per section of the forward
-// pass, from timestamps of marker kernels between sections.
+// The engine has --slots slots (default 2) of --max-ctx positions (default: what the runs need; the production shape is
+// --slots 2 --max-ctx 262144 --kv-int8 --experts-on-card -2, which is what the placement then counts).
+// Prefill: a fresh sequence of N tokens in chunks of --chunk; tokens per second over the whole prompt. Depth (llama-bench's -d):
+// the sequence first filled to D tokens untimed, then two chunks timed. Decode: --decode-slots slots (each) prefilled to CTX
+// tokens, then --decode-steps steps of one token per slot; tokens per second per sequence. Verify: one slot filled to
+// --verify-ctx, then --verify-steps blocks of B tokens (verify chunks with all B logits rows and the capture, each accepting
+// about half of the previous block): ms a step and the accepted tokens a second. --profile adds the card's time per section.
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
-#include <stdexcept>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <random>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <vector>
-
-#include <iterator>
 
 #include "core/json.hpp"
 #include "core/json_value.hpp"
@@ -59,7 +57,7 @@ void print_profile(const std::map<std::string, double>& p, json::Writer& w) {
   std::sort(rows.rbegin(), rows.rend());
   w.key("profile_s").begin_object();
   for (const auto& [v, k] : rows) {
-    std::printf("    %-16s %9.1f ms %5.1f%%\n", k.c_str(), v * 1e3, 100 * v / total);
+    std::printf("    %-18s %9.1f ms %5.1f%%\n", k.c_str(), v * 1e3, 100 * v / total);
     w.kv(k, v);
   }
   w.end_object();
@@ -69,15 +67,11 @@ void print_profile(const std::map<std::string, double>& p, json::Writer& w) {
 
 int main(int argc, char** argv) {
   std::string model, json_path, tokens_json;
-  std::vector<int64_t> prefill = {1024, 4096, 16384}, decode_ctx = {0, 4096, 16384}, depth;
-  int64_t chunk = 2048, decode_steps = 64;
-  int slots = 1;
-  bool profile = false, kv_int8 = false;
-  std::string expert_profile;
-  int64_t experts_on_card = -1;
-  int cpu_threads = 0;
-  int stream_slots = 40, stream_min_rows = 16;
-  double stream_copy_us = 300, stream_cpu_us = 22;
+  std::vector<int64_t> prefill = {1024, 4096, 16384}, decode_ctx = {0, 4096, 16384}, depth, decode_slots = {1}, verify, verify_ctx = {8192};
+  int64_t chunk = 2048, decode_steps = 64, verify_steps = 24, max_ctx = 0;
+  int slots = 2;
+  bool profile = false;
+  engine::Config ec;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -86,22 +80,33 @@ int main(int argc, char** argv) {
     else if (a == "--depth") depth = list(next());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
     else if (a == "--decode-ctx") decode_ctx = list(next());
+    else if (a == "--decode-slots") decode_slots = list(next());
     else if (a == "--decode-steps") decode_steps = std::atoll(next().c_str());
+    else if (a == "--verify") verify = list(next());
+    else if (a == "--verify-ctx") verify_ctx = list(next());
+    else if (a == "--verify-steps") verify_steps = std::atoll(next().c_str());
     else if (a == "--slots") slots = std::atoi(next().c_str());
+    else if (a == "--max-ctx") max_ctx = std::atoll(next().c_str());
     else if (a == "--profile") profile = true;
     else if (a == "--json") json_path = next();
     else if (a == "--tokens-json") tokens_json = next();
-    else if (a == "--kv-int8") kv_int8 = true;
-    else if (a == "--expert-profile") expert_profile = next();
-    else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
-    else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
-    else if (a == "--stream-slots") stream_slots = std::atoi(next().c_str());
-    else if (a == "--stream-min-rows") stream_min_rows = std::atoi(next().c_str());
-    else if (a == "--stream-copy-us") stream_copy_us = std::atof(next().c_str());
-    else if (a == "--stream-cpu-us") stream_cpu_us = std::atof(next().c_str());
+    else if (a == "--kv-int8") ec.int8_kv = true;
+    else if (a == "--no-capture") ec.capture_layers.clear();
+    else if (a == "--head-fp32") ec.head_dpas = false;
+    else if (a == "--embed-on-card") ec.embed_on_card = true;
+    else if (a == "--expert-profile") ec.expert_profile = next();
+    else if (a == "--experts-on-card") ec.experts_on_card = std::atoll(next().c_str());
+    else if (a == "--cpu-threads") ec.cpu_threads = std::atoi(next().c_str());
+    else if (a == "--stream-slots") ec.stream_slots = std::atoi(next().c_str());
+    else if (a == "--stream-min-rows") ec.stream_min_rows = std::atoi(next().c_str());
+    else if (a == "--stream-copy-us") ec.stream_copy_us = std::atof(next().c_str());
+    else if (a == "--stream-cpu-us") ec.stream_cpu_us = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--depth N,...] [--decode-ctx N,...] "
-                           "[--decode-steps N] [--slots N] [--profile] [--kv-int8] [--json FILE] [--tokens-json FILE] [--expert-profile JSON --experts-on-card N] [--cpu-threads N]\n");
+                           "[--decode-slots N,...] [--decode-steps N] [--verify B,...] [--verify-ctx N,...] [--verify-steps N] [--slots N] "
+                           "[--max-ctx N] [--profile] [--kv-int8] [--no-capture] [--json FILE] [--tokens-json FILE] "
+                           "[--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [--stream-min-rows N] "
+                           "[--stream-copy-us US] [--stream-cpu-us US] [--head-fp32] [--embed-on-card]\n");
       return 2;
     }
   }
@@ -110,30 +115,21 @@ int main(int argc, char** argv) {
     for (auto n : prefill) longest = std::max(longest, n);
     for (auto n : depth) longest = std::max(longest, n + 2 * chunk);
     for (auto n : decode_ctx) longest = std::max(longest, n + decode_steps);
-    engine::Config ec;
+    for (auto n : verify_ctx) longest = std::max(longest, n + verify_steps * 16 + 16);
     ec.n_slots = slots;
-    ec.max_ctx = (longest + 255) / 256 * 256;
-    ec.max_batch = std::max<int64_t>(chunk, slots);
-    ec.max_chunk = chunk;
-    ec.int8_global_kv = kv_int8;
-    ec.expert_profile = expert_profile;
-    ec.experts_on_card = experts_on_card;
-    ec.cpu_threads = cpu_threads;
-    ec.stream_slots = stream_slots;
-    ec.stream_min_rows = stream_min_rows;
-    ec.stream_copy_us = stream_copy_us;
-    ec.stream_cpu_us = stream_cpu_us;
-    ec.max_logits = slots;
+    ec.max_ctx = max_ctx > 0 ? max_ctx : (longest + 255) / 256 * 256;
+    ec.max_batch = std::max<int64_t>(chunk, 16 * slots);
+    ec.max_chunk = std::max<int64_t>(chunk, 16);
+    ec.max_logits = 16 * slots;
+    ec.max_capture_rows = std::min<int64_t>(ec.max_batch, 2048);
 
     auto f = gguf::File::open(model);
     sycl::queue q = profile ? sycl::queue(rt::pick_device(), {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()})
                             : sycl::queue(rt::pick_device(), sycl::property::queue::in_order());
     engine::Engine eng(q, f, ec);
-    std::printf("%s: %.2f GiB of weights, %.2f GiB of KV cache (%d slots of %lld)\n",
-                q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / 1073741824.0,
-                eng.cache_bytes() / 1073741824.0, slots, (long long)ec.max_ctx);
+    std::printf("%s: %d slots of %lld; %s\n", q.get_device().get_info<sycl::info::device::name>().c_str(), slots, (long long)ec.max_ctx,
+                eng.placement_line().c_str());
     const bool cold = eng.experts_on_card() < eng.model().n_expert;
-    if (cold) std::printf("experts on the card: %lld of %lld per layer, the rest on the CPU\n", (long long)eng.experts_on_card(), (long long)eng.model().n_expert);
     std::mt19937 rng(7);
     std::uniform_int_distribution<int32_t> id(256, 200000);
     std::vector<int32_t> text;
@@ -158,11 +154,32 @@ int main(int argc, char** argv) {
         eng.step({engine::Chunk{slot, s, tokens(c), s + c == start + n ? 1 : 0}});
       }
     };
+    auto cold_report = [&](const engine::Engine::ColdStats& cs0, uint64_t pr0, uint64_t cp0, const engine::Engine::StreamStats& ss0, double steps,
+                           bool per_step) {
+      if (!cold) return;
+      const auto cs = eng.cold_stats();
+      const auto ss = eng.stream_stats();
+      if (per_step)
+        std::printf("    cold experts per step: %.2f ms waiting on the card's routing, %.2f ms computing on the CPU, %.1f%% of pairs on the CPU; "
+                    "%.1f of %.1f cold layers had the card finished before the CPU; CPU phases gate|up %.2f, glu %.2f, down %.2f ms, %.1f distinct experts a step\n",
+                    1e3 * (cs.wait_s - cs0.wait_s) / steps, 1e3 * (cs.cpu_s - cs0.cpu_s) / steps,
+                    100.0 * double(eng.cold_pairs() - cp0) / double(std::max<uint64_t>(1, eng.pairs() - pr0)),
+                    double(cs.late_layers - cs0.late_layers) / steps, double(cs.layers - cs0.layers) / steps,
+                    1e3 * (cs.gu_s - cs0.gu_s) / steps, 1e3 * (cs.glu_s - cs0.glu_s) / steps, 1e3 * (cs.dn_s - cs0.dn_s) / steps, double(cs.experts - cs0.experts) / steps);
+      else
+        std::printf("    cold experts: %.2f s waiting on the card's routing, %.2f s computing on the CPU, %.1f%% of pairs cold, %llu of %llu layers with the card finished first; "
+                    "streamed %llu experts in %llu layers (%.1f%% of the cold pairs)\n",
+                    cs.wait_s - cs0.wait_s, cs.cpu_s - cs0.cpu_s, 100.0 * double(eng.cold_pairs() - cp0) / double(std::max<uint64_t>(1, eng.pairs() - pr0)),
+                    (unsigned long long)(cs.late_layers - cs0.late_layers), (unsigned long long)(cs.layers - cs0.layers),
+                    (unsigned long long)(ss.experts - ss0.experts), (unsigned long long)(ss.layers - ss0.layers),
+                    100.0 * double(ss.pairs - ss0.pairs) / double(std::max<uint64_t>(1, eng.cold_pairs() - cp0)));
+    };
     fill(0, std::min<int64_t>(chunk, 512));  // warm-up: first launches, scratch allocations
     eng.release(0);
 
     json::Writer w;
     w.begin_object().kv("device", q.get_device().get_info<sycl::info::device::name>()).kv("chunk", chunk).kv("slots", int64_t(slots));
+    w.kv("placement", eng.placement_line());
     w.key("prefill").begin_array();
     for (int64_t n : prefill) {
       prof.clear();
@@ -176,16 +193,7 @@ int main(int argc, char** argv) {
       eng.set_profile(nullptr);
       eng.release(0);
       std::printf("prefill %6lld tokens: %7.2f s, %8.1f tok/s\n", (long long)n, s, double(n) / s);
-      if (cold) {
-        const auto cs = eng.cold_stats();
-        std::printf("    cold experts: %.2f s waiting on the card's routing, %.2f s computing on the CPU, %.1f%% of pairs on the CPU, %llu of %llu layers with the card finished first\n",
-                    cs.wait_s - cs0.wait_s, cs.cpu_s - cs0.cpu_s, 100.0 * double(eng.cold_pairs() - cp0) / double(std::max<uint64_t>(1, eng.pairs() - pr0)),
-                    (unsigned long long)(cs.late_layers - cs0.late_layers), (unsigned long long)(cs.layers - cs0.layers));
-        const auto ss = eng.stream_stats();
-        std::printf("    streamed: %llu experts in %llu layers carried %.1f%% of the cold pairs (the CPU took the rest)\n",
-                    (unsigned long long)(ss.experts - ss0.experts), (unsigned long long)(ss.layers - ss0.layers),
-                    100.0 * double(ss.pairs - ss0.pairs) / double(std::max<uint64_t>(1, eng.cold_pairs() - cp0)));
-      }
+      cold_report(cs0, pr0, cp0, ss0, 1, false);
       w.begin_object().kv("tokens", n).kv("seconds", s).kv("tok_per_s", double(n) / s);
       if (profile) print_profile(prof, w);
       w.end_object();
@@ -195,51 +203,88 @@ int main(int argc, char** argv) {
       fill(0, d);
       prof.clear();
       eng.set_profile(profile ? &prof : nullptr);
+      const auto ss0 = eng.stream_stats();
+      const auto cs0 = eng.cold_stats();
+      const uint64_t pr0 = eng.pairs(), cp0 = eng.cold_pairs();
       auto t0 = std::chrono::steady_clock::now();
       fill(0, 2 * chunk);
       const double s = since(t0);
       eng.set_profile(nullptr);
       eng.release(0);
-      std::printf("prefill at depth %6lld: %7.2f s for %lld tokens, %8.1f tok/s\n", (long long)d, s, (long long)(2 * chunk),
-                  double(2 * chunk) / s);
+      std::printf("prefill at depth %6lld: %7.2f s for %lld tokens, %8.1f tok/s\n", (long long)d, s, (long long)(2 * chunk), double(2 * chunk) / s);
+      cold_report(cs0, pr0, cp0, ss0, 1, false);
       w.begin_object().kv("depth", d).kv("tokens", 2 * chunk).kv("seconds", s).kv("tok_per_s", double(2 * chunk) / s);
       if (profile) print_profile(prof, w);
       w.end_object();
     }
     w.end_array().key("decode").begin_array();
-    for (int64_t ctx : decode_ctx) {
-      for (int sl = 0; sl < slots; ++sl)
-        if (ctx > 0) fill(sl, ctx);
-      prof.clear();
-      eng.set_profile(profile ? &prof : nullptr);
-      double enqueue = 0;
-      const auto cs0 = eng.cold_stats();
-      const uint64_t pr0 = eng.pairs(), cp0 = eng.cold_pairs();
-      auto t0 = std::chrono::steady_clock::now();
-      for (int64_t i = 0; i < decode_steps; ++i) {
-        std::vector<engine::Chunk> step;
-        for (int sl = 0; sl < slots; ++sl) step.push_back(engine::Chunk{sl, eng.length(sl), tokens(1), 1});
-        eng.step(step);
-        enqueue += eng.enqueue_seconds();
+    for (int64_t ns : decode_slots) {
+      for (int64_t ctx : decode_ctx) {
+        for (int sl = 0; sl < ns; ++sl)
+          if (ctx > 0) fill(sl, ctx);
+        prof.clear();
+        eng.set_profile(profile ? &prof : nullptr);
+        double enqueue = 0;
+        const auto ss0 = eng.stream_stats();
+        const auto cs0 = eng.cold_stats();
+        const uint64_t pr0 = eng.pairs(), cp0 = eng.cold_pairs();
+        auto t0 = std::chrono::steady_clock::now();
+        for (int64_t i = 0; i < decode_steps; ++i) {
+          std::vector<engine::Chunk> step;
+          for (int sl = 0; sl < ns; ++sl) step.push_back(engine::Chunk{sl, eng.length(sl), tokens(1), 1});
+          eng.step(step);
+          enqueue += eng.enqueue_seconds();
+        }
+        const double s = since(t0);
+        eng.set_profile(nullptr);
+        for (int sl = 0; sl < ns; ++sl) eng.release(sl);
+        std::printf("decode, %lld slot%s, at %6lld: %7.2f ms/step (%.2f ms enqueueing), %6.1f tok/s per sequence\n", (long long)ns, ns == 1 ? "" : "s",
+                    (long long)ctx, 1e3 * s / double(decode_steps), 1e3 * enqueue / double(decode_steps), double(decode_steps) / s);
+        cold_report(cs0, pr0, cp0, ss0, double(decode_steps), true);
+        w.begin_object().kv("slots", ns).kv("ctx", ctx).kv("ms_per_step", 1e3 * s / double(decode_steps)).kv("enqueue_ms_per_step", 1e3 * enqueue / double(decode_steps));
+        w.kv("tok_per_s", double(decode_steps) / s);
+        if (profile) print_profile(prof, w);
+        w.end_object();
       }
-      const double s = since(t0);
-      eng.set_profile(nullptr);
-      for (int sl = 0; sl < slots; ++sl) eng.release(sl);
-      std::printf("decode at %6lld: %7.2f ms/step (%.2f ms enqueueing), %6.1f tok/s per sequence\n", (long long)ctx,
-                  1e3 * s / double(decode_steps), 1e3 * enqueue / double(decode_steps), double(decode_steps) / s);
-      if (cold) {
-        const auto cs = eng.cold_stats();
-        const double n = double(decode_steps);
-        std::printf("    cold experts per step: %.2f ms waiting on the card's routing, %.2f ms computing on the CPU, %.1f%% of pairs on the CPU; "
-                    "%.1f of %.1f cold layers had the card finished before the CPU\n",
-                    1e3 * (cs.wait_s - cs0.wait_s) / n, 1e3 * (cs.cpu_s - cs0.cpu_s) / n,
-                    100.0 * double(eng.cold_pairs() - cp0) / double(std::max<uint64_t>(1, eng.pairs() - pr0)),
-                    double(cs.late_layers - cs0.late_layers) / n, double(cs.layers - cs0.layers) / n);
+    }
+    w.end_array().key("verify").begin_array();
+    for (int64_t B : verify) {
+      for (int64_t ctx : verify_ctx) {
+        fill(0, ctx);
+        // Each block accepts about half of its tokens (3, 5 or 8 of 8; 6 to 11 of 16), the next block starting after them.
+        const std::vector<int64_t> pattern = B == 16 ? std::vector<int64_t>{6, 9, 11, 8} : std::vector<int64_t>{3, 5, 4, 5};
+        auto block = [&](int& acc_prev, int64_t& at, int64_t i) {
+          engine::Chunk c{0, at, tokens(B), B};
+          c.verify = true;
+          c.accept = acc_prev;
+          if (!ec.capture_layers.empty()) c.capture_rows = B;
+          eng.step({c});
+          acc_prev = int(std::min(B, pattern[size_t(i) % pattern.size()]));
+          at += acc_prev;
+        };
+        int acc_prev = -1;
+        int64_t at = eng.length(0), accepted = 0;
+        for (int64_t i = 0; i < 3; ++i) block(acc_prev, at, i);  // warm-up
+        prof.clear();
+        eng.set_profile(profile ? &prof : nullptr);
+        const auto ss0 = eng.stream_stats();
+        const auto cs0 = eng.cold_stats();
+        const uint64_t pr0 = eng.pairs(), cp0 = eng.cold_pairs();
+        auto t0 = std::chrono::steady_clock::now();
+        for (int64_t i = 0; i < verify_steps; ++i) {
+          block(acc_prev, at, i);
+          accepted += acc_prev;
+        }
+        const double s = since(t0);
+        eng.set_profile(nullptr);
+        eng.release(0);
+        std::printf("verify blocks of %2lld at %6lld: %7.2f ms/step, %6.1f accepted tokens/s (%.1f tokens accepted a block)\n", (long long)B, (long long)ctx,
+                    1e3 * s / double(verify_steps), double(accepted) / s, double(accepted) / double(verify_steps));
+        cold_report(cs0, pr0, cp0, ss0, double(verify_steps), true);
+        w.begin_object().kv("block", B).kv("ctx", ctx).kv("ms_per_step", 1e3 * s / double(verify_steps)).kv("accepted_per_s", double(accepted) / s);
+        if (profile) print_profile(prof, w);
+        w.end_object();
       }
-      w.begin_object().kv("ctx", ctx).kv("ms_per_step", 1e3 * s / double(decode_steps)).kv("enqueue_ms_per_step", 1e3 * enqueue / double(decode_steps));
-      w.kv("tok_per_s", double(decode_steps) / s);
-      if (profile) print_profile(prof, w);
-      w.end_object();
     }
     w.end_array().end_object();
     if (!json_path.empty()) std::ofstream(json_path) << w.str() << "\n";

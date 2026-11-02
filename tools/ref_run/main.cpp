@@ -1,11 +1,11 @@
-// eklow-ref-run: eklow's reference forward pass over one prompt, written in eklow-oracle's dump
+// eklow-ref-run: eklow's reference forward pass (qwen35moe, fp32) over one prompt, written in eklow-oracle's dump
 // format so tools/ref/compare_dumps.py can set the two side by side.
 //
 //   eklow-ref-run --model GGUF --out DIR (--tokens-json FILE | --tokens 2,105,...)
 //                 [--tensors PREFIX,...] [--logits-last N] [--routing FILE]
 //
 // --tokens-json reads the ids from an oracle's tokens.json, so both runs see the same tokens.
-// --tensors: graph names by prefix (default l_out-,result_norm); --logits-last: only the last N
+// --tensors: graph names by prefix, a trailing $ for an exact name (default l_out-,result_norm); --logits-last: only the last N
 // positions' logits (default all).
 // --routing: also record each token's selected expert ids (MoE models) to FILE as raw int32
 // little-endian, layer by layer and token by token, with a FILE.json sidecar.
@@ -14,13 +14,14 @@
 #include <cstdlib>
 #include <fstream>
 #include <iterator>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <vector>
 
 #include "core/json.hpp"
 #include "core/json_value.hpp"
-#include "model/gemma4.hpp"
+#include "model/qwen35.hpp"
 #include "model/gguf.hpp"
 #include "rt/device.hpp"
 
@@ -78,19 +79,25 @@ int main(int argc, char** argv) {
 
     auto t0 = std::chrono::steady_clock::now();
     auto f = gguf::File::open(model);
-    auto cfg = model::Gemma4Config::from_gguf(f);
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
-    auto w = model::Gemma4Weights::upload(f, cfg, q);
-    std::printf("loaded %.2f GiB onto %s in %.1f s\n", w.bytes / 1073741824.0,
-                q.get_device().get_info<sycl::info::device::name>().c_str(), since(t0));
+    // Layers are streamed to the card one at a time; the embedding, head and output norm stay on it.
+    const model::Qwen35Config qcfg = model::Qwen35Config::from_gguf(f);
+    const model::Qwen35Weights qw = model::Qwen35Weights::upload(f, qcfg, q);
+    const int n_vocab = qcfg.n_vocab, n_layer = qcfg.n_layer, n_used = qcfg.n_expert_used;
+    std::printf("loaded %.2f GiB onto %s in %.1f s\n", qw.bytes / 1073741824.0, q.get_device().get_info<sycl::info::device::name>().c_str(), since(t0));
 
     json::Writer index;
-    index.begin_object().kv("n_tokens", int64_t(tokens.size())).kv("n_vocab", int64_t(cfg.n_vocab));
+    index.begin_object().kv("n_tokens", int64_t(tokens.size())).kv("n_vocab", int64_t(n_vocab));
     index.key("tensors").begin_array();
     model::DumpSink sink;
     sink.wants = [&](const std::string& name) {
-      for (const auto& p : prefixes)
-        if (name.compare(0, p.size(), p) == 0) return true;
+      for (const auto& p : prefixes) {
+        if (!p.empty() && p.back() == '$') {  // exact name, as in eklow-oracle
+          if (name == p.substr(0, p.size() - 1)) return true;
+        } else if (name.compare(0, p.size(), p) == 0) {
+          return true;
+        }
+      }
       return false;
     };
     sink.put = [&](const std::string& name, const std::vector<float>& data, const std::vector<int64_t>& ne) {
@@ -103,18 +110,17 @@ int main(int argc, char** argv) {
 
     t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> routing;
-    auto logits = model::reference_forward(q, cfg, w, tokens, logits_last, &sink,
-                                           routing_file.empty() ? nullptr : &routing);
+    auto logits = model::reference_forward(q, qcfg, qw, tokens, logits_last, &sink, routing_file.empty() ? nullptr : &routing);
     std::printf("reference forward over %zu tokens: %.1f s\n", tokens.size(), since(t0));
     if (!routing_file.empty()) {
       std::ofstream(routing_file, std::ios::binary)
           .write(reinterpret_cast<const char*>(routing.data()), std::streamsize(routing.size() * sizeof(int32_t)));
-      std::ofstream(routing_file + ".json") << "{\"layers\": " << cfg.n_layer << ", \"tokens\": "
-                                            << tokens.size() << ", \"used\": " << cfg.n_expert_used << "}\n";
+      std::ofstream(routing_file + ".json") << "{\"layers\": " << n_layer << ", \"tokens\": "
+                                            << tokens.size() << ", \"used\": " << n_used << "}\n";
     }
     std::ofstream(out + "/logits.f32", std::ios::binary)
         .write(reinterpret_cast<const char*>(logits.data()), std::streamsize(logits.size() * sizeof(float)));
-    index.end_array().kv("logits_rows", int64_t(logits.size() / size_t(cfg.n_vocab))).end_object();
+    index.end_array().kv("logits_rows", int64_t(logits.size() / size_t(n_vocab))).end_object();
     std::ofstream(out + "/index.json") << index.str() << "\n";
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-ref-run: %s\n", e.what());

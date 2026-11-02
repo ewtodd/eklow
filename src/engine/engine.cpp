@@ -5,10 +5,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
-#include <future>
 #include <iterator>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -20,6 +21,81 @@
 
 namespace eklow::engine {
 
+namespace {
+
+uint64_t align256(uint64_t x) { return (x + 255) & ~uint64_t(255); }
+
+bool qtype_of(gguf::Type t, cpu::QType& q) {
+  switch (t) {
+    case gguf::Type::Q4_0: q = cpu::QType::Q4_0; return true;
+    case gguf::Type::Q8_0: q = cpu::QType::Q8_0; return true;
+    case gguf::Type::Q4_K: q = cpu::QType::Q4_K; return true;
+    case gguf::Type::Q5_K: q = cpu::QType::Q5_K; return true;
+    case gguf::Type::Q6_K: q = cpu::QType::Q6_K; return true;
+    case gguf::Type::IQ4_XS: q = cpu::QType::IQ4_XS; return true;
+    default: return false;
+  }
+}
+
+float half_to_float(uint16_t h) {
+  const uint32_t s = uint32_t(h >> 15) << 31, e = (h >> 10) & 31, m = h & 1023;
+  uint32_t u;
+  if (e == 0) {
+    if (m == 0) {
+      u = s;
+    } else {  // subnormal
+      int sh = 0;
+      uint32_t mm = m;
+      while (!(mm & 1024)) mm <<= 1, ++sh;
+      u = s | (uint32_t(127 - 15 - sh + 1) << 23) | ((mm & 1023) << 13);
+    }
+  } else if (e == 31) {
+    u = s | 0x7f800000u | (m << 13);
+  } else {
+    u = s | ((e + 112) << 23) | (m << 13);
+  }
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+// A small matrix (F32, F16, BF16 or Q8_0) as fp32 rows on the host.
+std::vector<float> dequant_host(const gguf::Tensor& t) {
+  const size_t n = size_t(t.elements());
+  std::vector<float> out(n);
+  switch (t.type) {
+    case gguf::Type::F32: std::memcpy(out.data(), t.data, n * 4); break;
+    case gguf::Type::F16:
+      for (size_t i = 0; i < n; ++i) {
+        uint16_t h;
+        std::memcpy(&h, t.data + 2 * i, 2);
+        out[i] = half_to_float(h);
+      }
+      break;
+    case gguf::Type::BF16:
+      for (size_t i = 0; i < n; ++i) {
+        uint16_t h;
+        std::memcpy(&h, t.data + 2 * i, 2);
+        const uint32_t u = uint32_t(h) << 16;
+        std::memcpy(&out[i], &u, 4);
+      }
+      break;
+    case gguf::Type::Q8_0:
+      for (size_t b = 0; b < n / 32; ++b) {
+        const uint8_t* blk = t.data + b * 34;
+        uint16_t h;
+        std::memcpy(&h, blk, 2);
+        const float d = half_to_float(h);
+        for (int i = 0; i < 32; ++i) out[b * 32 + size_t(i)] = d * float(int8_t(blk[2 + i]));
+      }
+      break;
+    default: throw std::runtime_error(t.name + ": a small matrix in " + gguf::type_name(t.type) + " is not supported");
+  }
+  return out;
+}
+
+}  // namespace
+
 float* Engine::dev(int64_t n) {
   auto* p = sycl::malloc_device<float>(size_t(n), q_);
   if (!p) throw std::runtime_error("engine: out of device memory");
@@ -27,9 +103,17 @@ float* Engine::dev(int64_t n) {
   return p;
 }
 
-Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), c_(cfg), cfg_(model::Gemma4Config::from_gguf(f)) {
+Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
+    : q_(q), c_(cfg), cfg_(model::Qwen35Config::from_gguf(f)) {
   if (c_.max_ctx % attn::kPage) throw std::runtime_error("engine: max_ctx must be a multiple of the page size");
-  const int64_t E = cfg_.n_embd, F = cfg_.n_ff, H = cfg_.n_head;
+  const int64_t E = cfg_.n_embd, H = cfg_.n_head, Hkv = cfg_.n_head_kv, D = cfg_.head_dim, NE = cfg_.n_expert, NU = cfg_.n_expert_used;
+  const int64_t Fe = cfg_.n_ff_exp, Fs = cfg_.n_ff_shexp, B = c_.max_batch;
+  if (cfg_.ssm_k_heads != gdn::kKeyHeads || cfg_.ssm_v_heads != gdn::kValueHeads || cfg_.ssm_head_dim != gdn::kHead ||
+      cfg_.ssm_conv != gdn::kConvTaps)
+    throw std::runtime_error("engine: the DeltaNet kernels take 16 key heads and 32 value heads of 128 with a 4-tap conv");
+  if (NE != 256 || NU > 16 || Fe % 64 || Fs % 64) throw std::runtime_error("engine: unsupported expert shape");
+  if (c_.max_pending < 0 || c_.max_pending > gdn::kMaxPendingLimit) throw std::runtime_error("engine: max_pending out of range");
+  group_ = H / Hkv;
   auto need = [&](const std::string& name) -> const gguf::Tensor& {
     const gguf::Tensor* t = f.tensor(name);
     if (!t) throw std::runtime_error(f.path() + ": missing tensor " + name);
@@ -45,217 +129,265 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   };
   auto vec = [&](const std::string& name) { return reinterpret_cast<const float*>(upload(need(name))); };
   auto vec_host = [&](const std::vector<float>& v) {
-    auto* d = sycl::malloc_device<float>(v.size(), q_);
-    if (!d) throw std::runtime_error("engine: out of device memory");
-    owned_.push_back(d);
+    float* d = dev(int64_t(v.size()));
     q_.memcpy(d, v.data(), v.size() * sizeof(float)).wait();
     return d;
   };
 
-  // Q4_0 matrices go through one staging buffer and are repacked for the matrix units. Matrices
-  // that read the same input are stacked into one (their outputs side by side in each row), so a
-  // decode step launches one matmul for Q, K and V and one for gate and up.
+  // Matrices go through one staging buffer and are repacked for the matrix units. Matrices that read the same input are
+  // stacked into one (their outputs side by side in each row), so a step launches one matmul for them.
   uint64_t staging_bytes = 0;
-  for (int l = 0; l < cfg_.n_layer; ++l)
-    for (const char* group : {"attn_q.weight|attn_k.weight|attn_v.weight", "ffn_gate.weight|ffn_up.weight"}) {
+  for (int l = 0; l < cfg_.n_layer; ++l) {
+    const std::string b = "blk." + std::to_string(l) + ".";
+    for (const char* group : {"attn_qkv.weight|attn_gate.weight", "attn_q.weight|attn_k.weight|attn_v.weight", "ssm_out.weight",
+                              "attn_output.weight", "ffn_gate_shexp.weight|ffn_up_shexp.weight", "ffn_down_shexp.weight"}) {
       uint64_t sum = 0;
       std::stringstream names(group);
       for (std::string n; std::getline(names, n, '|');)
-        if (const gguf::Tensor* t = f.tensor("blk." + std::to_string(l) + "." + n)) sum += t->nbytes;
+        if (const gguf::Tensor* t = f.tensor(b + n)) sum += t->nbytes;
       staging_bytes = std::max(staging_bytes, sum);
     }
-  for (const auto& t : f.tensors())
-    if (t.type == gguf::Type::Q4_0 && t.name.find("_exps") == std::string::npos) staging_bytes = std::max(staging_bytes, t.nbytes);
+  }
+  if (const gguf::Tensor* t = f.tensor("output.weight")) staging_bytes = std::max(staging_bytes, t->nbytes);
   auto* staging = sycl::malloc_device<uint8_t>(staging_bytes, q_);
   if (!staging) throw std::runtime_error("engine: out of device memory for weight staging");
-  auto matrix = [&](const std::vector<const gguf::Tensor*>& parts, bool interleave = false) {
+  // A matrix from tensors that stack (same type and width), on the matrix units in the file's format.
+  auto make_w = [&](const std::vector<const gguf::Tensor*>& parts, bool interleave) {
+    xmx::WeightFormat fmt;
+    if (!xmx::format_of(parts[0]->type, fmt))
+      throw std::runtime_error(f.path() + ": " + parts[0]->name + " is " + gguf::type_name(parts[0]->type) + ", which the matrix units do not run");
     uint64_t at = 0;
     int64_t n = 0;
     for (const gguf::Tensor* t : parts) {
-      if (t->type != gguf::Type::Q4_0) throw std::runtime_error(f.path() + ": " + t->name + " is not Q4_0");
-      if (t->ne[0] != parts[0]->ne[0]) throw std::runtime_error(f.path() + ": stacked matrices of different widths");
+      if (t->type != parts[0]->type || t->ne[0] != parts[0]->ne[0]) throw std::runtime_error(f.path() + ": stacked matrices of different types or widths");
       q_.memcpy(staging + at, t->data, t->nbytes);
       at += t->nbytes;
       n += int64_t(t->ne[1]);
       weight_bytes_ += t->nbytes;
     }
     q_.wait();
-    const ref::Weight raw{gguf::Type::Q4_0, int64_t(parts[0]->ne[0]), n, staging, parts[0]->nbytes / parts[0]->ne[1]};
-    xmx::Weight w = xmx::repack_q4_0(q_, raw, interleave);
+    const ref::Weight raw{parts[0]->type, int64_t(parts[0]->ne[0]), n, staging, parts[0]->nbytes / parts[0]->ne[1]};
+    xmx::Weight w = fmt == xmx::WeightFormat::Q4_0 ? xmx::repack_q4_0(q_, raw, interleave) : xmx::repack_format(q_, raw, fmt, interleave);
     owned_.push_back(w.tiles);
     owned_.push_back(w.scales);
     return w;
   };
+  auto dense_of = [&](const std::vector<const gguf::Tensor*>& parts) {
+    Dense d;
+    bool same = true;
+    for (const gguf::Tensor* t : parts) same &= t->type == parts[0]->type && t->ne[0] == parts[0]->ne[0];
+    if (same) {
+      d.parts.push_back(make_w(parts, false));
+    } else {
+      for (const gguf::Tensor* t : parts) d.parts.push_back(make_w({t}, false));
+    }
+    for (const gguf::Tensor* t : parts) d.n += int64_t(t->ne[1]);
+    return d;
+  };
 
-  {
-    const gguf::Tensor& emb = need("token_embd.weight");
-    if (emb.type != gguf::Type::Q6_K) throw std::runtime_error(f.path() + ": token_embd.weight is not Q6_K");
-    auto* raw = sycl::malloc_device<uint8_t>(emb.nbytes, q_);
-    if (!raw) throw std::runtime_error("engine: out of device memory loading token_embd.weight");
-    q_.memcpy(raw, emb.data, emb.nbytes).wait();
-    head_ = fast::repack_q6k(q_, ref::Weight{emb.type, int64_t(emb.ne[0]), int64_t(emb.ne[1]), raw, emb.nbytes / emb.ne[1]});
+  // Head, embedding.
+  const gguf::Tensor& out_t = need("output.weight");
+  if (c_.head_dpas) {
+    head_w_ = make_w({&out_t}, false);
+    act_head_ = xmx::alloc_activations(q_, c_.max_logits, E);
+  } else {
+    if (out_t.type != gguf::Type::Q6_K) throw std::runtime_error(f.path() + ": the fp32-activation head is Q6_K only");
+    auto* raw = sycl::malloc_device<uint8_t>(out_t.nbytes, q_);
+    if (!raw) throw std::runtime_error("engine: out of device memory loading output.weight");
+    q_.memcpy(raw, out_t.data, out_t.nbytes).wait();
+    head_q6_ = fast::repack_q6k(q_, ref::Weight{out_t.type, int64_t(out_t.ne[0]), int64_t(out_t.ne[1]), raw, out_t.nbytes / out_t.ne[1]});
     sycl::free(raw, q_);
-    owned_.push_back(head_.lo);
-    weight_bytes_ += emb.nbytes;
+    owned_.push_back(head_q6_.lo);
+    weight_bytes_ += out_t.nbytes;
   }
   output_norm_ = vec("output_norm.weight");
+  embd_ = &need("token_embd.weight");
+  embd_row_bytes_ = embd_->nbytes / embd_->ne[1];
+  if (c_.embed_on_card) {
+    embd_card_ = ref::Weight{embd_->type, int64_t(embd_->ne[0]), int64_t(embd_->ne[1]), upload(*embd_), embd_row_bytes_};
+  } else {
+    emb_host_ = sycl::malloc_host<uint8_t>(size_t(B) * embd_row_bytes_, q_);
+    emb_dev_ = sycl::malloc_device<uint8_t>(size_t(B) * embd_row_bytes_, q_);
+    if (!emb_host_ || !emb_dev_) throw std::runtime_error("engine: out of memory for the embedding rows");
+    owned_.push_back(emb_host_);
+    owned_.push_back(emb_dev_);
+    std::vector<int32_t> iota(static_cast<size_t>(B));
+    for (int64_t i = 0; i < B; ++i) iota[size_t(i)] = int32_t(i);
+    iota_ = sycl::malloc_device<int32_t>(size_t(B), q_);
+    owned_.push_back(iota_);
+    q_.memcpy(iota_, iota.data(), iota.size() * 4).wait();
+  }
 
-  // RoPE inverse frequencies, computed in double and stored as fp32.
-  const gguf::Tensor& rf = need("rope_freqs.weight");
-  const float* freqs = reinterpret_cast<const float*>(rf.data);
-  std::vector<float> inv_s(size_t(cfg_.head_dim_sliding / 2)), inv_g(size_t(cfg_.head_dim_global / 2));
-  for (size_t i = 0; i < inv_s.size(); ++i)
-    inv_s[i] = float(std::pow(double(cfg_.rope_base_sliding), -2.0 * double(i) / cfg_.head_dim_sliding));
-  for (size_t i = 0; i < inv_g.size(); ++i)
-    inv_g[i] = float(std::pow(double(cfg_.rope_base_global), -2.0 * double(i) / cfg_.head_dim_global) / double(freqs[i]));
-  float* is = dev(int64_t(inv_s.size()));
-  float* ig = dev(int64_t(inv_g.size()));
-  q_.memcpy(is, inv_s.data(), inv_s.size() * sizeof(float));
-  q_.memcpy(ig, inv_g.data(), inv_g.size() * sizeof(float)).wait();
-  inv_freq_sliding_ = is;
-  inv_freq_global_ = ig;
+  // RoPE inverse frequencies, in double, stored as fp32; the router's down scales (none: ones).
+  {
+    std::vector<float> inv(size_t(cfg_.n_rot / 2));
+    for (size_t i = 0; i < inv.size(); ++i) inv[i] = float(std::pow(double(cfg_.rope_base), -2.0 * double(i) / cfg_.n_rot));
+    inv_freq_ = vec_host(inv);
+    ones_ = vec_host(std::vector<float>(size_t(NE), 1.0f));
+  }
 
-  int n_ring = 0, n_page = 0;
+  int n_dn = 0, n_attn = 0;
   for (int l = 0; l < cfg_.n_layer; ++l) {
     const std::string b = "blk." + std::to_string(l) + ".";
-    Layer L{};
+    Layer L;
+    L.recurrent = cfg_.recurrent[size_t(l)];
     L.attn_norm = vec(b + "attn_norm.weight");
-    L.has_v = f.tensor(b + "attn_v.weight") != nullptr;
-    L.wqkv = L.has_v ? matrix({&need(b + "attn_q.weight"), &need(b + "attn_k.weight"), &need(b + "attn_v.weight")})
-                     : matrix({&need(b + "attn_q.weight"), &need(b + "attn_k.weight")});
-    L.wo = matrix({&need(b + "attn_output.weight")});
-    L.q_norm = vec(b + "attn_q_norm.weight");
-    L.k_norm = vec(b + "attn_k_norm.weight");
-    L.attn_post_norm = vec(b + "post_attention_norm.weight");
-    L.ffn_norm = vec(b + "ffn_norm.weight");
-    L.gate_up = matrix({&need(b + "ffn_gate.weight"), &need(b + "ffn_up.weight")}, true);
-    L.down = matrix({&need(b + "ffn_down.weight")});
-    L.ffn_post_norm = vec(b + "post_ffw_norm.weight");
-    const gguf::Tensor* os = f.tensor(b + "layer_output_scale.weight");
-    L.out_scale = os ? *reinterpret_cast<const float*>(os->data) : 1.0f;
-    if (cfg_.n_expert > 0) {
-      const int64_t n_expert = cfg_.n_expert;
-      const gguf::Tensor& gu_t = need(b + "ffn_gate_up_exps.weight");
-      const gguf::Tensor& dn_t = need(b + "ffn_down_exps.weight");
-      const gguf::Tensor& dn_s = need(b + "ffn_down_exps.scale");
-      L.w_router = ref::Weight{gguf::Type::F32, E, n_expert, upload(need(b + "ffn_gate_inp.weight")), uint64_t(E) * 4};
-      {
-        // The router input is rmsnorm(x) * ffn_gate_inp.scale / sqrt(E); fold the scalar in.
-        const gguf::Tensor& rs = need(b + "ffn_gate_inp.scale");
-        std::vector<float> host;
-        host.resize(size_t(E));
-        const float* src = reinterpret_cast<const float*>(rs.data);
-        const float inv_se = 1.0f / std::sqrt(float(E));
-        for (int64_t i = 0; i < E; ++i) host[size_t(i)] = src[i] * inv_se;
-        L.router_in_scale = vec_host(host);
-      }
-      L.post_ffw_norm_1 = vec(b + "post_ffw_norm_1.weight");
-      L.pre_ffw_norm_2 = vec(b + "pre_ffw_norm_2.weight");
-      L.post_ffw_norm_2 = vec(b + "post_ffw_norm_2.weight");
-      L.exp_down_scale.assign(reinterpret_cast<const float*>(dn_s.data),
-                              reinterpret_cast<const float*>(dn_s.data) + n_expert);
-      L.exp_down_scale_dev = vec_host(L.exp_down_scale);
-      L.gu_host = gu_t.data;
-      L.dn_host = dn_t.data;
+    L.post_norm = vec(b + "post_attention_norm.weight");
+    if (L.recurrent) {
+      L.gdn_idx = n_dn++;
+      L.in = dense_of({&need(b + "attn_qkv.weight"), &need(b + "attn_gate.weight")});
+      L.out = dense_of({&need(b + "ssm_out.weight")});
+      if (L.in.n != gdn::kChannels + gdn::kInner) throw std::runtime_error("engine: DeltaNet input projections have an unexpected width");
+      const gguf::Tensor& cv = need(b + "ssm_conv1d.weight");
+      auto* raw = sycl::malloc_device<float>(size_t(cv.nbytes / 4), q_);
+      q_.memcpy(raw, cv.data, cv.nbytes).wait();
+      float* cw = gdn::repack_conv_w(q_, raw);
+      sycl::free(raw, q_);
+      owned_.push_back(cw);
+      L.gw = gdn::Weights{cw, vec(b + "ssm_a"), vec(b + "ssm_dt.bias"), vec(b + "ssm_norm.weight"), cfg_.eps};
+      std::vector<float> ab = dequant_host(need(b + "ssm_alpha.weight"));
+      const std::vector<float> beta = dequant_host(need(b + "ssm_beta.weight"));
+      ab.insert(ab.end(), beta.begin(), beta.end());
+      if (int64_t(ab.size()) != 2 * gdn::kValueHeads * E) throw std::runtime_error("engine: ssm_alpha / ssm_beta have an unexpected shape");
+      L.w_ab = vec_host(ab);
+    } else {
+      L.attn_idx = n_attn++;
+      L.in = dense_of({&need(b + "attn_q.weight"), &need(b + "attn_k.weight"), &need(b + "attn_v.weight")});
+      L.out = dense_of({&need(b + "attn_output.weight")});
+      L.q_norm = vec(b + "attn_q_norm.weight");
+      L.k_norm = vec(b + "attn_k_norm.weight");
     }
-    if (cfg_.sliding[size_t(l)]) L.ring_index = n_ring++;
-    else L.page_index = n_page++;
-    layers_.push_back(L);
+    L.shexp_gu = make_w({&need(b + "ffn_gate_shexp.weight"), &need(b + "ffn_up_shexp.weight")}, true);
+    L.shexp_dn = make_w({&need(b + "ffn_down_shexp.weight")}, false);
+    {
+      // The router's rows, the shared expert's gate row and zero rows up to 32: one fp32 matrix.
+      std::vector<float> rg = dequant_host(need(b + "ffn_gate_inp.weight"));
+      if (int64_t(rg.size()) != NE * E) throw std::runtime_error("engine: router shape");
+      const std::vector<float> sg = dequant_host(need(b + "ffn_gate_inp_shexp.weight"));
+      if (int64_t(sg.size()) != E) throw std::runtime_error("engine: shared expert gate shape");
+      rg.insert(rg.end(), sg.begin(), sg.end());
+      rg.resize(size_t((NE + 32) * E), 0.0f);
+      L.w_rg = vec_host(rg);
+    }
+    if (f.tensor(b + "ffn_gate_up_exps.weight")) throw std::runtime_error(f.path() + ": merged gate_up expert tensors are not supported");
+    const gguf::Tensor &g = need(b + "ffn_gate_exps.weight"), &u = need(b + "ffn_up_exps.weight"), &d = need(b + "ffn_down_exps.weight");
+    if (g.type != u.type || g.nbytes != u.nbytes) throw std::runtime_error(f.path() + ": gate and up experts differ in type");
+    if (l == 0) {
+      t_gu_ = g.type;
+      t_dn_ = d.type;
+    } else if (g.type != t_gu_ || d.type != t_dn_) {
+      throw std::runtime_error(f.path() + ": experts of different types in different layers are not supported");
+    }
+    L.gate_host = g.data;
+    L.up_host = u.data;
+    L.down_host = d.data;
+    layers_.push_back(std::move(L));
   }
   sycl::free(staging, q_);
-
-  // KV cache: rings for the sliding layers, a page pool for the global ones.
-  for (int l = 0; l < cfg_.n_layer; ++l) {
-    int64_t& hkv = cfg_.sliding[size_t(l)] ? hkv_sliding_ : hkv_global_;
-    if (hkv && hkv != cfg_.n_head_kv[size_t(l)]) throw std::runtime_error("engine: K/V heads differ between layers of a kind");
-    hkv = cfg_.n_head_kv[size_t(l)];
+  if (!xmx::format_of(t_gu_, f_gu_) || !xmx::format_of(t_dn_, f_dn_) || !qtype_of(t_gu_, q_gu_) || !qtype_of(t_dn_, q_dn_))
+    throw std::runtime_error(f.path() + ": expert type " + gguf::type_name(t_gu_) + " / " + gguf::type_name(t_dn_) + " is not supported");
+  {
+    const gguf::Tensor& g = need("blk.0.ffn_gate_exps.weight");
+    const gguf::Tensor& d = need("blk.0.ffn_down_exps.weight");
+    gu_row_ = g.nbytes / (g.ne[1] * g.ne[2]);
+    dn_row_ = d.nbytes / (d.ne[1] * d.ne[2]);
+    raw_gu_ = 2 * uint64_t(Fe) * gu_row_;
+    raw_dn_ = uint64_t(E) * dn_row_;
+    raw_expert_ = raw_gu_ + raw_dn_;
+    gu_tb_ = align256(xmx::weight_tile_bytes(f_gu_, E, 2 * Fe));
+    gu_mb_ = align256(xmx::weight_meta_bytes(f_gu_, E, 2 * Fe));
+    dn_tb_ = align256(xmx::weight_tile_bytes(f_dn_, Fe, E));
+    dn_mb_ = align256(xmx::weight_meta_bytes(f_dn_, Fe, E));
+    packed_expert_ = gu_tb_ + gu_mb_ + dn_tb_ + dn_mb_;
+    expert_set_bytes_ = uint64_t(cfg_.n_layer) * packed_expert_;
   }
-  group_sliding_ = H / hkv_sliding_;
-  group_global_ = H / hkv_global_;
-  ring_pages_ = (cfg_.window + c_.max_chunk + attn::kPage - 1) / attn::kPage;
-  ring_layer_stride_ = int64_t(c_.n_slots) * ring_pages_ * hkv_sliding_ * attn::kPage * cfg_.head_dim_sliding;
-  const size_t ring_elems = size_t(ring_layer_stride_ * n_ring);
-  ring_k_ = sycl::malloc_device<sycl::half>(ring_elems, q_);
-  ring_v_ = sycl::malloc_device<sycl::half>(ring_elems, q_);
+
+  // KV cache: a page pool for the attention layers.
   max_pages_ = c_.max_ctx / attn::kPage;
   n_pages_ = max_pages_ * c_.n_slots;
-  // The global layers' pages, one allocation per layer and array: at 2 x 262k an fp16 layer is
-  // 537 MB, and Level Zero refuses single allocations above 4 GB.
-  const size_t page_elems = size_t(n_pages_ * hkv_global_ * attn::kPage * cfg_.head_dim_global);
-  const size_t elem = c_.int8_global_kv ? 1 : 2;
+  const size_t page_elems = size_t(n_pages_ * Hkv * attn::kPage * D);
+  const size_t elem = c_.int8_kv ? 1 : 2;
   page_table_ = sycl::malloc_device<int32_t>(size_t(c_.n_slots * max_pages_), q_);
-  if (!ring_k_ || !ring_v_ || !page_table_) throw std::runtime_error("engine: out of device memory for the KV cache");
-  for (void* p : {static_cast<void*>(ring_k_), static_cast<void*>(ring_v_), static_cast<void*>(page_table_)}) owned_.push_back(p);
-  cache_bytes_ = ring_elems * 2 * sizeof(sycl::half);
-  for (int l = 0; l < n_page; ++l) {
-    GlobalCache g;
+  if (!page_table_) throw std::runtime_error("engine: out of device memory for the KV cache");
+  owned_.push_back(page_table_);
+  for (int l = 0; l < n_attn; ++l) {
+    KvLayer g;
     g.k = sycl::malloc_device(page_elems * elem, q_);
     g.v = sycl::malloc_device(page_elems * elem, q_);
-    if (c_.int8_global_kv) {
+    if (c_.int8_kv) {
       g.ks = sycl::malloc_device<sycl::half>(page_elems / 16, q_);
       g.vs = sycl::malloc_device<sycl::half>(page_elems / 16, q_);
     }
-    if (!g.k || !g.v || (c_.int8_global_kv && (!g.ks || !g.vs))) throw std::runtime_error("engine: out of device memory for the KV cache");
+    if (!g.k || !g.v || (c_.int8_kv && (!g.ks || !g.vs))) throw std::runtime_error("engine: out of device memory for the KV cache");
     for (void* p : {g.k, g.v, static_cast<void*>(g.ks), static_cast<void*>(g.vs)})
       if (p) owned_.push_back(p);
-    cache_bytes_ += 2 * page_elems * elem + (c_.int8_global_kv ? 2 * (page_elems / 16) * sizeof(sycl::half) : 0);
-    global_.push_back(g);
+    cache_bytes_ += 2 * page_elems * elem + (c_.int8_kv ? 2 * (page_elems / 16) * sizeof(sycl::half) : 0);
+    kv_.push_back(g);
   }
   page_table_host_.assign(size_t(c_.n_slots * max_pages_), 0);
   for (int64_t p = n_pages_ - 1; p >= 0; --p) free_pages_.push_back(int32_t(p));
   slots_.resize(size_t(c_.n_slots));
 
+  // The DeltaNet's recurrent state, the pending buffers and the step's scratch.
+  gcache_ = gdn::alloc_cache(q_, n_dn, c_.n_slots, c_.max_pending);
+  gscratch_ = gdn::alloc_scratch(q_, B + int64_t(c_.n_slots) * c_.max_pending);
+  cache_bytes_ += uint64_t(gcache_.snapshot_bytes()) * uint64_t(c_.n_slots) +
+                  uint64_t(c_.n_slots) * uint64_t(n_dn) * uint64_t(c_.max_pending) * (2 * gdn::kValueHeads * gdn::kHeadChannels + 64) * 4;
+  books_.assign(size_t(c_.n_slots), gdn::SlotBook{});
+  plan_dev_ = sycl::malloc_device<gdn::SlotStep>(size_t(c_.n_slots), q_);
+  plan_host_ = sycl::malloc_host<gdn::SlotStep>(size_t(c_.n_slots), q_);
+  if (!plan_dev_ || !plan_host_) throw std::runtime_error("engine: out of memory for the step plan");
+  owned_.push_back(plan_dev_);
+  owned_.push_back(plan_host_);
+  for (int s = 0; s < c_.n_slots; ++s) gdn::reset_slot(q_, gcache_, s);
+
   // Workspace.
-  const int64_t B = c_.max_batch, Dg = cfg_.head_dim_global;
-  int64_t kv_max = 0;
-  for (int l = 0; l < cfg_.n_layer; ++l) kv_max = std::max<int64_t>(kv_max, cfg_.n_head_kv[size_t(l)] * cfg_.head_dim(l));
   x_ = dev(B * E);
   x2_ = dev(B * E);
   h_ = dev(B * E);
   o_ = dev(B * E);
-  qb_ = dev(B * H * Dg);
-  att_ = dev(B * H * Dg);
-  kb_ = dev(B * kv_max);
-  vb_ = dev(B * kv_max);
-  int64_t qkv_max = 0;
-  for (const Layer& L : layers_) qkv_max = std::max(qkv_max, L.wqkv.n);
-  qkv_ = dev(B * qkv_max);
-  gu_ = dev(std::min(B, xmx::kFp16Rows) * 2 * F);  // the GeGLU's int8 path only
+  qz_ = dev(B * std::max<int64_t>(gdn::kChannels + gdn::kInner, (2 * H + 2 * Hkv) * D));
+  qb_ = dev(B * H * D);
+  gt_ = dev(B * H * D);
+  att_ = dev(B * std::max<int64_t>(H * D, 4 * E));  // also the streamed pairs' fp16 rows (up to B x n_used x E halves)
+  kb_ = dev(B * Hkv * D);
+  vb_ = dev(B * Hkv * D);
+  ab_ = dev(B * 2 * gdn::kValueHeads);
+  rlog_ = dev(B * NE);
+  sg_ = dev(B * 32);
+  rg_ = dev(std::min<int64_t>(B, 16) * (NE + 32));
+  moe_ = dev(B * E);
+  gx_ = dev(xmx::kFp16Rows * E);
+  moe_gu_ = dev(xmx::kFp16Rows * 2 * Fe);
+  sh_gu_ = dev(xmx::kFp16Rows * 2 * Fs);
   rows_ = dev(c_.max_logits * E);
   logits_ = dev(c_.max_logits * cfg_.n_vocab);
-  // At most one chunk per slot in a step, so at most n_slots partial tiles per K/V head.
-  max_tiles_sliding_ = hkv_sliding_ * ((B * group_sliding_ + 7) / 8 + c_.n_slots);
-  max_tiles_global_ = hkv_global_ * ((B * group_global_ + 7) / 8 + c_.n_slots);
-  // Tile lists packed with their groups: 4 ints a tile, at most 2 a tile for its group.
-  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}, {&lo_, B}, {&hi_, B}, {&tiles_sliding_, 6 * max_tiles_sliding_},
-                      {&tiles_global_, 6 * max_tiles_global_}}) {
+  tmp_ = dev(B * 8192);
+  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}, {&rpos_, 3 * B}}) {
     *p = sycl::malloc_device<int32_t>(size_t(n), q_);
     if (!*p) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(*p);
   }
-  // The attention scratch at its largest, before the experts take what is left of the card.
-  attn::reserve(q_, attn_scratch_, max_tiles_sliding_, c_.max_chunk * group_sliding_, hkv_sliding_, cfg_.head_dim_sliding);
-  attn::reserve(q_, attn_scratch_, max_tiles_global_, c_.max_chunk * group_global_, hkv_global_, cfg_.head_dim_global);
-  act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * Dg));
-  act_ffn_ = xmx::alloc_activations(q_, B, F);
-  if (cfg_.n_expert > 0) {
-    const int64_t NE = cfg_.n_expert, NU = cfg_.n_expert_used, P = B * NU, Fe = cfg_.n_ff_exp;
-    moe_ = dev(B * E);
-    rlog_ = dev(B * NE);
-    gx_ = dev(xmx::kFp16Rows * E);  // the decode path's expert outputs (at most kFp16Rows pairs)
-    // Per pair: the chosen expert and weight (decode keeps at most kFp16Rows pairs in them).
+  rows_idx_ = sycl::malloc_device<int32_t>(size_t(c_.max_logits), q_);
+  owned_.push_back(rows_idx_);
+  // At most one chunk per slot in a step, so at most n_slots partial tiles per K/V head.
+  max_tiles_ = Hkv * ((B * group_ + 7) / 8 + c_.n_slots);
+  tiles_ = sycl::malloc_device<int32_t>(size_t(6 * max_tiles_), q_);
+  if (!tiles_) throw std::runtime_error("engine: out of device memory");
+  owned_.push_back(tiles_);
+  attn::reserve(q_, attn_scratch_, max_tiles_, c_.max_chunk * group_, Hkv, D, group_);
+  act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * D));
+  act_sh_ = xmx::alloc_activations(q_, B, Fs);
+  act_exp_ffn_ = xmx::alloc_activations(q_, xmx::kFp16Rows, Fe);
+  {
+    const int64_t P = B * NU;
     moe_ids_ = sycl::malloc_device<int32_t>(size_t(P), q_);
     moe_row_ = sycl::malloc_device<int32_t>(size_t(P), q_);
-    if (!moe_ids_ || !moe_row_) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(moe_ids_);
     owned_.push_back(moe_row_);
     moe_w_ = dev(P);
-    moe_gu_ = dev((xmx::kFp16Rows + 12) * 2 * Fe);  // up to 32 expert pairs and 3 dense per row of 4
-    act_exp_ = xmx::alloc_activations(q_, xmx::kFp16Rows, E);
-    act_exp_ffn_ = xmx::alloc_activations(q_, xmx::kFp16Rows, Fe);
-    // Prefill: segments padded to row tiles, so at most P / tile + n_expert tiles. The tile and
-    // gate_up outputs are sized for that; the fp32 down outputs (the biggest) take the memory the
-    // fp16 inputs used.
+    // Prefill: pairs sorted by expert in row tiles of moe_tile_ rows: at most P / tile + n_expert tiles. The fp16 expert inputs
+    // share the fp32 down outputs' memory (dead once the gate_up is done).
     moe_max_tiles_ = (P + moe_tile_ - 1) / moe_tile_ + NE;
     const int64_t rows = moe_max_tiles_ * moe_tile_;
     moe_y_ = dev(rows * E);
@@ -266,12 +398,33 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     if (!moe_h_ || !moe_tiles_ || !moe_scratch_) throw std::runtime_error("engine: out of device memory");
     for (void* p : {static_cast<void*>(moe_h_), static_cast<void*>(moe_tiles_), static_cast<void*>(moe_scratch_)}) owned_.push_back(p);
   }
-  if (cfg_.n_expert > 0) load_experts();
+  hq_ = sycl::malloc_device<int8_t>(size_t(B * E), q_);
+  hqs_ = dev(B * E / 32);
+  owned_.push_back(hq_);
+  // Capture of hidden states.
+  cap_col_.assign(size_t(cfg_.n_layer), -1);
+  for (size_t j = 0; j < c_.capture_layers.size(); ++j) {
+    const int l = c_.capture_layers[j];
+    if (l < 0 || l >= cfg_.n_layer) throw std::runtime_error("engine: capture layer out of range");
+    cap_col_[size_t(l)] = int(j);
+  }
+  if (!c_.capture_layers.empty() && c_.max_capture_rows > 0) {
+    cap_ = dev(c_.max_capture_rows * int64_t(c_.capture_layers.size()) * E);
+    cap_idx_ = sycl::malloc_device<int32_t>(size_t(c_.max_capture_rows), q_);
+    owned_.push_back(cap_idx_);
+    capture_.width = int64_t(c_.capture_layers.size()) * E;
+  }
+  if (c_.record_routing) {
+    counts_.assign(size_t(cfg_.n_layer), std::vector<int64_t>(size_t(NE), 0));
+    rec_host_ = sycl::malloc_host<int32_t>(size_t(B * NU), q_);
+    owned_.push_back(rec_host_);
+  }
+  q_.wait();
+  load_experts();
 }
 
 void Engine::load_experts() {
   const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NE = cfg_.n_expert;
-  const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
   const bool fit = c_.experts_on_card == -2;
   const int64_t want = fit || c_.experts_on_card < 0 || c_.experts_on_card >= NE ? NE : c_.experts_on_card;
   // Each layer's experts by the profile's counts, busiest first, ties to the lower id.
@@ -292,90 +445,73 @@ void Engine::load_experts() {
       for (const auto& v : row.items()) c.push_back(std::atoll(v.int_digits().c_str()));
       std::stable_sort(order[size_t(l)].begin(), order[size_t(l)].end(), [&](int a, int b) { return c[size_t(a)] > c[size_t(b)]; });
     }
-  } else if (want < NE) {
-    throw std::runtime_error("engine: experts_on_card below the expert count needs an expert profile");
   }
-  // One expert of one layer is gate_up tiles, gate_up scales, down tiles, down scales, back to back (each a
-  // multiple of 128 bytes, so every piece stays aligned): the same bytes as the GGUF's two Q4_0 matrices. A layer's
-  // hot experts share one allocation (a slab), which also saves the rounding four allocations an expert paid
-  // (5% of the experts' bytes, 3a).
-  const uint64_t gu_tb = xmx::weight_tile_bytes(E, 2 * Fe), gu_sb = xmx::weight_scale_bytes(E, 2 * Fe),
-                 dn_tb = xmx::weight_tile_bytes(Fe, E), dn_sb = xmx::weight_scale_bytes(Fe, E);
-  expert_bytes_ = gu_tb + gu_sb + dn_tb + dn_sb;
-  expert_raw_gu_ = uint64_t(2 * Fe) * gu_row;
-  if (expert_bytes_ != expert_raw_gu_ + uint64_t(E) * dn_row) throw std::runtime_error("engine: repacked expert size differs from the GGUF's");
-  expert_set_bytes_ = uint64_t(cfg_.n_layer) * expert_bytes_;
-  auto expert_at = [&](uint8_t* base, xmx::Weight& gu, xmx::Weight& dn) {
-    gu = xmx::Weight{E, 2 * Fe, base, reinterpret_cast<sycl::half*>(base + gu_tb)};
-    dn = xmx::Weight{Fe, E, base + gu_tb + gu_sb, reinterpret_cast<sycl::half*>(base + gu_tb + gu_sb + dn_tb)};
-  };
-
-  // How many experts go on the card. When fitting, the driver's free memory less the margin is spent on the
-  // streaming slots (when there are cold experts to stream) and then on whole ranks of experts.
-  std::optional<uint64_t> fm;
-  int64_t n_hot = want;
   const int64_t slots_wanted = std::min<int64_t>(std::max(c_.stream_slots, 0), 256);
+  int64_t n_hot = want;
   if (fit) {
-    fm = rt::free_memory(q_.get_device());
+    const std::optional<uint64_t> fm = rt::free_memory(q_.get_device());
     if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
     free_at_placement_ = *fm;
-    const uint64_t budget = *fm > c_.card_margin_bytes ? *fm - c_.card_margin_bytes : 0;
+    const uint64_t keep = c_.card_margin_bytes + c_.draft_reserve_bytes + c_.vision_reserve_bytes;
+    const uint64_t budget = *fm > keep ? *fm - keep : 0;
     if (budget >= uint64_t(want) * expert_set_bytes_) {
       n_hot = want;
     } else {
-      const uint64_t slot_bytes = 2 * uint64_t(slots_wanted) * expert_bytes_;
+      const uint64_t slot_bytes = uint64_t(slots_wanted) * (raw_expert_ + packed_expert_);
       n_hot = budget > slot_bytes ? int64_t((budget - slot_bytes) / expert_set_bytes_) : 0;
     }
   }
   n_hot_ = n_hot;
   if (n_hot_ < NE && c_.expert_profile.empty()) throw std::runtime_error("engine: the experts do not all fit; an expert profile is needed to place some on the CPU");
 
-  const uint64_t stage_bytes = expert_bytes_;
-  auto* staging = sycl::malloc_device<uint8_t>(stage_bytes, q_);
+  auto expert_at = [&](uint8_t* base, xmx::Weight& gu, xmx::Weight& dn) {
+    gu = xmx::Weight{E, 2 * Fe, base, reinterpret_cast<sycl::half*>(base + gu_tb_), f_gu_};
+    dn = xmx::Weight{Fe, E, base + gu_tb_ + gu_mb_, reinterpret_cast<sycl::half*>(base + gu_tb_ + gu_mb_ + dn_tb_), f_dn_};
+  };
+  auto repack_into = [&](const ref::Weight& raw, bool interleave, const xmx::Weight& w) {
+    if (w.format == xmx::WeightFormat::Q4_0) xmx::repack_q4_0_into(q_, raw, interleave, w);
+    else xmx::repack_format_into(q_, raw, interleave, w);
+  };
+
+  auto* staging = sycl::malloc_device<uint8_t>(raw_expert_, q_);
   if (!staging) throw std::runtime_error("engine: out of device memory for weight staging");
   for (Layer& L : layers_) {
     L.cold.assign(size_t(NE), 1);
-    L.exp_gate_up.assign(size_t(NE), xmx::Weight{E, 2 * Fe, nullptr, nullptr});  // cold: a table entry with no tiles
-    L.exp_down.assign(size_t(NE), xmx::Weight{Fe, E, nullptr, nullptr});
+    L.exp_gu.assign(size_t(NE), xmx::Weight{E, 2 * Fe, nullptr, nullptr, f_gu_});  // cold: a table entry with no tiles
+    L.exp_dn.assign(size_t(NE), xmx::Weight{Fe, E, nullptr, nullptr, f_dn_});
     L.n_cold = int(NE - n_hot_);
   }
   // Experts go on the card one rank at a time, that rank of every layer, so that the layers stay alike.
   std::vector<uint8_t*> slab(layers_.size(), nullptr);
   if (n_hot_ > 0)
     for (size_t l = 0; l < layers_.size(); ++l) {
-      slab[l] = sycl::malloc_device<uint8_t>(size_t(uint64_t(n_hot_) * expert_bytes_), q_);
+      slab[l] = sycl::malloc_device<uint8_t>(size_t(uint64_t(n_hot_) * packed_expert_), q_);
       if (!slab[l]) throw std::runtime_error("engine: out of device memory for the experts");
       owned_.push_back(slab[l]);
     }
+  const uint64_t gate_b = uint64_t(Fe) * gu_row_;
   for (int64_t rank = 0; rank < n_hot_; ++rank) {
     for (int l = 0; l < cfg_.n_layer; ++l) {
       Layer& L = layers_[size_t(l)];
       const int e = order[size_t(l)][size_t(rank)];
       L.cold[size_t(e)] = 0;
-      // The expert's two matrices go to the staging buffer and are repacked into its place in the slab, so the
-      // originals are not kept on the card.
-      q_.memcpy(staging, L.gu_host + size_t(e) * expert_raw_gu_, size_t(expert_raw_gu_));
-      q_.memcpy(staging + expert_raw_gu_, L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row));
-      expert_at(slab[size_t(l)] + uint64_t(rank) * expert_bytes_, L.exp_gate_up[size_t(e)], L.exp_down[size_t(e)]);
-      xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, staging, gu_row}, true, L.exp_gate_up[size_t(e)]);
-      xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, staging + expert_raw_gu_, dn_row}, false, L.exp_down[size_t(e)]);
+      // The expert's gate, up and down rows go to the staging buffer and are repacked into its place in the slab.
+      q_.memcpy(staging, L.gate_host + size_t(e) * gate_b, size_t(gate_b));
+      q_.memcpy(staging + gate_b, L.up_host + size_t(e) * gate_b, size_t(gate_b));
+      q_.memcpy(staging + raw_gu_, L.down_host + size_t(e) * raw_dn_, size_t(raw_dn_));
+      expert_at(slab[size_t(l)] + uint64_t(rank) * packed_expert_, L.exp_gu[size_t(e)], L.exp_dn[size_t(e)]);
+      repack_into(ref::Weight{t_gu_, E, 2 * Fe, staging, gu_row_}, true, L.exp_gu[size_t(e)]);
+      repack_into(ref::Weight{t_dn_, Fe, E, staging + raw_gu_, dn_row_}, false, L.exp_dn[size_t(e)]);
       q_.wait();
-      weight_bytes_ += expert_bytes_;
+      weight_bytes_ += raw_expert_;
     }
   }
+  sycl::free(staging, q_);
   for (Layer& L : layers_) {
-    // Device tables of the experts' pointers for the grouped decode kernels.
-    {
-      // The dense FFN's gate|up as three more entries (its 3 x 1,408 interleaved columns are contiguous tile ranges).
-      std::vector<xmx::Weight> with_dense = L.exp_gate_up;
-      const int64_t third = L.gate_up.n / 3 / 8 * (L.gate_up.k / 32);  // tiles per third
-      for (int j = 0; j < 3; ++j)
-        with_dense.push_back(xmx::Weight{L.gate_up.k, L.gate_up.n / 3, L.gate_up.tiles + j * third * 128, L.gate_up.scales + j * third * 8});
-      L.tab_gate_up = xmx::make_expert_table(q_, with_dense);
-    }
-    L.tab_down = xmx::make_expert_table(q_, L.exp_down);
-    for (void* p : {static_cast<void*>(L.tab_gate_up.tiles), static_cast<void*>(L.tab_gate_up.scales), static_cast<void*>(L.tab_down.tiles),
-                    static_cast<void*>(L.tab_down.scales)})
+    L.tab_gu = xmx::make_expert_table(q_, L.exp_gu);
+    L.tab_dn = xmx::make_expert_table(q_, L.exp_dn);
+    for (void* p : {static_cast<void*>(L.tab_gu.tiles), static_cast<void*>(L.tab_gu.scales), static_cast<void*>(L.tab_dn.tiles),
+                    static_cast<void*>(L.tab_dn.scales)})
       owned_.push_back(p);
     if (L.n_cold) {
       L.cold_dev = sycl::malloc_device<uint8_t>(size_t(NE), q_);
@@ -384,10 +520,12 @@ void Engine::load_experts() {
       q_.memcpy(L.cold_dev, L.cold.data(), size_t(NE)).wait();
     }
   }
-  // Streaming slots on the card: a raw one (the bytes as the copy engine lands them) and a repacked one (what the
-  // grouped GEMMs read) each.
+  if (n_hot_ == NE) return;
+
+  // Streaming slots on the card: a raw one (the bytes as the copy engine lands them) and a repacked one (what the grouped
+  // GEMMs read) each.
   n_stream_ = int(std::min<int64_t>(slots_wanted, NE - n_hot_));
-  if (n_hot_ < NE && n_stream_ > 0) {
+  if (n_stream_ > 0) {
     try {
       copy_ = std::make_unique<rt::CopyEngine>(q_);
     } catch (const std::exception& ex) {
@@ -395,19 +533,16 @@ void Engine::load_experts() {
       n_stream_ = 0;
     }
   }
-  sycl::free(staging, q_);
-  if (n_hot_ == NE) return;
-
   if (n_stream_ > 0) {
     const int64_t S = n_stream_, B = c_.max_batch, P = B * cfg_.n_expert_used;
-    stream_raw_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * expert_bytes_), q_);
-    stream_slab_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * expert_bytes_), q_);
+    stream_raw_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * raw_expert_), q_);
+    stream_slab_ = sycl::malloc_device<uint8_t>(size_t(uint64_t(S) * packed_expert_), q_);
     if (!stream_raw_ || !stream_slab_) throw std::runtime_error("engine: out of device memory for the streaming slots");
     owned_.push_back(stream_raw_);
     owned_.push_back(stream_slab_);
     stream_w_gu_.resize(size_t(S));
     stream_w_dn_.resize(size_t(S));
-    for (int64_t j = 0; j < S; ++j) expert_at(stream_slab_ + uint64_t(j) * expert_bytes_, stream_w_gu_[size_t(j)], stream_w_dn_[size_t(j)]);
+    for (int64_t j = 0; j < S; ++j) expert_at(stream_slab_ + uint64_t(j) * packed_expert_, stream_w_gu_[size_t(j)], stream_w_dn_[size_t(j)]);
     stream_gu_ = xmx::make_expert_table(q_, stream_w_gu_);
     stream_dn_ = xmx::make_expert_table(q_, stream_w_dn_);
     for (void* p : {static_cast<void*>(stream_gu_.tiles), static_cast<void*>(stream_gu_.scales), static_cast<void*>(stream_dn_.tiles),
@@ -418,12 +553,13 @@ void Engine::load_experts() {
     stream_scratch_ = sycl::malloc_device<int32_t>(size_t((P / 256 + 2) * S), q_);
     if (!stream_map_ || !stream_tiles_ || !stream_scratch_) throw std::runtime_error("engine: out of device memory for the streaming slots");
     for (void* p : {static_cast<void*>(stream_map_), static_cast<void*>(stream_tiles_), static_cast<void*>(stream_scratch_)}) owned_.push_back(p);
-    // The streamed pairs' inputs (fp16, B x H x Dg fp32's worth) go in att_, which holds nothing during the MoE.
-    stream_rows_cap_ = std::min<int64_t>(B * cfg_.n_head * cfg_.head_dim_global * 4 / (E * 2), (P / moe_tile_ + S) * moe_tile_) / moe_tile_ * moe_tile_;
+    // The streamed pairs' inputs (fp16, one E row a pair) go in att_, which holds nothing during the MoE.
+    stream_rows_cap_ = std::min<int64_t>(B * std::max<int64_t>(cfg_.n_head * cfg_.head_dim, 4 * E) * 4 / (E * 2), (P / moe_tile_ + S) * moe_tile_) /
+                       moe_tile_ * moe_tile_;
   }
 
-  // The host side: a pool, buffers the card and the host share, and the cold experts' pages
-  // touched now (they come out of the page cache the first time, which a request should not wait for).
+  // The host side: a pool, buffers the card and the host share, and the cold experts in pinned memory (the CPU computes from
+  // there and the copy engine streams from there; the copy also brings the pages in, which a request should not wait for).
   const int threads = c_.cpu_threads > 0 ? c_.cpu_threads : 16;
   pool_ = std::make_unique<cpu::Pool>(threads);
   const int64_t B = std::max<int64_t>(c_.max_batch, xmx::kFp16Rows), P = B * cfg_.n_expert_used;
@@ -443,57 +579,57 @@ void Engine::load_experts() {
   host(hp_as_, E / 32 * 8);
   if (n_stream_ > 0) host(hp_smap_, NE);
   cold_map_ = reinterpret_cast<int32_t*>(dev(B));
-  // cold_sum_, the quantized inputs and their scales live in workspace that is dead during the MoE
-  // (qkv_, qb_, kb_: B x 2,816 fp32, B x 2,816 fp32 and B x 88 fp32 fit them), see step().
-  cold_sum_ = qkv_;
-  // Where the CPU reads the cold experts from. With streaming they are copied (once, in parallel) into pinned host
-  // memory, from which the copy engine moves them to the card without the CPU's help (from the GGUF's mapping the
-  // driver stages the bytes through the CPU, 530 us an expert while the cold GEMVs run, against 300). The copy also
-  // brings the pages in, which a request should not wait for.
+  // cold_sum_ lives in workspace that is dead during the MoE (qz_: B x 12,288 fp32).
+  cold_sum_ = qz_;
   for (Layer& L : layers_) {
     L.cold_gu.assign(size_t(NE), nullptr);
     L.cold_dn.assign(size_t(NE), nullptr);
     std::vector<int> cold;
     for (int e = 0; e < NE; ++e)
       if (L.cold[size_t(e)]) cold.push_back(e);
-    uint8_t* blk = nullptr;
-    if (n_stream_ > 0) blk = sycl::malloc_host<uint8_t>(size_t(uint64_t(cold.size()) * expert_bytes_), q_);
-    if (n_stream_ > 0 && !blk) throw std::runtime_error("engine: out of pinned host memory for the cold experts");
-    if (blk) {
-      owned_.push_back(blk);
-      pinned_bytes_ += uint64_t(cold.size()) * expert_bytes_;
-    }
+    auto* blk = sycl::malloc_host<uint8_t>(size_t(uint64_t(cold.size()) * raw_expert_), q_);
+    if (!blk) throw std::runtime_error("engine: out of pinned host memory for the cold experts");
+    owned_.push_back(blk);
+    pinned_bytes_ += uint64_t(cold.size()) * raw_expert_;
     for (size_t j = 0; j < cold.size(); ++j) {
-      const size_t e = size_t(cold[j]);
-      L.cold_gu[e] = blk ? blk + j * expert_bytes_ : L.gu_host + e * expert_raw_gu_;
-      L.cold_dn[e] = blk ? blk + j * expert_bytes_ + expert_raw_gu_ : L.dn_host + e * E * dn_row;
+      L.cold_gu[size_t(cold[j])] = blk + j * raw_expert_;
+      L.cold_dn[size_t(cold[j])] = blk + j * raw_expert_ + raw_gu_;
     }
-    if (blk) {
-      pool_->for_each(int64_t(cold.size()), 1, [&](int64_t lo, int64_t hi) {
-        for (int64_t j = lo; j < hi; ++j) {
-          std::memcpy(blk + j * expert_bytes_, L.gu_host + size_t(cold[size_t(j)]) * expert_raw_gu_, expert_raw_gu_);
-          std::memcpy(blk + j * expert_bytes_ + expert_raw_gu_, L.dn_host + size_t(cold[size_t(j)]) * E * dn_row, size_t(E * dn_row));
-        }
-      });
-    }
-  }
-  if (n_stream_ == 0) {
-    std::vector<std::pair<const uint8_t*, size_t>> spans;
-    for (const Layer& L : layers_)
-      for (int e = 0; e < NE; ++e)
-        if (L.cold[size_t(e)]) {
-          spans.push_back({L.gu_host + size_t(e) * 2 * Fe * gu_row, size_t(2 * Fe * gu_row)});
-          spans.push_back({L.dn_host + size_t(e) * E * dn_row, size_t(E * dn_row)});
-        }
-    std::atomic<uint64_t> sink{0};
-    pool_->for_each(int64_t(spans.size()), 8, [&](int64_t lo, int64_t hi) {
-      uint64_t s = 0;
-      for (int64_t i = lo; i < hi; ++i)
-        for (size_t o = 0; o < spans[size_t(i)].second; o += 4096) s += spans[size_t(i)].first[o];
-      sink += s;
+    pool_->for_each(int64_t(cold.size()), 1, [&](int64_t lo, int64_t hi) {
+      for (int64_t j = lo; j < hi; ++j) {
+        const size_t e = size_t(cold[size_t(j)]);
+        uint8_t* dst = blk + uint64_t(j) * raw_expert_;
+        std::memcpy(dst, L.gate_host + e * gate_b, gate_b);
+        std::memcpy(dst + gate_b, L.up_host + e * gate_b, gate_b);
+        std::memcpy(dst + raw_gu_, L.down_host + e * raw_dn_, raw_dn_);
+      }
     });
   }
 }
+
+std::string Engine::placement_line() const {
+  char buf[640];
+  const double gib = 1073741824.0;
+  const int64_t NE = cfg_.n_expert;
+  std::snprintf(buf, sizeof buf,
+                "%.2f GiB of weights on the card, %.2f GiB of KV and DeltaNet state; experts %s/%s: %lld of %lld per layer on the card "
+                "(free %.2f GiB before them, margin %.2f, draft %.2f, vision %.2f), %d streaming slots, %.2f GiB of cold experts in pinned host memory; head %s",
+                double(weight_bytes_) / gib, double(cache_bytes_) / gib, gguf::type_name(t_gu_), gguf::type_name(t_dn_), (long long)n_hot_,
+                (long long)NE, double(free_at_placement_) / gib, double(c_.card_margin_bytes) / gib, double(c_.draft_reserve_bytes) / gib,
+                double(c_.vision_reserve_bytes) / gib, n_stream_, double(pinned_bytes_) / gib, c_.head_dpas ? "dpas GEMV" : "fp32 activations");
+  return buf;
+}
+
+void Engine::dense(const xmx::Activations& a, const Dense& d, float* out) {
+  if (d.parts.size() == 1) return xmx::matmul(q_, a, d.parts[0], out);
+  int64_t c0 = 0;
+  for (const xmx::Weight& w : d.parts) {
+    xmx::matmul(q_, a, w, tmp_);
+    qwenk::copy_cols(q_, tmp_, a.m, w.n, out, d.n, c0);
+    c0 += w.n;
+  }
+}
+
 std::vector<int32_t> Engine::cold_list(const Layer& L, const int32_t* ids, int64_t P) const {
   std::vector<int32_t> cp;
   for (int64_t p = 0; p < P; ++p)
@@ -532,35 +668,39 @@ void Engine::cold_compute(const Layer& L, const std::vector<int32_t>& cp, const 
     dn_segs.push_back(std::move(b));
   }
   // Tasks are row ranges of one expert's matrix.
-  auto run = [&](const std::vector<Seg>& segs, const std::vector<const uint8_t*>& expert, int64_t k, int64_t n, int64_t step) {
+  auto run = [&](const std::vector<Seg>& segs, const std::vector<const uint8_t*>& expert, cpu::QType qt, int64_t k, int64_t n, int64_t step) {
     const int64_t per = (n + step - 1) / step;
     pool_->for_each(int64_t(segs.size()) * per, 1, [&](int64_t lo, int64_t hi) {
       for (int64_t t = lo; t < hi; ++t) {
         const Seg& s = segs[size_t(t / per)];
         const int64_t r0 = (t % per) * step, r1 = std::min(n, r0 + step);
-        cpu::gemv_q4_multi(expert[size_t(s.e)], k, r0, r1, s.xs.data(), int(s.xs.size()), s.ys.data());
+        cpu::gemv_q_multi(qt, expert[size_t(s.e)], k, r0, r1, s.xs.data(), int(s.xs.size()), s.ys.data());
       }
     });
   };
-  run(gu_segs, L.cold_gu, E, 2 * Fe, 32);
-  // GeGLU (the tanh form, as ref::gelu_mul) and the int8 quantization of its output, per pair.
+  const auto c0 = std::chrono::steady_clock::now();
+  run(gu_segs, L.cold_gu, q_gu_, E, 2 * Fe, 32);
+  const auto c1 = std::chrono::steady_clock::now();
+  // SwiGLU and the int8 quantization of its output, per pair.
   pool_->for_each(nc, 4, [&](int64_t lo, int64_t hi) {
     std::vector<float> g(static_cast<size_t>(Fe));
     for (int64_t k = lo; k < hi; ++k) {
-      const float* gu = cold_gu_.data() + k * 2 * Fe;
-      for (int64_t j = 0; j < Fe; ++j) {
-        const float a = gu[j];
-        g[size_t(j)] = 0.5f * a * (1.0f + std::tanh(0.7978845608028654f * (a + 0.044715f * a * a * a))) * gu[Fe + j];
-      }
+      cpu::glu(cold_gu_.data() + k * 2 * Fe, Fe, cpu::CpuGlu::Silu, g.data());
       cold_g_[size_t(k)] = cpu::quantize(g.data(), Fe);
     }
   });
-  run(dn_segs, L.cold_dn, Fe, E, 64);
+  const auto c2 = std::chrono::steady_clock::now();
+  run(dn_segs, L.cold_dn, q_dn_, Fe, E, 64);
+  const auto c3 = std::chrono::steady_clock::now();
+  cold_.gu_s += std::chrono::duration<double>(c1 - c0).count();
+  cold_.glu_s += std::chrono::duration<double>(c2 - c1).count();
+  cold_.dn_s += std::chrono::duration<double>(c3 - c2).count();
+  cold_.experts += gu_segs.size();
 }
 
 void Engine::cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event routed, sycl::event hot_done) {
   using Clock = std::chrono::steady_clock;
-  const int64_t E = cfg_.n_embd, NU = cfg_.n_expert_used, kb = E / 32;
+  const int64_t E = cfg_.n_embd, kb = E / 32;
   const auto t0 = Clock::now();
   routed.wait();
   const auto t1 = Clock::now();
@@ -568,7 +708,7 @@ void Engine::cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event route
   pairs_ += uint64_t(P);
   cold_pairs_ += cp.size();
   if (!cp.empty()) {
-    // The expert inputs are the card's own int8 rows (the first 8-row tile of act_exp_).
+    // The expert inputs are the card's own int8 rows (the first 8-row tile of act_).
     std::vector<cpu::Q8Blocks> x(static_cast<size_t>(T));
     for (int64_t t = 0; t < T; ++t) {
       cpu::Q8Blocks& r = x[size_t(t)];
@@ -591,7 +731,6 @@ void Engine::cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event route
     for (size_t k = 0; k < cp.size(); ++k) pl.pair[k] = cp[k];
     fast::cold_scatter(q_, hp_y_, pl, int64_t(cp.size()), E, gx_);
   }
-  (void)NU;
   const auto t2 = Clock::now();
   cold_.wait_s += std::chrono::duration<double>(t1 - t0).count();
   cold_.cpu_s += std::chrono::duration<double>(t2 - t1).count();
@@ -609,8 +748,8 @@ std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int
       if (cnt[size_t(e)] >= c_.stream_min_rows) cand.push_back(e);
     }
   std::sort(cand.begin(), cand.end(), [&](int32_t a, int32_t b) { return cnt[size_t(a)] != cnt[size_t(b)] ? cnt[size_t(a)] > cnt[size_t(b)] : a < b; });
-  // The copies and the CPU work run side by side: stream the busiest candidates until the copies would take
-  // longer than the CPU does on what is left, within the slots and the rows the gathered inputs can hold.
+  // The copies and the CPU work run side by side: stream the busiest candidates until the copies would take longer than
+  // the CPU does on what is left, within the slots and the rows the gathered inputs can hold.
   size_t best_k = 0;
   double best = rest * c_.stream_cpu_us;
   int64_t rows = 0;
@@ -632,20 +771,23 @@ std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int
 void Engine::stream_experts(const Layer& L, const std::vector<int32_t>& list, int64_t P, int32_t hot_rows, int64_t s_tiles,
                             const std::function<void(const char*)>& mark) {
   const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NU = cfg_.n_expert_used, NE = cfg_.n_expert;
-  const uint64_t gu_row = uint64_t(E) / 32 * 18, dn_row = uint64_t(Fe) / 32 * 18;
-  // The copy engine moves each expert's bytes (gate_up then down, as the GGUF has them) from pinned memory into its
-  // raw slot; the host does not wait: the queue does, on the copies' fence, before the repacking, the grouping and
-  // the GEMMs, which come after the hot experts'.
-  for (size_t j = 0; j < list.size(); ++j) copy_->copy(stream_raw_ + uint64_t(j) * expert_bytes_, L.cold_gu[size_t(list[j])], expert_bytes_);
+  // The copy engine moves each expert's bytes (gate | up rows, then down, as the GGUF has them) from pinned memory into its raw
+  // slot; the host does not wait: the queue does, on the copies' fence, before the repacking, the grouping and the GEMMs, which
+  // come after the hot experts'.
+  for (size_t j = 0; j < list.size(); ++j) copy_->copy(stream_raw_ + uint64_t(j) * raw_expert_, L.cold_gu[size_t(list[j])], raw_expert_);
   const sycl::event copied = copy_->event(copy_->fence());
   q_.submit([&](sycl::handler& h) {
     h.depends_on(copied);
     h.single_task([] {});
   });
+  auto repack_into = [&](const ref::Weight& raw, bool interleave, const xmx::Weight& w) {
+    if (w.format == xmx::WeightFormat::Q4_0) xmx::repack_q4_0_into(q_, raw, interleave, w);
+    else xmx::repack_format_into(q_, raw, interleave, w);
+  };
   for (size_t j = 0; j < list.size(); ++j) {
-    const uint8_t* raw = stream_raw_ + uint64_t(j) * expert_bytes_;
-    xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, E, 2 * Fe, raw, gu_row}, true, stream_w_gu_[j]);
-    xmx::repack_q4_0_into(q_, ref::Weight{gguf::Type::Q4_0, Fe, E, raw + expert_raw_gu_, dn_row}, false, stream_w_dn_[j]);
+    const uint8_t* raw = stream_raw_ + uint64_t(j) * raw_expert_;
+    repack_into(ref::Weight{t_gu_, E, 2 * Fe, raw, gu_row_}, true, stream_w_gu_[j]);
+    repack_into(ref::Weight{t_dn_, Fe, E, raw + raw_gu_, dn_row_}, false, stream_w_dn_[j]);
   }
   q_.memcpy(stream_map_, hp_smap_, size_t(NE) * 4);
   mark("stream_copy_repack");
@@ -653,7 +795,7 @@ void Engine::stream_experts(const Layer& L, const std::vector<int32_t>& list, in
   fast::moe_group(q_, moe_ids_, P, n_stream_, moe_tile_, stream_scratch_, stream_tiles_, moe_row_, nullptr, stream_map_, hot_rows);
   sycl::half* a = reinterpret_cast<sycl::half*>(att_);
   fast::moe_gather(q_, h_, moe_row_, P, NU, E, a, hot_rows);
-  xmx::matmul_geglu_grouped16(q_, a, stream_gu_, stream_tiles_, s_tiles, moe_tile_, moe_h_ + int64_t(hot_rows) * Fe);
+  xmx::matmul_geglu_grouped16(q_, a, stream_gu_, stream_tiles_, s_tiles, moe_tile_, moe_h_ + int64_t(hot_rows) * Fe, xmx::Glu::Silu);
   xmx::matmul_grouped16(q_, moe_h_ + int64_t(hot_rows) * Fe, stream_dn_, stream_tiles_, s_tiles, moe_tile_, moe_y_ + int64_t(hot_rows) * E);
   mark("stream_gemm");
 }
@@ -755,13 +897,14 @@ void Engine::cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event ids_
   if (hot_done.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete) ++cold_.late_layers;
 }
 
-
 Engine::~Engine() {
   q_.wait();
   xmx::free_activations(q_, act_);
-  xmx::free_activations(q_, act_ffn_);
-  if (act_exp_.q) xmx::free_activations(q_, act_exp_);
-  if (act_exp_ffn_.q) xmx::free_activations(q_, act_exp_ffn_);
+  xmx::free_activations(q_, act_sh_);
+  xmx::free_activations(q_, act_exp_ffn_);
+  if (act_head_.q) xmx::free_activations(q_, act_head_);
+  gdn::free_scratch(q_, gscratch_);
+  gdn::free_cache(q_, gcache_);
   if (attn_scratch_.q) sycl::free(attn_scratch_.q, q_);
   if (attn_scratch_.part) sycl::free(attn_scratch_.part, q_);
   if (attn_scratch_.part2) sycl::free(attn_scratch_.part2, q_);
@@ -782,15 +925,39 @@ void Engine::ensure_pages(int slot, int64_t positions) {
   }
 }
 
-void Engine::truncate(int slot, int64_t length) {
-  Slot& s = slots_.at(size_t(slot));
-  if (length < 0 || length > s.length) throw std::runtime_error("engine: truncate beyond the sequence");
+void Engine::free_pages_beyond(Slot& s, int64_t length) {
   const size_t keep = size_t((length + attn::kPage - 1) / attn::kPage);
   while (s.pages.size() > keep) {
     free_pages_.push_back(s.pages.back());
     s.pages.pop_back();
   }
-  s.length = length;
+}
+
+int Engine::accepted(const Slot& s, int accept) const {
+  if (s.pending == 0) {
+    if (accept > 0) throw std::runtime_error("engine: accept given for a slot with nothing pending");
+    return 0;
+  }
+  const int a = accept < 0 ? s.pending : accept;
+  if (a > s.pending) throw std::runtime_error("engine: accept " + std::to_string(a) + " of " + std::to_string(s.pending) + " pending tokens");
+  return a;
+}
+
+void Engine::upload_plan(const std::vector<gdn::SlotStep>& steps, gdn::Plan& plan) {
+  plan = gdn::Plan{};
+  plan.n_slots = int32_t(steps.size());
+  int32_t shift = 0;
+  for (size_t i = 0; i < steps.size(); ++i) {
+    gdn::SlotStep st = steps[i];
+    shift += st.accept;
+    st.shift = shift;
+    plan.n_tokens += st.n;
+    plan.max_n = std::max(plan.max_n, st.n);
+    plan_host_[i] = st;
+  }
+  plan.n_rows = plan.n_tokens + shift;
+  q_.memcpy(plan_dev_, plan_host_, steps.size() * sizeof(gdn::SlotStep));
+  plan.dev = plan_dev_;
 }
 
 void Engine::release(int slot) {
@@ -798,78 +965,189 @@ void Engine::release(int slot) {
   for (int32_t p : s.pages) free_pages_.push_back(p);
   s.pages.clear();
   s.length = 0;
+  s.pending = 0;
+  books_[size_t(slot)].pending = 0;
+  gdn::reset_slot(q_, gcache_, slot);
+}
+
+void Engine::truncate(int slot, int64_t length) {
+  Slot& s = slots_.at(size_t(slot));
+  if (s.pending) throw std::runtime_error("engine: truncate with tokens pending");
+  if (length != s.length) throw std::runtime_error("engine: the K/V alone cannot be cut: the DeltaNet state goes with it (restore a snapshot)");
+}
+
+void Engine::settle(int slot, int accept) {
+  Slot& s = slots_.at(size_t(slot));
+  if (!s.pending) return;
+  const int acc = accepted(s, accept);
+  const gdn::SlotStep st = books_[size_t(slot)].next(slot, 0, 0, acc, 0, c_.max_pending);
+  gdn::Plan plan;
+  upload_plan({st}, plan);
+  const gdn::Inputs in{qz_, qz_, ab_, ab_};
+  for (const Layer& L : layers_)
+    if (L.recurrent) gdn::step(q_, L.gw, gcache_, L.gdn_idx, plan, in, gscratch_, act_);
+  q_.wait();
+  s.length = s.verify_start + acc;
+  free_pages_beyond(s, s.length);
+  s.pending = 0;
+}
+
+Engine::Snapshot Engine::snapshot(int slot) {
+  Slot& s = slots_.at(size_t(slot));
+  if (s.pending) throw std::runtime_error("engine: snapshot with tokens pending (settle the slot first)");
+  Snapshot snap;
+  snap.bytes = uint64_t(gcache_.snapshot_bytes());
+  sycl::queue* q = &q_;
+  snap.host = std::shared_ptr<uint8_t>(sycl::malloc_host<uint8_t>(size_t(snap.bytes), q_), [q](uint8_t* p) { sycl::free(p, *q); });
+  if (!snap.host) throw std::runtime_error("engine: out of pinned memory for a snapshot");
+  gdn::snapshot_to_host(q_, gcache_, slot, snap.host.get()).wait();
+  snap.position = s.length;
+  return snap;
+}
+
+void Engine::restore(int slot, const Snapshot& snap, int64_t length) {
+  Slot& s = slots_.at(size_t(slot));
+  if (s.pending) throw std::runtime_error("engine: restore with tokens pending");
+  if (!snap.host || snap.bytes != uint64_t(gcache_.snapshot_bytes())) throw std::runtime_error("engine: not a snapshot of this engine");
+  if (length != snap.position) throw std::runtime_error("engine: a snapshot restores only to its own position");
+  if (length > s.length) throw std::runtime_error("engine: the slot does not hold the snapshot's positions");
+  gdn::restore_from_host(q_, gcache_, slot, snap.host.get()).wait();
+  free_pages_beyond(s, length);
+  s.length = length;
 }
 
 std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::DumpSink* dump) {
-  const int64_t E = cfg_.n_embd, H = cfg_.n_head, V = cfg_.n_vocab;
-  std::vector<int32_t> tok, slot, pos, logit_rows;
-  // Image spans make the sliding layers' key ranges per token (lo, hi); without any, tokens are causal as before.
-  std::vector<int32_t> lo, hi;
-  std::vector<std::pair<int64_t, const model::ImageRows*>> spans;  // batch row of the span's first token
-  bool ranged = false;
-  for (const auto& c : chunks) ranged |= !c.images.empty();
-  attn::TileList tiles_s(cfg_.head_dim_sliding), tiles_g(cfg_.head_dim_global);
-  for (const auto& c : chunks) {
+  const int64_t E = cfg_.n_embd, H = cfg_.n_head, Hkv = cfg_.n_head_kv, D = cfg_.head_dim, V = cfg_.n_vocab;
+  const int64_t NE = cfg_.n_expert, NU = cfg_.n_expert_used;
+  const int ncap = int(c_.capture_layers.size());
+
+  // Validation, before anything changes.
+  std::set<int> seen;
+  std::vector<int> acc(chunks.size(), 0);
+  int64_t n_tok = 0, n_logits = 0, n_cap = 0;
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    const Chunk& c = chunks[i];
     if (c.slot < 0 || c.slot >= c_.n_slots) throw std::runtime_error("engine: bad slot");
-    if (c.start_pos != slots_[size_t(c.slot)].length) throw std::runtime_error("engine: chunk does not continue its slot");
-    const int64_t base = int64_t(tok.size()), n = int64_t(c.tokens.size());
+    if (!seen.insert(c.slot).second) throw std::runtime_error("engine: two chunks of one slot in a step");
+    const int64_t n = int64_t(c.tokens.size());
+    if (n == 0) throw std::runtime_error("engine: empty chunk (settle() commits pending tokens alone)");
     if (n > c_.max_chunk) throw std::runtime_error("engine: chunk longer than max_chunk");
-    if (n == 0) continue;
-    for (int64_t i = 0; i < n; ++i) {
-      tok.push_back(c.tokens[size_t(i)]);
+    if (c.verify && n > c_.max_pending) throw std::runtime_error("engine: verify chunk longer than max_pending");
+    const Slot& s = slots_[size_t(c.slot)];
+    acc[i] = accepted(s, c.accept);
+    const int64_t at = s.pending ? s.verify_start + acc[i] : s.length;
+    if (c.start_pos != at) throw std::runtime_error("engine: chunk does not continue its slot");
+    if (c.capture_rows < 0 || c.capture_rows > n || (c.capture_rows > 0 && !cap_)) throw std::runtime_error("engine: bad capture_rows");
+    for (int32_t t : c.tokens)
+      if (t < 0 || t >= V) throw std::runtime_error("engine: token id out of range");
+    {
+      int64_t at_row = 0;
+      for (const model::ImageRows& im : c.images) {
+        if (im.n <= 0 || im.offset < at_row || im.offset + im.n > n || !im.rows || im.nx <= 0 || im.ny <= 0 || im.nx * im.ny != im.n)
+          throw std::runtime_error("engine: bad image span (rows, grid, order or place)");
+        at_row = im.offset + im.n;
+      }
+      if (c.rope_delta < 0 || c.start_pos - c.rope_delta < 0) throw std::runtime_error("engine: bad rope_delta");
+    }
+    if (at + n > c_.max_ctx) throw std::runtime_error("engine: sequence longer than max_ctx");
+    n_tok += n;
+    n_logits += std::min(n, std::max<int64_t>(c.logits_rows, 0));
+    n_cap += c.capture_rows;
+  }
+  if (n_tok > c_.max_batch) throw std::runtime_error("engine: step larger than max_batch");
+  if (n_logits > c_.max_logits) throw std::runtime_error("engine: too many logits rows");
+  if (n_cap > c_.max_capture_rows) throw std::runtime_error("engine: too many capture rows");
+
+  std::vector<int32_t> tok, slot, pos, logit_rows, cap_rows, rpos;  // rpos: [3][T] once built
+  std::vector<int32_t> rpos_t, rpos_h, rpos_w;
+  std::vector<gdn::SlotStep> gsteps;
+  attn::TileList tiles(D);
+  capture_.ids.clear();
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    const Chunk& c = chunks[i];
+    Slot& s = slots_[size_t(c.slot)];
+    if (s.pending) {
+      s.length = s.verify_start + acc[i];
+      free_pages_beyond(s, s.length);
+    }
+    const int64_t base = int64_t(tok.size()), n = int64_t(c.tokens.size());
+    for (int64_t j = 0; j < n; ++j) {
+      tok.push_back(c.tokens[size_t(j)]);
       slot.push_back(c.slot);
-      pos.push_back(int32_t(c.start_pos + i));
+      pos.push_back(int32_t(c.start_pos + j));
     }
-    if (ranged) {
-      int64_t at = 0;
-      for (const auto& im : c.images) {
-        if (im.n <= 0 || im.offset < at || im.offset + im.n > n || !im.rows) throw std::runtime_error("engine: bad image span");
-        at = im.offset + im.n;
-        spans.push_back({base + im.offset, &im});
+    // The rotary positions (time, row, column) of the chunk's tokens: text at its sequence index less the images' saving so far,
+    // an image's rows on its grid.
+    {
+      int64_t delta = c.rope_delta;
+      size_t k = 0;
+      for (int64_t j = 0; j < n;) {
+        if (k < c.images.size() && j == c.images[k].offset) {
+          const model::ImageRows& im = c.images[k];
+          const int64_t p = c.start_pos + j - delta;
+          for (int64_t r = 0; r < im.n; ++r) {
+            rpos_t.push_back(int32_t(p)), rpos_h.push_back(int32_t(p + r / im.nx)), rpos_w.push_back(int32_t(p + r % im.nx));
+          }
+          delta += im.n - im.n_pos();
+          j += im.n;
+          ++k;
+        } else {
+          const int32_t p = int32_t(c.start_pos + j - delta);
+          rpos_t.push_back(p), rpos_h.push_back(p), rpos_w.push_back(p);
+          ++j;
+        }
       }
-      // Image tokens see up to the span's last position; every other token is causal. lo and hi do not decrease.
-      size_t next = 0;
-      for (int64_t i = 0; i < n; ++i) {
-        const int64_t p = c.start_pos + i;
-        int64_t h = p;
-        while (next < c.images.size() && i >= c.images[next].offset + c.images[next].n) ++next;
-        if (next < c.images.size() && i >= c.images[next].offset) h = c.start_pos + c.images[next].offset + c.images[next].n - 1;
-        lo.push_back(int32_t(std::max<int64_t>(0, p - cfg_.window + 1)));
-        hi.push_back(int32_t(h));
-      }
-      tiles_s.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_sliding_, hkv_sliding_, 0, lo[size_t(base)], hi.back());
-    } else {
-      tiles_s.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_sliding_, hkv_sliding_, cfg_.window);
     }
-    tiles_g.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_global_, hkv_global_, 0);
+    tiles.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_, Hkv, 0);
     for (int64_t r = std::max<int64_t>(0, n - c.logits_rows); r < n; ++r) logit_rows.push_back(int32_t(base + r));
+    for (int64_t r = n - c.capture_rows; r < n; ++r) {
+      cap_rows.push_back(int32_t(base + r));
+      capture_.ids.push_back({int32_t(c.slot), int32_t(c.start_pos + r)});
+    }
     ensure_pages(c.slot, c.start_pos + n);
+    gsteps.push_back(books_[size_t(c.slot)].next(c.slot, int32_t(base), int32_t(n), acc[i], c.verify ? 0 : int32_t(n), c_.max_pending));
+    s.pending = c.verify ? int(n) : 0;
+    s.verify_start = c.start_pos;
+    s.length = c.start_pos + n;
   }
   const int64_t T = int64_t(tok.size()), R = int64_t(logit_rows.size());
+  capture_.rows = int64_t(cap_rows.size());
+  capture_.data = cap_;
+  if (T == 0) return {};
+  const int64_t P = T * NU;
+  const bool small = P <= xmx::kFp16Rows;  // decode's grouped GEMVs: up to 4 tokens
   // Decode calls the pool every few hundred microseconds and wants its workers spinning; prefill's phases
   // last milliseconds and the spinning only takes the cores from the hot kernels' host thread.
-  if (pool_) pool_->set_spin_us(T * cfg_.n_expert_used <= xmx::kFp16Rows ? 400 : 0);
-  if (T == 0) return {};
+  if (pool_) pool_->set_spin_us(T <= 16 ? 400 : 0);
   const auto t_step = std::chrono::steady_clock::now();
-  if (T > c_.max_batch) throw std::runtime_error("engine: step larger than max_batch");
-  if (R > c_.max_logits) throw std::runtime_error("engine: too many logits rows");
+
+  // The embedding rows of the step's tokens, gathered on the host from the mapping.
+  if (!c_.embed_on_card) {
+    for (int64_t t = 0; t < T; ++t)
+      std::memcpy(emb_host_ + uint64_t(t) * embd_row_bytes_, embd_->data + uint64_t(tok[size_t(t)]) * embd_row_bytes_, embd_row_bytes_);
+    q_.memcpy(emb_dev_, emb_host_, size_t(uint64_t(T) * embd_row_bytes_));
+  }
   q_.memcpy(tok_, tok.data(), size_t(T) * 4);
   q_.memcpy(slot_, slot.data(), size_t(T) * 4);
   q_.memcpy(pos_, pos.data(), size_t(T) * 4);
-  if (ranged) {
-    q_.memcpy(lo_, lo.data(), size_t(T) * 4);
-    q_.memcpy(hi_, hi.data(), size_t(T) * 4);
-  }
-  const std::vector<int32_t> packed_s = tiles_s.packed(), packed_g = tiles_g.packed();
-  q_.memcpy(tiles_sliding_, packed_s.data(), packed_s.size() * 4);
-  q_.memcpy(tiles_global_, packed_g.data(), packed_g.size() * 4);
+  rpos.insert(rpos.end(), rpos_t.begin(), rpos_t.end());
+  rpos.insert(rpos.end(), rpos_h.begin(), rpos_h.end());
+  rpos.insert(rpos.end(), rpos_w.begin(), rpos_w.end());
+  q_.memcpy(rpos_, rpos.data(), size_t(3 * T) * 4);
+  const std::vector<int32_t> packed = tiles.packed();
+  q_.memcpy(tiles_, packed.data(), packed.size() * 4);
   q_.memcpy(page_table_, page_table_host_.data(), page_table_host_.size() * 4);
-  const attn::Tokens toks{slot_, pos_, T}, toks_s{slot_, pos_, T, ranged ? lo_ : nullptr, ranged ? hi_ : nullptr};
+  if (R) q_.memcpy(rows_idx_, logit_rows.data(), size_t(R) * 4);
+  if (!cap_rows.empty()) q_.memcpy(cap_idx_, cap_rows.data(), cap_rows.size() * 4);
+  gdn::Plan plan;
+  upload_plan(gsteps, plan);
+  const attn::Tokens toks{slot_, pos_, T};
+
   // On a profiling queue each mark is an empty kernel whose end timestamp closes the section, so
   // the card's own time is measured; otherwise the host waits at each mark.
   const bool gpu_marks = profile_ && q_.has_property<sycl::property::queue::enable_profiling>();
   std::vector<std::pair<const char*, sycl::event>> marks;
-  auto settle = [&] {
+  auto settle_marks = [&] {
     if (!gpu_marks || marks.empty()) return;
     namespace ep = sycl::info::event_profiling;
     uint64_t prev = marks[0].second.get_profiling_info<ep::command_end>();
@@ -902,177 +1180,166 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     dump->put(name, host, ne);
   };
 
-  // Each layer starts with its attention input already normed and quantized in act_: by the
-  // fused kernel at the end of the layer before, or here for the first.
-  fast::embed(q_, head_, tok_, T, std::sqrt(float(E)), x_);
-  // Image rows replace the lookups, unscaled (llama.cpp: "do not normalize weights for raw embeddings input").
-  for (const auto& [row, im] : spans) q_.memcpy(x_ + row * E, im->rows, size_t(im->n * E) * sizeof(float));
-  emit("inp_scaled", x_, {E, T});
-  fast::residual_norm_quant(q_, nullptr, nullptr, x_, 1.0f, nullptr, layers_[0].attn_norm, cfg_.eps, T, E, &act_, h_);
+  // Each layer starts with its input already normed and quantized in act_ (and, for DeltaNet layers, in fp32 in h_ for the
+  // alpha / beta matmul): by the fused kernel at the end of the layer before, or here for the first.
+  if (c_.embed_on_card) ref::embed(q_, embd_card_, tok_, T, 1.0f, x_);
+  else ref::embed(q_, ref::Weight{embd_->type, E, T, emb_dev_, embd_row_bytes_}, iota_, T, 1.0f, x_);
+  // Image rows replace the lookups (unscaled: Qwen's embeddings are not scaled either).
+  for (size_t i = 0, base = 0; i < chunks.size(); base += chunks[i].tokens.size(), ++i)
+    for (const model::ImageRows& im : chunks[i].images)
+      q_.memcpy(x_ + (int64_t(base) + im.offset) * E, im.rows, size_t(im.n * E) * sizeof(float));
+  emit("model.input_embed", x_, {E, T});
+  qwenk::add_norm_quant(q_, nullptr, x_, layers_[0].attn_norm, cfg_.eps, T, E, nullptr, &act_, h_);
   mark("embed");
+  const float attn_scale = 1.0f / std::sqrt(float(D));
   for (int l = 0; l < cfg_.n_layer; ++l) {
     const Layer& L = layers_[size_t(l)];
-    const std::string s = "-" + std::to_string(l);
-    const bool sliding = cfg_.sliding[size_t(l)];
-    // The 26B at decode: fused norms and tail kernels, everything on the card.
-    const bool fused = cfg_.n_expert > 0 && T * cfg_.n_expert_used <= xmx::kFp16Rows;
-    const int64_t D = cfg_.head_dim(l), Hkv = cfg_.n_head_kv[size_t(l)];
-    const float* inv = sliding ? inv_freq_sliding_ : inv_freq_global_;
-    emit("attn_norm" + s, h_, {E, T});
+    const std::string s = dump ? "-" + std::to_string(l) : std::string();
+    if (dump) emit("attn_norm" + s, h_, {E, T});
 
-    xmx::matmul(q_, act_, L.wqkv, qkv_);
-    mark("qkv");
-    fast::qkv_heads(q_, qkv_, T, H, Hkv, D, L.has_v, L.q_norm, L.k_norm, cfg_.eps, pos_, inv, qb_, kb_, vb_);
-    emit("Qcur_pos" + s, qb_, {D, H, T});
-    emit("Kcur_pos" + s, kb_, {D, Hkv, T});
-    emit("Vcur_normed" + s, vb_, {D, Hkv, T});
-    mark("qkv_heads");
-
-    if (sliding) {
-      const attn::Cache cache{ring_k_ + L.ring_index * ring_layer_stride_, ring_v_ + L.ring_index * ring_layer_stride_, nullptr,
-                              ring_pages_, cfg_.window, Hkv, D};
-      attn::write(q_, kb_, vb_, toks, cache);
-      attn::attend(q_, qb_, toks_s, tiles_s, tiles_sliding_, cache, H, 1.0f, att_, attn_scratch_);
-      mark("attn_sliding");
+    if (L.recurrent) {
+      dense(act_, L.in, qz_);
+      mark("qkvz");
+      if (T <= 16) fast::matmul_f32_small(q_, L.w_ab, 2 * gdn::kValueHeads, E, h_, T, ab_);
+      else fast::matmul_f32(q_, L.w_ab, 2 * gdn::kValueHeads, E, h_, T, ab_);
+      const gdn::Inputs in{qz_, qz_ + gdn::kChannels, ab_, ab_ + gdn::kValueHeads, L.in.n, L.in.n, 2 * gdn::kValueHeads, 2 * gdn::kValueHeads};
+      mark("alpha_beta");
+      gdn::step(q_, L.gw, gcache_, L.gdn_idx, plan, in, gscratch_, act_);
+      mark("gdn");
+      dense(act_, L.out, o_);
+      mark("ssm_out");
+      if (dump) emit("linear_attn_out" + s, o_, {E, T, 1});
     } else {
-      const GlobalCache& g = global_[size_t(L.page_index)];
-      const attn::Cache cache{g.k, g.v, page_table_, max_pages_, 0, Hkv, D, g.ks, g.vs};
+      dense(act_, L.in, qz_);
+      mark("qkv");
+      qwenk::attn_heads(q_, qz_, T, H, Hkv, D, cfg_.n_rot, L.q_norm, L.k_norm, cfg_.eps, rpos_, cfg_.rope_sections, inv_freq_, qb_, kb_, vb_, gt_);
+      mark("attn_heads");
+      const KvLayer& kv = kv_[size_t(L.attn_idx)];
+      const attn::Cache cache{kv.k, kv.v, page_table_, max_pages_, 0, Hkv, D, kv.ks, kv.vs};
       attn::write(q_, kb_, vb_, toks, cache);
-      attn::attend(q_, qb_, toks, tiles_g, tiles_global_, cache, H, 1.0f, att_, attn_scratch_);
-      mark("attn_global");
+      attn::attend(q_, qb_, toks, tiles, tiles_, cache, H, attn_scale, att_, attn_scratch_);
+      mark("attn");
+      qwenk::gate_quant(q_, att_, gt_, T, H * D, act_);
+      dense(act_, L.out, o_);
+      mark("attn_out");
+      if (dump) emit("attn_output" + s, o_, {E, T});
     }
-    emit("kqv_out" + s, att_, {H * D, T});
-    act_.k = H * D;
-    xmx::quantize(q_, att_, T, act_);
-    xmx::matmul(q_, act_, L.wo, o_);
-    mark("wo");
-    if (fused)
-      fast::residual_norm_quant3(q_, o_, L.attn_post_norm, x_, x2_, cfg_.eps, T, E, act_, L.ffn_norm, act_exp_, L.pre_ffw_norm_2, h_,
-                                 L.router_in_scale);
-    else
-      fast::residual_norm_quant(q_, o_, L.attn_post_norm, x_, 1.0f, x2_, L.ffn_norm, cfg_.eps, T, E, &act_, h_);
-    emit("attn_out" + s, x2_, {E, T});
+    // x2 = x + out; m = rmsnorm(x2) * post_attention_norm, fp32 in h_ and quantized in act_.
+    qwenk::add_norm_quant(q_, o_, x_, L.post_norm, cfg_.eps, T, E, x2_, &act_, h_);
+    if (dump) {
+      emit("attn_residual" + s, x2_, {E, T});
+      emit("attn_post_norm" + s, h_, {E, T});
+    }
     mark("post_attn");
 
-    if (!fused) {
-      xmx::matmul_geglu(q_, act_, L.gate_up, act_ffn_, gu_);
-      mark("gate_up");
-      xmx::matmul(q_, act_ffn_, L.down, o_);
-      mark("down");
-    }
-    if (cfg_.n_expert > 0) {
-      // The 26B's MoE: the dense part is normed on its own (post_ffw_norm_1), then added to the
-      // routed experts' sum (normed with post_ffw_norm_2).
-      const int64_t n_expert = cfg_.n_expert, n_used = cfg_.n_expert_used;
-      if (!fused) fast::rmsnorm(q_, o_, L.post_ffw_norm_1, T, E, cfg_.eps, o_);
-      if (!fused) emit("ffn_mlp" + s, o_, {E, T});
-      // Router: r = rmsnorm(x2_) * (ffn_gate_inp.scale / sqrt(E)), then r @ W_router^T.
-      if (!fused) fast::rmsnorm(q_, x2_, L.router_in_scale, T, E, cfg_.eps, h_);
-      const float* w_router = reinterpret_cast<const float*>(L.w_router.data);
-      if (T * n_used <= xmx::kFp16Rows) fast::matmul_f32_small(q_, w_router, n_expert, E, h_, T, rlog_);
-      else fast::matmul_f32(q_, w_router, n_expert, E, h_, T, rlog_);
-      mark("router");
-      emit("ffn_moe_logits" + s, rlog_, {n_expert, T});
-      const int64_t P = T * n_used;
-      if (P <= xmx::kFp16Rows) {
-        // Decode (up to 4 tokens): routing, the grouped expert GEMVs and the weighted sum all on the
-        // card, nothing copied to or waited on by the host.
-        fast::moe_route(q_, rlog_, T, n_expert, n_used, L.exp_down_scale_dev, moe_ids_, moe_w_);
-        mark("moe_route");
-        // Cold experts: the routing and the experts' int8 input row come to pinned host memory, and the host
-        // waits for them only after the hot experts' kernels are enqueued, so the card works meanwhile.
-        sycl::event routed;
-        if (L.n_cold) {
-          const int64_t kb = E / 32;
-          routed = fast::host_pack(q_, moe_ids_, P, act_exp_.q, kb * 256, act_exp_.s, kb * 8, hp_ids_, hp_aq_, hp_as_);
-        }
-        // The dense FFN's gate|up rides along as three more experts; its down follows.
-        xmx::matmul_geglu_grouped_dense(q_, act_exp_, act_, L.tab_gate_up, moe_ids_, P, n_used, T, act_exp_ffn_, act_ffn_, moe_gu_);
-        mark("moe_gate_up");
-        xmx::matmul(q_, act_ffn_, L.down, o_);
-        mark("down");
-        xmx::matmul_grouped(q_, act_exp_ffn_, L.tab_down, moe_ids_, P, 1, gx_);
-        mark("moe_down");
-        if (L.n_cold) cold_decode(L, T, P, routed, q_.single_task([] {}));
-        // The layer's tail in one kernel; with a dump sink its intermediates are kept for it.
-        const bool d1 = dump && dump->wants("ffn_mlp" + s), d2 = dump && dump->wants("ffn_moe" + s),
-                   d3 = dump && dump->wants("ffn_moe_combined" + s);
-        const float* next_norm = l + 1 < cfg_.n_layer ? layers_[size_t(l) + 1].attn_norm : nullptr;
-        fast::moe_tail(q_, o_, L.post_ffw_norm_1, gx_, moe_w_, n_used, L.post_ffw_norm_2, L.ffn_post_norm, x2_, L.out_scale, x_,
-                       next_norm, cfg_.eps, T, E, &act_, d1 ? h_ : nullptr, d2 ? moe_ : nullptr, d3 ? o_ : nullptr);
-        if (d1) emit("ffn_mlp" + s, h_, {E, T});
-        // The next layer's dump of attn_norm reads h_, which the unfused kernel wrote.
-        if (next_norm && dump && dump->wants("attn_norm-" + std::to_string(l + 1))) fast::rmsnorm(q_, x_, next_norm, T, E, cfg_.eps, h_);
-        mark("moe_tail");
-      } else {
-        // Prefill: routing, grouping of the pairs by expert into row tiles, the experts' GEMMs over all
-        // their tokens at once and the weighted sum, all on the card.
-        fast::moe_route(q_, rlog_, T, n_expert, n_used, L.exp_down_scale_dev, moe_ids_, moe_w_);
-        mark("moe_route");
-        // Expert input rmsnorm(x2_) * pre_ffw_norm_2 (h_ is scratch).
-        fast::rmsnorm(q_, x2_, L.pre_ffw_norm_2, T, E, cfg_.eps, h_);
-        sycl::event routed, ids_ready;
-        if (L.n_cold) {
-          // As at decode, the host waits for the routing and the input rows after the hot work is enqueued (the ids
-          // first: they say which cold experts to stream).
-          ids_ready = q_.memcpy(hp_ids_, moe_ids_, size_t(P) * 4);
-          q_.memcpy(hp_w_, moe_w_, size_t(P) * 4);
-          // The expert inputs go as int8 (the form the CPU computes with), a quarter of the bytes.
-          fast::quantize_rows(q_, h_, T, E, reinterpret_cast<int8_t*>(qb_), kb_);
-          q_.memcpy(hp_xq_, qb_, size_t(T * E));
-          routed = q_.memcpy(hp_xs_, kb_, size_t(T) * size_t(E / 32) * sizeof(float));
-        }
-        fast::moe_group(q_, moe_ids_, P, n_expert, moe_tile_, moe_scratch_, moe_tiles_, moe_row_, L.cold_dev);
-        mark("moe_group");
-        // Each pair's row in sorted order.
-        fast::moe_gather(q_, h_, moe_row_, P, n_used, E, moe_a_);
-        mark("moe_gather");
-        const int64_t max_tiles = (P + moe_tile_ - 1) / moe_tile_ + n_expert;
-        xmx::matmul_geglu_grouped16(q_, moe_a_, L.tab_gate_up, moe_tiles_, max_tiles, moe_tile_, moe_h_);
-        mark("moe_gate_up");
-        xmx::matmul_grouped16(q_, moe_h_, L.tab_down, moe_tiles_, max_tiles, moe_tile_, moe_y_);
-        mark("moe_down");
-        if (L.n_cold) cold_prefill(L, T, P, ids_ready, routed, q_.single_task([] {}), mark);
-        fast::moe_combine(q_, moe_y_, moe_w_, T, n_used, E, moe_, moe_row_, L.n_cold ? cold_sum_ : nullptr, L.n_cold ? cold_map_ : nullptr);
-        mark("moe_sum");
-      }
-      if (!fused) fast::rmsnorm(q_, moe_, L.post_ffw_norm_2, T, E, cfg_.eps, moe_);
-      mark("moe_post_norm");
-      emit("ffn_moe" + s, moe_, {E, T});
-      // Combine: o_ = ffn_mlp + moe.
-      if (!fused) {
-        float* o = o_;
-        const float* moe = moe_;
-        q_.parallel_for(sycl::range<1>(size_t(T * E)), [=](sycl::id<1> id) { o[id[0]] += moe[id[0]]; });
-      }
-      emit("ffn_moe_combined" + s, o_, {E, T});
-      mark("moe_add");
-    }
+    // The routed experts and the shared expert (gate | up interleaved, SwiGLU, down, into o_).
     const float* next_norm = l + 1 < cfg_.n_layer ? layers_[size_t(l) + 1].attn_norm : nullptr;
-    if (!fused) fast::residual_norm_quant(q_, o_, L.ffn_post_norm, x2_, L.out_scale, x_, next_norm, cfg_.eps, T, E, &act_, h_);
-    emit("l_out" + s, x_, {E, T});
-    mark("post_ffn");
+    const bool next_h = next_norm && (layers_[size_t(l) + 1].recurrent || (dump && dump->wants("attn_norm-" + std::to_string(l + 1))));
+    const float* sgate;
+    int64_t ld_sg;
+    if (T <= 16) {
+      fast::matmul_f32_small(q_, L.w_rg, NE + 32, E, h_, T, rg_);
+      mark("router");
+      if (dump && dump->wants("ffn_moe_logits" + s)) {
+        std::vector<float> host(size_t(T * (NE + 32))), logits(size_t(T * NE));
+        q_.memcpy(host.data(), rg_, host.size() * 4).wait();
+        for (int64_t t = 0; t < T; ++t) std::memcpy(&logits[size_t(t * NE)], &host[size_t(t * (NE + 32))], size_t(NE) * 4);
+        dump->put("ffn_moe_logits" + s, logits, {NE, T});
+      }
+      fast::moe_route(q_, rg_, T, NE, NU, nullptr, moe_ids_, moe_w_, NE + 32);
+      sgate = rg_ + NE;
+      ld_sg = NE + 32;
+    } else {
+      fast::matmul_f32(q_, L.w_rg, NE, E, h_, T, rlog_);
+      fast::matmul_f32(q_, L.w_rg + NE * E, 32, E, h_, T, sg_);
+      mark("router");
+      if (dump) emit("ffn_moe_logits" + s, rlog_, {NE, T});
+      fast::moe_route(q_, rlog_, T, NE, NU, nullptr, moe_ids_, moe_w_);
+      sgate = sg_;
+      ld_sg = 32;
+    }
+    mark("moe_route");
+    if (c_.record_routing) {
+      q_.memcpy(rec_host_, moe_ids_, size_t(P) * 4).wait();
+      for (int64_t p = 0; p < P; ++p) ++counts_[size_t(l)][size_t(rec_host_[p])];
+    }
+    if (small) {
+      // Decode (up to 4 tokens): the experts' grouped GEMVs and the weighted sum on the card; the cold experts' rows come from
+      // the host after the hot kernels are enqueued, so the card works meanwhile.
+      sycl::event routed;
+      if (L.n_cold) {
+        const int64_t kb = E / 32;
+        routed = fast::host_pack(q_, moe_ids_, P, act_.q, kb * 256, act_.s, kb * 8, hp_ids_, hp_aq_, hp_as_);
+      }
+      xmx::matmul_geglu_grouped(q_, act_, L.tab_gu, moe_ids_, P, NU, act_exp_ffn_, moe_gu_, xmx::Glu::Silu);
+      mark("moe_gate_up");
+      xmx::matmul_grouped(q_, act_exp_ffn_, L.tab_dn, moe_ids_, P, 1, gx_);
+      mark("moe_down");
+      xmx::matmul_geglu(q_, act_, L.shexp_gu, act_sh_, sh_gu_, xmx::Glu::Silu);
+      xmx::matmul(q_, act_sh_, L.shexp_dn, o_);
+      mark("shexp");
+      if (dump) emit("ffn_shexp" + s, o_, {E, T});
+      if (L.n_cold) cold_decode(L, T, P, routed, q_.single_task([] {}));
+      qwenk::moe_tail(q_, x2_, gx_, moe_w_, NU, nullptr, sgate, ld_sg, o_, next_norm, cfg_.eps, T, E, x_, &act_, next_h ? h_ : nullptr);
+    } else {
+      // Prefill and verify: the pairs grouped by expert into row tiles, the experts' GEMMs over all their tokens at once.
+      sycl::event routed, ids_ready;
+      if (L.n_cold) {
+        // As at decode, the host waits for the routing and the input rows after the hot work is enqueued (the ids first: they say
+        // which cold experts to stream). The expert inputs go as int8 (the form the CPU computes with), a quarter of the bytes.
+        ids_ready = q_.memcpy(hp_ids_, moe_ids_, size_t(P) * 4);
+        q_.memcpy(hp_w_, moe_w_, size_t(P) * 4);
+        fast::quantize_rows(q_, h_, T, E, hq_, hqs_);
+        q_.memcpy(hp_xq_, hq_, size_t(T * E));
+        routed = q_.memcpy(hp_xs_, hqs_, size_t(T) * size_t(E / 32) * sizeof(float));
+      }
+      fast::moe_group(q_, moe_ids_, P, NE, moe_tile_, moe_scratch_, moe_tiles_, moe_row_, L.cold_dev);
+      mark("moe_group");
+      fast::moe_gather(q_, h_, moe_row_, P, NU, E, moe_a_);
+      mark("moe_gather");
+      const int64_t max_tiles = (P + moe_tile_ - 1) / moe_tile_ + NE;
+      xmx::matmul_geglu_grouped16(q_, moe_a_, L.tab_gu, moe_tiles_, max_tiles, moe_tile_, moe_h_, xmx::Glu::Silu);
+      mark("moe_gate_up");
+      xmx::matmul_grouped16(q_, moe_h_, L.tab_dn, moe_tiles_, max_tiles, moe_tile_, moe_y_);
+      mark("moe_down");
+      xmx::matmul_geglu(q_, act_, L.shexp_gu, act_sh_, sh_gu_, xmx::Glu::Silu);
+      xmx::matmul(q_, act_sh_, L.shexp_dn, o_);
+      mark("shexp");
+      if (dump) emit("ffn_shexp" + s, o_, {E, T});
+      if (L.n_cold) cold_prefill(L, T, P, ids_ready, routed, q_.single_task([] {}), mark);
+      fast::moe_combine(q_, moe_y_, moe_w_, T, NU, E, moe_, moe_row_, L.n_cold ? cold_sum_ : nullptr, L.n_cold ? cold_map_ : nullptr);
+      mark("moe_sum");
+      if (dump) emit("ffn_moe_out" + s, moe_, {E, T});
+      qwenk::moe_tail(q_, x2_, nullptr, nullptr, NU, moe_, sgate, ld_sg, o_, next_norm, cfg_.eps, T, E, x_, &act_, next_h ? h_ : nullptr);
+    }
+    if (dump) emit("l_out" + s, x_, {E, T});
+    if (cap_col_[size_t(l)] >= 0 && !cap_rows.empty())
+      qwenk::gather_rows(q_, x_, cap_idx_, int64_t(cap_rows.size()), E, cap_, int64_t(ncap) * E, int64_t(cap_col_[size_t(l)]) * E);
+    mark("tail");
   }
 
-  for (const auto& c : chunks) slots_[size_t(c.slot)].length += int64_t(c.tokens.size());
   if (R == 0) {
     enqueue_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_step).count();
     q_.wait();
-    settle();
+    settle_marks();
     return {};
   }
-  // Logits only for the rows asked for: gather them, final norm, tied head, softcap.
-  for (int64_t r = 0; r < R; ++r) q_.memcpy(rows_ + r * E, x_ + int64_t(logit_rows[size_t(r)]) * E, size_t(E) * sizeof(float));
+  // Logits only for the rows asked for: gather them, final norm, head.
+  qwenk::gather_rows(q_, x_, rows_idx_, R, E, rows_, E, 0);
   fast::rmsnorm(q_, rows_, output_norm_, R, E, cfg_.eps, rows_);
   emit("result_norm", rows_, {E, R});
-  fast::matmul_q6(q_, head_, rows_, R, logits_);
-  if (cfg_.softcap > 0) fast::softcap(q_, logits_, cfg_.softcap, R * V);
+  if (c_.head_dpas) {
+    xmx::quantize(q_, rows_, R, act_head_);
+    xmx::matmul(q_, act_head_, head_w_, logits_);
+  } else {
+    fast::matmul_q6(q_, head_q6_, rows_, R, logits_);
+  }
   mark("head");
   std::vector<float> out(size_t(R * V));
   auto done = q_.memcpy(out.data(), logits_, out.size() * sizeof(float));
   enqueue_s_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_step).count();
   done.wait();
-  settle();
+  settle_marks();
   return out;
 }
 

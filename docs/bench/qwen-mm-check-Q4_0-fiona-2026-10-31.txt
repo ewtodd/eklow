@@ -1,0 +1,55 @@
+== Q4_0 (Q4_0)
+  Q4_0     expert gate|up             2048x1024    rows   1  vs fp32  7.08e-03  vs emul  2.71e-07 ( 0.1 eps) 
+  Q4_0     expert gate|up             2048x1024    rows   2  vs fp32  9.75e-03  vs emul  3.48e-07 ( 0.2 eps) 
+  Q4_0     expert gate|up             2048x1024    rows   5  vs fp32  1.23e-02  vs emul  4.07e-07 ( 0.2 eps) 
+  Q4_0     expert gate|up             2048x1024    rows   8  vs fp32  1.02e-02  vs emul  5.65e-07 ( 0.2 eps) 
+  Q4_0     expert gate|up             2048x1024    rows  16  vs fp32  1.15e-02  vs emul  5.00e-07 ( 0.2 eps) 
+  Q4_0     expert gate|up             2048x1024    rows  32  vs fp32  1.03e-02  vs emul  4.86e-07 ( 0.2 eps) 
+  Q4_0     expert down                 512x2048    rows   1  vs fp32  9.48e-03  vs emul  1.75e-07 ( 0.2 eps) 
+  Q4_0     expert down                 512x2048    rows   2  vs fp32  1.51e-02  vs emul  2.26e-07 ( 0.1 eps) 
+  Q4_0     expert down                 512x2048    rows   5  vs fp32  1.01e-02  vs emul  4.62e-07 ( 0.4 eps) 
+  Q4_0     expert down                 512x2048    rows   8  vs fp32  1.23e-02  vs emul  6.71e-07 ( 0.6 eps) 
+  Q4_0     expert down                 512x2048    rows  16  vs fp32  1.17e-02  vs emul  4.67e-07 ( 0.4 eps) 
+  Q4_0     expert down                 512x2048    rows  32  vs fp32  1.31e-02  vs emul  1.01e-06 ( 0.7 eps) 
+  Q4_0     attn_qkv / attn_q          2048x8192    rows   1  vs fp32  1.20e-02  vs emul  2.73e-07 ( 0.1 eps) 
+  Q4_0     attn_qkv / attn_q          2048x8192    rows   2  vs fp32  8.25e-03  vs emul  2.50e-07 ( 0.1 eps) 
+  Q4_0     attn_qkv / attn_q          2048x8192    rows   5  vs fp32  8.55e-03  vs emul  2.19e-07 ( 0.1 eps) 
+  Q4_0     attn_qkv / attn_q          2048x8192    rows   8  vs fp32  1.22e-02  vs emul  4.51e-07 ( 0.2 eps) 
+  Q4_0     attn_qkv / attn_q          2048x8192    rows  16  vs fp32  1.04e-02  vs emul  3.34e-07 ( 0.1 eps) 
+  Q4_0     attn_qkv / attn_q          2048x8192    rows  32  vs fp32  1.07e-02  vs emul  3.45e-07 ( 0.2 eps) 
+  Q4_0     attn_gate                  2048x4096    rows   1  vs fp32  1.17e-02  vs emul  1.94e-07 ( 0.1 eps) 
+  Q4_0     attn_gate                  2048x4096    rows   2  vs fp32  8.24e-03  vs emul  1.55e-07 ( 0.1 eps) 
+  Q4_0     attn_gate                  2048x4096    rows   5  vs fp32  1.38e-02  vs emul  5.73e-07 ( 0.2 eps) 
+  Q4_0     attn_gate                  2048x4096    rows   8  vs fp32  9.34e-03  vs emul  2.86e-07 ( 0.1 eps) 
+  Q4_0     attn_gate                  2048x4096    rows  16  vs fp32  1.08e-02  vs emul  4.54e-07 ( 0.2 eps) 
+  Q4_0     attn_gate                  2048x4096    rows  32  vs fp32  1.09e-02  vs emul  3.96e-07 ( 0.2 eps) 
+  Q4_0     ssm_out / attn_output      4096x2048    rows   1  vs fp32  1.05e-02  vs emul  2.44e-07 ( 0.1 eps) 
+  Q4_0     ssm_out / attn_output      4096x2048    rows   2  vs fp32  1.51e-02  vs emul  4.55e-07 ( 0.1 eps) 
+  Q4_0     ssm_out / attn_output      4096x2048    rows   5  vs fp32  9.94e-03  vs emul  5.74e-07 ( 0.2 eps) 
+  Q4_0     ssm_out / attn_output      4096x2048    rows   8  vs fp32  9.77e-03  vs emul  4.98e-07 ( 0.2 eps) 
+  Q4_0     ssm_out / attn_output      4096x2048    rows  16  vs fp32  1.05e-02  vs emul  5.94e-07 ( 0.2 eps) 
+  Q4_0     ssm_out / attn_output      4096x2048    rows  32  vs fp32  1.06e-02  vs emul  5.92e-07 ( 0.2 eps) 
+  Q4_0     attn_k / attn_v            2048x512     rows   1  vs fp32  1.28e-02  vs emul  4.08e-07 ( 0.1 eps) 
+  Q4_0     attn_k / attn_v            2048x512     rows   2  vs fp32  8.43e-03  vs emul  2.81e-07 ( 0.1 eps) 
+  Q4_0     attn_k / attn_v            2048x512     rows   5  vs fp32  1.10e-02  vs emul  3.35e-07 ( 0.2 eps) 
+  Q4_0     attn_k / attn_v            2048x512     rows   8  vs fp32  1.20e-02  vs emul  5.61e-07 ( 0.2 eps) 
+  Q4_0     attn_k / attn_v            2048x512     rows  16  vs fp32  1.09e-02  vs emul  5.44e-07 ( 0.2 eps) 
+  Q4_0     attn_k / attn_v            2048x512     rows  32  vs fp32  1.20e-02  vs emul  5.45e-07 ( 0.2 eps) 
+  Q4_0     SwiGLU   gate|up 2048x1024   rows   1  vs fp32  2.02e-02 
+  Q4_0     SwiGLU   gate|up 2048x1024   rows   2  vs fp32  1.48e-02 
+  Q4_0     SwiGLU   gate|up 2048x1024   rows   5  vs fp32  1.80e-02 
+  Q4_0     SwiGLU   gate|up 2048x1024   rows   8  vs fp32  1.71e-02 
+  Q4_0     SwiGLU   gate|up 2048x1024   rows  16  vs fp32  1.72e-02 
+  Q4_0     SwiGLU   gate|up 2048x1024   rows  32  vs fp32  1.75e-02 
+  Q4_0     GeGLU    gate|up 2048x1024   rows   1  vs fp32  1.46e-02 
+  Q4_0     GeGLU    gate|up 2048x1024   rows   2  vs fp32  1.64e-02 
+  Q4_0     GeGLU    gate|up 2048x1024   rows   5  vs fp32  1.84e-02 
+  Q4_0     GeGLU    gate|up 2048x1024   rows   8  vs fp32  1.44e-02 
+  Q4_0     GeGLU    gate|up 2048x1024   rows  16  vs fp32  1.89e-02 
+  Q4_0     GeGLU    gate|up 2048x1024   rows  32  vs fp32  1.74e-02 
+  Q4_0     grouped P= 8  gate_up vs matmul  1.21e-07  down  8.43e-08  SwiGLU(int8) vs fp32  7.26e-03 
+  Q4_0     grouped P=16  gate_up vs matmul  1.41e-07  down  7.91e-08  SwiGLU(int8) vs fp32  8.02e-03 
+  Q4_0     grouped P=32  gate_up vs matmul  1.58e-07  down  6.10e-08  SwiGLU(int8) vs fp32  7.89e-03 
+  Q4_0     rows_of(512, 768) of 2048x2048  rows   1  vs the whole  1.43e-07 
+  Q4_0     rows_of(512, 768) of 2048x2048  rows   8  vs the whole  0.00e+00 
+  Q4_0     rows_of(512, 768) of 2048x2048  rows 256  vs the whole  0.00e+00 

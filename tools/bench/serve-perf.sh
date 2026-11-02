@@ -2,9 +2,8 @@
 # The README's performance numbers: eklow-server with production flags under the GPU lock, then serve_perf.py's depth
 # and GSM8K runs against it; the server's startup lines and both results land in OUT. Run on fiona from a built tree.
 #   tools/bench/serve-perf.sh OUT MODEL_GGUF ALIAS [eklow-server flags]
-#   tools/bench/serve-perf.sh ~/eklow-bench/26b ~/models/gemma-4-26b-a4b-it-qat-q4_0.gguf gemma-4-26b-a4b \
-#     --expert-profile data/gemma-4-26b-a4b-experts.json
-# DOCS (default ~/eklow-bench/data) holds gemma-DEPTH.txt and gsm48.jsonl; DEPTHS overrides serve_perf.py's depths.
+#   tools/bench/serve-perf.sh ~/eklow-bench/qwen MODEL.gguf qwen36 --expert-profile data/qwen36-experts.json
+# DOCS (default ~/eklow-bench/data) holds qwen-DEPTH.txt and gsm48.jsonl; DEPTHS overrides serve_perf.py's depths.
 set -euo pipefail
 # A second server beside fiona's production eklow.service starves it into UR_RESULT_ERROR_OUT_OF_RESOURCES on
 # every request until it restarts (2026-10-27). To measure production itself, run serve_perf.py against it.

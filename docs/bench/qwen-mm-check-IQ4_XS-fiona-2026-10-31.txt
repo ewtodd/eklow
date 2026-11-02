@@ -1,0 +1,79 @@
+== IQ4_XS (IQ4_XS)
+  IQ4_XS   real blk.0.ffn_gate.weight 3840x15360   rows   1  vs fp32  1.03e-02  vs emul  5.97e-07 ( 0.2 eps) 
+  IQ4_XS   real blk.0.ffn_gate.weight 3840x15360   rows   2  vs fp32  7.71e-03  vs emul  4.79e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.0.ffn_gate.weight 3840x15360   rows   5  vs fp32  9.25e-03  vs emul  4.37e-07 ( 0.2 eps) 
+  IQ4_XS   real blk.0.ffn_gate.weight 3840x15360   rows   8  vs fp32  1.22e-02  vs emul  8.09e-07 ( 0.2 eps) 
+  IQ4_XS   real blk.0.ffn_gate.weight 3840x15360   rows  16  vs fp32  9.67e-03  vs emul  6.83e-07 ( 0.3 eps) 
+  IQ4_XS   real blk.0.ffn_gate.weight 3840x15360   rows  32  vs fp32  9.62e-03  vs emul  7.19e-07 ( 0.2 eps) 
+  IQ4_XS   real blk.0.ffn_down.weight 15360x3840    rows   1  vs fp32  1.16e-02  vs emul  4.57e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.0.ffn_down.weight 15360x3840    rows   2  vs fp32  1.10e-02  vs emul  3.10e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.0.ffn_down.weight 15360x3840    rows   5  vs fp32  1.16e-02  vs emul  4.25e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.0.ffn_down.weight 15360x3840    rows   8  vs fp32  1.16e-02  vs emul  7.11e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.0.ffn_down.weight 15360x3840    rows  16  vs fp32  1.13e-02  vs emul  8.09e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.0.ffn_down.weight 15360x3840    rows  32  vs fp32  1.06e-02  vs emul  1.09e-06 ( 0.1 eps) 
+  IQ4_XS   real blk.5.attn_q.weight   3840x8192    rows   1  vs fp32  1.09e-02  vs emul  3.39e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.5.attn_q.weight   3840x8192    rows   2  vs fp32  1.24e-02  vs emul  3.53e-07 ( 0.2 eps) 
+  IQ4_XS   real blk.5.attn_q.weight   3840x8192    rows   5  vs fp32  1.14e-02  vs emul  3.02e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.5.attn_q.weight   3840x8192    rows   8  vs fp32  1.01e-02  vs emul  4.67e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.5.attn_q.weight   3840x8192    rows  16  vs fp32  1.09e-02  vs emul  4.77e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.5.attn_q.weight   3840x8192    rows  32  vs fp32  1.04e-02  vs emul  6.74e-07 ( 0.2 eps) 
+  IQ4_XS   real blk.0.attn_output.weight 4096x3840    rows   1  vs fp32  7.43e-03  vs emul  1.13e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.0.attn_output.weight 4096x3840    rows   2  vs fp32  9.80e-03  vs emul  1.78e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.0.attn_output.weight 4096x3840    rows   5  vs fp32  1.07e-02  vs emul  3.50e-07 ( 0.1 eps) 
+  IQ4_XS   real blk.0.attn_output.weight 4096x3840    rows   8  vs fp32  1.06e-02  vs emul  4.11e-07 ( 0.2 eps) 
+  IQ4_XS   real blk.0.attn_output.weight 4096x3840    rows  16  vs fp32  1.10e-02  vs emul  6.30e-07 ( 0.2 eps) 
+  IQ4_XS   real blk.0.attn_output.weight 4096x3840    rows  32  vs fp32  1.18e-02  vs emul  6.44e-07 ( 0.2 eps) 
+  IQ4_XS   expert gate|up             2048x1024    rows   1  vs fp32  9.31e-03  vs emul  1.72e-07 ( 0.1 eps) 
+  IQ4_XS   expert gate|up             2048x1024    rows   2  vs fp32  1.50e-02  vs emul  2.52e-07 ( 0.1 eps) 
+  IQ4_XS   expert gate|up             2048x1024    rows   5  vs fp32  1.20e-02  vs emul  2.95e-07 ( 0.2 eps) 
+  IQ4_XS   expert gate|up             2048x1024    rows   8  vs fp32  1.11e-02  vs emul  3.74e-07 ( 0.2 eps) 
+  IQ4_XS   expert gate|up             2048x1024    rows  16  vs fp32  1.01e-02  vs emul  3.85e-07 ( 0.2 eps) 
+  IQ4_XS   expert gate|up             2048x1024    rows  32  vs fp32  1.19e-02  vs emul  4.17e-07 ( 0.2 eps) 
+  IQ4_XS   expert down                 512x2048    rows   1  vs fp32  8.97e-03  vs emul  1.92e-07 ( 0.1 eps) 
+  IQ4_XS   expert down                 512x2048    rows   2  vs fp32  8.91e-03  vs emul  2.81e-07 ( 0.2 eps) 
+  IQ4_XS   expert down                 512x2048    rows   5  vs fp32  8.62e-03  vs emul  2.08e-07 ( 0.2 eps) 
+  IQ4_XS   expert down                 512x2048    rows   8  vs fp32  1.37e-02  vs emul  3.24e-07 ( 0.4 eps) 
+  IQ4_XS   expert down                 512x2048    rows  16  vs fp32  1.05e-02  vs emul  3.34e-07 ( 0.3 eps) 
+  IQ4_XS   expert down                 512x2048    rows  32  vs fp32  8.91e-03  vs emul  7.19e-07 ( 0.9 eps) 
+  IQ4_XS   attn_qkv / attn_q          2048x8192    rows   1  vs fp32  1.00e-02  vs emul  2.14e-07 ( 0.1 eps) 
+  IQ4_XS   attn_qkv / attn_q          2048x8192    rows   2  vs fp32  1.22e-02  vs emul  2.06e-07 ( 0.1 eps) 
+  IQ4_XS   attn_qkv / attn_q          2048x8192    rows   5  vs fp32  1.36e-02  vs emul  3.40e-07 ( 0.2 eps) 
+  IQ4_XS   attn_qkv / attn_q          2048x8192    rows   8  vs fp32  1.25e-02  vs emul  2.55e-07 ( 0.1 eps) 
+  IQ4_XS   attn_qkv / attn_q          2048x8192    rows  16  vs fp32  1.11e-02  vs emul  4.37e-07 ( 0.2 eps) 
+  IQ4_XS   attn_qkv / attn_q          2048x8192    rows  32  vs fp32  1.13e-02  vs emul  5.09e-07 ( 0.3 eps) 
+  IQ4_XS   attn_gate                  2048x4096    rows   1  vs fp32  1.07e-02  vs emul  1.76e-07 ( 0.1 eps) 
+  IQ4_XS   attn_gate                  2048x4096    rows   2  vs fp32  1.11e-02  vs emul  3.51e-07 ( 0.2 eps) 
+  IQ4_XS   attn_gate                  2048x4096    rows   5  vs fp32  1.24e-02  vs emul  4.57e-07 ( 0.2 eps) 
+  IQ4_XS   attn_gate                  2048x4096    rows   8  vs fp32  1.11e-02  vs emul  7.38e-07 ( 0.3 eps) 
+  IQ4_XS   attn_gate                  2048x4096    rows  16  vs fp32  1.11e-02  vs emul  6.95e-07 ( 0.3 eps) 
+  IQ4_XS   attn_gate                  2048x4096    rows  32  vs fp32  1.16e-02  vs emul  3.67e-07 ( 0.2 eps) 
+  IQ4_XS   ssm_out / attn_output      4096x2048    rows   1  vs fp32  1.05e-02  vs emul  4.17e-07 ( 0.2 eps) 
+  IQ4_XS   ssm_out / attn_output      4096x2048    rows   2  vs fp32  1.26e-02  vs emul  5.07e-07 ( 0.2 eps) 
+  IQ4_XS   ssm_out / attn_output      4096x2048    rows   5  vs fp32  1.06e-02  vs emul  4.62e-07 ( 0.1 eps) 
+  IQ4_XS   ssm_out / attn_output      4096x2048    rows   8  vs fp32  1.06e-02  vs emul  5.07e-07 ( 0.2 eps) 
+  IQ4_XS   ssm_out / attn_output      4096x2048    rows  16  vs fp32  9.81e-03  vs emul  4.34e-07 ( 0.2 eps) 
+  IQ4_XS   ssm_out / attn_output      4096x2048    rows  32  vs fp32  1.01e-02  vs emul  5.49e-07 ( 0.2 eps) 
+  IQ4_XS   attn_k / attn_v            2048x512     rows   1  vs fp32  1.17e-02  vs emul  2.34e-07 ( 0.2 eps) 
+  IQ4_XS   attn_k / attn_v            2048x512     rows   2  vs fp32  1.02e-02  vs emul  3.29e-07 ( 0.2 eps) 
+  IQ4_XS   attn_k / attn_v            2048x512     rows   5  vs fp32  1.05e-02  vs emul  5.56e-07 ( 0.2 eps) 
+  IQ4_XS   attn_k / attn_v            2048x512     rows   8  vs fp32  9.22e-03  vs emul  6.25e-07 ( 0.3 eps) 
+  IQ4_XS   attn_k / attn_v            2048x512     rows  16  vs fp32  9.27e-03  vs emul  3.56e-07 ( 0.2 eps) 
+  IQ4_XS   attn_k / attn_v            2048x512     rows  32  vs fp32  1.19e-02  vs emul  4.14e-07 ( 0.2 eps) 
+  IQ4_XS   SwiGLU   gate|up 2048x1024   rows   1  vs fp32  1.96e-02 
+  IQ4_XS   SwiGLU   gate|up 2048x1024   rows   2  vs fp32  2.39e-02 
+  IQ4_XS   SwiGLU   gate|up 2048x1024   rows   5  vs fp32  1.60e-02 
+  IQ4_XS   SwiGLU   gate|up 2048x1024   rows   8  vs fp32  1.84e-02 
+  IQ4_XS   SwiGLU   gate|up 2048x1024   rows  16  vs fp32  2.05e-02 
+  IQ4_XS   SwiGLU   gate|up 2048x1024   rows  32  vs fp32  1.74e-02 
+  IQ4_XS   GeGLU    gate|up 2048x1024   rows   1  vs fp32  1.31e-02 
+  IQ4_XS   GeGLU    gate|up 2048x1024   rows   2  vs fp32  2.22e-02 
+  IQ4_XS   GeGLU    gate|up 2048x1024   rows   5  vs fp32  1.65e-02 
+  IQ4_XS   GeGLU    gate|up 2048x1024   rows   8  vs fp32  1.61e-02 
+  IQ4_XS   GeGLU    gate|up 2048x1024   rows  16  vs fp32  1.86e-02 
+  IQ4_XS   GeGLU    gate|up 2048x1024   rows  32  vs fp32  1.62e-02 
+  IQ4_XS   grouped P= 8  gate_up vs matmul  1.08e-07  down  0.00e+00  SwiGLU(int8) vs fp32  8.17e-03 
+  IQ4_XS   grouped P=16  gate_up vs matmul  1.23e-07  down  6.46e-08  SwiGLU(int8) vs fp32  7.91e-03 
+  IQ4_XS   grouped P=32  gate_up vs matmul  1.30e-07  down  7.95e-08  SwiGLU(int8) vs fp32  6.48e-03 
+  IQ4_XS   rows_of(512, 768) of 2048x2048  rows   1  vs the whole  0.00e+00 
+  IQ4_XS   rows_of(512, 768) of 2048x2048  rows   8  vs the whole  0.00e+00 
+  IQ4_XS   rows_of(512, 768) of 2048x2048  rows 256  vs the whole  0.00e+00 

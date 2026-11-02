@@ -1,0 +1,41 @@
+== IQ4_XS (IQ4_XS)
+  IQ4_XS   expert gate|up             2048x1024    rows  64  vs fp32  3.25e-04  vs emul  7.34e-06 
+  IQ4_XS   expert gate|up             2048x1024    rows 256  vs fp32  3.35e-04  vs emul  8.22e-06 
+  IQ4_XS   expert gate|up             2048x1024    rows 2048  vs fp32  3.97e-04  vs emul  8.18e-06 
+  IQ4_XS   expert down                 512x2048    rows  64  vs fp32  3.37e-04  vs emul  3.88e-06 
+  IQ4_XS   expert down                 512x2048    rows 256  vs fp32  4.20e-04  vs emul  3.41e-06 
+  IQ4_XS   expert down                 512x2048    rows 2048  vs fp32  3.18e-04  vs emul  1.40e-06 
+  IQ4_XS   attn_qkv / attn_q          2048x8192    rows  64  vs fp32  3.32e-04  vs emul  5.86e-06 
+  IQ4_XS   attn_qkv / attn_q          2048x8192    rows 256  vs fp32  4.26e-04  vs emul  5.52e-06 
+  IQ4_XS   attn_qkv / attn_q          2048x8192    rows 2048  vs fp32  3.67e-04  vs emul  9.23e-06 
+  IQ4_XS   attn_gate                  2048x4096    rows  64  vs fp32  3.74e-04  vs emul  6.54e-06 
+  IQ4_XS   attn_gate                  2048x4096    rows 256  vs fp32  3.94e-04  vs emul  8.96e-06 
+  IQ4_XS   attn_gate                  2048x4096    rows 2048  vs fp32  3.22e-04  vs emul  6.38e-06 
+  IQ4_XS   ssm_out / attn_output      4096x2048    rows  64  vs fp32  3.53e-04  vs emul  1.24e-05 
+  IQ4_XS   ssm_out / attn_output      4096x2048    rows 256  vs fp32  3.31e-04  vs emul  1.36e-05 
+  IQ4_XS   ssm_out / attn_output      4096x2048    rows 2048  vs fp32  3.41e-04  vs emul  1.58e-05 
+  IQ4_XS   attn_k / attn_v            2048x512     rows  64  vs fp32  3.24e-04  vs emul  6.60e-06 
+  IQ4_XS   attn_k / attn_v            2048x512     rows 256  vs fp32  3.77e-04  vs emul  4.94e-06 
+  IQ4_XS   attn_k / attn_v            2048x512     rows 2048  vs fp32  3.62e-04  vs emul  9.92e-06 
+  IQ4_XS   SwiGLU   gate|up 2048x1024   rows  64  vs fp32  5.69e-04 
+  IQ4_XS   SwiGLU   gate|up 2048x1024   rows 256  vs fp32  5.60e-04 
+  IQ4_XS   SwiGLU   gate|up 2048x1024   rows 2048  vs fp32  5.65e-04 
+  IQ4_XS   GeGLU    gate|up 2048x1024   rows  64  vs fp32  5.94e-04 
+  IQ4_XS   GeGLU    gate|up 2048x1024   rows 256  vs fp32  5.62e-04 
+  IQ4_XS   GeGLU    gate|up 2048x1024   rows 2048  vs fp32  5.59e-04 
+  IQ4_XS   expert gate|up           2048x1024    rows 2048      0.315 ms    27.3 TFLOPS 
+  IQ4_XS   expert gate|up           2048x1024    rows 4096      0.570 ms    30.1 TFLOPS 
+  IQ4_XS   expert gate|up + SwiGLU  2048x1024    rows 2048      0.291 ms    29.5 TFLOPS (GLU epilogue, TFLOPS counted on the stacked matrix)
+  IQ4_XS   expert gate|up + SwiGLU  2048x1024    rows 4096      0.562 ms    30.6 TFLOPS (GLU epilogue, TFLOPS counted on the stacked matrix)
+  IQ4_XS   expert down               512x2048    rows 2048      0.185 ms    23.3 TFLOPS 
+  IQ4_XS   expert down               512x2048    rows 4096      0.249 ms    34.5 TFLOPS 
+  IQ4_XS   attn_qkv / attn_q        2048x8192    rows 2048      1.438 ms    47.8 TFLOPS 
+  IQ4_XS   attn_qkv / attn_q        2048x8192    rows 4096      2.820 ms    48.7 TFLOPS 
+  IQ4_XS   attn_gate                2048x4096    rows 2048      0.737 ms    46.6 TFLOPS 
+  IQ4_XS   attn_gate                2048x4096    rows 4096      1.436 ms    47.9 TFLOPS 
+  IQ4_XS   ssm_out / attn_output    4096x2048    rows 2048      0.994 ms    34.6 TFLOPS 
+  IQ4_XS   ssm_out / attn_output    4096x2048    rows 4096      1.492 ms    46.1 TFLOPS 
+  IQ4_XS   attn_k / attn_v          2048x512     rows 2048      0.148 ms    29.0 TFLOPS 
+  IQ4_XS   attn_k / attn_v          2048x512     rows 4096      0.280 ms    30.7 TFLOPS 
+  IQ4_XS   grouped16 tile  64  gate|up+SwiGLU    3.701 ms   18.6 TFLOPS (  27.6 padded)   down    2.271 ms   15.1 TFLOPS (  22.5 padded)   vs dense: gate|up 0.00e+00  down 0.00e+00 
+  IQ4_XS   grouped16 tile 128  gate|up+SwiGLU    4.199 ms   16.4 TFLOPS (  32.7 padded)   down    2.536 ms   13.5 TFLOPS (  27.1 padded)

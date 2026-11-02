@@ -1,0 +1,296 @@
+{
+  "device": "Intel(R) Arc(TM) A770M Graphics",
+  "eus": 512,
+  "max_clock_mhz": 2050,
+  "verify": [
+    {
+      "kind": "fp16",
+      "layout": "vnni ops=2",
+      "max_err": 1.6298145055770874e-07,
+      "ok": true
+    },
+    {
+      "kind": "s8",
+      "layout": "vnni ops=4",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xs4",
+      "layout": "vnni ops=4",
+      "max_err": 5984,
+      "ok": false
+    },
+    {
+      "kind": "s8xs4",
+      "layout": "vnni ops=8",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s4",
+      "layout": "vnni ops=8",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xs8 K=32",
+      "layout": "dword (k/4)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xu8 K=32",
+      "layout": "dword (k/4)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xs8 K=32",
+      "layout": "dword (k/4)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xu8 K=32",
+      "layout": "dword (k/4)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xs4 K=32",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xu4 K=32",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xs4 K=32",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xu4 K=32",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xs2 K=32",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s8xu2 K=32",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xs2 K=32",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u8xu2 K=32",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "u4xu4 K=64",
+      "layout": "dword (k/8)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s4xs2 K=64",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    },
+    {
+      "kind": "s4xu2 K=64",
+      "layout": "dword (k/16)*8+n",
+      "max_err": 0,
+      "ok": true
+    }
+  ],
+  "throughput": [
+    {
+      "kind": "fp16",
+      "seconds": 0.089007708,
+      "tops": 98.82394704746245
+    },
+    {
+      "kind": "bf16",
+      "seconds": 0.089007708,
+      "tops": 98.82394704746245
+    },
+    {
+      "kind": "s8",
+      "seconds": 0.089007708,
+      "tops": 197.6478940949249
+    },
+    {
+      "kind": "s8xs4",
+      "seconds": 0.089007709,
+      "tops": 197.64789187435437
+    },
+    {
+      "kind": "s4",
+      "seconds": 0.089007708,
+      "tops": 395.2957881898498
+    },
+    {
+      "kind": "s8xu4",
+      "seconds": 0.089007708,
+      "tops": 197.6478940949249
+    },
+    {
+      "kind": "u8xu4",
+      "seconds": 0.089007813,
+      "tops": 197.64766093529337
+    },
+    {
+      "kind": "s8xs2",
+      "seconds": 0.089007604,
+      "tops": 197.64812503453075
+    },
+    {
+      "kind": "s8xu2",
+      "seconds": 0.089007708,
+      "tops": 197.6478940949249
+    },
+    {
+      "kind": "s8xu8",
+      "seconds": 0.089007708,
+      "tops": 197.6478940949249
+    },
+    {
+      "kind": "s8xs4+scale",
+      "seconds": 0.039666354,
+      "tops": 221.75199218481234
+    },
+    {
+      "kind": "fp16+dequant",
+      "seconds": 0.330943855,
+      "tops": 26.578807520713745
+    }
+  ],
+  "decode_tile_arithmetic": [
+    {
+      "kind": "Q4_0 (s8 x s4)",
+      "gbps": 4941.049609896337,
+      "ns_per_tile": 477.4888305664063
+    },
+    {
+      "kind": "Q8_0 (s8 x s8)",
+      "gbps": 4013.8156808711046,
+      "ns_per_tile": 1110.2771911621096
+    },
+    {
+      "kind": "Q4_K (u4 + ones)",
+      "gbps": 4650.3940730995055,
+      "ns_per_tile": 507.3324890136719
+    },
+    {
+      "kind": "Q5_K (u4 + u2 + ones)",
+      "gbps": 5401.155641866985,
+      "ns_per_tile": 533.882781982422
+    },
+    {
+      "kind": "Q6_K (2 x (u4 + s2))",
+      "gbps": 4615.25113154467,
+      "ns_per_tile": 745.4935607910156
+    },
+    {
+      "kind": "IQ4_XS (iselect pairs)",
+      "gbps": 210.79359547739597,
+      "ns_per_tile": 10570.643737792969
+    },
+    {
+      "kind": "IQ4_XS (select tree)",
+      "gbps": 358.13484909051766,
+      "ns_per_tile": 6221.745819091798
+    },
+    {
+      "kind": "IQ4_XS (SLM gather pairs)",
+      "gbps": 730.0022431830503,
+      "ns_per_tile": 3052.3522644042973
+    }
+  ],
+  "read_bandwidth": [
+    {
+      "threads": 8192,
+      "loads_in_flight": 2,
+      "gbps": 383.69340599770516
+    },
+    {
+      "threads": 8192,
+      "loads_in_flight": 4,
+      "gbps": 386.890491591576
+    },
+    {
+      "threads": 8192,
+      "loads_in_flight": 8,
+      "gbps": 388.3040392245215
+    },
+    {
+      "threads": 16384,
+      "loads_in_flight": 2,
+      "gbps": 395.7278477327156
+    },
+    {
+      "threads": 16384,
+      "loads_in_flight": 4,
+      "gbps": 391.8617045192445
+    },
+    {
+      "threads": 16384,
+      "loads_in_flight": 8,
+      "gbps": 389.9640464030786
+    },
+    {
+      "threads": 32768,
+      "loads_in_flight": 2,
+      "gbps": 396.04721545796497
+    },
+    {
+      "threads": 32768,
+      "loads_in_flight": 4,
+      "gbps": 389.6251420169509
+    },
+    {
+      "threads": 32768,
+      "loads_in_flight": 8,
+      "gbps": 392.4436161592607
+    }
+  ],
+  "read_bandwidth_gbps": 396.04721545796497,
+  "local_read": [
+    {
+      "kind": "slm read",
+      "gbps": 10847.589066456196,
+      "bytes_per_clock_per_core": 225.99143888450408
+    },
+    {
+      "kind": "l1 read",
+      "gbps": 9822.916950549985,
+      "bytes_per_clock_per_core": 204.64410313645803
+    },
+    {
+      "kind": "slm+l1 read",
+      "gbps": 8297.786137665087,
+      "bytes_per_clock_per_core": 172.87054453468932
+    }
+  ]
+}

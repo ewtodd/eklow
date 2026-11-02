@@ -16,7 +16,9 @@
 #include "core/json_value.hpp"
 #include "serve/sampler.hpp"
 #include "serve/scheduler.hpp"
-#include "text/tokenizer.hpp"
+#include "text/chat_qwen36.hpp"
+#include "text/tokenizer_qwen.hpp"
+#include "text/tool_schema.hpp"
 
 namespace eklow::serve {
 
@@ -40,6 +42,7 @@ struct EncodedImage {
   uint64_t hash = 0;
   int64_t n = 0;
   std::shared_ptr<const std::vector<float>> rows;
+  int64_t nx = 0, ny = 0;  // the grid of rows (Qwen3.6's M-RoPE positions); n = nx * ny
 };
 // The bytes of an image (JPEG, PNG, GIF or BMP) to its rows. Throws ApiError for a picture it cannot read.
 using ImageEncoder = std::function<EncodedImage(std::span<const uint8_t> bytes)>;
@@ -51,26 +54,32 @@ std::vector<uint8_t> image_bytes(const std::string& url);
 struct ChatDefaults {
   SamplingParams sampling;  // what a request leaves out
   int64_t max_ctx;          // positions per slot
-  ImageEncoder encode_image = {};  // null: the server has no vision encoder and refuses image parts
+  text::QwenTemplate chat_template = text::QwenTemplate::Stock;
+  // Image input: encodes an image_url part's picture (null: image parts are refused with a 400). It may block (it holds the
+  // scheduler for the encode) and is called on the request's thread, once per image, in conversation order.
+  const ImageEncoder* images = nullptr;
+  int64_t max_image_rows = INT64_MAX;  // an image's rows are prefilled in one chunk: the shorter of the batch and the chunk
 };
 
 struct ChatRequest {
   std::string model;
   std::vector<int32_t> prompt;
-  std::vector<ImageInput> images;  // the prompt's image spans (their positions hold ids below zero naming the rows)
   SamplingParams sampling;
   int64_t max_tokens = 0;
   std::vector<std::string> stop;
   bool stream = false, include_usage = false, thinking = false, tools = false;
-  bool in_thinking = false;  // the prompt ends inside the thought channel
-  std::vector<std::string> tool_names;
+  bool in_thinking = false;  // the prompt ends inside the reasoning
+  std::shared_ptr<const text::ToolSpecs> tool_specs;  // the request's tools, for reading and constraining calls
+  std::vector<int64_t> snapshot_points;  // see Request::snapshot_points
+  int draft_block = -1;      // eklow extension: "speculative": false decodes plain even when the server has a draft; an integer is a block size
+  std::vector<ImageInput> images;  // the prompt's image spans (their ids in `prompt` are image_row_id's), in order
 };
 
-// Renders the conversation with Gemma 4's template and tokenizes it (request text without special
-// tokens). An image part becomes what llama.cpp's server and mtmd make of it: the prompt is split at the image,
-// <|image>, the image's rows and <image|> go in, with no newline of their own. Throws ApiError for what the server
-// cannot do or the request gets wrong.
-ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, const ChatDefaults& d);
+// Renders the conversation with Qwen3.6's template and tokenizes it (request text without special tokens). An image_url
+// part becomes the template's <|vision_start|><|image_pad|><|vision_end|>, and the pad is expanded to the image's rows (as
+// llama.cpp's mtmd: the start token, the rows, the end token); with no encoder in `d`, and for video and audio parts, the
+// request is refused. Throws ApiError for what the server cannot do or the request gets wrong.
+ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, const ChatDefaults& d);
 
 std::string new_completion_id();
 

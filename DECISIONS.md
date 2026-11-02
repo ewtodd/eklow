@@ -1209,3 +1209,566 @@ setting them to -inf (`nth_element`'s pivots on that data). Top-k now keeps the 
 the logits, skipping the bans by comparing each id with the next one: 0.21 ms with or without bans, and the same picks
 as before (900 of 900 against main's sampler over greedy, top-k 64 and none, top-p, min-p and penalties, ties
 included).
+
+## 2026-10-31 — Qwen3.6-35B-A3B in place of Gemma 4, with DFlash 2
+
+The owner asked to drop Gemma 4 12B and 26B A4B for Qwen3.6-35B-A3B finetunes served with DFlash 2 speculative
+decoding, trying several; Ornith-1.5-35B-A3B (ornith-ai, revision 10fbf86f) first. Its model card claims large gains
+over stock Qwen3.6 on agentic coding (SWE-bench Verified 79 against 73.4, Terminal-Bench 2.1 67.8 against 52.5), but
+every number there is the vendor's own, its Qwen3.6 baselines included, and no independent comparison or
+contamination check existed on this date (one private 30-task test: 15 against 13). So both are served and measured
+here: stock `Qwen/Qwen3.6-35B-A3B` (995ad96e) and Ornith, the same architecture (their configs differ only in metadata,
+their tokenizers not at all), with eklow's fidelity checks and the owner's own evals, and the numbers published.
+EmbeddingGemma 2 stays (production embeddings use it), and with it Gemma's tokenizer and vision encoder.
+
+**The model** (llama.cpp's `qwen35moe`, which the oracle's pin ea0c4c2c runs, with DFlash 2 since PR 27342): 40 layers
+of hidden 2048; every 4th (3, 7, ..., 39) gated attention with 16 query heads and 2 K/V heads of 256, IMRoPE over 64
+dims at base 1e7, the output scaled by a sigmoid gate from the query projection; the other 30 Gated DeltaNet (16 key
+heads and 32 value heads of 128, a 4-tap causal conv, a 128 x 128 fp32 state per value head); every layer 256 routed
+experts of 512 (softmax, top 8, renormalized, SwiGLU) beside a shared expert of 512 under a sigmoid gate; an untied
+head over 248,320 tokens. 35B parameters, 3B active a token; the routed experts are 32.2B of them.
+
+**Memory at 2 x 262,144.** KV exists only for the 10 attention layers: 10 x 2 x 2 x 256 values a token, 5.6 GiB for
+both slots in int8 with fp16 scales (the 26B's was 6.4). The DeltaNet state is ~60 MiB a slot. The experts are 18.1 GB
+at 4.5 bits a weight, so after ~1.5 GB of dense weights (at 8.5), the head (0.4 GB, Q6_K), the KV, the draft (~0.5 GB)
+and the 1 GiB margin, roughly 70-80 of each layer's 256 stay on the card, chosen by a routing profile as the 26B's
+were, and the rest (~13 GB) are computed by the CPU from pinned memory: on fiona's 30 GB that fits, tightly.
+
+**Weights.** The format is chosen by quality per byte among those the card runs well, and eklow gets the kernels for
+it (the owner: what matters is what the hardware supports, not what eklow implements today). Decode reads every
+weight it uses once a token at up to 399 GB/s, so bits per weight decide its speed; the matrix units take int8 and
+int4 operands 32 deep, so formats with 32-weight sub-blocks and a scale (Q4_0, Q4_1, Q4_K, Q5_K, Q8_0) go straight
+into the int8 decode path, a min costing one more term from the activations' block sums; Q6_K (16-weight
+sub-blocks) and IQ4_XS (a 16-value table per nibble) need an unpack step first, which decode's spare arithmetic
+covers; prefill dequantizes any of them to fp16 in shared memory. K-quant kernels also let eklow serve the published
+Q4_K_M files of other finetunes as they are. The candidates (the published Q4_K_M, Q4_K_S, IQ4_XS and Q4_0, and
+mixes made with the oracle's converter and quantizer under bartowski's importance matrix) are measured by KL against
+Q8_0, with the experts' bytes (what fits on the card, what the CPU reads per cold expert) and the dense bytes (what a
+decode token reads) counted apart (`tools/weights/`, `qwen/weights` branch). If the winner is a file of our own,
+the owner hosts it on Hugging Face (uploaded from son-of-anton, which holds the key).
+
+**DFlash 2** (Inco AI, August 2026; z-lab `dflash/model.py`): a 6-layer Qwen3 draft over the target's hidden states
+from layers 1, 6, 11, 16, 22, 27, 32, 37 (concatenated, projected by `fc`, normed, written as K/V into the draft's
+sliding cache once a token is committed), drafting a block of [last token, MASK x (B-1)] in one pass, non-causal within
+the block, with a two-tap grouped dynamic convolution around each layer's attention and MLP, and a selector that walks
+the top 16 candidates at each position with low-rank codebook scores (predecessor x hidden x successor). The target
+verifies the block; acceptance is rejection sampling against the selector's distribution. Ornith's own draft
+(ornith-ai/Ornith-1.5-35B-A3B-DFlash) is DFlash 1, not 2. Two DFlash 2 drafts fit: `incoai/Qwen3.6-35B-A3B-DFlash2`
+(51ef7b69, the authors', trained on stock Qwen3.6; block 8, window 2,048; 5.21 / 4.90 / 4.41 tokens accepted a verify
+on GSM8K / HumanEval / MT-Bench at temperature 1, SGLang) and `jzinno/Ornith-1.5-35B-A3B-DFlash2` (9b4852c0, a
+community draft trained on Ornith's outputs; block 16, window 4,096; ~4.0 greedy at 10 drafted tokens). The owner: use
+Inco's, and the community one if it is better; llama.cpp's acceptance for the four pairs is measured first as the
+reference eklow's implementation will be held to. Both drafts use sliding attention in every layer, so their cache
+stays a few tens of MB however long the context.
+
+**The DeltaNet on the card.** Each column of a value head's state updates independently given that token's k, q, gate
+and beta, so one recurrent kernel can serve prefill, decode and verify alike: a thread holds a slice of columns and
+walks its slot's tokens in order. By estimate ~0.2-0.3 us a token, 30 layers of a 2,048-token chunk ~15 ms against
+~400 ms for the rest of the chunk, so the chunked (WY) form is left until measurements ask for it (`qwen/gdn` measures).
+A verify block must leave the state as if only its accepted tokens had run: rather than copying states, a step keeps
+the inputs of tokens it leaves pending and the next step replays the accepted ones onto the committed state before its
+own tokens. Prefix reuse cannot truncate a recurrent state, so the server will keep snapshots of a slot's state (~60
+MiB, copied to pinned host memory in ~6 ms) where conversations diverge (the end of a prompt); Ornith's template
+re-renders earlier reasoning exactly as generated, which helps.
+
+**The card.** Development needs fiona's A770M for long stretches, and the owner chose to stop production for the
+duration: `eklow.service` (the 26B) stopped 2026-10-31 17:40. The work happens on `qwen/*` branches merged into
+`qwen/main`; main keeps the 26B until the new model serves, then the Gemma 4 chat code goes.
+
+## 2026-10-31 — the Gated DeltaNet's serving kernels
+
+`src/kernels/gdn.*` (`qwen/gdn`, merged): everything between a DeltaNet layer's input matmuls and `ssm_out`, for steps
+holding several slots' tokens. Two forms with one layout and interface: for up to 16 new tokens a slot (decode, verify
+blocks) one fused kernel, a work-group per (slot, value head) in 32 KB of shared memory (conv, silu, l2 norm, the
+recurrence, the gated norm, the quantization for `ssm_out`); for longer steps three (prepare, scan, gated norm), the
+scan's threads each holding two columns of a head's state in registers and walking the slot's tokens. The recurrence is
+llama.cpp's with the decay folded in (`kv = eg S^T k; d = beta (v - kv); o = eg S^T q + d (k.q); S = eg S + k d^T`);
+value head h reads key head h % 16 (the converter's tiled order).
+
+Rollback: a verify block runs with `commit = 0` (outputs from the committed state walked through the block in
+registers, nothing written back, the tokens' post-conv inputs and raw rows saved as pending); the slot's next step says
+how many were accepted and the scan replays them first through the same loop. Against a twin that ran only the
+accepted tokens: 1,524 of 1,524 comparisons bit-identical per form (blocks of 2-16, every acceptance count, 200-block
+random chains), and a mutated replay fails it. A separate replay loop did not stay bit-identical (IGC fused the
+multiply-adds differently), hence the one loop. The fused and split forms agree to a few ulp, not bitwise. Against a
+double emulation in llama.cpp's op order over 4,200 tokens: rms error / rms signal 1.4e-7 on the output, 1.3e-7 on the
+state, no drift; 4e-6 at the edges (decay from 0 to below -100, beta saturated).
+
+Measured (`eklow-gdn-test`, fiona, GPU time for 30 layers): decode 0.59 ms (0.66 wall), two slots 1.0 ms; verify blocks
+of 8 and 16 tokens 0.79 and 0.96 ms; a 2,048-token prefill chunk 84 ms (138 ms for two slots at once); a slot's
+state (64 MiB) to or from pinned host memory in 6 ms, exact. Decode sits at about twice its state traffic (2 MiB read and
+written a layer, 316 us for 30 layers at 399 GB/s). Prefill is the weak part: ~1 us a token and layer, not the 0.2-0.3
+estimated, about 17% of the ~400 ms the rest of a chunk was estimated at. The scan is bound by its threads' loads of k and
+q (each thread takes its own 1 KB a token; an Xe-core delivers 64 B a clock); with them removed it runs at 0.58 us.
+Four columns a thread halve that traffic but leave one slot only 1,024 threads (slower for the common case). Untried,
+in order: carrying the decay's running product instead of rescaling the state every token, k and q in fp16, the chunked
+form on the matrix units.
+
+## 2026-10-31 — Qwen's weight formats on the card and the CPU: what each costs
+
+`qwen/mm`. Every format the `qwen/weights` candidates use now has kernels on both: Q8_0, Q4_K, Q5_K, Q6_K and IQ4_XS
+beside Q4_0, each at the bytes per weight of ggml's own (8.5, 4.5, 5.5, 6.5625, 4.25 bits; Q4_0 4.5). Raw output of
+every number below: `docs/bench/qwen-mm-*` and `xmx-fiona-2026-10-31.*`; the tools are `eklow-xmx-bench`,
+`eklow-qfmt-test` (card) and `eklow-cpu-qgemv-test` (CPU).
+
+**What the matrix units take** (`eklow-xmx-bench`, extended). Every integer operand pair runs and every one at the rate
+of its larger operand, s8 x anything 197.6 TOPS, s4 x s4 and u4 x u4 395.3: s8 / u8 activations against s8, u8, s4,
+u4, s2 and u2 weights (a 2-bit operand does not double the rate against s8). B's layout follows one rule, a dword
+holds 32 / bits consecutive k of one column, dword (k / G) * 8 + n, for all of them (the s8 x s4 finding generalizes;
+checked against a CPU reference for all 16 pairs). fp16 x bf16 mixed, and tf32, are refused by the compiler's
+static_asserts; the 16-wide execution size compiles and runs on DG2 (native is 8; not checked further). This is what
+makes the formats cheap: Q4_K and Q5_K feed the nibbles to the u4 dpas as they are (the minimum comes off with one
+more dpas against a tile of ones, which sums the activation block), Q5_K's fifth bit goes through a u2 dpas whose
+operand is two bit-masks of one stored word, and Q6_K's low 4 bits and high 2 bits through a u4 and an s2 dpas (the
+xor of the stored field makes q - 32 = low + 16 s2), each on one 16-weight half of the tile (the other half of the B
+operand zero), so no format unpacks to bytes. Only IQ4_XS needs a lookup.
+
+**Decode GEMV** (int8 activations per 32-block as before; `Weight` repacked per format at load into tiles of 8 columns
+x 32 K plus per-superblock records, `src/kernels/xmx_fmt.hpp`; one schedule for all: a work-group of T threads per
+8-column group splits K and merges in shared local memory; 1 row dpas with repeat count 1, 2-32 rows 8-row tiles).
+GB/s of weight read, one row (the card reads 399): attn_qkv 2048 -> 8192: Q4_0 279, Q8_0 303, Q4_K 269, Q5_K 286,
+Q6_K 295, IQ4_XS 161; the head 2048 -> 248,320: 367, 364, 354, 358, 357, 218. Every format but IQ4_XS reads at the same rate as
+Q4_0's, so a decode token's time follows the bits per weight; the small matrices (an expert's 0.6-1.2 MB) are
+launch and latency bound at ~8-9 us a call whatever the format. The grouped GEMVs of the experts (256 experts,
+distinct ones read, P = 8 pairs, gate|up + SwiGLU): 196 (Q4_0), 243 (Q8_0), 178 (Q4_K), 194 (Q5_K), 208 (Q6_K), 122
+(IQ4_XS) GB/s, so per byte Q4_K costs 10% more than Q4_0 and per weight (bits / rate) Q5_K +23%, Q6_K +37%, Q8_0 +52%,
+IQ4_XS +52%. At 16 and 32 rows
+(a verify block) the K-quants' scale work shows: attn_qkv at 32 rows 98-107 GB/s against Q4_0's 134 and Q8_0's 176.
+- **IQ4_XS** is bound by its table: the 16-value int8 table is looked up per packed byte (a 256-entry table of int8
+  pairs in shared local memory, one gather lane for two weights, 16-bit entries +3-4% over 32-bit). With the gather
+  taken out (wrong results) the kernel reads 238 / 341 GB/s (qkv / head) instead of 161 / 218. Register-indirect
+  `iselect` as the lookup is slower still (211 GB/s as an arithmetic ceiling, in registers with free memory), a
+  16-bit select tree 358, the gather 730; all the chunk's gathers issued together before the dpas: -8%. At 4.25 bits it
+  costs as much time as Q8_0 does at 8.5 on the grouped GEMVs.
+- The Q6_K head: the dpas GEMV (int8 activations) reads at 357 GB/s at 1-8 rows, `fast::matmul_q6` (fp32
+  activations, one sub-group a column) at 253 GB/s at one row, 150 at two, 46 at eight: 1.4 / 2.4 / 7.6x faster. The
+  price is int8 activations on the head (1e-2 of the output vs fp32 activations); not wired into the engine.
+
+**fp16 GEMM** (dequantized to fp16 in shared memory per format, `GemmDec` in `xmx_fmt.hpp`; scales rounded to fp16 as
+Q4_0's, so ~4e-4 of the fp32 product, against ~2e-4 for Q4_0): at 2,048 rows attn_qkv 54.5 (Q4_0), 51.2 (Q8_0), 49.8
+(Q4_K), 49.1 (Q5_K), 49.6 (Q6_K), 47.8 (IQ4_XS) TFLOPS; the grouped expert GEMMs (2,048 tokens x 8 of 256 experts,
+tile 128, gate|up + SwiGLU epilogue, TFLOPS on real pairs) 27.1, 24.8, 26.5, 23.9, 24.1, 16.4. The K-quants cost 8-9% of the
+GEMM at the big shapes, IQ4_XS 12% there and 40% on the experts. The 32-row-tile grouped kernel spills 256-1,216 bytes
+for the new formats (the Meta registers); tiles 64 and 128 do not.
+
+**SwiGLU**: `matmul_geglu`, `matmul_geglu_grouped`, `matmul_geglu_grouped_dense` and `matmul_geglu_grouped16` take a
+`Glu` (default Gemma's GeGLU, existing callers unchanged); the GEMM epilogue and the int8 requantizing kernels branch
+on it. Checked against the fp32 silu(gate) * up of the dequantized halves.
+
+**CPU** (fiona's i7-12700H, AVX-VNNI, ggml's bytes read in place; `src/cpu/qgemv.cpp`; the same int8 activations):
+its two DDR4 channels read 43 GB/s (8 threads and up; 25 on one). One cold expert's FFN (gate|up GEMV, SwiGLU,
+requantize, down GEMV; 1.67-3.34 MB), best of 1-16 threads, one input: Q4_0 44 us (40 GB/s), Q4_K 45, IQ4_XS 42, Q5_K
+53, Q6_K 64, Q8_0 77 us (43.5 GB/s): every format reads at the DRAM rate, so time follows bytes (the pshufb lookup of
+IQ4_XS costs nothing here). With 8 and 16 inputs (tokens of a verify block that pick the same expert) it is arithmetic
+bound: 122-156 us and 233-290 us, 15-19 us a token against 42-77 for one: sharing the read makes a block of eight cost ~3
+singles. Q4_0 is the fastest there (233 us at 16 inputs), Q8_0 next (251: its sign trick has fewer ops than the K-quants'
+scale work), then Q4_K 267, IQ4_XS 278, Q6_K 280, Q5_K 290.
+
+**Correctness**: every kernel against ggml's own dequantization at the fp32 activations (1e-2 up to 32 rows, 2-5e-4
+above) and an exact emulation of the arithmetic on the card's own int8 activations (<= 1 float epsilon of the sum of
+absolute terms, ~1e-6), on real tensors (Gemma 12B requantized by llama-quantize to each format) and random valid
+blocks, plus grouped, interleaved gate|up, `rows_of` views, and the grouped GEMMs against the dense path (bit-equal).
+An early emulation that quantized the activations on the host showed 2-4e-4 outliers: a quantization tie rounds either
+way by an ulp of the reciprocal, the same as the old 5.8e-4 at `attn_output` 16 rows. Gates: `bench.sh kernels`
+unchanged (same numbers as main), `attn` all ok.
+
+**Which formats are cheap enough** (card and CPU costs alone): the card reads Q4_K, Q5_K, Q6_K and Q8_0 at Q4_0's
+rate, so an expert in Q4_K costs 10% more decode time than in Q4_0 at the same bytes and the CPU none; Q5_K and Q6_K
+cost about their bytes (+22% and +46% on the CPU, +23% and +37% on the card's grouped GEMVs); Q8_0 is for the dense matrices
+(1.9x the bytes of 4.5 bits) and is the fastest per byte on the card; IQ4_XS saves 6% of the bytes and costs 1.7x the
+card's decode time and 40% of its expert prefill, though the CPU reads it as fast as Q4_0. The dense matrices and
+the head are 1.5 GB of the ~20, read once a token at 300-360 GB/s whatever the format: their cost is their bytes.
+
+## 2026-10-31 — Qwen3.6's text layer
+
+`qwen/text` (merged): the tokenizer (`src/text/tokenizer_qwen.*`), both chat templates (`chat_qwen36.*`: stock
+Qwen3.6's and Ornith's, chosen by the template's exact text, anything else refused), the output parser
+(`output_parser_qwen.*`) and the tool-call grammar (`src/serve/tool_grammar_qwen.*`), held to Hugging Face as the
+Gemma ones were (transformers 5.17, tokenizers 0.23.2). The rule from the Gemma port stays: request text never becomes
+an added token, special or not (`<think>` or `<tool_call>` typed by a user are characters).
+
+- **Tokenizer**: added tokens, NFC, the pre-tokenizer's regex written by hand over code points, byte-level BPE. Against
+  `tokenizers`: 648,044 strings / 14.4M tokens encoded and 1.36M decodes, 0 differences; every code point in 17
+  contexts (18.9M strings), 0. 26-31M tokens/s on one core. Hugging Face's NFC is Unicode 9 (the Rust crate's data),
+  not 16: with Python's full tables 371 of 10.2M probes differed. The generator leaves out what the installed
+  `tokenizers` does not know (120 combining classes, 21 decompositions, 21 compositions), so eklow matches Hugging
+  Face; regenerate if `tokenizers` moves (`tools/ref/qwen_classes_check.py` shows it). The GGUF marks 33 tokens
+  special against tokenizer.json's 26 (7 audio / TTS ones, plus 243 unused `[PAD...]`): those are plain text in encode,
+  nothing in decode, and never sampled.
+- **Templates**: 39,177 cases per variant (5,177 written for the branches, 34,000 random), 0 differences, and 7.8M
+  tokens of ids, 0. Ornith's repo ships stock's `tokenizer_config.json` byte for byte, stock template inside, while its
+  own is `chat_template.jinja`, which transformers uses; llama.cpp's converter takes the former, so **an Ornith GGUF
+  converted as-is carries stock's template** (it drops earlier reasoning that Ornith's keeps). And the official Ornith
+  GGUFs (`ornith-ai/Ornith-1.5-35B-A3B-GGUF`) carry a third, Unsloth's edit of Ornith's (a `developer` role, two
+  system messages merged, arguments by mapping test). So the server takes the template variant as an option when the
+  file's is not one eklow knows, and renders the model repo's own template.
+- **Parser**: generation starts in the reasoning (the prompt ends `<think>\n`), then content, then
+  `<tool_call>\n<function=NAME>\n<parameter=KEY>\nVALUE\n</parameter>\n...</function>\n</tool_call>` calls. Values go
+  back to JSON by the request's schema, after vLLM's `qwen3_coder` parser with three differences: a string parameter's
+  "null" stays the string, 5.0 stays 5.0, a value that does not parse as its type stays text (vLLM makes a bad boolean
+  False). 40,000 rendered turns (60,078 runs, 72,022 calls) parse back exactly. One hole no parser can close: a string
+  value containing `</parameter>` followed by `</function>` or `<parameter=`.
+- **Grammar**: a byte automaton keeping calls in the template's shape: declared tools and parameters (each once,
+  required ones before `</function>`), free text for string parameters, JSON of the declared kinds for the rest, enums
+  exact. 20,432 valid calls accepted token by token as Hugging Face tokenizes them, 12,000 mutated ones refused at
+  their first bad token, 40,000 random walks closed into calls the parser accepts; bans equal refusals on 828 of 828
+  (state, special token) pairs.
+
+## 2026-10-31 — Qwen3.6's reference forward, and what the engine is held to
+
+`qwen/ref` (merged): `src/model/qwen35.*`, `eklow-ref-run` on qwen35moe, and the reference kernels it needs
+(`ref.*`: the causal conv, l2 norm, the gated delta rule, the gated norm, SwiGLU, the MoE's gathers; `ref::matmul`
+dequantizes Q4_K, Q5_K and IQ4_XS as ggml does, bit-identical to the gguf package on real tensors for Q4_0, Q4_K, Q6_K,
+Q8_0). A layer's weights (~450 MB) go to the card as the layer runs: the file is larger than the card.
+`eklow-oracle` runs qwen35moe unchanged; `nix/oracle-cuda.nix` builds it against llama.cpp CUDA for e-desktop's 4090.
+
+Layout facts (llama.cpp's graph and converter): attention layers are those with (l + 1) % 4 == 0; `attn_q` interleaves
+256 query and 256 gate columns head by head; DeltaNet value head h reads key head h % 16; the GGUF's norms carry the
++1 except `ssm_norm`; "attn_post_norm" is the pre-MoE norm (`x2 = x + attn(rmsnorm(x)); x = x2 + moe(m) + shared(m)`,
+m = rmsnorm(x2) * post_attention_norm), no norm on sub-layer outputs; RoPE is NeoX over the first 64 of 256 dims at
+base 1e7 (IMRoPE with equal position components); the MoE renormalizes its top 8 by their sum (floored at 2^-14), the
+shared expert is scaled by sigmoid(m . ffn_gate_inp_shexp) and added.
+
+Checks (prompts tokenized by the oracle: `long`, DESIGN.md as a user turn with thinking on, 2,573 tokens; `chat`, 27):
+- A tiny random qwen35moe in F32 (4 layers, the real tensor names): every tensor of every layer within 1e-7..5e-6 of
+  llama.cpp CPU, logits 27/27 at KL 1.7e-11: no head order, norm or rope convention is off.
+- The real files: layer 0's dense tensors within fp32 rounding of llama.cpp CPU (4e-7..5e-6 at `long`, where its CPU
+  matmuls run in float); the first difference is the routed experts (8e-3, ggml's int8 activations), and `l_out` then
+  grows smoothly to ~9e-2 at the last layer, with no step at a layer-type boundary.
+- Logits, last 256 positions of `long` / all of `chat` (stock EK8): llama.cpp CPU against CUDA 231/256 top-1, mean KL
+  9.7e-2 (median 6.8e-3) / 26/27; CPU against the reference 243/256, 1.18e-1 (4.1e-3) / 26/27, 3.5e-4; CUDA against the
+  reference 228/256, 1.51e-1. Ornith EK8, a less certain model on the same text: 203 / 214 / 203 of 256. The mean is a
+  few positions' (the digits of dates in DESIGN.md, 1-9 nats of entropy, where another set of experts flips a digit).
+
+So, as with the 26B, llama.cpp's two backends are no closer to each other than either is to the reference, and the
+fp32 reference is the engine's ground truth. The gate for the engine against it (from the CPU-CUDA distance, stock
+EK8): `long` top-1 >= 225/256, mean KL <= 1.2e-1, median <= 1e-2; `chat` top-1 >= 25/27, mean KL <= 2e-3; Ornith
+`long` >= 195/256, mean KL <= 2e-1. Judge by top-1 and median: three positions move the mean ~5x. Dumps on fiona:
+`~/eklow-oracle-qwen36/`, `~/eklow-ref-qwen36/` (`NOTES.txt` has the files' sha256). The reference takes 19 s on
+`chat` and 139-163 s on `long`.
+
+## 2026-10-31 — the DFlash 2 draft on the card, and lossless acceptance
+
+`qwen/dflash`. `src/model/dflash2.*` (config, weights from the draft GGUF, `Dflash2Ref` the fp32 reference forward,
+`Dflash2` the serving forward in `dflash2_fast.cpp`), `src/kernels/ref_dflash.*` and `dflash.*`, `src/serve/spec.*`
+(walk over the selector's lattice, greedy and rejection-sampling verify), `tools/dflash_test/` (`eklow-dflash-test`
+torch|fast|accept|matmul|time, `eklow-spec-test`, `ref_torch.py`). Shared files touched: `attn::attend` gets head 128 with
+4 query heads per K/V head (fp16 ring only: three lines), `Sampler` gets `distribution()` (sample() draws the same
+tokens as before: 55,000 of 55,000 equal to the previous implementation).
+
+**Checks.** Reference vs z-lab's model.py in PyTorch fp32 on real target features (eklow-oracle on stock Q8_0, a 523-token
+chat, layers 1, 6, ..., 37; BF16 draft file): hidden rel error 3-6e-6, lattice 1e-6, 8 of 8 greedy paths equal, for Inco's
+draft at B = 8 and 16, jzinno's at B = 16, and with the window cut to 64 and 100 (ring and window logic). model.py's
+draft predicts the text well (7 of 7 tokens at several positions), which also confirms the layer indices: the GGUF's
+`target_layers` are the layer outputs plus one (llama.cpp reads layer inputs). Serving vs reference: the matmuls on int8
+activations equal the reference on the same rounded activations to 2e-7; the whole forward is chaotic at int8 (a 1e-7
+perturbation of the input moves the logits ~5%, the same as serving vs exact), so judged by what the draft does: mean
+tokens agreeing with the text, 100 blocks of 8: exact fp32 3.570, serving 3.580; B = 16 Inco 4.393 vs 4.518, jzinno 4.143
+vs 4.143, window 100 2.375 vs 2.375; whole greedy drafts equal in 41-97% of blocks, the rest differ at near-ties.
+**Acceptance:** chi-square over 11 sampler configurations (temperature, top-k, top-p, min-p, penalties, bans, grammar,
+all of them) with a poor and a near-target drafter: all pass; two deliberately broken verifies (accept-all, no residual)
+fail every time; greedy sequences equal plain greedy in 20,000 of 20,000 per case.
+
+**Timings** (A770M, Inco Q8_0, 780 MiB on the card with two slots): context injection 3.7 us a row at 1,024-2,048 rows,
+0.4-0.5 ms for 1-16 rows; a block of B = 8 5.6 ms (layers 3.1, head 1.6, selector 0.8), B = 16 6.3 ms; two slots at B = 8
+6.4 ms, at B = 16 11.5 ms (the head's 32-row GEMV 5.8).
+
+**Where model.py and llama.cpp differ.** llama.cpp drafts n_max tokens from a block of n_max + 1 (the block size is the
+caller's), applies an optional p_min cut on the walk, and runs its sliding window in a unified KV cache; the target-layer
+ids in its GGUF are +1. Same math otherwise (the conv taps, the lattice layout, ties to the first candidate).
+**Not done:** a token-for-token comparison with llama.cpp's draft (its draft graph needs a target context and the
+private `llama_get_embeddings_nextn`); BF16/F16 draft files only run in the reference (xmx::matmul_geglu cannot form
+fp16 outputs for few rows).
+
+## 2026-11-01 — the serving engine for Qwen3.6-35B-A3B
+
+`qwen/engine` (merged): `src/engine/engine.*` rewritten for qwen35moe; the Gemma 4 chat engine and its reference
+(`src/model/gemma4.*`) are gone (EmbeddingGemma 2, the vision encoder and Gemma's text code stay). Steps of prefill
+chunks, decode tokens and verify blocks (B <= 16 tokens with every logits row, the DeltaNet tokens left pending until the
+slot's next chunk says how many were accepted, the K/V past them dropped); capture of layers 1, 6, 11, 16, 22, 27, 32,
+37's outputs for the draft; `settle`, `snapshot` / `restore` of a slot's recurrent state for prefix reuse. Weights in
+their file's formats (EKK8: Q4_K experts, Q8_0 dense, Q6_K head through the dpas GEMV); experts placed rank by rank by a
+routing profile (`data/qwen36-experts.json`, `data/ornith-1.5-experts.json`) in the card's free memory less the 1 GiB
+margin and a 1.2 GiB reservation for the draft; the cold ones on the CPU from pinned memory, the busiest streamed for
+prefill. `eklow.service` stayed stopped; `server` is out of the build until the next task rewires it.
+
+**Fidelity** (`checkq.sh`, against the fp32 reference on the 2,573-token prompt's last 256 positions, six ways: chunks of
+1,024 and 2,048, the last 64 decoded, verify blocks of 8 accepting 3, mixed acceptances, blocks of 16 accepting 5): stock
+EK8 238-245/256, median KL 2.2-4.5e-3; stock EKK8 237-246, 1.7-3.5e-3; Ornith EK8 201-221, 2.2-3.6e-2; `chat` 27/27,
+27/27, 25/27 (mean KL 8.6e-4, 9.8e-4, 1.4e-2). Verify with replay is within the noise of plain decode. An apparent 10x
+gap between EKK8's and EK8's `chat` KL (2.2e-3 against 2.2e-4) came from an earlier build and from placement: on 27
+tokens the KL moves 10x with how many experts sit on the card (EK8 1.5e-4 to 1.6e-3 over 0-96 of them), in both files.
+
+**At the production shape** (2 x 262,144, int8 KV): 6.46 GiB of weights and 5.84 GiB of KV and DeltaNet state on the
+card, 7.16 GiB free before the experts, **71 of 256 experts a layer on the card**, ~12.2 GiB of cold experts in pinned host
+memory. `eklow-engine-bench`, no profiling (prefill: 4,096 tokens after the depth; decode per sequence):
+
+| | stock EKK8 | stock EK8 | the 26B in production |
+|---|---|---|---|
+| prefill from empty (2,048) | 1,297 tok/s | 1,402 | |
+| prefill at 8k / 32k / 128k | 1,071 / 848 / 393 | 1,189 / 808 / 408 | 1,865 / 1,794 / 1,177 |
+| decode, one slot, at 0 / 8k / 32k / 128k | 41.3 / 39.6 / 36.8 / 31.4 | 41.7 / 40.3 / 39.1 / 31.9 | 36.6 at 8k, 34.0 at 32k, 30.5 at 128k |
+| decode, two slots, per sequence | 32.4 / 32.1 / 28.6 / 24.5 | 33.0 / 32.9 / 29.8 / 24.6 | |
+| verify block of 8 / 16 at 8k, one slot | 70.9 / 112.8 ms | 67.6 / 106.4 ms | |
+
+Decode matches or beats the 26B; prefill is behind it everywhere and a third of it at 128k. Where the time goes
+(`--profile`): decode is launches plus the round trip to the CPU's cold experts (half the pairs are cold at 71 a layer:
+9.3 ms of CPU a step, and the card waits 9.4 ms for routing); a verify block of 8 costs 2.8 decode steps and is bound by
+the CPU (43.8 ms of cold experts; the card finished first in 38 of 40 layers), with `moe_sum` 35% of the card's part;
+prefill is the streamed experts' copy and repack (41% from empty, 36% at 8k) and, deeper, the attention layers' prefill
+attention (37% at 32k, 63% at 128k: the two-GEMM segments, DECISIONS 2026-10-27, exist only for head 512, and Qwen's
+heads are 256). Those four are the levers.
+
+## 2026-11-01 — prefill attention at depth for Qwen3.6: the segment path for head 256, group 8
+
+The 26B's two-GEMM segment path (2026-10-27, "global prefill attention as two GEMMs") now also serves Qwen3.6's 10
+attention layers (16 query heads over 2 K/V heads of 256, int8 or fp16 pages): `attn::reserve` takes the group, and
+`run` takes the segment branch for D = 256, G = 8 when a chunk has 64 tokens or more; shorter chunks and decode keep the
+flash kernels. The engine's change is the one `reserve` argument: its scratch (128 MB for a 2,048-token chunk) is
+allocated before the experts are placed, so the placement's free-memory reading counts it.
+
+- `eklow-attn-test` `qwen8` / `qwen`, 2,048-row chunk (was flash): 13.4 -> 27.6-28.3 TFLOPS at 16k, 64k, 128k and 256k
+  keys; two slots' chunks at once 27.6-27.7. 4,096-key segments (kSeg, shared with head 512, whose numbers did not
+  move: 27.4) against 2,048: 27.6 vs 25.6 at 16k, 27.7 vs 23.8 at 128k, so 4,096 for both heads (twice the
+  probabilities' memory: 128 MB). P.V's fp16 tail mask as scalar dword masks per row removed a spill. SegQK still
+  reports 32 bytes of spill, with no measurable cost.
+- `bench.sh engineq` (2 x 262,144, int8 KV, 2,048-token chunks), prefill at depth 8k / 32k / 128k, tok/s:
+  1,091 / 851 / 390 -> 1,180 / 1,032 / 539 (+8% / +21% / +38%); the 128k chunk's attention is ~3.9 s of 8.2 s. Decode at
+  0 / 8k / 32k / 128k: 24.5 / 25.4 / 25.6 / 31.5 ms -> 24.3 / 24.9 / 25.4 / 31.2 ms; verify blocks unchanged. Cold-expert
+  waits (5-7 s of the 128k prefill) are now the larger share and are the MoE worker's.
+- Decode attention of these layers (split-K): the first level's blocks were fine (main kernel 585 us of 685 at 128k
+  keys, ~460 GB/s of K/V), the cost was the fold between the split levels, 92 us of 750 at 128k: its work-items now run
+  the dimensions fastest (128-byte reads of the partials) and folds by 8 from 8 splits up, level by level between the two
+  partial buffers (fold and merge 12 us each). `qwen8` decode 128k 755 -> 690 us, 256k 1,196 -> 1,124 us, 16k 275 -> 126 us
+  (391 / 478 GB/s of K/V counting the merges); a step's saving ~0.7 ms of 31 at 128k (10 layers), so the decode step at
+  depth is the experts', not the attention's. Splits' count and blocks per split (kPerSplitMax 8 vs 4..16) were not
+  better elsewhere.
+- Gates: `bench.sh attn` every kind ok; `checkq ekk8` long 248/256 (1,024 chunks), mean KL 3.5e-2, median 2.0e-3, chat
+  27/27, 9.8e-4; `checkq oek8` long 216/256, mean KL 1.08e-1, chat 25/27; `kernels` unchanged. Raw output in
+  `docs/bench/*-fiona-2026-11-01.txt` (the "before" 128k profile's attn row overflowed; its engineq rows are good).
+
+## 2026-11-01 — the MoE's speed for Qwen3.6: what bounds it (measured; one CPU kernel change kept)
+
+`qwen/moeperf`. Raw output in `docs/bench/qwen-moeperf-*-2026-11-01.txt`.
+
+**The cold experts' GEMVs are at the DDR wall in decode and verify.** A multithreaded AVX2 read of 2 GiB gives 38-41 GB/s
+on fiona's i7-12700H at 4-20 threads (`mb/bw.cpp`: 41.2 at 8, 38.8 at 16), and the microbenchmark of a verify layer's cold
+work (18 distinct experts, 33 pairs, `mb`) runs at 41 GB/s. In the engine a verify block of 8 reads 712 distinct cold experts a
+step (1.26 GB) in 41.7 ms of CPU: 30 GB/s; decode 160 experts in 9 ms, 33 GB/s. So the CPU phase is ~75-80% of the wall and
+what is left is barriers and imbalance between the gate|up, SwiGLU and down phases. The software prefetch and the 2-3 input
+passes of 708e456 already took what the cores' own latency left. Consequences: (1) copying a block's busiest cold experts
+to the card does not remove bytes from DDR (the copy reads them too, once, as the CPU does), it moves the compute; (2) nothing
+that is a kernel makes a verify block's CPU phase much shorter, only fewer distinct cold experts (more on the card) does;
+(3) `moe_sum` in the verify profile (33-45%) is not the combine: it is the mark after `cold_prefill`, i.e. the card
+waiting for the host (the combine is a few rows).
+
+**Prefill's CPU phase is compute-bound, not bandwidth-bound**: the pairs that are not streamed (~1.8k a layer over ~120
+experts of ~15 rows each) run at 8 GB/s and ~15 us a pair. The Q4_K dot now builds the superblock's 8 scales and minimums as
+vectors once and takes each input's scale products through the stack as broadcasts, with the minimum terms accumulated as a
+vector: **14.7 to 10.2-11.8 us a pair** (`mb`, 120 experts x 1,800 pairs; 18.9-19.2 to 16.2-16.5 at 400 pairs), results
+unchanged (`eklow-cpu-qgemv-test` vs emul 1e-6; checkq ekk8 241/256 median KL 3.5e-3, ek8 238/256 4.5e-3, oek8 201-203/256,
+all inside the DECISIONS 2026-11-01 ranges). In `engineq` it moves prefill from empty within noise (1,297 before, 1,315
+after; CPU phase 1.07 to 0.93 s, the card's wait for the routing up by the same): at this operating point the CPU and
+the card paths are balanced, so a faster CPU alone shifts the balance rather than lifting the throughput.
+
+**The streaming cost model is at its optimum** (prefill 2,048 from empty, tok/s): `stream_cpu_us` 5 / 7 / 10 / 15 / 20 / 30 =
+1,085 / 1,172 / 1,239 / 1,202 / 1,144 / 1,119; `stream_copy_us` 200 / 270 / 350 = 1,224 / ~1,240 / 1,160; `stream_min_rows` 8
+the same as 16. Streaming more makes the card's path (copies, their DMA tax on every kernel, repack) the longer one
+(waiting on the routing 0.4 to 1.0 s), streaming less the CPU's (1.1 to 1.4 s). Chunks of 4,096 do not help either:
+the activations cost ten ranks of experts (61 of 256 on the card instead of 71) and the run gives 1,225 tok/s (CPU 2.43 of 3.34 s).
+Prefill from empty: the copy of 63 experts a layer (~4.5 GB a chunk, 410 ms at the link's 10.9 GB/s) plus the repack is the
+41%; the DMA tax of DECISIONS 2026-10-27 makes it also a cost on every other kernel, so the copy bytes are the lever. A
+repacked pinned copy would remove the repack and the raw slots but needs a second 12 GiB of pinned memory; fiona has 30 GB.
+
+**Not done / left**: (a) the iGPU of the 12700H (96 EU, int8 dp4a, same DDR) as a second compute device for the
+non-streamed pairs; (b) a SYCL command graph or fused kernels for the decode layer's ~25 launches (the card's critical chain
+between two CPU phases is ~0.25 ms a layer, 10 ms a step); (c) a smaller hot KV footprint for more experts on the card, which
+is the only thing that shortens verify (each rank is 40 experts, ~71 MB, and one fewer distinct cold expert a layer); (d) the
+profile `--profile` of a verify block with timeline per layer.
+
+`engineq` after (no profile; before = the 2026-11-01 table): prefill 1,315 (1,297) / 8k 1,135 (1,071) / 32k 867 (848) / 128k
+395 (393) tok/s; decode 41.3 / 39.5 / 37.4 / 31.3 (41.3 / 39.6 / 36.8 / 31.4); verify 8 at 8k 72.2 (70.9) ms, 16: 113.6 (112.8). All within run-to-run noise (fiona's
+CPU is shared with the other workers' server tests): the kernel change is a CPU saving that these paths do not turn into tok/s.
+
+## 2026-11-01 — eklow-server on Qwen3.6, with DFlash 2 and snapshots of the DeltaNet state
+
+`qwen/serve`: `eklow-server` and `eklow-prompt` are back in the build on the qwen35moe engine, linking `eklow_spec` (sampler
+and acceptance). Chat uses Qwen's tokenizer, template (stock or Ornith, from the GGUF or `--chat-template`), parser and
+tool grammar; images are refused with a clear 400; sampling defaults come from `general.sampling.*`. Engine changes: none
+beyond reading `Engine::head_weight` for the draft (which shares the target's head) and a 1.3 GiB `draft_reserve_bytes`.
+
+**Speculation.** A generating slot's step is a verify chunk of its sampled token and B-1 drafted ones; `serve::verify`
+decides with the slot's sampler and a grammar and parser cloned per row; two slots draft in one pass. The block is a
+trade the card sets: a verify row beyond the first costs ~8.5 ms (the cold experts' CPU time grows with the distinct
+experts the rows touch). GSM8K, one stream at 8k: plain 35.4 tok/s, blocks of 4 / 6 / 8 / 12 / 16 56.3 / 54.5 / 53.1 /
+50.1 / 42.7 (3.5 / 4.6 / 5.3 / 6.6 / 6.5 tokens a verify); prose at 8k: 4 beats 8 by a third. Default block 4 (or the
+draft's if smaller); `"speculative": N` per request (0 or false: plain). With two streams the blocks of 4 and 8 finish
+the same 16 requests in the same time (449 against 428 s on GSM8K at temperature 1), so 4 costs nothing there.
+Acceptance with blocks of 8, temperature 1, against llama.cpp's on the same pair: GSM8K 5.75 (5.24), HumanEval 5.43
+(4.98), MT-Bench 5.02 (4.53); eklow's is higher, not lower. Through the server, 3,000 completions at temperature 1 with the
+draft against 3,000 without: chi-square 17.1 on 32 degrees of freedom, p = 0.985. At temperature 0 the outputs agree for
+hundreds of characters and then part at a near-tie (the int8 activations depend on the step's shape; a request alone and
+beside another do the same): that is the engine's noise, not the acceptance's.
+
+**Snapshots.** 64 MiB each in pinned host memory under `--snapshot-mib`, at the starts of the request's messages (the
+prefix a next turn shares), before the generation prompt, at the last two paragraph breaks before the last message (a
+document and then another question), every `--snapshot-every` tokens of a long prefill, and at the end of a generation;
+a new request takes the slot and snapshot that leave the least to prefill. A 10k conversation: 9.2 s cold, next turn 0.61 s
+(stock; 105 tokens prefilled) or 0.26 s (Ornith, which keeps the reasoning); a question on a read 100k document 0.28-0.31 s
+against 146-159 s. Finding: the end-of-generation snapshot is unusable when the template's re-rendering of the answer
+tokenizes differently from what was sampled (a sampled " D" + "amas" against the tokenizer's " Damas"; Ornith's third turn
+in the bench lost 677 tokens, +1.1 s). The server now logs where a slot's sequence and a prompt part. A snapshot every
+~256 generated tokens would bound the loss; not done (each needs the verify's pending state settled mid-generation).
+
+Gates and the tables are in README "Performance" and `docs/bench/serve-*-qwen-*`: whole and streamed chat, reasoning,
+tool calls, stop strings, seeds, two at once, cancel, reuse (`serve_test.py basic`, all ok with the draft, without it,
+and with Ornith); needle at 88k and 167k found with two requests and embeddings at once (embeddings 91-238 ms beside the
+prefills).
+
+## 2026-11-01 — the draft for both models, and the files on Hugging Face
+
+**The draft.** llama.cpp's acceptance (tokens per verify, temperature 1, top-p 0.95, top-k 20, thinking on, 32
+requests each; `docs/bench/qwen36-dflash2-llamacpp-2026-11-01.txt`): on stock Qwen3.6 (EKK8) Inco's draft gives 5.24 /
+5.08 / 4.59 on GSM8K / HumanEval / MT-Bench at block 8 and 6.58 / 6.14 / 5.49 at block 16; jzinno's (trained on Ornith)
+4.59 / 3.76 / 3.87 and 5.49 / 4.08 / 4.23: Inco's is clearly better there. On Ornith (EK8) the two tie at block 8 (Inco
+5.21 / 5.01 / 4.01, jzinno 5.23 / 5.00 / 3.92) and jzinno's leads a little at block 16 on two of three (6.51 / 6.27 /
+4.49 against 6.43 / 6.04 / 4.59). The protocol check reproduces Inco's own numbers (5.24 / 4.98 / 4.53 against 5.21 /
+4.90 / 4.41 on SGLang). On this card a verify row costs ~8.5 ms of the CPU's cold experts, so eklow runs short blocks
+(the server's sweep: block 4 best, 56.3 tok/s on GSM8K at 8k against 53.1 at 8 and 42.7 at 16), where the drafts tie on
+Ornith. The owner's rule ("use Inco's, the community one if it is better") gives **Inco's draft for both models**: one
+draft file. Worth revisiting if verify rows get cheap enough for blocks of 16.
+
+**The files** (the owner: no "eklow" in the names, the quant style instead; public, so fiona's Nix fetch needs no token;
+uploaded from fiona, the draft's repo created by the owner):
+- `ethanwtodd/Qwen3.6-35B-A3B-Q4_K-Q8_0-GGUF` @ 8db5016e: `Qwen3.6-35B-A3B-Q4_K-Q8_0.gguf` (EKK8), sha256 48cf98f4...
+- `ethanwtodd/Ornith-1.5-35B-A3B-Q4_K-Q8_0-GGUF` @ a89886e0: `Ornith-1.5-35B-A3B-Q4_K-Q8_0.gguf` (EKK8 with Ornith's
+  own chat template), sha256 25a68129...
+- `ethanwtodd/Qwen3.6-35B-A3B-DFlash2-Q8_0-GGUF` @ 65aaab95: `Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf` (Inco's draft through
+  the pinned converter), sha256 986b8f24...
+
+The model cards carry the KL tables: each file beats the published Q4_K_M of its model (stock 0.0134 against bartowski's
+0.0168 at 4k; Ornith 0.0354 against bartowski's 0.0460 and the official 0.0596). Working copies live on fiona
+(`~/models`, `~/models/drafts`); e-desktop's home filesystem was at 99% and the owner had them deleted there after their
+sha256 matched fiona's.
+
+## 2026-11-02 — Qwen3.6's vision encoder (Ornith-1.5), checked against llama.cpp
+
+Projector `qwen3vl_merger` (`model::VisionQwen3VL`, `src/model/vision_qwen3vl*.cpp`, `src/image/qwen3vl_image.*`,
+`eklow-vision-qwen`): 27 layers of 1,152 (16 heads of 72), LayerNorm with bias, fused qkv with bias, "vision M-RoPE"
+(pairs (i, i + 36) of a head turn by the patch's row for i < 18 and by its column for i >= 18, base 10,000), scale
+1/sqrt(72), gelu (tanh) FFN of 4,304, the learned 48 x 48 table bilinearly resized to the grid with align_corners (ggml's
+float arithmetic), a post LayerNorm, then four neighbours side by side (4,608) -> mm.0 -> gelu -> mm.2 -> 2,048-wide rows.
+The two conv kernels (two frames) see the same picture for a still image, so they are one weight, their sum. Patches are
+kept in the model's merge order (a 2 x 2 block consecutive), so output row r is the merged grid row by row.
+
+**The projector.** `convert_hf_to_gguf.py --mmproj --outtype bf16` at the oracle's revision on Ornith-1.5-35B-A3B @
+10fbf86fed7e (only `model-00001-of-00016.safetensors`, sha256 250b3b09..., holds the 333 `model.visual.*` tensors; the
+converter was given a directory of the configs, that shard and an index cut to it). `~/models/mmproj-Ornith-1.5-35B-A3B-
+bf16.gguf` on fiona, 902,821,920 B, sha256 5a1ad8ff16aa66f4e538b34976b36c6551c0279b06112e61e26658e110871b23 (334
+tensors: the patch kernel is split in two; BF16 matrices, F32 vectors, patch kernels and position table). Against bartowski's
+`mmproj-Ornith-1.5-35B-A3B-bf16.gguf` @ 64b0493d34: all 334 tensors byte-identical, only `general.*` metadata differs
+(name, basename, license, tags). An F32 conversion (1.79 GB) is the oracle's projector for the checks. No `image_min/max_pixels`
+keys are written: llama.cpp's own limits apply (8 to 4,096 tokens).
+Stock Qwen/Qwen3.6-35B-A3B (@995ad96e, visual tensors in its shards 1-2 of 26): all 333 `model.visual.*` tensors are byte-identical to Ornith's (compared by range requests, `tools/vision/cmp_towers.py`): Ornith did not touch the tower, so one projector serves both models.
+
+**Preprocessing** is mtmd's `dyn_size`: stb decode to RGB, `calc_size_preserved_ratio` with align 32 and the pixel limits
+min/max tokens x 1,024 (llama.cpp's `--image-min-tokens` 8 / `--image-max-tokens` 4,096; eklow's tool defaults to a max of
+1,024), Pillow bicubic into the target centred on black, then `(x / 255 - 0.5) / 0.5` in float. `image::qwen3vl_size` gives the
+size (and so the token count) from the dimensions alone. The token grid equals llama.cpp's on all 17 images x budgets tried (up
+to 4,096 tokens): 1 x 1, 17 x 9, 48 x 36, 2400 x 60, 5000 x 20, 20 x 3000, 70 x 1500, 6000 x 4000, grayscale, RGBA PNG, 16-bit
+PNG, palette GIF, JPEGs. Patch embeddings agree with the oracle's to 1-2.5e-4 (its im2col rounds to fp16), so the pixels are the same.
+
+**Encoder.** Reference: fp32 on `ref::` kernels, all weights on the card (861 MiB). Fast: xmx fp16 GEMMs (BF16 as fp16; qkv,
+o, up (4,304 padded to 4,352), down (K padded to 4,320), and the merger as three more streamed pieces: mm.0's halves and mm.2),
+`vattn` attention with heads of 72 padded to 96 and the 1/sqrt(72) folded into Q, fused LayerNorm/bias/residual/gelu kernels, the
+picture cut and normalized on the card from the RGB bytes, the position table (pinned host) interpolated on the card. Weights are
+streamed a unit at a time from pinned host memory into two 30.6 MiB staging buffers as Gemma's (`--resident` keeps all 30
+units on the card instead).
+
+| budget (big.jpg) | tokens | patches | streamed | resident | card, streamed / resident |
+|---|---|---|---|---|---|
+| 256 | 238 | 952 | 146 ms | 63 ms | 210 / 1,027 MiB |
+| 1,024 | 986 | 3,944 | 387 ms | 299 ms | 267 / 1,084 MiB |
+| 4,096 | 4,071 | 16,284 | 2.90 s | 2.83 s | 456 / 1,273 MiB |
+
+(A run of the same binary on another day varied by 10%: 132 ms at 256 earlier; read the table as +-10%.) Streaming costs a near
+constant ~65-85 ms (0.9 GB at ~13 GB/s) and saves 817 MiB, i.e. ~11 experts a layer of 256: it is the default. At 1,024 tokens
+(profile, streamed): attention 136 ms (~14 TFLOPS on the real 72 dims), GEMMs 118 (27 TFLOPS), elementwise ~60, copy waits 78.
+GEMM chunks of 2,048 rows beat 1,024 (+8%) and 4,096 (+4%). The card memory while encoding is mostly attention scratch (~75 MiB),
+Q/K/V tiles, residual, GEMM output and the staging; the encoder frees all but 3 MiB on `release()`.
+
+**Checks** against `eklow-oracle --encode-only` with the F32 projector (`tools/vision/check-qwen.sh`; the oracle now loads
+only the vocabulary in that mode, 1.3 s instead of 20 s and gigabytes of repacked experts). The encoder is chaotic in some
+rows: shifting every pixel of an image by one level (+0.4%) moves eklow's own rows by 0.08-0.12 total relative L2, with single
+rows at 0.5-1.0; the stock BF16 projector in the oracle moves the oracle's rows from its F32 run by 2.0e-2 (tall, 64 tokens)
+and 8.7e-2 (test-1, 256), worst row cosine 0.78. Layer by layer (tall, reference) the difference grows smoothly from 2e-4
+to 6.6e-3, no step. Against that: reference vs F32 oracle, 64 tokens: total relative L2 1.1-5.6e-3, mean cosine >= 0.99999,
+worst row cosine 0.9997; fast: 2.1-4.5e-3 (mean cos >= 0.99999); at 256 tokens the reference 1.6e-3..3.3e-2 and fast
+2.2e-3..1.3e-2; fast at 1,024: 2.2e-3..3.6e-2 (gray.png and the alpha PNG 3.1e-2 and 3.6e-2, one row each at cosine 0.88-0.92);
+at 4,096 tokens (6000 x 4000, 4,056 rows) 4.3e-3, mean cosine 0.999992. The band for the fast encoder: mean cosine >= 0.9993 and
+total relative L2 <= 4e-2 against the F32-weight oracle, inside the oracle's own BF16-vs-F32 spread and its sensitivity to
+a pixel level. Fast against reference: 1.9e-3 (test-1, 64 tokens) to 4.4e-2 (test-1, 256, the chaotic image).
+Not done: the model's answers about images (the text side is `qwen/imgserve2`'s).
+
+**Interface for the server**: `model::VisionQwen3VL enc(q, gguf::File::open(mmproj))`; `spec = enc.spec(max_tokens, min_tokens)`;
+`image::qwen3vl_size(w, h, spec)` -> pixels, tokens = (W/32) x (H/32); `QwenImageRows r = enc.encode(bytes, spec)` (or
+`encode(prepare_qwen3vl(decode(bytes), spec))`) -> `r.rows` (`DeviceRows`: fp32 `[n][2048]` on the card, shared_ptr) and
+`r.grid_w, r.grid_h` (merged patches; n = w * h); `reserve(max_tokens)`, `card_bytes(max_tokens)`, `release()` as VisionGemma4V's.
+
+## 2026-11-02 — image input for Qwen3.6 through the engine and the server
+
+`qwen/imgserve2`. The language-model side of images (the encoder is `qwen/vision`'s, DECISIONS above), checked against
+llama.cpp at the oracle's revision on Ornith-1.5 (EKK8) with bartowski's mmproj.
+
+**What llama.cpp does** (mtmd.cpp, mtmd-helper, llama-kv-cache.cpp, ggml-cpu rope): the media marker becomes
+`<|vision_start|>`, the rows, `<|vision_end|>` (the template's `<|vision_start|><|image_pad|><|vision_end|>` gives the same
+ids). An image of nx x ny rows takes n = nx * ny K/V cells but max(nx, ny) positions; row i has the three rotary
+components (p, p + i / nx, p + i % nx) and the text after continues at p + max(nx, ny); text tokens are (p, p, p). IMRoPE
+sections [11, 11, 10, 0] interleave the 32 rotary pairs: pair j takes the time component when j % 3 == 0, the row's when
+j % 3 == 1, the column's when j % 3 == 2. Qwen3-VL images are decoded causally (`mtmd_decode_use_non_causal` is false for
+it; the rows share a time position, and the mask then falls back to raster order), the DeltaNet layers just see the rows.
+
+**Engine.** `Chunk::images` (spans with their grid, rows from the host, never split across chunks) and `Chunk::rope_delta`
+(sequence index minus rotary position at the chunk's start); K/V index stays the sequence index (`pos_`), the rotary
+positions go to `attn_heads` as `rpos_` [3][tokens] with the config's sections. Text-only steps are bit-identical to before
+(checkq ekk8: long 248/244/245/244/245/242 of 256, medians 1.9-3.6e-3, chat 27/27 at 9.5e-4). `Config::vision_reserve_bytes`
+for an encoder loaded after the engine (one loaded before is in the free memory the placement reads).
+
+**Draft.** As llama.cpp's DFlash path: the draft's positions are the target's rotary ones (time component), image rows are
+not injected, and a block is drafted at the rotary position. Our draft restarts its context at the gap an image leaves
+(`Dflash2::inject` with a later position), where llama.cpp's windowed cache keeps the text before the image; acceptance
+after an image is therefore from the text after it (2.4-2.75 tokens per verify, blocks of 4, in the server tests below).
+
+**Server.** `image_url` parts (base64 data: URLs, JPEG/PNG/GIF/BMP; http(s), file: and WebP refused) become the
+template's image item; each `<|image_pad|>` is expanded to the image's rows, named in the prompt by ids below zero
+derived from the image's hash, its budget and the row (`image_row_id`), so prefix reuse and snapshots tell images apart;
+snapshot points never fall inside an image, a prefix never ends inside one, a prefill chunk never splits one (an image
+needs `--chunk`/`--batch` >= its rows). Images are encoded on the request's thread with the scheduler held, the last six by
+hash cached. `--mmproj GGUF` turns it on (checked: qwen3vl_merger, projection width = the model's), `--image-max-tokens`
+(1,024 by default, 8-4,096, at most the chunk) is the encoder's budget, `--vision-reserve-mib` for a late encoder;
+without `--mmproj` an image part gets a 400. The encoder is loaded before the engine, so its weights and scratch (267 MiB
+at 1,024 rows) come out of the experts' share (N = 144 of 256 on a 32k-context two-slot test server). The module has
+`mmproj` and `imageMaxTokens`. `--image-rows-dir` serves llama.cpp's own rows for known pictures (test source).
+
+**Checks against llama.cpp** (`tools/ref/image_logits_compare.py`; text positions after the first image; llama.cpp's own
+oracle with M-RoPE positions for the image chunks; 256-row budget): prompts `one` (1 image, 16 positions after it), `two`
+(2 images, 27) and `turn` (an image in an earlier turn, 42). Token ids and image spans of eklow-prompt equal the oracle's
+in all three (254, 401, 291 tokens).
+
+| top-1 / median KL after the image | llama.cpp CPU vs CUDA (the band) | engine, CPU's rows | engine, eklow's encoder |
+|---|---|---|---|
+| one | 13/16, 1.0e-2 | 16/16, 8.5e-3 | 15/16, 1.0e-2 |
+| two | 21/27, 5.9e-2 | 23/27, 5.2e-2 | 21/27, 6.5e-2 |
+| turn | 38/42, 2.8e-2 | 34/42, 9.5e-3 | 36/42, 1.0e-2 |
+
+Chunks of 300, 20 tokens decoded after the prompt, and verify blocks of 8 (accepting 3) after it stay in the same range
+(turn 36/42 and 38/42, medians 7.8e-3 to 9.5e-3). The 4090 run needed the userspace driver of the loaded kernel module
+(595.112.07; the 595.104.02 in the task text no longer matches). The CPU oracle against itself (a rerun with other
+threading) lands in the same range, so these are the noise of this model on short texts.
+
+**Server tests** (Ornith EKK8 + Inco's draft, 2 slots, 32k, through the HTTP API): descriptions of the NYT front page
+(correct headline, date, Aldrin photo) and of a llama.cpp logo, a comparison of two images, a second turn that cites
+the picture's colours, one text-only follow-up after an image turn, two image requests at once on the two slots, tall and
+wide pictures told apart. Prefix reuse with images: a second turn of a 480-token prompt cached 461, a repeat 315 of 322
+(prompts under snapshot_min = 256 tokens reuse nothing, as for text). Encoding 0.12-0.31 s at 120-800 rows.
+Errors: http(s) 400, undecodable bytes 400, no `--mmproj` 400 (`image input is off`).

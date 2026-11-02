@@ -1,0 +1,8 @@
+conversation of about 10000 tokens:
+  turn 1: prompt 9957, cached 0, completion 1292, ttft 9.24 s (1078 tok/s over the uncached part)
+  turn 2: prompt 10057, cached 9952, completion 1318, ttft 0.61 s (171 tok/s over the uncached part)
+  turn 3: prompt 10112, cached 10052, completion 217, ttft 0.54 s (112 tok/s over the uncached part)
+document of about 100000 tokens:
+  question 1: prompt 99943, cached 0, ttft 146.25 s (683 tok/s over the uncached part)
+  question 2: prompt 99941, cached 99924, ttft 0.28 s (61 tok/s over the uncached part)
+  question 3: prompt 99944, cached 99924, ttft 0.31 s (65 tok/s over the uncached part)

@@ -6,9 +6,9 @@
 import json, sys, threading, time, urllib.request
 
 NEEDLES = {"a": (0.02, "plum-anchor-4417"), "b": (0.55, "cobalt-heron-2093")}
-QUESTION = ("What is the passphrase for the eklow vault, given in a note somewhere in the code above? "
+QUESTION = ("What is the passphrase for the eklow vault, given in a note somewhere in the text above? "
             "Reply with the passphrase alone on the first line, then describe in about 250 words what "
-            "the code above does.")
+            "the text above is about.")
 
 
 def build(hay_a, hay_b, bytes_a, bytes_b, out):
@@ -20,7 +20,7 @@ def build(hay_a, hay_b, bytes_a, bytes_b, out):
         text = text[:cut] + note + text[cut:]
         content = text + "\n\n" + QUESTION
         open(f"{out}/req-{key}.txt", "w").write(content)
-        body = {"model": "gemma-4-12b", "stream": True, "max_tokens": 700, "temperature": 0,
+        body = {"model": "qwen3.6-35b-a3b", "stream": True, "max_tokens": 700, "temperature": 0,
                 "reasoning_effort": "none", "stream_options": {"include_usage": True},
                 "messages": [{"role": "user", "content": content}]}
         json.dump(body, open(f"{out}/req-{key}.json", "w"))

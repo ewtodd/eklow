@@ -64,6 +64,100 @@ inline float dot_q6_k(const uint8_t* row, const float* x, int64_t k) {
   return acc;
 }
 
+// K-quant and IQ4_XS blocks (256 weights): decoded as ggml's dequantize_row_q4_K / q5_K / iq4_xs do,
+// then dotted.
+inline void scale_min_k4(int j, const uint8_t* q, uint8_t& d, uint8_t& m) {
+  if (j < 4) {
+    d = q[j] & 63;
+    m = q[j + 4] & 63;
+  } else {
+    d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4);
+    m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4);
+  }
+}
+
+// Q4_K (144 bytes): fp16 d, fp16 dmin, 12 bytes of 6-bit scales and mins, 128 bytes of nibbles.
+inline void decode_q4_k(const uint8_t* blk, float* y) {
+  const float d = half_at(blk), mn = half_at(blk + 2);
+  const uint8_t* sc = blk + 4;
+  const uint8_t* q = blk + 16;
+  int is = 0;
+  for (int j = 0; j < 256; j += 64) {
+    uint8_t s, m;
+    scale_min_k4(is, sc, s, m);
+    const float d1 = d * s, m1 = mn * m;
+    scale_min_k4(is + 1, sc, s, m);
+    const float d2 = d * s, m2 = mn * m;
+    for (int l = 0; l < 32; ++l) *y++ = d1 * (q[l] & 0xF) - m1;
+    for (int l = 0; l < 32; ++l) *y++ = d2 * (q[l] >> 4) - m2;
+    q += 32;
+    is += 2;
+  }
+}
+
+// Q5_K (176 bytes): as Q4_K, then 32 bytes of high bits before the 128 bytes of low nibbles.
+inline void decode_q5_k(const uint8_t* blk, float* y) {
+  const float d = half_at(blk), mn = half_at(blk + 2);
+  const uint8_t* sc = blk + 4;
+  const uint8_t* qh = blk + 16;
+  const uint8_t* ql = blk + 48;
+  int is = 0;
+  uint8_t u1 = 1, u2 = 2;
+  for (int j = 0; j < 256; j += 64) {
+    uint8_t s, m;
+    scale_min_k4(is, sc, s, m);
+    const float d1 = d * s, m1 = mn * m;
+    scale_min_k4(is + 1, sc, s, m);
+    const float d2 = d * s, m2 = mn * m;
+    for (int l = 0; l < 32; ++l) *y++ = d1 * ((ql[l] & 0xF) + (qh[l] & u1 ? 16 : 0)) - m1;
+    for (int l = 0; l < 32; ++l) *y++ = d2 * ((ql[l] >> 4) + (qh[l] & u2 ? 16 : 0)) - m2;
+    ql += 32;
+    is += 2;
+    u1 <<= 2;
+    u2 <<= 2;
+  }
+}
+
+// IQ4_XS (136 bytes): fp16 d, uint16 scales_h, 4 bytes scales_l, 128 bytes of nibbles indexing a
+// non-linear table; sub-block ib of 32 has scale d * (ls - 32), ls 6 bits.
+inline void decode_iq4_xs(const uint8_t* blk, float* y) {
+  constexpr int8_t table[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+  const float d = half_at(blk);
+  const uint32_t scales_h = uint32_t(blk[2]) | uint32_t(blk[3]) << 8;
+  const uint8_t* scales_l = blk + 4;
+  const uint8_t* qs = blk + 8;
+  for (int ib = 0; ib < 8; ++ib) {
+    const int ls = ((scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((scales_h >> (2 * ib)) & 3) << 4);
+    const float dl = d * float(ls - 32);
+    for (int j = 0; j < 16; ++j) {
+      y[j] = dl * float(table[qs[j] & 0xf]);
+      y[j + 16] = dl * float(table[qs[j] >> 4]);
+    }
+    y += 32;
+    qs += 16;
+  }
+}
+
+inline void decode_block(gguf::Type t, const uint8_t* blk, float* y) {
+  if (t == gguf::Type::Q4_K) decode_q4_k(blk, y);
+  else if (t == gguf::Type::Q5_K) decode_q5_k(blk, y);
+  else decode_iq4_xs(blk, y);
+}
+
+inline uint32_t block_bytes(gguf::Type t) { return t == gguf::Type::Q4_K ? 144 : t == gguf::Type::Q5_K ? 176 : 136; }
+
+inline float dot_kblocks(gguf::Type t, const uint8_t* row, const float* x, int64_t k) {
+  float acc = 0;
+  float y[256];
+  for (int64_t b = 0; b < k / 256; ++b) {
+    decode_block(t, row + b * block_bytes(t), y);
+    float s = 0;
+    for (int i = 0; i < 256; ++i) s += y[i] * x[b * 256 + i];
+    acc += s;
+  }
+  return acc;
+}
+
 // Q8_0 (32 weights, 34 bytes): fp16 d, then 32 int8; w = q * d.
 inline float dot_q8_0(const uint8_t* row, const float* x, int64_t k) {
   float acc = 0;
@@ -93,6 +187,13 @@ inline float weight_at(gguf::Type t, const uint8_t* row, int64_t i) {
       return half_at(blk) * float(int(j < 16 ? v & 15 : v >> 4) - 8);
     }
     case gguf::Type::Q6_K: return q6k_weight(row + (i / 256) * 210, int(i % 256));
+    case gguf::Type::Q4_K:
+    case gguf::Type::Q5_K:
+    case gguf::Type::IQ4_XS: {
+      float y[256];
+      decode_block(t, row + (i / 256) * block_bytes(t), y);
+      return y[i % 256];
+    }
     default: return 0;
   }
 }
@@ -104,7 +205,10 @@ void check_type(const Weight& w) {
     case gguf::Type::BF16:
     case gguf::Type::Q4_0:
     case gguf::Type::Q8_0:
-    case gguf::Type::Q6_K: return;
+    case gguf::Type::Q6_K:
+    case gguf::Type::Q4_K:
+    case gguf::Type::Q5_K:
+    case gguf::Type::IQ4_XS: return;
     default: throw std::runtime_error(std::string("ref: no reference kernel for ") + gguf::type_name(w.type));
   }
 }
@@ -149,6 +253,8 @@ void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, flo
        if (ww.type == gguf::Type::Q4_0) acc = dot_q4_0(row, xm, ww.k);
        else if (ww.type == gguf::Type::Q8_0) acc = dot_q8_0(row, xm, ww.k);
        else if (ww.type == gguf::Type::Q6_K) acc = dot_q6_k(row, xm, ww.k);
+       else if (ww.type == gguf::Type::Q4_K || ww.type == gguf::Type::Q5_K || ww.type == gguf::Type::IQ4_XS)
+         acc = dot_kblocks(ww.type, row, xm, ww.k);
        else {
          acc = 0;
          for (int64_t i = 0; i < ww.k; ++i) acc += weight_at(ww.type, row, i) * xm[i];
@@ -338,6 +444,147 @@ void scale(sycl::queue& q, float* x, float s, int64_t n) {
 
 void softcap(sycl::queue& q, float* x, float cap, int64_t n) {
   q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { x[id[0]] = cap * sycl::tanh(x[id[0]] / cap); });
+}
+
+// ---- Qwen3.5/3.6 ----
+
+void silu(sycl::queue& q, const float* x, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+     const float v = x[id[0]];
+     out[id[0]] = v / (1.0f + sycl::exp(-v));
+   });
+}
+
+void swiglu(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+     const float g = gate[id[0]];
+     out[id[0]] = g / (1.0f + sycl::exp(-g)) * up[id[0]];
+   });
+}
+
+void sigmoid(sycl::queue& q, const float* x, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = 1.0f / (1.0f + sycl::exp(-x[id[0]])); });
+}
+
+void softplus(sycl::queue& q, const float* x, int64_t n, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
+     const float v = x[id[0]];
+     out[id[0]] = v > 20.0f ? v : sycl::log(1.0f + sycl::exp(v));
+   });
+}
+
+void mul_by_row_scalar(sycl::queue& q, const float* x, const float* s, int64_t rows, int64_t cols, float* out) {
+  q.parallel_for(sycl::range<2>(size_t(rows), size_t(cols)), [=](sycl::id<2> id) {
+     const int64_t r = int64_t(id[0]), c = int64_t(id[1]);
+     out[r * cols + c] = x[r * cols + c] * s[r];
+   });
+}
+
+void causal_conv(sycl::queue& q, const float* x, const float* w, int64_t n_tok, int64_t channels, int64_t kernel,
+                 float* out) {
+  q.parallel_for(sycl::range<2>(size_t(n_tok), size_t(channels)), [=](sycl::id<2> id) {
+     const int64_t t = int64_t(id[0]), c = int64_t(id[1]);
+     float acc = 0;
+     for (int64_t j = 0; j < kernel; ++j) {
+       const int64_t src = t - (kernel - 1) + j;
+       acc += (src >= 0 ? x[src * channels + c] : 0.0f) * w[c * kernel + j];
+     }
+     out[t * channels + c] = acc;
+   });
+}
+
+void l2_norm_heads(sycl::queue& q, const float* x, int64_t tok_stride, int64_t n_tok, int64_t n_heads, int64_t cols,
+                   float eps, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(n_tok * n_heads)), [=](sycl::id<1> id) {
+     const int64_t r = int64_t(id[0]);
+     const float* xr = x + (r / n_heads) * tok_stride + (r % n_heads) * cols;
+     float ss = 0;
+     for (int64_t i = 0; i < cols; ++i) ss += xr[i] * xr[i];
+     const float scale = 1.0f / sycl::sqrt(ss / float(cols) + eps / float(cols)) * (1.0f / sycl::sqrt(float(cols)));
+     for (int64_t i = 0; i < cols; ++i) out[r * cols + i] = xr[i] * scale;
+   });
+}
+
+void gated_delta_rule(sycl::queue& q, const float* qv, const float* kv, const float* v, int64_t v_stride,
+                      const float* g, const float* beta, int64_t n_tok, int64_t n_k_heads, int64_t n_v_heads, int64_t s,
+                      float* state, float* out) {
+  q.fill(state, 0.0f, size_t(n_v_heads * s * s));
+  const float qscale = 1.0f / std::sqrt(float(s));
+  // Tokens per launch: each work-item does about 6 * s multiply-adds a token; 256 keeps a launch to a
+  // few milliseconds at s = 128 and the 5 s limit out of sight.
+  const int64_t per = 256;
+  for (int64_t t0 = 0; t0 < n_tok; t0 += per) {
+    const int64_t tc = std::min(per, n_tok - t0);
+    q.parallel_for(sycl::range<2>(size_t(n_v_heads), size_t(s)), [=](sycl::id<2> id) {
+       const int64_t h = int64_t(id[0]), j = int64_t(id[1]), kh = h % n_k_heads;
+       float* S = state + (h * s + j) * s;  // column j of the state, key index i fastest
+       for (int64_t t = t0; t < t0 + tc; ++t) {
+         const float* kt = kv + (t * n_k_heads + kh) * s;
+         const float* qt = qv + (t * n_k_heads + kh) * s;
+         const float decay = sycl::exp(g[t * n_v_heads + h]);
+         float sk = 0;
+         for (int64_t i = 0; i < s; ++i) {
+           S[i] *= decay;
+           sk += S[i] * kt[i];
+         }
+         const float d = (v[t * v_stride + h * s + j] - sk) * beta[t * n_v_heads + h];
+         float o = 0;
+         for (int64_t i = 0; i < s; ++i) {
+           S[i] += kt[i] * d;
+           o += S[i] * (qt[i] * qscale);
+         }
+         out[(t * n_v_heads + h) * s + j] = o;
+       }
+     });
+  }
+}
+
+void gated_rmsnorm(sycl::queue& q, const float* x, const float* z, const float* w, int64_t rows, int64_t cols,
+                   float eps, float* out) {
+  q.parallel_for(sycl::range<1>(size_t(rows)), [=](sycl::id<1> id) {
+     const int64_t r = int64_t(id[0]);
+     const float* xr = x + r * cols;
+     float ss = 0;
+     for (int64_t i = 0; i < cols; ++i) ss += xr[i] * xr[i];
+     const float inv = 1.0f / sycl::sqrt(ss / float(cols) + eps);
+     for (int64_t i = 0; i < cols; ++i) {
+       const float zi = z[r * cols + i];
+       out[r * cols + i] = xr[i] * inv * w[i] * (zi / (1.0f + sycl::exp(-zi)));
+     }
+   });
+}
+
+void split_q_gate(sycl::queue& q, const float* full, int64_t n_tok, int64_t n_head, int64_t d, float* qout,
+                  float* gate) {
+  q.parallel_for(sycl::range<3>(size_t(n_tok), size_t(n_head), size_t(d)), [=](sycl::id<3> id) {
+     const int64_t t = int64_t(id[0]), h = int64_t(id[1]), i = int64_t(id[2]);
+     const float* src = full + (t * n_head + h) * 2 * d;
+     qout[(t * n_head + h) * d + i] = src[i];
+     gate[(t * n_head + h) * d + i] = src[d + i];
+   });
+}
+
+void gather_rows(sycl::queue& q, const float* src, const int32_t* ids, int64_t n, int64_t cols, float* dst) {
+  q.parallel_for(sycl::range<2>(size_t(n), size_t(cols)), [=](sycl::id<2> id) {
+     const int64_t i = int64_t(id[0]), c = int64_t(id[1]);
+     dst[i * cols + c] = src[int64_t(ids[i]) * cols + c];
+   });
+}
+
+void scatter_add_rows(sycl::queue& q, const float* src, const int32_t* ids, const float* w, int64_t n,
+                      int64_t cols, float* dst) {
+  q.parallel_for(sycl::range<2>(size_t(n), size_t(cols)), [=](sycl::id<2> id) {
+     const int64_t i = int64_t(id[0]), c = int64_t(id[1]);
+     dst[int64_t(ids[i]) * cols + c] += w[i] * src[i * cols + c];
+   });
+}
+
+void split_gate_up(sycl::queue& q, const float* gu, int64_t n, int64_t f, float* gate, float* up) {
+  q.parallel_for(sycl::range<2>(size_t(n), size_t(f)), [=](sycl::id<2> id) {
+     const int64_t i = int64_t(id[0]), j = int64_t(id[1]);
+     gate[i * f + j] = gu[i * 2 * f + j];
+     up[i * f + j] = gu[i * 2 * f + f + j];
+   });
 }
 
 }  // namespace eklow::ref

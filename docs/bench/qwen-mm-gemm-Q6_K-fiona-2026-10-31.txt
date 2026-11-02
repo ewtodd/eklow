@@ -1,0 +1,41 @@
+== Q6_K (Q6_K)
+  Q6_K     expert gate|up             2048x1024    rows  64  vs fp32  4.40e-04  vs emul  7.27e-06 
+  Q6_K     expert gate|up             2048x1024    rows 256  vs fp32  3.76e-04  vs emul  6.27e-06 
+  Q6_K     expert gate|up             2048x1024    rows 2048  vs fp32  3.76e-04  vs emul  6.85e-06 
+  Q6_K     expert down                 512x2048    rows  64  vs fp32  3.05e-04  vs emul  3.69e-06 
+  Q6_K     expert down                 512x2048    rows 256  vs fp32  3.72e-04  vs emul  5.30e-06 
+  Q6_K     expert down                 512x2048    rows 2048  vs fp32  3.55e-04  vs emul  3.55e-06 
+  Q6_K     attn_qkv / attn_q          2048x8192    rows  64  vs fp32  3.28e-04  vs emul  5.70e-06 
+  Q6_K     attn_qkv / attn_q          2048x8192    rows 256  vs fp32  3.45e-04  vs emul  7.52e-06 
+  Q6_K     attn_qkv / attn_q          2048x8192    rows 2048  vs fp32  3.72e-04  vs emul  6.65e-06 
+  Q6_K     attn_gate                  2048x4096    rows  64  vs fp32  3.69e-04  vs emul  1.16e-05 
+  Q6_K     attn_gate                  2048x4096    rows 256  vs fp32  3.53e-04  vs emul  8.73e-06 
+  Q6_K     attn_gate                  2048x4096    rows 2048  vs fp32  3.31e-04  vs emul  1.03e-05 
+  Q6_K     ssm_out / attn_output      4096x2048    rows  64  vs fp32  3.37e-04  vs emul  1.52e-05 
+  Q6_K     ssm_out / attn_output      4096x2048    rows 256  vs fp32  3.67e-04  vs emul  1.09e-05 
+  Q6_K     ssm_out / attn_output      4096x2048    rows 2048  vs fp32  3.31e-04  vs emul  1.03e-05 
+  Q6_K     attn_k / attn_v            2048x512     rows  64  vs fp32  3.67e-04  vs emul  5.56e-06 
+  Q6_K     attn_k / attn_v            2048x512     rows 256  vs fp32  3.54e-04  vs emul  1.02e-05 
+  Q6_K     attn_k / attn_v            2048x512     rows 2048  vs fp32  3.53e-04  vs emul  6.32e-06 
+  Q6_K     SwiGLU   gate|up 2048x1024   rows  64  vs fp32  5.39e-04 
+  Q6_K     SwiGLU   gate|up 2048x1024   rows 256  vs fp32  6.08e-04 
+  Q6_K     SwiGLU   gate|up 2048x1024   rows 2048  vs fp32  5.70e-04 
+  Q6_K     GeGLU    gate|up 2048x1024   rows  64  vs fp32  5.84e-04 
+  Q6_K     GeGLU    gate|up 2048x1024   rows 256  vs fp32  5.50e-04 
+  Q6_K     GeGLU    gate|up 2048x1024   rows 2048  vs fp32  5.55e-04 
+  Q6_K     expert gate|up           2048x1024    rows 2048      0.239 ms    35.9 TFLOPS 
+  Q6_K     expert gate|up           2048x1024    rows 4096      0.452 ms    38.0 TFLOPS 
+  Q6_K     expert gate|up + SwiGLU  2048x1024    rows 2048      0.220 ms    39.1 TFLOPS (GLU epilogue, TFLOPS counted on the stacked matrix)
+  Q6_K     expert gate|up + SwiGLU  2048x1024    rows 4096      0.422 ms    40.7 TFLOPS (GLU epilogue, TFLOPS counted on the stacked matrix)
+  Q6_K     expert down               512x2048    rows 2048      0.139 ms    30.9 TFLOPS 
+  Q6_K     expert down               512x2048    rows 4096      0.246 ms    34.9 TFLOPS 
+  Q6_K     attn_qkv / attn_q        2048x8192    rows 2048      1.386 ms    49.6 TFLOPS 
+  Q6_K     attn_qkv / attn_q        2048x8192    rows 4096      2.724 ms    50.5 TFLOPS 
+  Q6_K     attn_gate                2048x4096    rows 2048      0.719 ms    47.8 TFLOPS 
+  Q6_K     attn_gate                2048x4096    rows 4096      1.396 ms    49.2 TFLOPS 
+  Q6_K     ssm_out / attn_output    4096x2048    rows 2048      0.724 ms    47.5 TFLOPS 
+  Q6_K     ssm_out / attn_output    4096x2048    rows 4096      1.447 ms    47.5 TFLOPS 
+  Q6_K     attn_k / attn_v          2048x512     rows 2048      0.156 ms    27.6 TFLOPS 
+  Q6_K     attn_k / attn_v          2048x512     rows 4096      0.220 ms    39.1 TFLOPS 
+  Q6_K     grouped16 tile  64  gate|up+SwiGLU    3.584 ms   19.2 TFLOPS (  27.6 padded)   down    2.257 ms   15.2 TFLOPS (  21.9 padded)   vs dense: gate|up 0.00e+00  down 0.00e+00 
+  Q6_K     grouped16 tile 128  gate|up+SwiGLU    2.847 ms   24.1 TFLOPS (  48.3 padded)   down    1.959 ms   17.5 TFLOPS (  35.1 padded)

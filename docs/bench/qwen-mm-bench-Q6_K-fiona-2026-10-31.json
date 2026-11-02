@@ -1,0 +1,459 @@
+{
+  "device": "Intel(R) Arc(TM) A770M Graphics",
+  "decode_Q6_K": [
+    {
+      "format": "Q6_K",
+      "shape": "expert gate|up",
+      "k": 2048,
+      "n": 1024,
+      "rows": 1,
+      "ms": 0.010604974576271187,
+      "weight_gbps": 162.21821067343677,
+      "bytes": 1720320
+    },
+    {
+      "format": "Q6_K",
+      "shape": "expert gate|up",
+      "k": 2048,
+      "n": 1024,
+      "rows": 2,
+      "ms": 0.011786728813559324,
+      "weight_gbps": 145.95398156789378,
+      "bytes": 1720320
+    },
+    {
+      "format": "Q6_K",
+      "shape": "expert gate|up",
+      "k": 2048,
+      "n": 1024,
+      "rows": 8,
+      "ms": 0.01191200847457627,
+      "weight_gbps": 144.41897045923605,
+      "bytes": 1720320
+    },
+    {
+      "format": "Q6_K",
+      "shape": "expert gate|up",
+      "k": 2048,
+      "n": 1024,
+      "rows": 16,
+      "ms": 0.01693383050847458,
+      "weight_gbps": 101.5907180090802,
+      "bytes": 1720320
+    },
+    {
+      "format": "Q6_K",
+      "shape": "expert gate|up",
+      "k": 2048,
+      "n": 1024,
+      "rows": 32,
+      "ms": 0.027208415254237287,
+      "weight_gbps": 63.22749722559042,
+      "bytes": 1720320
+    },
+    {
+      "format": "Q6_K",
+      "shape": "expert down",
+      "k": 512,
+      "n": 2048,
+      "rows": 1,
+      "ms": 0.008378203125,
+      "weight_gbps": 102.66640557249559,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "expert down",
+      "k": 512,
+      "n": 2048,
+      "rows": 2,
+      "ms": 0.0093042734375,
+      "weight_gbps": 92.44784192747453,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "expert down",
+      "k": 512,
+      "n": 2048,
+      "rows": 8,
+      "ms": 0.0096495625,
+      "weight_gbps": 89.13979260717778,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "expert down",
+      "k": 512,
+      "n": 2048,
+      "rows": 16,
+      "ms": 0.0140553203125,
+      "weight_gbps": 61.198178403307026,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "expert down",
+      "k": 512,
+      "n": 2048,
+      "rows": 32,
+      "ms": 0.0240323984375,
+      "weight_gbps": 35.79168355738526,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_qkv / attn_q",
+      "k": 2048,
+      "n": 8192,
+      "rows": 1,
+      "ms": 0.04671625,
+      "weight_gbps": 294.5989885746394,
+      "bytes": 13762560
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_qkv / attn_q",
+      "k": 2048,
+      "n": 8192,
+      "rows": 2,
+      "ms": 0.05366525,
+      "weight_gbps": 256.45198708661565,
+      "bytes": 13762560
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_qkv / attn_q",
+      "k": 2048,
+      "n": 8192,
+      "rows": 8,
+      "ms": 0.054063,
+      "weight_gbps": 254.56522945452528,
+      "bytes": 13762560
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_qkv / attn_q",
+      "k": 2048,
+      "n": 8192,
+      "rows": 16,
+      "ms": 0.07550581249999999,
+      "weight_gbps": 182.2715304202574,
+      "bytes": 13762560
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_qkv / attn_q",
+      "k": 2048,
+      "n": 8192,
+      "rows": 32,
+      "ms": 0.12912856250000002,
+      "weight_gbps": 106.58029279927901,
+      "bytes": 13762560
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_gate",
+      "k": 2048,
+      "n": 4096,
+      "rows": 1,
+      "ms": 0.027973400000000002,
+      "weight_gbps": 245.99369400930883,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_gate",
+      "k": 2048,
+      "n": 4096,
+      "rows": 2,
+      "ms": 0.03463053333333333,
+      "weight_gbps": 198.705573886628,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_gate",
+      "k": 2048,
+      "n": 4096,
+      "rows": 8,
+      "ms": 0.03474803333333333,
+      "weight_gbps": 198.0336537031832,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_gate",
+      "k": 2048,
+      "n": 4096,
+      "rows": 16,
+      "ms": 0.0457692,
+      "weight_gbps": 150.34739519152618,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_gate",
+      "k": 2048,
+      "n": 4096,
+      "rows": 32,
+      "ms": 0.07259963333333333,
+      "weight_gbps": 94.78394978119725,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "ssm_out / attn_output",
+      "k": 4096,
+      "n": 2048,
+      "rows": 1,
+      "ms": 0.027617066666666665,
+      "weight_gbps": 249.1676644393805,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "ssm_out / attn_output",
+      "k": 4096,
+      "n": 2048,
+      "rows": 2,
+      "ms": 0.0395251,
+      "weight_gbps": 174.0989902618842,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "ssm_out / attn_output",
+      "k": 4096,
+      "n": 2048,
+      "rows": 8,
+      "ms": 0.04024826666666667,
+      "weight_gbps": 170.9708409803155,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "ssm_out / attn_output",
+      "k": 4096,
+      "n": 2048,
+      "rows": 16,
+      "ms": 0.04866903333333334,
+      "weight_gbps": 141.38928860308846,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "ssm_out / attn_output",
+      "k": 4096,
+      "n": 2048,
+      "rows": 32,
+      "ms": 0.0781515,
+      "weight_gbps": 88.05051726454387,
+      "bytes": 6881280
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_k / attn_v",
+      "k": 2048,
+      "n": 512,
+      "rows": 1,
+      "ms": 0.0083984375,
+      "weight_gbps": 102.4190511627907,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_k / attn_v",
+      "k": 2048,
+      "n": 512,
+      "rows": 2,
+      "ms": 0.00952625,
+      "weight_gbps": 90.29366224904868,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_k / attn_v",
+      "k": 2048,
+      "n": 512,
+      "rows": 8,
+      "ms": 0.0096591953125,
+      "weight_gbps": 89.05089628810629,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_k / attn_v",
+      "k": 2048,
+      "n": 512,
+      "rows": 16,
+      "ms": 0.0141756796875,
+      "weight_gbps": 60.67857196000853,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "attn_k / attn_v",
+      "k": 2048,
+      "n": 512,
+      "rows": 32,
+      "ms": 0.02312715625,
+      "weight_gbps": 37.19264014571614,
+      "bytes": 860160
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head",
+      "k": 2048,
+      "n": 248320,
+      "rows": 1,
+      "ms": 1.1692122500000002,
+      "weight_gbps": 356.80228290457956,
+      "bytes": 417177600
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head",
+      "k": 2048,
+      "n": 248320,
+      "rows": 2,
+      "ms": 1.1608945,
+      "weight_gbps": 359.3587530994419,
+      "bytes": 417177600
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head",
+      "k": 2048,
+      "n": 248320,
+      "rows": 8,
+      "ms": 1.183754875,
+      "weight_gbps": 352.4189076729251,
+      "bytes": 417177600
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head",
+      "k": 2048,
+      "n": 248320,
+      "rows": 16,
+      "ms": 1.853562625,
+      "weight_gbps": 225.06798225929919,
+      "bytes": 417177600
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head",
+      "k": 2048,
+      "n": 248320,
+      "rows": 32,
+      "ms": 4.92403025,
+      "weight_gbps": 84.72279389429015,
+      "bytes": 417177600
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head (fast::matmul_q6)",
+      "rows": 1,
+      "ms": 1.646506,
+      "weight_gbps": 253.37144231481696
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head (fast::matmul_q6)",
+      "rows": 2,
+      "ms": 2.787405,
+      "weight_gbps": 149.66522625883212
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head (fast::matmul_q6)",
+      "rows": 8,
+      "ms": 8.98092575,
+      "weight_gbps": 46.451514199413126
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head (fast::matmul_q6)",
+      "rows": 16,
+      "ms": 17.966206,
+      "weight_gbps": 23.22012783333332
+    },
+    {
+      "format": "Q6_K",
+      "shape": "head (fast::matmul_q6)",
+      "rows": 32,
+      "ms": 35.921945625,
+      "weight_gbps": 11.61344667560723
+    },
+    {
+      "format": "Q6_K",
+      "grouped": "gate_up",
+      "pairs": 8,
+      "distinct": 7.84375,
+      "ms": 0.054710218750000005,
+      "weight_gbps": 246.64057845683536
+    },
+    {
+      "format": "Q6_K",
+      "grouped": "gate_up_swiglu",
+      "pairs": 8,
+      "ms": 0.06472334375000001,
+      "weight_gbps": 208.4836662969842
+    },
+    {
+      "format": "Q6_K",
+      "grouped": "gate_up",
+      "pairs": 16,
+      "distinct": 15.5,
+      "ms": 0.09611921875,
+      "weight_gbps": 277.415488252707
+    },
+    {
+      "format": "Q6_K",
+      "grouped": "gate_up_swiglu",
+      "pairs": 16,
+      "ms": 0.10592078125,
+      "weight_gbps": 251.74436673634335
+    },
+    {
+      "format": "Q6_K",
+      "grouped": "gate_up",
+      "pairs": 32,
+      "distinct": 30.46875,
+      "ms": 0.18461487499999998,
+      "weight_gbps": 283.9207837396635
+    },
+    {
+      "format": "Q6_K",
+      "grouped": "gate_up_swiglu",
+      "pairs": 32,
+      "ms": 0.19528546875,
+      "weight_gbps": 268.40706753814726
+    },
+    {
+      "format": "Q6_K",
+      "grouped": "down",
+      "pairs": 8,
+      "distinct": 7.9375,
+      "ms": 0.03731721875,
+      "weight_gbps": 182.95897252525015
+    },
+    {
+      "format": "Q6_K",
+      "grouped": "down",
+      "pairs": 16,
+      "distinct": 15.5625,
+      "ms": 0.056635000000000005,
+      "weight_gbps": 236.35984815043702
+    },
+    {
+      "format": "Q6_K",
+      "grouped": "down",
+      "pairs": 32,
+      "distinct": 30.15625,
+      "ms": 0.09933775,
+      "weight_gbps": 261.12127564797873
+    }
+  ]
+}

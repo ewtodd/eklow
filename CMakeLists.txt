@@ -40,16 +40,20 @@ endfunction()
 
 # Serving text layer: the tokenizer (and, later, the chat template and output parser). No device code.
 add_library(eklow_text STATIC
-  src/text/chat_gemma4.cpp
-  src/text/output_parser.cpp
+  src/text/chat_qwen36.cpp
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
+  src/text/output_parser_qwen.cpp
+  src/text/tokenizer_qwen.cpp
+  src/text/tool_schema.cpp
+  src/text/unicode.cpp
 )
 target_link_libraries(eklow_text PUBLIC eklow_host)
 
 # Images for Gemma 4's vision encoders: decoding (stb_image, vendored) and preparation. No device code.
 add_library(eklow_image STATIC
   src/image/gemma4_image.cpp
+  src/image/qwen3vl_image.cpp
   src/image/stb_image.cpp
 )
 target_include_directories(eklow_image PUBLIC src third_party)
@@ -74,13 +78,23 @@ eklow_sycl(eklow_rt)
 add_library(eklow_model STATIC
   src/kernels/attention.cpp
   src/kernels/fast.cpp
+  src/kernels/gdn.cpp
+  src/kernels/qwen_fast.cpp
   src/kernels/ref.cpp
   src/kernels/xmx.cpp
+  src/kernels/xmx_fmt.cpp
+  src/kernels/xmx_gemv_iq4xs.cpp
+  src/kernels/xmx_gemv_q4k.cpp
+  src/kernels/xmx_gemv_q5k.cpp
+  src/kernels/xmx_gemv_q6k.cpp
+  src/kernels/xmx_gemv_q8.cpp
   src/model/embed_gemma2.cpp
   src/model/vision_gemma4v.cpp
   src/model/vision_gemma4v_fast.cpp
+  src/model/vision_qwen3vl.cpp
+  src/model/vision_qwen3vl_fast.cpp
   src/kernels/vision_attn.cpp
-  src/model/gemma4.cpp
+  src/model/qwen35.cpp
 )
 target_link_libraries(eklow_model PUBLIC eklow_host eklow_image eklow_rt)
 eklow_sycl(eklow_model)
@@ -88,6 +102,11 @@ eklow_sycl(eklow_model)
 add_executable(eklow-kernel-test tools/kernel_test/main.cpp)
 target_link_libraries(eklow-kernel-test PRIVATE eklow_model)
 eklow_sycl(eklow-kernel-test)
+
+# The Qwen weight formats' kernels, checked against ggml's dequantization and timed (TASK qwen/mm).
+add_executable(eklow-qfmt-test tools/qfmt_test/main.cpp)
+target_link_libraries(eklow-qfmt-test PRIVATE eklow_model)
+eklow_sycl(eklow-qfmt-test)
 
 add_executable(eklow-embed tools/embed/main.cpp)
 target_link_libraries(eklow-embed PRIVATE eklow_model eklow_text)
@@ -97,9 +116,21 @@ add_executable(eklow-vision tools/vision/main.cpp)
 target_link_libraries(eklow-vision PRIVATE eklow_model)
 eklow_sycl(eklow-vision)
 
+add_executable(eklow-vision-qwen tools/vision/qwen_main.cpp)
+target_link_libraries(eklow-vision-qwen PRIVATE eklow_model)
+eklow_sycl(eklow-vision-qwen)
+
 add_executable(eklow-attn-test tools/attn_test/main.cpp)
 target_link_libraries(eklow-attn-test PRIVATE eklow_model)
 eklow_sycl(eklow-attn-test)
+
+add_executable(eklow-gdn-test tools/gdn_test/main.cpp)
+target_link_libraries(eklow-gdn-test PRIVATE eklow_model)
+eklow_sycl(eklow-gdn-test)
+
+add_executable(eklow-dequant-test tools/dequant_test/main.cpp)
+target_link_libraries(eklow-dequant-test PRIVATE eklow_model)
+eklow_sycl(eklow-dequant-test)
 
 add_executable(eklow-ref-run tools/ref_run/main.cpp)
 target_link_libraries(eklow-ref-run PRIVATE eklow_model)
@@ -119,19 +150,17 @@ target_link_libraries(eklow-engine-bench PRIVATE eklow_engine)
 eklow_sycl(eklow-engine-bench)
 
 # The tool-call grammar: host code over the vocabulary, tested against the output parser.
-add_library(eklow_grammar STATIC src/serve/tool_grammar.cpp)
+add_library(eklow_grammar STATIC src/serve/tool_grammar_qwen.cpp)
 target_link_libraries(eklow_grammar PUBLIC eklow_text)
 
-add_executable(eklow-grammar-test tools/grammar_test/main.cpp)
-target_link_libraries(eklow-grammar-test PRIVATE eklow_grammar)
+add_executable(eklow-grammar-test-qwen tools/grammar_test/main.cpp)
+target_link_libraries(eklow-grammar-test-qwen PRIVATE eklow_grammar)
 
-# Serving: sampler and scheduler over the engine, and the OpenAI-compatible server.
-add_library(eklow_serve STATIC
-  src/serve/openai.cpp
-  src/serve/sampler.cpp
-  src/serve/scheduler.cpp
-)
-target_link_libraries(eklow_serve PUBLIC eklow_engine eklow_grammar)
+# Serving: the request layer (OpenAI surface, Qwen3.6's chat template and tokenizer), the scheduler (continuous batching,
+# speculative decoding with a DFlash 2 draft, snapshots of the recurrent state) and the server. The sampler and the
+# acceptance are eklow_spec's.
+add_library(eklow_serve STATIC src/serve/openai.cpp src/serve/scheduler.cpp)
+target_link_libraries(eklow_serve PUBLIC eklow_spec eklow_grammar eklow_text eklow_engine)
 eklow_sycl(eklow_serve)
 
 add_executable(eklow-server tools/server/main.cpp)
@@ -139,17 +168,15 @@ target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
 target_link_libraries(eklow-server PRIVATE eklow_serve Threads::Threads)
 eklow_sycl(eklow-server)
 
-# The prompt of a chat request (images as rows counted, not encoded), for checking against llama.cpp's without the card.
 add_executable(eklow-prompt tools/prompt/main.cpp)
 target_link_libraries(eklow-prompt PRIVATE eklow_serve)
 eklow_sycl(eklow-prompt)
-
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
 # CPU Q4_0 GEMVs for the 26B's cold experts (TASK: m6/cpu-experts): plain host code, AVX-VNNI,
 # so the flags are per source file and there is no -fsycl.
-add_library(eklow_cpu STATIC src/cpu/q4_gemv.cpp)
+add_library(eklow_cpu STATIC src/cpu/q4_gemv.cpp src/cpu/qgemv.cpp)
 target_include_directories(eklow_cpu PUBLIC src)
 target_compile_options(eklow_cpu PRIVATE -O3 -mavx2 -mfma -mf16c -mavxvnni)
 target_link_libraries(eklow_cpu PUBLIC Threads::Threads)
@@ -176,6 +203,30 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-cpu-gemv-test RUNTIME DESTINATION bin)
-# The 26B's routing profile, for eklow-server --expert-profile (which experts stay on the card).
-install(FILES data/gemma-4-26b-a4b-experts.json DESTINATION share/eklow)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test-qwen eklow-cpu-gemv-test RUNTIME DESTINATION bin)
+# The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
+install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
+
+# The CPU GEMVs of the Qwen formats for the cold experts, checked and timed (TASK qwen/mm).
+add_executable(eklow-cpu-qgemv-test tools/cpu_qgemv_test/main.cpp)
+target_compile_options(eklow-cpu-qgemv-test PRIVATE -O2 -mavx2 -mf16c)
+target_link_libraries(eklow-cpu-qgemv-test PRIVATE eklow_cpu eklow_host)
+install(TARGETS eklow-cpu-qgemv-test RUNTIME DESTINATION bin)
+
+# DFlash 2 drafting and speculative decoding (TASK qwen/dflash): the draft's kernels and model, the acceptance of a
+# drafted block, and their checks. Appended here so as not to touch the lists above.
+target_sources(eklow_model PRIVATE src/kernels/ref_dflash.cpp src/kernels/dflash.cpp src/model/dflash2.cpp src/model/dflash2_fast.cpp)
+# The sampler and the acceptance of a drafted block (eklow_serve links them).
+add_library(eklow_spec STATIC src/serve/sampler.cpp src/serve/spec.cpp)
+target_link_libraries(eklow_spec PUBLIC eklow_host)
+
+# The acceptance's statistical test: host code over the sampler only.
+add_executable(eklow-spec-test tools/dflash_test/spec_test.cpp)
+target_link_libraries(eklow-spec-test PRIVATE eklow_spec)
+target_include_directories(eklow-spec-test PRIVATE src)
+install(TARGETS eklow-spec-test RUNTIME DESTINATION bin)
+
+add_executable(eklow-dflash-test tools/dflash_test/main.cpp)
+target_link_libraries(eklow-dflash-test PRIVATE eklow_model eklow_spec)
+eklow_sycl(eklow-dflash-test)
+install(TARGETS eklow-dflash-test RUNTIME DESTINATION bin)

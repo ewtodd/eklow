@@ -1,0 +1,45 @@
+== Q4_K (Q4_K)
+  Q4_K     expert gate|up           2048x1024    rows   1     0.0090 ms      131 GB/s  (4.500 bits a weight)
+  Q4_K     expert gate|up           2048x1024    rows   2     0.0099 ms      119 GB/s  (4.500 bits a weight)
+  Q4_K     expert gate|up           2048x1024    rows   8     0.0101 ms      117 GB/s  (4.500 bits a weight)
+  Q4_K     expert gate|up           2048x1024    rows  16     0.0143 ms       82 GB/s  (4.500 bits a weight)
+  Q4_K     expert gate|up           2048x1024    rows  32     0.0229 ms       52 GB/s  (4.500 bits a weight)
+  Q4_K     expert down               512x2048    rows   1     0.0076 ms       77 GB/s  (4.500 bits a weight)
+  Q4_K     expert down               512x2048    rows   2     0.0087 ms       68 GB/s  (4.500 bits a weight)
+  Q4_K     expert down               512x2048    rows   8     0.0090 ms       65 GB/s  (4.500 bits a weight)
+  Q4_K     expert down               512x2048    rows  16     0.0128 ms       46 GB/s  (4.500 bits a weight)
+  Q4_K     expert down               512x2048    rows  32     0.0203 ms       29 GB/s  (4.500 bits a weight)
+  Q4_K     attn_qkv / attn_q        2048x8192    rows   1     0.0351 ms      269 GB/s  (4.500 bits a weight)
+  Q4_K     attn_qkv / attn_q        2048x8192    rows   2     0.0425 ms      222 GB/s  (4.500 bits a weight)
+  Q4_K     attn_qkv / attn_q        2048x8192    rows   8     0.0428 ms      221 GB/s  (4.500 bits a weight)
+  Q4_K     attn_qkv / attn_q        2048x8192    rows  16     0.0560 ms      168 GB/s  (4.500 bits a weight)
+  Q4_K     attn_qkv / attn_q        2048x8192    rows  32     0.0962 ms       98 GB/s  (4.500 bits a weight)
+  Q4_K     attn_gate                2048x4096    rows   1     0.0213 ms      222 GB/s  (4.500 bits a weight)
+  Q4_K     attn_gate                2048x4096    rows   2     0.0275 ms      171 GB/s  (4.500 bits a weight)
+  Q4_K     attn_gate                2048x4096    rows   8     0.0282 ms      168 GB/s  (4.500 bits a weight)
+  Q4_K     attn_gate                2048x4096    rows  16     0.0362 ms      130 GB/s  (4.500 bits a weight)
+  Q4_K     attn_gate                2048x4096    rows  32     0.0562 ms       84 GB/s  (4.500 bits a weight)
+  Q4_K     ssm_out / attn_output    4096x2048    rows   1     0.0203 ms      232 GB/s  (4.500 bits a weight)
+  Q4_K     ssm_out / attn_output    4096x2048    rows   2     0.0325 ms      145 GB/s  (4.500 bits a weight)
+  Q4_K     ssm_out / attn_output    4096x2048    rows   8     0.0332 ms      142 GB/s  (4.500 bits a weight)
+  Q4_K     ssm_out / attn_output    4096x2048    rows  16     0.0396 ms      119 GB/s  (4.500 bits a weight)
+  Q4_K     ssm_out / attn_output    4096x2048    rows  32     0.0618 ms       76 GB/s  (4.500 bits a weight)
+  Q4_K     attn_k / attn_v          2048x512     rows   1     0.0078 ms       76 GB/s  (4.500 bits a weight)
+  Q4_K     attn_k / attn_v          2048x512     rows   2     0.0091 ms       65 GB/s  (4.500 bits a weight)
+  Q4_K     attn_k / attn_v          2048x512     rows   8     0.0092 ms       64 GB/s  (4.500 bits a weight)
+  Q4_K     attn_k / attn_v          2048x512     rows  16     0.0129 ms       46 GB/s  (4.500 bits a weight)
+  Q4_K     attn_k / attn_v          2048x512     rows  32     0.0203 ms       29 GB/s  (4.500 bits a weight)
+  Q4_K     head                     2048x248320  rows   1     0.8075 ms      354 GB/s  (4.500 bits a weight)
+  Q4_K     head                     2048x248320  rows   2     0.8472 ms      338 GB/s  (4.500 bits a weight)
+  Q4_K     head                     2048x248320  rows   8     0.8651 ms      331 GB/s  (4.500 bits a weight)
+  Q4_K     head                     2048x248320  rows  16     2.1448 ms      133 GB/s  (4.500 bits a weight)
+  Q4_K     head                     2048x248320  rows  32     3.8623 ms       74 GB/s  (4.500 bits a weight)
+  Q4_K     grouped gate|up      P= 8  distinct   7.9     0.0428 ms      219 GB/s
+  Q4_K     grouped   + SwiGLU   P= 8  distinct   7.9     0.0525 ms      178 GB/s
+  Q4_K     grouped gate|up      P=16  distinct  15.7     0.0720 ms      258 GB/s
+  Q4_K     grouped   + SwiGLU   P=16  distinct  15.7     0.0823 ms      225 GB/s
+  Q4_K     grouped gate|up      P=32  distinct  30.2     0.1239 ms      288 GB/s
+  Q4_K     grouped   + SwiGLU   P=32  distinct  30.2     0.1341 ms      266 GB/s
+  Q4_K     grouped down         P= 8  distinct   8.0     0.0318 ms      148 GB/s
+  Q4_K     grouped down         P=16  distinct  15.6     0.0452 ms      203 GB/s
+  Q4_K     grouped down         P=32  distinct  29.9     0.0730 ms      241 GB/s

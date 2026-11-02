@@ -1,7 +1,7 @@
 // eklow-attn-test: the cache attention (kernels/attention.hpp) against ref::attention on random
 // Q/K/V, driven as the engine drives it, and its speed at decode and prefill shapes.
 //
-//   eklow-attn-test [--len N] [--chunk N] [--decode N] [--time-ctx N,...] [--json FILE] [--heads N] [--only KIND] [--no-check]
+//   eklow-attn-test [--len N] [--chunk N] [--decode N] [--time-ctx N,...] [--pf N] [--pf-slots N] [--json FILE] [--heads N] [--only KIND] [--no-check]
 //
 // Correctness: two slots hold different random sequences of --len tokens, fed in the same steps as
 // prefill chunks of --chunk and then --decode single tokens; every output row is compared with the
@@ -42,7 +42,9 @@ struct Kind {
   bool int8;
 };
 constexpr Kind kKinds[] = {{"sliding", 256, 8, 1024, false}, {"global", 512, 1, 0, false},
-                           {"sliding8", 256, 8, 1024, true}, {"global8", 512, 1, 0, true}};
+                           {"sliding8", 256, 8, 1024, true}, {"global8", 512, 1, 0, true},
+                           // Qwen3.6's attention layers: 16 query heads over 2 K/V heads of 256, paged, no window
+                           {"qwen", 256, 2, 0, false}, {"qwen8", 256, 2, 0, true}};
 
 std::vector<int64_t> list(const std::string& s) {
   std::vector<int64_t> out;
@@ -181,6 +183,7 @@ double gpu_seconds(sycl::queue& q, F&& f) {
 int main(int argc, char** argv) {
   int64_t len = 3000, chunk = 512, decode = 40;
   std::vector<int64_t> time_ctx = {4096, 16384};
+  int64_t pf_len = 1024, pf_slots = 1;
   std::string json_path, only;
   bool no_check = false;
   for (int i = 1; i < argc; ++i) {
@@ -190,12 +193,14 @@ int main(int argc, char** argv) {
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
     else if (a == "--decode") decode = std::atoll(next().c_str());
     else if (a == "--time-ctx") time_ctx = list(next());
+    else if (a == "--pf") pf_len = std::atoll(next().c_str());
+    else if (a == "--pf-slots") pf_slots = std::atoll(next().c_str());
     else if (a == "--json") json_path = next();
     else if (a == "--heads") kHeads = std::atoll(next().c_str());
     else if (a == "--only") only = next();
     else if (a == "--no-check") no_check = true;
     else {
-      std::fprintf(stderr, "usage: eklow-attn-test [--len N] [--chunk N] [--decode N] [--time-ctx N,...] [--json FILE] [--heads N] [--only KIND] [--no-check]\n");
+      std::fprintf(stderr, "usage: eklow-attn-test [--len N] [--chunk N] [--decode N] [--time-ctx N,...] [--pf N] [--pf-slots N] [--json FILE] [--heads N] [--only KIND] [--no-check]\n");
       return 2;
     }
   }
@@ -297,38 +302,42 @@ int main(int argc, char** argv) {
     for (const Kind& k : kKinds)
       for (int64_t ctx : time_ctx) {
         if (!only.empty() && only != k.name) continue;
-        const int64_t D = k.head_dim, Hkv = k.n_head_kv, pf = std::min<int64_t>(1024, ctx);
-        TestCache cache(q, k, 1, ctx + 1, pf);
+        const int64_t D = k.head_dim, Hkv = k.n_head_kv, pf = std::min<int64_t>(pf_len, ctx), NS = pf_slots;
+        TestCache cache(q, k, int(NS), ctx + 1, pf);
         attn::Scratch scratch;
-        float *dq = sycl::malloc_device<float>(size_t(pf * kHeads * D), q), *dk = sycl::malloc_device<float>(size_t(pf * Hkv * D), q),
-              *dv = sycl::malloc_device<float>(size_t(pf * Hkv * D), q), *dout = sycl::malloc_device<float>(size_t(pf * kHeads * D), q);
-        int32_t *dslot = sycl::malloc_device<int32_t>(size_t(pf), q), *dpos = sycl::malloc_device<int32_t>(size_t(pf), q);
-        int32_t* dtiles = sycl::malloc_device<int32_t>(size_t(6 * Hkv * (pf * kHeads / Hkv / 8 + 1)), q);
+        float *dq = sycl::malloc_device<float>(size_t(NS * pf * kHeads * D), q), *dk = sycl::malloc_device<float>(size_t(NS * pf * Hkv * D), q),
+              *dv = sycl::malloc_device<float>(size_t(NS * pf * Hkv * D), q), *dout = sycl::malloc_device<float>(size_t(NS * pf * kHeads * D), q);
+        int32_t *dslot = sycl::malloc_device<int32_t>(size_t(NS * pf), q), *dpos = sycl::malloc_device<int32_t>(size_t(NS * pf), q);
+        int32_t* dtiles = sycl::malloc_device<int32_t>(size_t(6 * Hkv * (NS * pf * kHeads / Hkv / 8 + NS)), q);
         auto fill = [&](std::vector<float>& v) {
           v = randn(rng, v.size());
         };
-        std::vector<float> hq(size_t(pf * kHeads * D)), hk(size_t(pf * Hkv * D)), hv(hk.size());
+        std::vector<float> hq(size_t(NS * pf * kHeads * D)), hk(size_t(NS * pf * Hkv * D)), hv(hk.size());
         fill(hq), fill(hk), fill(hv);
         q.memcpy(dq, hq.data(), hq.size() * 4);
         q.memcpy(dk, hk.data(), hk.size() * 4);
         q.memcpy(dv, hv.data(), hv.size() * 4);
-        q.memset(dslot, 0, size_t(pf) * 4).wait();
+        q.wait();
         // Fill positions 0..ctx with the same random rows (the speed does not depend on them).
         attn::TileList tl(D);
-        auto prepare = [&](int64_t a, int64_t b) {
-          std::vector<int32_t> pos;
-          for (int64_t t = a; t < b; ++t) pos.push_back(int32_t(t));
+        // Positions [a, b) of the first `ns` slots, one chunk each.
+        auto prepare = [&](int64_t a, int64_t b, int64_t ns) {
+          std::vector<int32_t> pos, slot;
           tl.clear();
-          tl.add_chunk(0, b - a, b - 1, kHeads / Hkv, Hkv, k.window);
+          for (int64_t s = 0; s < ns; ++s) {
+            tl.add_chunk(int32_t(pos.size()), b - a, b - 1, kHeads / Hkv, Hkv, k.window);
+            for (int64_t t = a; t < b; ++t) pos.push_back(int32_t(t)), slot.push_back(int32_t(s));
+          }
           q.memcpy(dpos, pos.data(), pos.size() * 4);
+          q.memcpy(dslot, slot.data(), slot.size() * 4);
           const std::vector<int32_t> packed = tl.packed();
           q.memcpy(dtiles, packed.data(), packed.size() * 4).wait();
-          return attn::Tokens{dslot, dpos, b - a};
+          return attn::Tokens{dslot, dpos, ns * (b - a)};
         };
-        for (int64_t a = 0; a <= ctx; a += pf) attn::write(q, dk, dv, prepare(a, std::min(ctx + 1, a + pf)), cache.c);
+        for (int64_t a = 0; a <= ctx; a += pf) attn::write(q, dk, dv, prepare(a, std::min(ctx + 1, a + pf), NS), cache.c);
         q.wait();
         auto timed = [&](int64_t a, int64_t b, int reps) {
-          const attn::Tokens tok = prepare(a, b);
+          const attn::Tokens tok = prepare(a, b, NS);
           auto go = [&] { attn::attend(q, dq, tok, tl, dtiles, cache.c, kHeads, 1.0f / std::sqrt(float(D)), dout, scratch); };
           go();  // warm-up, scratch sizes
           q.wait();
@@ -339,11 +348,11 @@ int main(int argc, char** argv) {
         const double t_dec = timed(ctx, ctx + 1, 50);
         const double t_pf = timed(ctx - pf, ctx, 5);
         double flops = 0;
-        for (int64_t t = ctx - pf; t < ctx; ++t) flops += 4.0 * double(kHeads * D) * double(k.window > 0 ? std::min(k.window, t + 1) : t + 1);
+        for (int64_t t = ctx - pf; t < ctx; ++t) flops += double(NS) * 4.0 * double(kHeads * D) * double(k.window > 0 ? std::min(k.window, t + 1) : t + 1);
         const int64_t keys = k.window > 0 ? std::min(k.window, ctx + 1) : ctx + 1;
-        const double dec_bytes = double(keys * Hkv * D * 2 * 2);
-        std::printf("%-8s ctx %6lld: decode %8.1f us (%6.1f GB/s of K/V), prefill %lld %8.2f ms (%5.2f TFLOPS)\n", k.name,
-                    (long long)ctx, t_dec * 1e6, dec_bytes / t_dec / 1e9, (long long)pf, t_pf * 1e3, flops / t_pf / 1e12);
+        const double dec_bytes = double(NS) * double(keys * Hkv * D * 2 * 2);
+        std::printf("%-8s ctx %6lld: decode %8.1f us (%6.1f GB/s of K/V), prefill %lld x %lld %8.2f ms (%5.2f TFLOPS)\n", k.name,
+                    (long long)ctx, t_dec * 1e6, dec_bytes / t_dec / 1e9, (long long)NS, (long long)pf, t_pf * 1e3, flops / t_pf / 1e12);
         w.begin_object().kv("kind", k.name).kv("ctx", ctx).kv("decode_us", t_dec * 1e6).kv("prefill_chunk", pf);
         w.kv("prefill_ms", t_pf * 1e3).kv("prefill_tflops", flops / t_pf / 1e12).end_object();
         for (float* p : {dq, dk, dv, dout}) sycl::free(p, q);

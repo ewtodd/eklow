@@ -1,0 +1,100 @@
+Qwen3.6-35B-A3B finetunes: fidelity of eklow's quantization mixes and of bartowski's / the official GGUFs
+against each model's own Q8_0, as KL divergence of the next-token distribution (raw results; worker
+qwen/weights, 2026-10-31 .. 2026-11-01, e-desktop).
+
+Tool: llama-perplexity --kl-divergence at the revision flake.nix pins (llama.cpp ea0c4c2c), CUDA build
+(tools/weights/cuda.nix) on the RTX 4090, layers that do not fit on the card left to the CPU (--fit on).
+Base logits: the model's own Q8_0 (convert_hf_to_gguf.py --outtype bf16, then llama-quantize ... Q8_0), saved
+once per text. Command (tools/weights/kl.sh, which holds the 4090 lock):
+  llama-perplexity -m FILE -f TEXT -c CTX --chunks N --fit on --kl-divergence --kl-divergence-base BASE
+Texts:
+  wiki4k: wikitext-2-raw test, context 4,096, 20 chunks
+  doc32k: one Pile document (son-of-anton:/work/data/compare/doc-131072.txt), context 32,768, 2 chunks
+"PPL" is the file's perplexity on the text, "base PPL" the Q8_0's. Small differences between PPL and base PPL
+in either direction are noise from the finite text; the KL columns are the measure. "same top p" is the share
+of positions where the file and the Q8_0 pick the same top token. The raw llama-perplexity output of every
+row is in ~/eklow-qwen-data/logs/kl/MODEL-TEXT-FILE.log on e-desktop (not committed: 2.5 MB).
+
+Mixes (tools/weights/make-gguf.sh; the importance matrix is bartowski's, pinned, for the Q4_0/Q4_K/IQ4_XS
+tensors; MTP/NextN block 40 left out with the converter's --no-mtp, llama.cpp loads the files):
+  name  routed experts (ffn_{gate,up,down}_exps)  dense matrices (GDN attn_qkv/attn_gate/ssm_out, attention
+                                                   attn_q/attn_output, shared expert)
+  EK8   Q4_0                                       Q8_0     (what eklow's kernels read today)
+  EK4   Q4_0                                       Q4_0
+  EKD6  Q4_0                                       Q6_K
+  EKI8  IQ4_XS                                     Q8_0
+  EKK8  Q4_K                                       Q8_0     (the pick: best KL at 4.5 bits per expert weight)
+  EKK6  Q4_K                                       Q6_K
+  all: attn_k, attn_v, ssm_alpha, ssm_beta, token_embd Q8_0; output Q6_K; norms, ssm_a, ssm_dt, ssm_conv1d,
+  ffn_gate_inp (router) and ffn_gate_inp_shexp F32.
+Published comparison files (bartowski, repos and revisions of the imatrix; the Ornith "Q4_K_M official" is
+ornith-ai/Ornith-1.5-35B-A3B-GGUF @ 12393612fd): they carry the NextN block, which llama.cpp loads and ignores
+for scoring ("unused tensor blk.40" warnings in their logs).
+
+Published files (sha256 from the Hub's LFS metadata, checked after download; deleted after scoring):
+  Qwen_Qwen3.6-35B-A3B-Q4_0.gguf    52312daa5b2190c1f5723d33c3315c01c55af4206f6c6e6eb63f3d8dd52bb85e  20836243072 B
+  Qwen_Qwen3.6-35B-A3B-Q4_K_M.gguf  b46fedd33e0bfb0cae308aa3c158d0a4b2c4a1d2185a1ed6f093cdaf39064772  22285080192 B
+  Qwen_Qwen3.6-35B-A3B-Q4_K_S.gguf  20933baa65d05b0c3b3958d3006a4485b8abbae1850c1f0a43c77c8316e9531c  21486360192 B
+  Qwen_Qwen3.6-35B-A3B-IQ4_XS.gguf  afc7238af403ed454b7846454091b5e38b07575bdbb64c3e86777414dde4193c  19699553920 B
+    (bartowski/Qwen_Qwen3.6-35B-A3B-GGUF @ 5c2410d715)
+  Ornith-1.5-35B-A3B-Q4_0.gguf      5e16e8a2567e2cecaf9fd7c0e12a2c1af0c5e42414b04fb3d8c608ed61423d71  20415243936 B
+  Ornith-1.5-35B-A3B-Q4_K_M.gguf    12d8d5c01bae7f23ea4822b2f96ba069d531f827d02a57c31002f2f95e72614a  21864081056 B
+  Ornith-1.5-35B-A3B-Q4_K_S.gguf    7666f715af2cab0e880ebf4494ee36c13db1e68392d7c513806502c14ff549d3  21065361056 B
+  Ornith-1.5-35B-A3B-IQ4_XS.gguf    d6aef57fa948e9bba3ca4959b3c237ed898c605471f48c73a32cedbd24aabe70  19278554784 B
+    (bartowski/Ornith-1.5-35B-A3B-GGUF @ 64b0493d34)
+  Ornith-1.5-35B-Q4_K_M.gguf (official) 42739874cc2ccfdb8523b23fbe52e29b2a7555c8176737ca9ca0b5d59859d41f  21713463040 B
+    (ornith-ai/Ornith-1.5-35B-A3B-GGUF @ 12393612fd; table name "Ornith-1.5-35B-Q4_K_M")
+  Their tensor types: tools/weights/published-types.sh; e.g. bartowski's Q4_0 is not Q4_0 throughout (Q4_1 x5,
+  Q5_0 x60, Q6_K x5, BF16 router tensors in block 40).
+Kept files: see the end.
+
+== stock: Q8_0 base vs each file
+
+| file | text | PPL | base PPL | mean KL | 99% KL | same top p % |
+|---|---|---|---|---|---|---|
+| EK4 | wiki4k | 5.4593 | 5.3736 | 0.04149 | 0.3742 | 91.905 |
+| EK4 | doc32k | 5.8527 | 6.0177 | 0.09099 | 1.4755 | 91.549 |
+| EK8 | wiki4k | 5.3994 | 5.3736 | 0.01650 | 0.1772 | 95.005 |
+| EK8 | doc32k | 6.1396 | 6.0177 | 0.04187 | 0.4959 | 95.068 |
+| EKD6 | wiki4k | 5.4029 | 5.3736 | 0.01843 | 0.1796 | 94.626 |
+| EKD6 | doc32k | 6.1489 | 6.0177 | 0.04441 | 0.5326 | 94.790 |
+| EKI8 | wiki4k | 5.4028 | 5.3736 | 0.01468 | 0.1547 | 95.269 |
+| EKI8 | doc32k | 6.1021 | 6.0177 | 0.04128 | 0.4883 | 95.202 |
+| EKK6 | wiki4k | 5.4044 | 5.3736 | 0.01487 | 0.1496 | 95.315 |
+| EKK6 | doc32k | 6.1364 | 6.0177 | 0.04016 | 0.5206 | 95.086 |
+| EKK8 | wiki4k | 5.3982 | 5.3736 | 0.01344 | 0.1384 | 95.589 |
+| EKK8 | doc32k | 6.0163 | 6.0177 | 0.03464 | 0.3978 | 95.477 |
+| Qwen_Qwen3.6-35B-A3B-IQ4_XS | wiki4k | 5.4444 | 5.3736 | 0.02291 | 0.2285 | 93.942 |
+| Qwen_Qwen3.6-35B-A3B-IQ4_XS | doc32k | 5.9537 | 6.0177 | 0.06159 | 0.8621 | 94.018 |
+| Qwen_Qwen3.6-35B-A3B-Q4_0 | wiki4k | 5.4585 | 5.3736 | 0.03131 | 0.2985 | 92.897 |
+| Qwen_Qwen3.6-35B-A3B-Q4_0 | doc32k | 5.8024 | 6.0177 | 0.07521 | 1.2109 | 92.950 |
+| Qwen_Qwen3.6-35B-A3B-Q4_K_M | wiki4k | 5.4140 | 5.3736 | 0.01680 | 0.1704 | 94.890 |
+| Qwen_Qwen3.6-35B-A3B-Q4_K_M | doc32k | 5.9127 | 6.0177 | 0.04980 | 0.6926 | 94.699 |
+| Qwen_Qwen3.6-35B-A3B-Q4_K_S | wiki4k | 5.4297 | 5.3736 | 0.01979 | 0.1978 | 94.570 |
+| Qwen_Qwen3.6-35B-A3B-Q4_K_S | doc32k | 5.9368 | 6.0177 | 0.05536 | 0.7119 | 94.241 |
+
+== ornith: Q8_0 base vs each file
+
+| file | text | PPL | base PPL | mean KL | 99% KL | same top p % |
+|---|---|---|---|---|---|---|
+| EK4 | wiki4k | 6.5471 | 6.8175 | 0.10462 | 1.0646 | 87.174 |
+| EK4 | doc32k | 7.7231 | 7.7897 | 0.10427 | 1.1350 | 88.003 |
+| EK8 | wiki4k | 6.7965 | 6.8175 | 0.03864 | 0.4221 | 92.218 |
+| EK8 | doc32k | 8.4720 | 7.7897 | 0.05906 | 0.6463 | 91.720 |
+| EKI8 | wiki4k | 6.6116 | 6.8175 | 0.04177 | 0.4359 | 92.079 |
+| EKI8 | doc32k | 7.1825 | 7.7897 | 0.06218 | 0.7541 | 91.540 |
+| EKK6 | wiki4k | 6.7213 | 6.8175 | 0.03873 | 0.4079 | 92.328 |
+| EKK6 | doc32k | 8.4984 | 7.7897 | 0.06758 | 0.7516 | 91.430 |
+| EKK8 | wiki4k | 6.7127 | 6.8175 | 0.03542 | 0.3732 | 92.677 |
+| EKK8 | doc32k | 8.4013 | 7.7897 | 0.05114 | 0.5652 | 92.016 |
+| Ornith-1.5-35B-A3B-IQ4_XS | wiki4k | 6.7919 | 6.8175 | 0.05822 | 0.6162 | 90.630 |
+| Ornith-1.5-35B-A3B-IQ4_XS | doc32k | 7.4190 | 7.7897 | 0.06748 | 0.7534 | 90.783 |
+| Ornith-1.5-35B-A3B-Q4_0 | wiki4k | 6.7031 | 6.8175 | 0.07739 | 0.7709 | 88.923 |
+| Ornith-1.5-35B-A3B-Q4_0 | doc32k | 7.9202 | 7.7897 | 0.07956 | 0.8850 | 89.684 |
+| Ornith-1.5-35B-A3B-Q4_K_M | wiki4k | 6.9395 | 6.8175 | 0.04603 | 0.4760 | 91.517 |
+| Ornith-1.5-35B-A3B-Q4_K_M | doc32k | 8.0623 | 7.7897 | 0.05478 | 0.5826 | 91.677 |
+| Ornith-1.5-35B-A3B-Q4_K_S | wiki4k | 6.9873 | 6.8175 | 0.05114 | 0.5042 | 91.067 |
+| Ornith-1.5-35B-A3B-Q4_K_S | doc32k | 7.3777 | 7.7897 | 0.06608 | 0.7522 | 91.021 |
+| Ornith-1.5-35B-Q4_K_M | wiki4k | 6.9727 | 6.8175 | 0.05960 | 0.5924 | 90.308 |
+| Ornith-1.5-35B-Q4_K_M | doc32k | 8.4606 | 7.7897 | 0.08122 | 0.9090 | 89.828 |
+

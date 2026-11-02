@@ -1,0 +1,36 @@
+sliding      46 steps, 2 slots: rel L2 0.000103, max abs 0.000479 ok
+sliding+img  46 steps, 2 slots: rel L2 0.000102, max abs 0.000455 ok
+global       46 steps, 2 slots: rel L2 0.000364, max abs 0.00166 ok
+global+img   46 steps, 2 slots: rel L2 0.000363, max abs 0.00202 ok
+sliding8     46 steps, 2 slots: rel L2 0.00901, max abs 0.0358 ok
+sliding8+img 46 steps, 2 slots: rel L2 0.00903, max abs 0.0406 ok
+global8      46 steps, 2 slots: rel L2 0.00892, max abs 0.0363 ok
+global8+img  46 steps, 2 slots: rel L2 0.00889, max abs 0.0383 ok
+qwen         46 steps, 2 slots: rel L2 0.000144, max abs 0.000463 ok
+qwen+img     46 steps, 2 slots: rel L2 0.000144, max abs 0.000496 ok
+qwen8        46 steps, 2 slots: rel L2 0.00899, max abs 0.0366 ok
+qwen8+img    46 steps, 2 slots: rel L2 0.00896, max abs 0.0308 ok
+sliding  ctx  16384: decode     74.5 us ( 112.7 GB/s of K/V), prefill 1 x 2048     3.06 ms (11.23 TFLOPS)
+sliding  ctx  65536: decode     68.6 us ( 122.2 GB/s of K/V), prefill 1 x 2048     3.03 ms (11.35 TFLOPS)
+sliding  ctx 131072: decode     67.2 us ( 124.9 GB/s of K/V), prefill 1 x 2048     3.03 ms (11.35 TFLOPS)
+sliding  ctx 262144: decode     67.3 us ( 124.7 GB/s of K/V), prefill 1 x 2048     3.04 ms (11.30 TFLOPS)
+global   ctx  16384: decode    229.5 us ( 146.2 GB/s of K/V), prefill 1 x 2048    30.35 ms (33.96 TFLOPS)
+global   ctx  65536: decode    702.4 us ( 191.1 GB/s of K/V), prefill 1 x 2048   132.73 ms (32.62 TFLOPS)
+global   ctx 131072: decode   1164.8 us ( 230.5 GB/s of K/V), prefill 1 x 2048   269.46 ms (32.39 TFLOPS)
+global   ctx 262144: decode   2063.6 us ( 260.2 GB/s of K/V), prefill 1 x 2048   540.83 ms (32.40 TFLOPS)
+sliding8 ctx  16384: decode     74.6 us ( 112.5 GB/s of K/V), prefill 1 x 2048     3.10 ms (11.08 TFLOPS)
+sliding8 ctx  65536: decode     73.4 us ( 114.3 GB/s of K/V), prefill 1 x 2048     3.12 ms (11.02 TFLOPS)
+sliding8 ctx 131072: decode     73.4 us ( 114.3 GB/s of K/V), prefill 1 x 2048     3.12 ms (11.01 TFLOPS)
+sliding8 ctx 262144: decode     73.4 us ( 114.3 GB/s of K/V), prefill 1 x 2048     3.11 ms (11.03 TFLOPS)
+global8  ctx  16384: decode    231.3 us ( 145.1 GB/s of K/V), prefill 1 x 2048    29.89 ms (34.49 TFLOPS)
+global8  ctx  65536: decode    701.5 us ( 191.3 GB/s of K/V), prefill 1 x 2048   131.03 ms (33.04 TFLOPS)
+global8  ctx 131072: decode   1111.9 us ( 241.4 GB/s of K/V), prefill 1 x 2048   266.99 ms (32.69 TFLOPS)
+global8  ctx 262144: decode   1955.3 us ( 274.6 GB/s of K/V), prefill 1 x 2048   535.17 ms (32.74 TFLOPS)
+qwen     ctx  16384: decode    159.7 us ( 210.1 GB/s of K/V), prefill 1 x 2048    18.78 ms (27.44 TFLOPS)
+qwen     ctx  65536: decode    531.2 us ( 252.6 GB/s of K/V), prefill 1 x 2048    76.88 ms (28.16 TFLOPS)
+qwen     ctx 131072: decode    949.8 us ( 282.6 GB/s of K/V), prefill 1 x 2048   158.53 ms (27.53 TFLOPS)
+qwen     ctx 262144: decode   1697.8 us ( 316.2 GB/s of K/V), prefill 1 x 2048   319.65 ms (27.41 TFLOPS)
+qwen8    ctx  16384: decode    126.3 us ( 265.7 GB/s of K/V), prefill 1 x 2048    18.64 ms (27.64 TFLOPS)
+qwen8    ctx  65536: decode    451.7 us ( 297.1 GB/s of K/V), prefill 1 x 2048    76.59 ms (28.26 TFLOPS)
+qwen8    ctx 131072: decode    690.5 us ( 388.8 GB/s of K/V), prefill 1 x 2048   157.50 ms (27.71 TFLOPS)
+qwen8    ctx 262144: decode   1123.9 us ( 477.7 GB/s of K/V), prefill 1 x 2048   317.85 ms (27.57 TFLOPS)
