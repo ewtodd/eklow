@@ -53,11 +53,12 @@ inline float sigmoid(float x) { return 1.0f / (1.0f + sycl::exp(-x)); }
 }  // namespace
 
 void attn_heads(sycl::queue& q, const float* qkv, int64_t n_tok, int64_t n_head, int64_t n_head_kv, int64_t head_dim, int64_t n_rot,
-                const float* q_norm, const float* k_norm, float eps, const int32_t* pos, const float* inv_freq, float* Q, float* K,
-                float* V, float* G) {
+                const float* q_norm, const float* k_norm, float eps, const int32_t* pos, const int* sections, const float* inv_freq,
+                float* Q, float* K, float* V, float* G) {
   const int32_t H = int32_t(n_head), Hkv = int32_t(n_head_kv), D = int32_t(head_dim), half = D / 2, R = int32_t(n_rot);
   if (D > 512 || R > D || R % 2 || R / 2 > half) throw std::runtime_error("qwenk::attn_heads: unsupported head shape");
-  const int32_t row = (2 * H + 2 * Hkv) * D, slots = H + 2 * Hkv;
+  const int32_t row = (2 * H + 2 * Hkv) * D, slots = H + 2 * Hkv, n_t = int32_t(n_tok);
+  const int32_t s0 = sections[0], s1 = sections[1], s2 = sections[2];
   q.submit([&](sycl::handler& h) {
     sycl::local_accessor<float, 1> slm(sycl::range<1>(size_t(D)), h);
     h.parallel_for(sycl::nd_range<1>(size_t(n_tok * slots * half), size_t(half)), [=](sycl::nd_item<1> it) {
@@ -90,7 +91,9 @@ void attn_heads(sycl::queue& q, const float* qkv, int64_t n_tok, int64_t n_head,
       float x = slm[i];
       if (i < R) {
         const int32_t p = i % (R / 2);
-        const float theta = float(pos[t]) * inv_freq[p], c = sycl::cos(theta), sn = sycl::sin(theta);
+        // The component of this pair (an unclaimed pair would take the fourth, which is 0; the config refuses sections that leave one).
+        const int32_t comp = p % 3 == 0 && p < 3 * s0 ? 0 : p % 3 == 1 && p < 3 * s1 ? 1 : p % 3 == 2 && p < 3 * s2 ? 2 : 3;
+        const float theta = (comp < 3 ? float(pos[comp * n_t + t]) : 0.0f) * inv_freq[p], c = sycl::cos(theta), sn = sycl::sin(theta);
         x = i < R / 2 ? x * c - slm[i + R / 2] * sn : slm[i - R / 2] * sn + x * c;
       }
       dst[i] = x;

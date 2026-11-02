@@ -91,6 +91,22 @@ in
       description = "The embedding model's GGUF, served on `embedPort`; null serves chat only.";
     };
 
+    mmproj = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = lib.literalExpression ''
+        pkgs.fetchurl {
+          name = "mmproj-Ornith-1.5-35B-A3B-bf16.gguf";
+          url = "https://huggingface.co/bartowski/Ornith-1.5-35B-A3B-GGUF/resolve/64b0493d34/mmproj-Ornith-1.5-35B-A3B-bf16.gguf";
+          sha256 = "...";
+        }
+      '';
+      description = ''
+        The chat model's vision projector (Qwen3.6's tower, llama.cpp's mmproj GGUF), for image_url parts in
+        /v1/chat/completions; null refuses them. The encoder's weights and scratch come out of the experts' share of the card.
+      '';
+    };
+
     embedMmproj = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = null;
@@ -222,6 +238,10 @@ in
           ++ lib.optionals (cfg.chatTemplate != null) [
             "--chat-template"
             cfg.chatTemplate
+          ]
+          ++ lib.optionals (cfg.mmproj != null) [
+            "--mmproj"
+            cfg.mmproj
           ]
           ++ lib.optionals (cfg.embedModel != null) [
             "--embed-model"

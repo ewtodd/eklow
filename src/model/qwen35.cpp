@@ -60,13 +60,15 @@ Qwen35Config Qwen35Config::from_gguf(const gguf::File& f) {
     unsupported(f, "DeltaNet head layout (value heads must be a multiple of key heads, all of one size)");
   if (c.n_head % c.n_head_kv != 0 || c.n_rot > c.head_dim || c.n_rot % 2) unsupported(f, "attention layout");
 
-  // IMRoPE for text: every position component equals the token's position, so the rotation is plain NeoX
-  // over n_rot dims as long as the sections cover all n_rot/2 frequencies and none is left to the 4th component.
+  // IMRoPE: for text every position component equals the token's position, so the rotation is plain NeoX over n_rot dims as
+  // long as the sections cover all n_rot/2 frequencies and none is left to the 4th component (the reference forward is
+  // text only; the engine takes an image's three components, engine.hpp).
   const auto& sec = f.at(p + "rope.dimension_sections").as_array();
   int sum = 0;
   for (size_t i = 0; i < sec.size(); ++i) {
     if (i == 3 && sec[i].as_int() != 0) unsupported(f, "a fourth rope section");
     sum += int(sec[i].as_int());
+    if (i < 3) c.rope_sections[i] = int(sec[i].as_int());
   }
   if (sum != c.n_rot / 2) unsupported(f, "rope sections that do not cover the rotated dims");
 

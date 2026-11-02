@@ -6,7 +6,7 @@
 //                    [--verify-last N --verify-block B --accept A,...] [--max-ctx N] [--kv-int8]
 //                    [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N]
 //                    [--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US] [--head-fp32] [--embed-on-card]
-//                    [--record-routing FILE] [--capture-check] [--snapshot-test]
+//                    [--record-routing FILE] [--capture-check] [--snapshot-test] [--images-dir DIR]
 //
 // The prompt is fed in prefill chunks of --chunk tokens (default: one chunk), then --verify-last tokens as verify blocks of
 // --verify-block tokens whose acceptance follows the pattern --accept (a count per block, cycled; the unaccepted tokens are fed
@@ -15,6 +15,9 @@
 // re-fed token would appear twice).
 // --record-routing writes the (layer, expert) selection counts of the whole run as a routing profile (DECISIONS: data/*-experts.json).
 // --snapshot-test: prefill all but 16 tokens, snapshot, decode the 16, restore and decode them again (identical logits, the cost of both).
+// --images-dir DIR: the prompt holds images, as eklow-oracle --mmproj wrote them: DIR/tokens.json lists them ("images": pos, n, nx, ny;
+// their ids in "ids" are -1) and DIR/image_K.f32 holds their rows. They are fed as image spans with Qwen's 3D positions (a prefill chunk
+// never cuts one); the logits are of every position, image rows included.
 // --capture-check asks every chunk for its hidden-state capture and compares layer 1's with l_out-1 in the dumps.
 #include <algorithm>
 #include <chrono>
@@ -34,6 +37,7 @@
 #include "core/json_value.hpp"
 #include "engine/engine.hpp"
 #include "model/gguf.hpp"
+#include "model/image_rows.hpp"
 #include "rt/device.hpp"
 
 using namespace eklow;
@@ -55,7 +59,7 @@ double since(std::chrono::steady_clock::time_point t0) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, out, tokens_json, tokens_arg, record_routing;
+  std::string model, out, tokens_json, tokens_arg, record_routing, images_dir;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   std::vector<int64_t> accept_pattern = {3};
   int64_t logits_last = 1, chunk = 0, decode_last = 0, verify_last = 0, verify_block = 8, max_ctx = 0;
@@ -85,6 +89,7 @@ int main(int argc, char** argv) {
     else if (a == "--capture-check") capture_check = true;
     else if (a == "--snapshot-test") snapshot_test = true;
     else if (a == "--record-routing") record_routing = next();
+    else if (a == "--images-dir") images_dir = next();
     else if (a == "--expert-profile") ec.expert_profile = next();
     else if (a == "--experts-on-card") ec.experts_on_card = std::atoll(next().c_str());
     else if (a == "--cpu-threads") ec.cpu_threads = std::atoi(next().c_str());
@@ -113,6 +118,47 @@ int main(int argc, char** argv) {
       for (const auto& t : split(tokens_arg, ',')) tokens.push_back(int32_t(std::atoi(t.c_str())));
     }
     if (tokens.empty() || out.empty() || model.empty()) throw std::runtime_error("need --model, --out and tokens");
+    // The images of the prompt (oracle format): where they sit in the sequence, their grids and rows.
+    struct Img {
+      int64_t pos, n, nx, ny;
+      std::vector<float> rows;
+    };
+    std::vector<Img> imgs;
+    if (!images_dir.empty()) {
+      std::ifstream in(images_dir + "/tokens.json");
+      const json::Value doc = json::parse(std::string((std::istreambuf_iterator<char>(in)), {}));
+      const json::Value* arr = doc.find("images");
+      if (arr && arr->is_array()) {
+        auto num = [](const json::Value& o, const char* k) { return int64_t(std::atoll(o.find(k)->int_digits().c_str())); };
+        for (const auto& v : arr->items()) imgs.push_back({num(v, "pos"), num(v, "n"), num(v, "nx"), num(v, "ny"), {}});
+      }
+      for (size_t k = 0; k < imgs.size(); ++k) {
+        std::ifstream f(images_dir + "/image_" + std::to_string(k) + ".f32", std::ios::binary);
+        imgs[k].rows.resize(size_t(imgs[k].n) * 2048);
+        f.read(reinterpret_cast<char*>(imgs[k].rows.data()), std::streamsize(imgs[k].rows.size() * 4));
+        if (!f) throw std::runtime_error("cannot read image " + std::to_string(k) + " rows (n_embd 2048)");
+      }
+      for (int32_t& t : tokens) t = std::max<int32_t>(t, 0);
+    }
+    // A chunk of tokens [s, e) of the sequence: the image spans inside it and the rotary offset at its start.
+    auto make_chunk = [&](int64_t s, int64_t e, int64_t logits_rows) {
+      engine::Chunk c{0, s, std::vector<int32_t>(tokens.begin() + s, tokens.begin() + e), logits_rows};
+      int64_t delta = 0;
+      for (const Img& im : imgs) {
+        if (im.pos + im.n <= s) delta += im.n - std::max(im.nx, im.ny);
+        else if (im.pos >= s && im.pos + im.n <= e) c.images.push_back({im.pos - s, im.n, im.rows.data(), im.nx, im.ny});
+        else if (im.pos < e && im.pos + im.n > s) throw std::runtime_error("a chunk cuts an image");
+      }
+      c.rope_delta = delta;
+      return c;
+    };
+    // The end of a prefill chunk from s of at most `chunk` tokens that does not cut an image (an image bigger than the chunk goes whole).
+    auto chunk_end = [&](int64_t s, int64_t limit) {
+      int64_t e = std::min(limit, s + chunk);
+      for (const Img& im : imgs)
+        if (im.pos < e && im.pos + im.n > e) e = im.pos > s ? im.pos : std::min(limit, im.pos + im.n);
+      return e;
+    };
     for (int64_t a : accept_pattern)
       if (a < 1) throw std::runtime_error("--accept counts must be at least 1");
     const int64_t n = int64_t(tokens.size());
@@ -227,9 +273,9 @@ int main(int argc, char** argv) {
       return l;
     };
     // Prefill chunks.
-    for (int64_t s = 0; s < prefill; s += chunk) {
-      const int64_t e = std::min(prefill, s + chunk);
-      engine::Chunk c{0, s, std::vector<int32_t>(tokens.begin() + s, tokens.begin() + e), std::max<int64_t>(0, e - std::max(s, first_pos))};
+    for (int64_t s = 0, e = 0; s < prefill; s = e) {
+      e = chunk_end(s, prefill);
+      engine::Chunk c = make_chunk(s, e, std::max<int64_t>(0, e - std::max(s, first_pos)));
       const std::vector<float> l = run(c, s);
       for (int64_t r = 0; r < c.logits_rows; ++r) keep(e - c.logits_rows + r, l.data() + r * V);
       pos = e;
@@ -240,7 +286,7 @@ int main(int argc, char** argv) {
     int accept_prev = -1;
     while (pos < verify_end) {
       const int64_t b = std::min(verify_block, verify_end - pos);
-      engine::Chunk c{0, pos, std::vector<int32_t>(tokens.begin() + pos, tokens.begin() + pos + b), b};
+      engine::Chunk c = make_chunk(pos, pos + b, b);
       c.verify = true;
       c.accept = accept_prev;
       const std::vector<float> l = run(c, pos);
@@ -251,7 +297,7 @@ int main(int argc, char** argv) {
     }
     // Decode, one token a step (the first one accepts the last verify block's tokens).
     for (int64_t s = verify_end; s < n; ++s) {
-      engine::Chunk c{0, s, {tokens[size_t(s)]}, 1};
+      engine::Chunk c = make_chunk(s, s + 1, 1);
       c.accept = accept_prev;
       accept_prev = -1;
       const std::vector<float> l = run(c, s);

@@ -3,7 +3,7 @@
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
 //                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
-//                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]]
+//                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
 //                [--log-interval S]
 //
@@ -22,7 +22,12 @@
 // --snapshot-mib is the pinned host memory kept for snapshots of the DeltaNet state, which make a conversation's or a
 // document's prefix reusable (taken before each prompt's generation prompt, every --snapshot-every tokens of a long
 // prefill, and at the end of a generation); 0 keeps none, and then only a slot's live sequence is reused.
-// Image parts in chat are refused (the vision encoder is not ported); --embed-mmproj (EmbeddingGemma 2's) lets an
+// --mmproj (the chat model's vision projector, llama.cpp's GGUF) turns on image_url parts in chat (base64 data: URLs of JPEG,
+// PNG, GIF or BMP; anything else, and chat without --mmproj, gets a 400): the template's <|vision_start|><|image_pad|>
+// <|vision_end|> becomes the start token, the image's rows and the end token, as llama.cpp's mtmd tokenizes them; the
+// rows are Qwen3.6's, in a grid whose positions the attention layers' IMRoPE reads (engine.hpp). --image-rows-dir DIR serves
+// llama.cpp's own rows for known pictures instead of an encoder (a test source; DIR/<fnv1a of the file, hex>.f32 and .grid);
+// --vision-reserve-mib keeps card memory for an encoder loaded after the engine. --embed-mmproj (EmbeddingGemma 2's) lets an
 // embeddings input be an array of text and image_url parts, --image-tokens being its budget of rows per image
 // (llama.cpp's image_max_tokens, 70 to 1,120, 280 by default). Each image is encoded on its request's thread with the
 // scheduler held, one at a time per encoder, and counts in the prompt tokens.
@@ -42,12 +47,15 @@
 #include <chrono>
 #include <cmath>
 #include <csignal>
+#include <fstream>
+#include <functional>
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
 #include <list>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <string>
 #include <thread>
 
@@ -237,6 +245,90 @@ class ImageService {
   std::list<Entry> cache_;
 };
 
+// Images to rows for Qwen3.6's text model, behind serve::ImageEncoder. The encoder is a function from an image's bytes to its grid
+// and host rows (fp32 [ny * nx][n_embd]); it runs on the request's thread with the scheduler held (an encode runs for seconds on
+// the card, and every wait on the card costs a turn behind a long prefill: DECISIONS 2026-10-26) and one at a time. A few encoded
+// images are kept by the hash of their bytes: a conversation sends its images again every turn, and the rows are the same.
+struct HostRows {
+  int64_t nx = 0, ny = 0;
+  std::vector<float> rows;
+};
+using RowsFn = std::function<HostRows(std::span<const uint8_t>)>;
+
+class QwenImageService {
+ public:
+  QwenImageService(RowsFn fn, int64_t n_embd) : fn_(std::move(fn)), n_embd_(n_embd) {}
+  void bind(serve::Scheduler* s) { sched_ = s; }
+
+  serve::EncodedImage operator()(std::span<const uint8_t> bytes) {
+    uint64_t h = 0xcbf29ce484222325ull;  // FNV-1a over the bytes
+    for (uint8_t b : bytes) h = (h ^ b) * 0x100000001b3ull;
+    {
+      std::lock_guard lk(cache_mu_);
+      for (auto it = cache_.begin(); it != cache_.end(); ++it)
+        if (it->hash == h && it->n_bytes == int64_t(bytes.size())) {
+          cache_.splice(cache_.begin(), cache_, it);
+          return {h, it->nx * it->ny, it->rows, it->nx, it->ny};
+        }
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    std::lock_guard lk(enc_mu_);
+    std::unique_ptr<serve::Scheduler::Hold> hold;
+    if (sched_) hold = std::make_unique<serve::Scheduler::Hold>(*sched_);
+    const auto t1 = std::chrono::steady_clock::now();
+    HostRows r;
+    try {
+      r = fn_(bytes);
+    } catch (const std::invalid_argument& e) {
+      throw serve::ApiError(400, "invalid_request_error", "unsupported_content", std::string("image_url: ") + e.what());
+    }
+    if (r.nx <= 0 || r.ny <= 0 || int64_t(r.rows.size()) != r.nx * r.ny * n_embd_) throw std::runtime_error("the image encoder returned rows that do not match its grid");
+    size_t bad = 0;
+    for (float x : r.rows) bad += !std::isfinite(x);
+    if (bad) log_line(fmt("image: %zu of %zu row values are not finite", bad, r.rows.size()));
+    log_line(fmt("image: %lldx%lld rows | wait %.2f s, encoded in %.2f s", (long long)r.nx, (long long)r.ny, seconds(t1 - t0),
+                 seconds(std::chrono::steady_clock::now() - t1)));
+    auto host = std::make_shared<std::vector<float>>(std::move(r.rows));
+    {
+      std::lock_guard ck(cache_mu_);
+      cache_.push_front({h, int64_t(bytes.size()), r.nx, r.ny, host});
+      if (cache_.size() > 6) cache_.pop_back();
+    }
+    return {h, r.nx * r.ny, host, r.nx, r.ny};
+  }
+
+ private:
+  struct Entry {
+    uint64_t hash;
+    int64_t n_bytes, nx, ny;
+    std::shared_ptr<const std::vector<float>> rows;
+  };
+  RowsFn fn_;
+  int64_t n_embd_;
+  serve::Scheduler* sched_ = nullptr;
+  std::mutex enc_mu_, cache_mu_;
+  std::list<Entry> cache_;
+};
+
+// Test source of rows (--image-rows-dir): llama.cpp's own rows for known pictures, as eklow-oracle --mmproj --encode-only wrote
+// them. DIR/<fnv1a of the picture's bytes, 16 hex digits>.f32 holds the rows and DIR/<same>.grid "NX NY".
+RowsFn rows_from_dir(const std::string& dir, int64_t n_embd) {
+  return [dir, n_embd](std::span<const uint8_t> bytes) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint8_t b : bytes) h = (h ^ b) * 0x100000001b3ull;
+    char name[32];
+    std::snprintf(name, sizeof name, "%016llx", (unsigned long long)h);
+    HostRows r;
+    std::ifstream g(dir + "/" + name + ".grid");
+    if (!(g >> r.nx >> r.ny)) throw std::invalid_argument(std::string("no rows for this picture in ") + dir + " (" + name + ")");
+    r.rows.resize(size_t(r.nx * r.ny * n_embd));
+    std::ifstream f(dir + "/" + name + ".f32", std::ios::binary);
+    f.read(reinterpret_cast<char*>(r.rows.data()), std::streamsize(r.rows.size() * sizeof(float)));
+    if (!f) throw std::runtime_error(dir + "/" + name + ".f32 is shorter than its grid");
+    return r;
+  };
+}
+
 // The embedding endpoint: inputs one at a time through the model (each its own sequence,
 // attended both ways), each at most max_tokens long, with the scheduler held so that no new chat
 // step starts until they are done. Each request is logged (its wait for the model, behind another request,
@@ -384,7 +476,8 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 
 int main(int argc, char** argv) {
   std::string model_path, alias = "qwen3.6-35b-a3b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", embed_mmproj_path;
-  std::string draft_path, chat_template;
+  std::string draft_path, chat_template, mmproj_path, image_rows_dir;
+  int64_t vision_reserve_mib = 0;
   int image_tokens = 280;
   int port = 8081, slots = 2, embed_port = 8082, draft_block = 0;
   int64_t ctx = 262144, batch = 2048, chunk = 2048;
@@ -420,6 +513,9 @@ int main(int argc, char** argv) {
     else if (a == "--embed-port") embed_port = std::atoi(next().c_str());
     else if (a == "--embed-alias") embed_alias = next();
     else if (a == "--embed-mmproj") embed_mmproj_path = next();
+    else if (a == "--mmproj") mmproj_path = next();
+    else if (a == "--image-rows-dir") image_rows_dir = next();
+    else if (a == "--vision-reserve-mib") vision_reserve_mib = std::atoll(next().c_str());
     else if (a == "--image-tokens") image_tokens = std::atoi(next().c_str());
     else if (a == "--kv-int8") kv_int8 = true;
     else if (a == "--kv-fp16") kv_int8 = false;
@@ -428,7 +524,7 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
                            "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
                            "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] "
-                           "[--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S]\n");
+                           "[--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S]\n");
       return 2;
     }
   }
@@ -508,6 +604,29 @@ int main(int argc, char** argv) {
       ec.capture_layers.clear();
       ec.draft_reserve_bytes = 0;
     }
+    // Image input for chat (Qwen3.6's vision tower). The projector is checked against the model here; its encoder must be resident
+    // before the engine places its experts (or --vision-reserve-mib keeps room for one loaded after), so that its weights and
+    // scratch come out of the experts' share and not of the margin that long requests allocate into.
+    std::unique_ptr<gguf::File> mmproj_file;
+    std::unique_ptr<QwenImageService> chat_images;
+    const model::Qwen35Config qcfg = model::Qwen35Config::from_gguf(file);
+    if (!mmproj_path.empty() || !image_rows_dir.empty()) {
+      RowsFn fn;
+      if (!mmproj_path.empty()) {
+        mmproj_file = std::make_unique<gguf::File>(gguf::File::open(mmproj_path));
+        const gguf::Value* pt = mmproj_file->find("clip.projector_type");
+        const gguf::Value* pd = mmproj_file->find("clip.vision.projection_dim");
+        if (!pt || pt->as_string() != "qwen3vl_merger")
+          throw std::runtime_error(mmproj_path + ": not a Qwen3-VL vision projector (clip.projector_type " + (pt ? pt->as_string() : std::string("missing")) + ")");
+        if (!pd || pd->as_int() != qcfg.n_embd)
+          throw std::runtime_error(mmproj_path + ": projects to " + (pd ? std::to_string(pd->as_int()) : std::string("?")) + " but the model's width is " + std::to_string(qcfg.n_embd));
+      }
+      if (!image_rows_dir.empty()) fn = rows_from_dir(image_rows_dir, qcfg.n_embd);
+      else throw std::runtime_error("--mmproj: the vision encoder is not wired into the server yet (qwen/vision); --image-rows-dir serves llama.cpp's rows for known pictures");
+      chat_images = std::make_unique<QwenImageService>(std::move(fn), qcfg.n_embd);
+      ec.vision_reserve_bytes = uint64_t(std::max<int64_t>(vision_reserve_mib, 0)) << 20;
+      std::fprintf(stderr, "eklow-server: image input on%s%s, %lld MiB kept for the encoder\n", mmproj_path.empty() ? "" : " with ", mmproj_path.c_str(), (long long)vision_reserve_mib);
+    }
     // The embedding model: its own queue on the card, so its work does not wait behind steps. It goes on
     // first, with room for its longest input, so that the experts' placement sees what it leaves.
     std::unique_ptr<gguf::File> embed_file;
@@ -582,6 +701,7 @@ int main(int argc, char** argv) {
                  text::qwen36_template_name(tmpl), double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p),
                  double(eng.snapshot_bytes()) / 1048576.0, (long long)snapshot_mib);
     if (embed_images) embed_images->bind(&sched);
+    if (chat_images) chat_images->bind(&sched);
     std::thread engine_thread([&] { sched.run(g_stop); });
     EmbedStats embed_stats;
     // The engine's line every log_interval seconds while there is traffic, and once more after it ends (rates
@@ -606,6 +726,9 @@ int main(int argc, char** argv) {
         }
       });
     serve::ChatDefaults defaults{sampling, ec.max_ctx, tmpl};
+    const serve::ImageEncoder chat_encoder = [&](std::span<const uint8_t> bytes) { return (*chat_images)(bytes); };
+    if (chat_images) defaults.images = &chat_encoder;
+    defaults.max_image_rows = std::min(batch, chunk);
 
     httplib::Server http;
     http.new_task_queue = [] { return new httplib::ThreadPool(16); };
@@ -637,6 +760,7 @@ int main(int argc, char** argv) {
       r->tool_specs = cr.tool_specs;
       r->snapshot_points = cr.snapshot_points;
       r->draft_block = cr.draft_block;
+      r->images = std::move(cr.images);
       r->tag = serve::new_completion_id();
       try {
         sched.submit(r);

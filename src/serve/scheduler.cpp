@@ -73,6 +73,14 @@ void Scheduler::submit(std::shared_ptr<Request> r) {
   if (int64_t(r->prompt.size()) >= c_.max_ctx)
     throw std::invalid_argument("the prompt is " + std::to_string(r->prompt.size()) + " tokens, the context " +
                                 std::to_string(c_.max_ctx));
+  int64_t at = 0;
+  for (const ImageInput& im : r->images) {
+    if (im.n <= 0 || im.nx <= 0 || im.ny <= 0 || im.nx * im.ny != im.n || im.start < at || im.start + im.n > int64_t(r->prompt.size()) || !im.rows)
+      throw std::invalid_argument("a malformed image in the prompt");
+    if (im.n > c_.max_chunk || im.n > c_.max_batch)
+      throw std::invalid_argument("an image of " + std::to_string(im.n) + " rows does not fit a prefill chunk of " + std::to_string(std::min(c_.max_chunk, c_.max_batch)));
+    at = im.start + im.n;
+  }
   r->submitted = std::chrono::steady_clock::now();
   {
     std::lock_guard lk(mu_);
@@ -114,7 +122,10 @@ bool Scheduler::admit() {
       if (q.req) continue;
       size_t lcp = 0;
       while (lcp < q.tokens.size() && lcp < r->prompt.size() && q.tokens[lcp] == r->prompt[lcp]) ++lcp;
-      const int64_t usable = int64_t(std::min(lcp, r->prompt.size() - 1));
+      // A prefix never ends inside an image (its rows are prefilled together; the ids differ from the first row on when the
+      // pictures do, so this only matters for a prompt that ends in one).
+      int64_t usable = int64_t(std::min(lcp, r->prompt.size() - 1));
+      if (const ImageInput* im = image_at(*r, usable); im && usable > im->start) usable = im->start;
       int64_t keep = 0;
       Snap* snap = nullptr;
       if (int64_t(q.tokens.size()) <= usable) keep = int64_t(q.tokens.size());
@@ -133,7 +144,8 @@ bool Scheduler::admit() {
       while (lcp < q.tokens.size() && lcp < r->prompt.size() && q.tokens[lcp] == r->prompt[lcp]) ++lcp;
       if (lcp >= 256 && lcp < q.tokens.size() && lcp < r->prompt.size())
         std::fprintf(stderr, "eklow-server: prefix: the slot's sequence (%zu tokens) and the prompt (%zu) part at token %zu: sampled %s, prompt %s; reusing %lld\n", q.tokens.size(),
-                     r->prompt.size(), lcp, tok_.bytes(q.tokens[lcp]).c_str(), tok_.bytes(r->prompt[lcp]).c_str(), (long long)keep);
+                     r->prompt.size(), lcp, q.tokens[lcp] < 0 ? "an image row" : tok_.bytes(q.tokens[lcp]).c_str(),
+                     r->prompt[lcp] < 0 ? "an image row" : tok_.bytes(r->prompt[lcp]).c_str(), (long long)keep);
     }
     if (keep == 0) {
       if (!q.tokens.empty()) eng_.release(best);
@@ -145,7 +157,7 @@ bool Scheduler::admit() {
     drop_snapshots_beyond(q, keep);
     if (c_.draft) {
       if (keep == 0) c_.draft->reset(best);
-      else c_.draft->truncate(best, keep);
+      else c_.draft->truncate(best, keep - rope_delta(*r, keep));
     }
     q.tokens.resize(size_t(keep));
     q.fed = size_t(keep);
@@ -307,9 +319,12 @@ void Scheduler::step() {
       std::vector<int> who;
       for (int s : gen) {
         const Seq& q = seqs_[size_t(s)];
-        const int64_t pos = int64_t(q.tokens.size());
+        const int64_t seq = int64_t(q.tokens.size());
+        // The draft's positions are the target's rotary ones (llama.cpp's DFlash path reads the time component), which run
+        // behind the sequence index by what the images before saved.
+        const int64_t pos = seq - rope_delta(*q.req, seq);
         // A block needs room in the context, and the draft's context must end where the block starts.
-        if (block_of(q) == B && pos + B <= c_.max_ctx && c_.draft->context_end(s) == pos) reqs.push_back({s, q.next_token, pos}), who.push_back(s);
+        if (block_of(q) == B && seq + B <= c_.max_ctx && c_.draft->context_end(s) == pos) reqs.push_back({s, q.next_token, pos}), who.push_back(s);
       }
       const size_t per = size_t(std::max(1, 32 / B));
       for (size_t i0 = 0; i0 < reqs.size(); i0 += per) {
@@ -327,6 +342,7 @@ void Scheduler::step() {
     Seq& q = seqs_[size_t(s)];
     engine::Chunk c;
     c.slot = s, c.start_pos = int64_t(q.tokens.size()), c.accept = q.pending_accept;
+    c.rope_delta = rope_delta(*q.req, c.start_pos);
     c.tokens.push_back(q.next_token);
     Item it{Item::Decode, s, 1, {}};
     if (const int B = speculate[size_t(s)]) {
@@ -357,13 +373,27 @@ void Scheduler::step() {
       if (wants_snapshot(q, g)) cut = std::min(cut, g);
       n = std::min(n, cut - fed);
     }
+    // An image is never split: the chunk ends before one it would cut, and one that starts the chunk goes whole (it fits
+    // max_chunk and max_batch: submit checked), or waits for a step with room.
+    auto fit = [&](int64_t len) -> int64_t {
+      const int64_t end = fed + len;
+      for (const ImageInput& im : q.req->images)
+        if (im.start < end && end < im.start + im.n) return im.start > fed ? im.start - fed : -im.n;
+      return len;
+    };
+    n = fit(n);
+    if (n < 0) {
+      if (-n > budget) continue;
+      n = -n;
+    }
     int64_t cap = 0;
     if (spec) {
       const int64_t from = std::max(fed, P - W);
       cap = std::max<int64_t>(0, fed + n - from);
       if (cap > cap_left) {
         n = from + cap_left - fed;
-        cap = cap_left;
+        if (n = fit(n); n < 0) continue;
+        cap = std::max<int64_t>(0, fed + n - from);
       }
     }
     if (n <= 0) continue;
@@ -371,6 +401,10 @@ void Scheduler::step() {
     engine::Chunk chunk;
     chunk.slot = int(s), chunk.start_pos = int64_t(q.tokens.size());
     chunk.tokens.assign(q.req->prompt.begin() + fed, q.req->prompt.begin() + fed + n);
+    chunk.rope_delta = rope_delta(*q.req, fed);
+    for (const ImageInput& im : q.req->images)
+      if (im.start >= fed && im.start + im.n <= fed + n) chunk.images.push_back({im.start - fed, im.n, im.rows->data(), im.nx, im.ny});
+    for (int32_t& t : chunk.tokens) t = std::max<int32_t>(t, 0);  // an image's rows carry ids below zero; the engine ignores them
     chunk.logits_rows = last ? 1 : 0, chunk.capture_rows = cap;
     chunks.push_back(std::move(chunk));
     items.push_back({Item::Prefill, int(s), last ? 1 : 0, {}});
@@ -398,7 +432,20 @@ void Scheduler::step() {
   auto inject = [&](const engine::Chunk& c, int64_t first_cap_row, int64_t count) {
     if (!spec || count <= 0) return;
     Timer timer(mu_, stats_.inject_s);
-    c_.draft->inject(c.slot, capture.data + first_cap_row * capture.width, int64_t(capture.ids[size_t(first_cap_row)].pos), count);
+    // Runs of consecutive rows at consecutive rotary positions; an image's rows are left out (llama.cpp's draft skips them: they
+    // share a position, and the draft jumps over the gap, which restarts its context here).
+    const Request& r = *seqs_[size_t(c.slot)].req;
+    for (int64_t i = 0; i < count;) {
+      const int64_t seq = int64_t(capture.ids[size_t(first_cap_row + i)].pos);
+      if (image_at(r, seq)) {
+        ++i;
+        continue;
+      }
+      int64_t j = i + 1;
+      while (j < count && !image_at(r, int64_t(capture.ids[size_t(first_cap_row + j)].pos))) ++j;
+      c_.draft->inject(c.slot, capture.data + (first_cap_row + i) * capture.width, seq - rope_delta(r, seq), j - i);
+      i = j;
+    }
   };
   auto logits_row = [&](size_t r) { return std::span<const float>(logits.data() + r * V, V); };
   for (size_t i = 0; i < chunks.size(); ++i) {
@@ -411,7 +458,8 @@ void Scheduler::step() {
     cap_row += c.capture_rows;
     switch (it.kind) {
       case Item::Prefill: {
-        q.tokens.insert(q.tokens.end(), c.tokens.begin(), c.tokens.end());
+        // The prompt's own ids (an image's rows are named by theirs), not the zeros the engine was given.
+        q.tokens.insert(q.tokens.end(), q.req->prompt.begin() + std::ptrdiff_t(q.fed), q.req->prompt.begin() + std::ptrdiff_t(q.fed + c.tokens.size()));
         q.fed += c.tokens.size();
         inject(c, cap0, c.capture_rows);
         const int64_t pos = int64_t(q.tokens.size());
@@ -546,7 +594,7 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
     // draft's context cut to match, and the state at the end of the generation snapshotted.
     if (eng_.pending(slot)) eng_.settle(slot, q.pending_accept);
     q.pending_accept = -1;
-    if (c_.draft) c_.draft->truncate(slot, int64_t(q.tokens.size()));
+    if (c_.draft) c_.draft->truncate(slot, int64_t(q.tokens.size()) - rope_delta(*q.req, int64_t(q.tokens.size())));
     if (q.generated > 0) take_snapshot(slot);
   }
   Event e;
@@ -564,6 +612,7 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
     RequestLog l;
     l.tag = q.req->tag, l.reason = q.req->cancelled() ? "cancelled" : reason, l.error = error;
     l.prompt_tokens = e.prompt_tokens, l.cached_tokens = e.cached_tokens, l.completion_tokens = e.completion_tokens;
+    for (const ImageInput& im : q.req->images) l.image_tokens += im.n;
     l.verifies = q.verifies, l.drafted = q.drafted, l.accepted = q.accepted;
     l.queue_s = seconds(q.admitted - q.req->submitted);
     if (q.generated > 0) {
