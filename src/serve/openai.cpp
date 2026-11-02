@@ -6,7 +6,7 @@
 #include <string_view>
 
 #include "core/json.hpp"
-#include "text/chat_gemma4.hpp"
+#include "text/chat.hpp"
 #include "text/chat_qwen36.hpp"
 
 namespace eklow::serve {

@@ -18,7 +18,7 @@
 #include <vector>
 
 #include "core/json_value.hpp"
-#include "text/chat_gemma4.hpp"  // ChatPart, ChatError, join
+#include "text/chat.hpp"  // ChatPart, ChatError, join
 
 namespace eklow::text {
 
