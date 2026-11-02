@@ -502,8 +502,8 @@ int main(int argc, char** argv) {
       ec.capture_layers = draft_cfg.target_layers;
       ec.max_capture_rows = chunk + int64_t(slots) * 16;
       ec.max_pending = std::max(ec.max_pending, draft_block);
-      // The draft's weights, rings and scratch (0.76 GiB) and the token table it embeds blocks with (0.5 GiB), kept from the experts.
-      ec.draft_reserve_bytes = uint64_t(1.3 * 1073741824.0);
+      // The draft's weights, rings and scratch (0.76 GiB), kept from the experts (its token table stays on the host).
+      ec.draft_reserve_bytes = uint64_t(0.85 * 1073741824.0);
     } else {
       ec.capture_layers.clear();
       ec.draft_reserve_bytes = 0;
@@ -558,22 +558,18 @@ int main(int argc, char** argv) {
       std::fprintf(stderr, "eklow-server: prefill streams busy cold experts to the card: %d slots, %.2f GiB of cold experts pinned in host memory\n",
                    eng.stream_slots(), eng.pinned_bytes() / GiB);
     // The draft goes on after the engine, into the memory the engine kept for it.
-    std::unique_ptr<uint8_t, std::function<void(uint8_t*)>> draft_embd;  // the token table, on the card for the draft (the engine keeps its own on the host)
     std::unique_ptr<model::Dflash2> draft;
     if (draft_file) {
       const gguf::Tensor* emb = file.tensor("token_embd.weight");
       if (!emb) throw std::runtime_error(model_path + ": no token_embd.weight");
-      draft_embd = {sycl::malloc_device<uint8_t>(emb->nbytes, q), [&q](uint8_t* p) { sycl::free(p, q); }};
-      if (!draft_embd) throw std::runtime_error("out of device memory for the draft's token table");
-      q.memcpy(draft_embd.get(), emb->data, emb->nbytes).wait();
-      // The head is the engine's own.
-      const model::Dflash2Target target{ref::Weight{emb->type, int64_t(emb->ne[0]), int64_t(emb->ne[1]), draft_embd.get(), emb->nbytes / emb->ne[1]}, eng.head_weight()};
+      // The token table stays in the mapped file (a pass copies the rows it embeds); the head is the engine's own.
+      const model::Dflash2Target target{ref::Weight{emb->type, int64_t(emb->ne[0]), int64_t(emb->ne[1]), static_cast<const uint8_t*>(emb->data), emb->nbytes / emb->ne[1]}, eng.head_weight(), true};
       model::Dflash2::Options opt;
       opt.slots = slots;
       opt.max_block = 16;  // a request may ask for a larger block than the default
       draft = std::make_unique<model::Dflash2>(q, *draft_file, target, opt);
-      std::fprintf(stderr, "eklow-server: DFlash 2 draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card (and the target's token table, %.0f MiB); free card memory now %.2f GiB\n",
-                   draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0, double(emb->nbytes) / 1048576.0,
+      std::fprintf(stderr, "eklow-server: DFlash 2 draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card (its token table stays on the host); free card memory now %.2f GiB\n",
+                   draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0,
                    rt::free_memory(q.get_device()).value_or(0) / GiB);
     }
     serve::SchedulerConfig sc{batch, chunk, ec.max_ctx, [](const serve::RequestLog& l) { log_line(request_line(l)); }};

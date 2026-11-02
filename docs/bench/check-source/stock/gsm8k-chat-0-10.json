@@ -1,0 +1,32 @@
+{
+  "model": "qwen3.6-35b-a3b",
+  "bench": "gsm8k",
+  "protocol": "chat",
+  "level": "medium",
+  "seed": 1234,
+  "items": 10,
+  "fewshot_seed": 1234,
+  "strict_match": 1.0,
+  "flexible_extract": 1.0,
+  "strict_match_ci95": 0.0,
+  "flexible_extract_ci95": 0.0,
+  "truncated": 0,
+  "parse_fail": 0,
+  "mean_completion_tokens": 1984.2,
+  "max_completion_tokens": 3340,
+  "mean_reasoning_tokens": null,
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "max_tokens": 65536,
+    "chat_template_kwargs": {
+      "reasoning_effort": "medium"
+    }
+  },
+  "serving": {
+    "weights": "EKK8 (Q4_K experts, Q8_0 dense, Q6_K head)",
+    "activations": "int8 small batches, fp16 large",
+    "kv_cache": "int8"
+  }
+}

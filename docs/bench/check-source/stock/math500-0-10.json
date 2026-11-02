@@ -1,0 +1,28 @@
+{
+  "model": "qwen3.6-35b-a3b",
+  "bench": "math500",
+  "level": "medium",
+  "seed": 1234,
+  "items": 10,
+  "exact_match": 0.6,
+  "exact_match_ci95": 0.3036418943426615,
+  "math_verify": 1.0,
+  "math_verify_ci95": 0.0,
+  "truncated": 0,
+  "mean_completion_tokens": 13924.2,
+  "mean_reasoning_tokens": null,
+  "generation": {
+    "temperature": 1.0,
+    "top_p": 0.95,
+    "top_k": 20,
+    "max_tokens": 65536,
+    "chat_template_kwargs": {
+      "reasoning_effort": "medium"
+    }
+  },
+  "serving": {
+    "weights": "EKK8 (Q4_K experts, Q8_0 dense, Q6_K head)",
+    "activations": "int8 small batches, fp16 large",
+    "kv_cache": "int8"
+  }
+}

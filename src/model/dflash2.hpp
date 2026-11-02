@@ -117,6 +117,10 @@ class Dflash2Ref {
 struct Dflash2Target {
   ref::Weight tok_embd;
   xmx::Weight head;
+  // If set, tok_embd.data is HOST memory (the target's file as mapped) and the draft copies the rows a pass embeds (each
+  // block's anchor and the mask token) to a small table on the card, instead of keeping the whole table there: 515 MiB
+  // of the card, 7 experts of every layer, for a few row copies a pass.
+  bool host_table = false;
 };
 
 // A Dflash2Target loaded from a GGUF holding the target's `token_embd.weight` and `output.weight` (the target file, or
