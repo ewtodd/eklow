@@ -678,7 +678,9 @@ void Engine::cold_compute(const Layer& L, const std::vector<int32_t>& cp, const 
       }
     });
   };
+  const auto c0 = std::chrono::steady_clock::now();
   run(gu_segs, L.cold_gu, q_gu_, E, 2 * Fe, 32);
+  const auto c1 = std::chrono::steady_clock::now();
   // SwiGLU and the int8 quantization of its output, per pair.
   pool_->for_each(nc, 4, [&](int64_t lo, int64_t hi) {
     std::vector<float> g(static_cast<size_t>(Fe));
@@ -687,7 +689,13 @@ void Engine::cold_compute(const Layer& L, const std::vector<int32_t>& cp, const 
       cold_g_[size_t(k)] = cpu::quantize(g.data(), Fe);
     }
   });
+  const auto c2 = std::chrono::steady_clock::now();
   run(dn_segs, L.cold_dn, q_dn_, Fe, E, 64);
+  const auto c3 = std::chrono::steady_clock::now();
+  cold_.gu_s += std::chrono::duration<double>(c1 - c0).count();
+  cold_.glu_s += std::chrono::duration<double>(c2 - c1).count();
+  cold_.dn_s += std::chrono::duration<double>(c3 - c2).count();
+  cold_.experts += gu_segs.size();
 }
 
 void Engine::cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event routed, sycl::event hot_done) {

@@ -1,0 +1,56 @@
+# cost-model sweeps, prefill 2048 from empty (tok/s)
+== --stream-cpu-us 15
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.70 s,   1202.4 tok/s
+    cold experts: 0.78 s waiting on the card's routing, 0.86 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 2840 experts in 40 layers (87.1% of the cold pairs)
+== --stream-cpu-us 20
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.79 s,   1144.2 tok/s
+    cold experts: 0.92 s waiting on the card's routing, 0.80 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 3036 experts in 40 layers (88.6% of the cold pairs)
+== --stream-cpu-us 30
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.83 s,   1119.2 tok/s
+    cold experts: 1.03 s waiting on the card's routing, 0.73 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 3175 experts in 40 layers (89.4% of the cold pairs)
+== --stream-cpu-us 20 --stream-min-rows 8
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.79 s,   1142.7 tok/s
+    cold experts: 0.91 s waiting on the card's routing, 0.80 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 3036 experts in 40 layers (88.6% of the cold pairs)
+== --stream-cpu-us 10
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.65 s,   1238.6 tok/s
+    cold experts: 0.42 s waiting on the card's routing, 1.18 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 2521 experts in 40 layers (84.2% of the cold pairs)
+== --stream-cpu-us 7
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.75 s,   1171.6 tok/s
+    cold experts: 0.39 s waiting on the card's routing, 1.29 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 2231 experts in 40 layers (80.9% of the cold pairs)
+== --stream-cpu-us 5
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.89 s,   1084.5 tok/s
+    cold experts: 0.40 s waiting on the card's routing, 1.43 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 1961 experts in 40 layers (77.1% of the cold pairs)
+== --stream-copy-us 200
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.67 s,   1223.5 tok/s
+    cold experts: 0.73 s waiting on the card's routing, 0.88 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 2759 experts in 40 layers (86.4% of the cold pairs)
+== --stream-copy-us 350
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.76 s,   1160.4 tok/s
+    cold experts: 0.39 s waiting on the card's routing, 1.31 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 2308 experts in 40 layers (81.9% of the cold pairs)
+# DDR read ceiling (mb/bw.cpp)
+threads 4: 38.1 GB/s
+threads 8: 41.2 GB/s
+threads 12: 39.2 GB/s
+threads 14: 38.8 GB/s
+threads 16: 38.8 GB/s
+threads 20: 38.8 GB/s
+old
+pairs 1800: 14.65 us/pair; huge 1 threads 16 gstep 32 dstep 64: gu 17326 us dn 9035 us, layer 26361 us = 8.1 GB/s
+pairs 400: 19.22 us/pair; huge 1 threads 16 gstep 32 dstep 64: gu 5146 us dn 2543 us, layer 7689 us = 27.6 GB/s
+new
+pairs 1800: 11.79 us/pair; huge 1 threads 16 gstep 32 dstep 64: gu 13613 us dn 7612 us, layer 21225 us = 10.0 GB/s
+pairs 400: 16.53 us/pair; huge 1 threads 16 gstep 32 dstep 64: gu 4395 us dn 2218 us, layer 6613 us = 32.1 GB/s
+old
+pairs 1800: 14.75 us/pair; huge 1 threads 16 gstep 32 dstep 64: gu 17458 us dn 9095 us, layer 26554 us = 8.0 GB/s
+pairs 400: 18.90 us/pair; huge 1 threads 16 gstep 32 dstep 64: gu 5062 us dn 2499 us, layer 7561 us = 28.1 GB/s
+new
+pairs 1800: 10.19 us/pair; huge 1 threads 16 gstep 32 dstep 64: gu 11788 us dn 6552 us, layer 18340 us = 11.6 GB/s
+pairs 400: 16.22 us/pair; huge 1 threads 16 gstep 32 dstep 64: gu 4310 us dn 2178 us, layer 6488 us = 32.7 GB/s

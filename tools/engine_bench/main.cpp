@@ -161,10 +161,11 @@ int main(int argc, char** argv) {
       const auto ss = eng.stream_stats();
       if (per_step)
         std::printf("    cold experts per step: %.2f ms waiting on the card's routing, %.2f ms computing on the CPU, %.1f%% of pairs on the CPU; "
-                    "%.1f of %.1f cold layers had the card finished before the CPU\n",
+                    "%.1f of %.1f cold layers had the card finished before the CPU; CPU phases gate|up %.2f, glu %.2f, down %.2f ms, %.1f distinct experts a step\n",
                     1e3 * (cs.wait_s - cs0.wait_s) / steps, 1e3 * (cs.cpu_s - cs0.cpu_s) / steps,
                     100.0 * double(eng.cold_pairs() - cp0) / double(std::max<uint64_t>(1, eng.pairs() - pr0)),
-                    double(cs.late_layers - cs0.late_layers) / steps, double(cs.layers - cs0.layers) / steps);
+                    double(cs.late_layers - cs0.late_layers) / steps, double(cs.layers - cs0.layers) / steps,
+                    1e3 * (cs.gu_s - cs0.gu_s) / steps, 1e3 * (cs.glu_s - cs0.glu_s) / steps, 1e3 * (cs.dn_s - cs0.dn_s) / steps, double(cs.experts - cs0.experts) / steps);
       else
         std::printf("    cold experts: %.2f s waiting on the card's routing, %.2f s computing on the CPU, %.1f%% of pairs cold, %llu of %llu layers with the card finished first; "
                     "streamed %llu experts in %llu layers (%.1f%% of the cold pairs)\n",
