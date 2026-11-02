@@ -39,6 +39,7 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "gguf.h"
 #include "llama.h"
 #include "mtmd-helper.h"
 #include "mtmd.h"
@@ -186,7 +187,16 @@ int encode_images(llama_model* model, const std::string& mmproj, const std::vect
     std::fprintf(stderr, "oracle: mtmd_tokenize failed (%d)\n", r);
     return 1;
   }
-  const int n_embd = llama_model_n_embd_inp(model);
+  // A vocabulary-only model has no width; the projector's output is the rows' (the encoders here all end in it).
+  int n_embd = llama_model_n_embd_inp(model);
+  if (n_embd <= 0) {
+    gguf_init_params gp{true, nullptr};
+    if (gguf_context* g = gguf_init_from_file(mmproj.c_str(), gp)) {
+      const int64_t k = gguf_find_key(g, "clip.vision.projection_dim");
+      if (k >= 0) n_embd = int(gguf_get_val_u32(g, k));
+      gguf_free(g);
+    }
+  }
   std::ostringstream imgs;
   int n_images = 0;
   for (size_t i = 0; i < mtmd_input_chunks_size(chunks); ++i) {
@@ -398,6 +408,9 @@ int main(int argc, char** argv) {
   llama_backend_init();
   auto mp = llama_model_default_params();
   mp.n_gpu_layers = ngl;
+  // --encode-only needs the text model only for its vocabulary and widths (mtmd tokenizes and sizes the rows by them): skip
+  // its weights, which the CPU would repack into gigabytes.
+  mp.vocab_only = encode_only;
   llama_model* model = llama_model_load_from_file(model_path.c_str(), mp);
   if (!model) {
     std::fprintf(stderr, "oracle: cannot load %s\n", model_path.c_str());

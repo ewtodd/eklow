@@ -13,10 +13,14 @@ Live state, written as a handoff (2026-11-01). Design and targets: `DESIGN.md`; 
 - **Production on fiona is stopped**: the owner agreed to stop `eklow.service` (the 26B) for the port on 2026-10-31
   17:40. A deploy or reboot starts it again (the service is enabled): check `systemctl is-active eklow` before any card
   work, stop it, and say so. Clients that pick `eklow/gemma-4-26b-a4b` get nothing meanwhile.
-- **The switch, still to do**: the release numbers (both models through the server, and the owner's `check-source`
-  evals, branch `qwen/release`) decide which model fiona serves; then `qwen/main` goes into `main` and is pushed, and
-  `/etc/nixos` gets the new eklow config (model, draft, profile, template; maitred's upstream id) together with the
-  eklow input update, so a deploy never evaluates the new options against the old eklow. The owner deploys.
+- **The switch, still to do**: fiona will serve **Ornith-1.5** (the owner's choice, 2026-11-02), once image input
+  works (the owner's priority: the 26B took images): Qwen3.6's vision encoder (`qwen/vision`) and images through the
+  engine and the server (`qwen/imgserve2`) are being built. Then `qwen/main` goes into `main` and is pushed, and
+  `/etc/nixos` gets the new eklow config (model, draft, projector, profile; maitred's `eklow/ornith-1.5-35b-a3b`)
+  together with the eklow input update, so a deploy never evaluates the new options against the old eklow; the change
+  waits as a patch in e-desktop `~/eklow-qwen-data/etc-nixos-ornith-switch.patch`. The owner deploys and tests the model
+  in production; no further evals (`check-source` stopped after stock's GSM8K: 293/300, 97.7% +- 1.7%,
+  `docs/bench/check-source/stock/`).
 - **fiona's card**: the A770M is kept out of runtime suspend (`/etc/nixos` 432377be, deployed 2026-11-01): on xe a
   resume from it sometimes failed (forcewake timeouts, only while the card idled) and once lost the card until a reboot.
 
@@ -61,8 +65,8 @@ segments were merged, so prefill at depth is now higher; DECISIONS 2026-11-01, "
 Fidelity: the engine within the fp32 reference's band on every path (`checkq`: stock EKK8 242-248 of 256 top-1 on the
 2,573-token prompt, chat 27/27); DFlash 2 lossless through the server (3,000 sampled completions with and without the
 draft, chi-square p = 0.985); acceptance at block 8 5.75 / 5.43 / 5.02 on GSM8K / HumanEval / MT-Bench (llama.cpp:
-5.24 / 4.98 / 4.53). The final numbers on the merged tree, for both models, and the `check-source` scores are being
-measured (`qwen/release`) and will replace this section and README's tables.
+5.24 / 4.98 / 4.53). The final numbers on the merged tree, for both models (59 experts a layer): README
+"Performance" and `docs/bench/release/`.
 
 ## Where things are
 
@@ -101,20 +105,20 @@ measured (`qwen/release`) and will replace this section and README's tables.
 
 ## Open, in order
 
-1. **The switch** (above): release numbers, the model choice, `main`, `/etc/nixos`, the owner's deploy.
-2. **Prefill**: half the 26B's at 8k (the experts are 18 GB and only 52-71 of 256 a layer fit beside 2 x 262k of KV;
+1. **Image input, then the switch** (above): the vision encoder and images through the engine and server, then `main`,
+   `/etc/nixos`, the owner's deploy of Ornith-1.5.
+2. **Prefill**: 60-74% of the 26B's (the experts are 18 GB and only 59-71 of 256 a layer fit beside 2 x 262k of KV;
    72% of a chunk's expert work is cold). The CPU's share is at its memory wall and streaming near its optimum
    (DECISIONS 2026-11-01, "the MoE's speed"). Levers: context for experts (2 x 128k frees ~2.9 GiB, ~30 more experts a
    layer: the owner's call), the Iris Xe as a second device for the pairs not streamed, the placement gap below.
-3. **Placement**: the server places 52 experts a layer against the engine bench's 71 (the embedding model, the draft's
-   reserve, scratch): account for it and take back what is wasted (`qwen/release` item 1).
+3. **Placement**: the server places 59 experts a layer (52 before the draft's token table went to the host) against
+   the engine bench's 71 (the embedding model, the draft, scratch): what is left to take back.
 4. **Verify rows**: each row past the first costs ~8.5 ms of the CPU's cold experts, so blocks of 4 are best; cheaper
    rows would make the drafts' longer blocks pay (6.5 tokens a verify at block 16).
 5. **Snapshots mid-generation**: Ornith's third turn reused 10,398 of 11,075 tokens because a sampled answer
    tokenized differently from its re-render; a snapshot every ~256 generated tokens would bound that.
 6. **Decode launches**: ~25 a layer; a fused tail or SYCL graphs.
-7. **Image input for Qwen3.6** (its vision encoder is not ported: image parts are refused).
-8. A routing profile from real traffic (today's are from the reference's recordings).
+7. A routing profile from real traffic (today's are from the reference's recordings).
 
 ## History
 

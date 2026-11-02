@@ -1650,3 +1650,67 @@ The model cards carry the KL tables: each file beats the published Q4_K_M of its
 0.0168 at 4k; Ornith 0.0354 against bartowski's 0.0460 and the official 0.0596). Working copies live on fiona
 (`~/models`, `~/models/drafts`); e-desktop's home filesystem was at 99% and the owner had them deleted there after their
 sha256 matched fiona's.
+
+## 2026-11-02 — Qwen3.6's vision encoder (Ornith-1.5), checked against llama.cpp
+
+Projector `qwen3vl_merger` (`model::VisionQwen3VL`, `src/model/vision_qwen3vl*.cpp`, `src/image/qwen3vl_image.*`,
+`eklow-vision-qwen`): 27 layers of 1,152 (16 heads of 72), LayerNorm with bias, fused qkv with bias, "vision M-RoPE"
+(pairs (i, i + 36) of a head turn by the patch's row for i < 18 and by its column for i >= 18, base 10,000), scale
+1/sqrt(72), gelu (tanh) FFN of 4,304, the learned 48 x 48 table bilinearly resized to the grid with align_corners (ggml's
+float arithmetic), a post LayerNorm, then four neighbours side by side (4,608) -> mm.0 -> gelu -> mm.2 -> 2,048-wide rows.
+The two conv kernels (two frames) see the same picture for a still image, so they are one weight, their sum. Patches are
+kept in the model's merge order (a 2 x 2 block consecutive), so output row r is the merged grid row by row.
+
+**The projector.** `convert_hf_to_gguf.py --mmproj --outtype bf16` at the oracle's revision on Ornith-1.5-35B-A3B @
+10fbf86fed7e (only `model-00001-of-00016.safetensors`, sha256 250b3b09..., holds the 333 `model.visual.*` tensors; the
+converter was given a directory of the configs, that shard and an index cut to it). `~/models/mmproj-Ornith-1.5-35B-A3B-
+bf16.gguf` on fiona, 902,821,920 B, sha256 5a1ad8ff16aa66f4e538b34976b36c6551c0279b06112e61e26658e110871b23 (334
+tensors: the patch kernel is split in two; BF16 matrices, F32 vectors, patch kernels and position table). Against bartowski's
+`mmproj-Ornith-1.5-35B-A3B-bf16.gguf` @ 64b0493d34: all 334 tensors byte-identical, only `general.*` metadata differs
+(name, basename, license, tags). An F32 conversion (1.79 GB) is the oracle's projector for the checks. No `image_min/max_pixels`
+keys are written: llama.cpp's own limits apply (8 to 4,096 tokens).
+Stock Qwen/Qwen3.6-35B-A3B (@995ad96e, visual tensors in its shards 1-2 of 26): all 333 `model.visual.*` tensors are byte-identical to Ornith's (compared by range requests, `tools/vision/cmp_towers.py`): Ornith did not touch the tower, so one projector serves both models.
+
+**Preprocessing** is mtmd's `dyn_size`: stb decode to RGB, `calc_size_preserved_ratio` with align 32 and the pixel limits
+min/max tokens x 1,024 (llama.cpp's `--image-min-tokens` 8 / `--image-max-tokens` 4,096; eklow's tool defaults to a max of
+1,024), Pillow bicubic into the target centred on black, then `(x / 255 - 0.5) / 0.5` in float. `image::qwen3vl_size` gives the
+size (and so the token count) from the dimensions alone. The token grid equals llama.cpp's on all 17 images x budgets tried (up
+to 4,096 tokens): 1 x 1, 17 x 9, 48 x 36, 2400 x 60, 5000 x 20, 20 x 3000, 70 x 1500, 6000 x 4000, grayscale, RGBA PNG, 16-bit
+PNG, palette GIF, JPEGs. Patch embeddings agree with the oracle's to 1-2.5e-4 (its im2col rounds to fp16), so the pixels are the same.
+
+**Encoder.** Reference: fp32 on `ref::` kernels, all weights on the card (861 MiB). Fast: xmx fp16 GEMMs (BF16 as fp16; qkv,
+o, up (4,304 padded to 4,352), down (K padded to 4,320), and the merger as three more streamed pieces: mm.0's halves and mm.2),
+`vattn` attention with heads of 72 padded to 96 and the 1/sqrt(72) folded into Q, fused LayerNorm/bias/residual/gelu kernels, the
+picture cut and normalized on the card from the RGB bytes, the position table (pinned host) interpolated on the card. Weights are
+streamed a unit at a time from pinned host memory into two 30.6 MiB staging buffers as Gemma's (`--resident` keeps all 30
+units on the card instead).
+
+| budget (big.jpg) | tokens | patches | streamed | resident | card, streamed / resident |
+|---|---|---|---|---|---|
+| 256 | 238 | 952 | 146 ms | 63 ms | 210 / 1,027 MiB |
+| 1,024 | 986 | 3,944 | 387 ms | 299 ms | 267 / 1,084 MiB |
+| 4,096 | 4,071 | 16,284 | 2.90 s | 2.83 s | 456 / 1,273 MiB |
+
+(A run of the same binary on another day varied by 10%: 132 ms at 256 earlier; read the table as +-10%.) Streaming costs a near
+constant ~65-85 ms (0.9 GB at ~13 GB/s) and saves 817 MiB, i.e. ~11 experts a layer of 256: it is the default. At 1,024 tokens
+(profile, streamed): attention 136 ms (~14 TFLOPS on the real 72 dims), GEMMs 118 (27 TFLOPS), elementwise ~60, copy waits 78.
+GEMM chunks of 2,048 rows beat 1,024 (+8%) and 4,096 (+4%). The card memory while encoding is mostly attention scratch (~75 MiB),
+Q/K/V tiles, residual, GEMM output and the staging; the encoder frees all but 3 MiB on `release()`.
+
+**Checks** against `eklow-oracle --encode-only` with the F32 projector (`tools/vision/check-qwen.sh`; the oracle now loads
+only the vocabulary in that mode, 1.3 s instead of 20 s and gigabytes of repacked experts). The encoder is chaotic in some
+rows: shifting every pixel of an image by one level (+0.4%) moves eklow's own rows by 0.08-0.12 total relative L2, with single
+rows at 0.5-1.0; the stock BF16 projector in the oracle moves the oracle's rows from its F32 run by 2.0e-2 (tall, 64 tokens)
+and 8.7e-2 (test-1, 256), worst row cosine 0.78. Layer by layer (tall, reference) the difference grows smoothly from 2e-4
+to 6.6e-3, no step. Against that: reference vs F32 oracle, 64 tokens: total relative L2 1.1-5.6e-3, mean cosine >= 0.99999,
+worst row cosine 0.9997; fast: 2.1-4.5e-3 (mean cos >= 0.99999); at 256 tokens the reference 1.6e-3..3.3e-2 and fast
+2.2e-3..1.3e-2; fast at 1,024: 2.2e-3..3.6e-2 (gray.png and the alpha PNG 3.1e-2 and 3.6e-2, one row each at cosine 0.88-0.92);
+at 4,096 tokens (6000 x 4000, 4,056 rows) 4.3e-3, mean cosine 0.999992. The band for the fast encoder: mean cosine >= 0.9993 and
+total relative L2 <= 4e-2 against the F32-weight oracle, inside the oracle's own BF16-vs-F32 spread and its sensitivity to
+a pixel level. Fast against reference: 1.9e-3 (test-1, 64 tokens) to 4.4e-2 (test-1, 256, the chaotic image).
+Not done: the model's answers about images (the text side is `qwen/imgserve2`'s).
+
+**Interface for the server**: `model::VisionQwen3VL enc(q, gguf::File::open(mmproj))`; `spec = enc.spec(max_tokens, min_tokens)`;
+`image::qwen3vl_size(w, h, spec)` -> pixels, tokens = (W/32) x (H/32); `QwenImageRows r = enc.encode(bytes, spec)` (or
+`encode(prepare_qwen3vl(decode(bytes), spec))`) -> `r.rows` (`DeviceRows`: fp32 `[n][2048]` on the card, shared_ptr) and
+`r.grid_w, r.grid_h` (merged patches; n = w * h); `reserve(max_tokens)`, `card_bytes(max_tokens)`, `release()` as VisionGemma4V's.
