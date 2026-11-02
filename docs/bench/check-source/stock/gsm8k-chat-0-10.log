@@ -1,0 +1,3 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+  10/10
+RESULT gsm8k chat level=medium seed=1234 items=10 strict=1.0000 flexible=1.0000 serving=EKK8 (Q4_K experts, Q8_0 dense, Q6_K head) / int8 small batches, fp16 large / int8
