@@ -1624,3 +1624,29 @@ Gates and the tables are in README "Performance" and `docs/bench/serve-*-qwen-*`
 tool calls, stop strings, seeds, two at once, cancel, reuse (`serve_test.py basic`, all ok with the draft, without it,
 and with Ornith); needle at 88k and 167k found with two requests and embeddings at once (embeddings 91-238 ms beside the
 prefills).
+
+## 2026-11-01 — the draft for both models, and the files on Hugging Face
+
+**The draft.** llama.cpp's acceptance (tokens per verify, temperature 1, top-p 0.95, top-k 20, thinking on, 32
+requests each; `docs/bench/qwen36-dflash2-llamacpp-2026-11-01.txt`): on stock Qwen3.6 (EKK8) Inco's draft gives 5.24 /
+5.08 / 4.59 on GSM8K / HumanEval / MT-Bench at block 8 and 6.58 / 6.14 / 5.49 at block 16; jzinno's (trained on Ornith)
+4.59 / 3.76 / 3.87 and 5.49 / 4.08 / 4.23: Inco's is clearly better there. On Ornith (EK8) the two tie at block 8 (Inco
+5.21 / 5.01 / 4.01, jzinno 5.23 / 5.00 / 3.92) and jzinno's leads a little at block 16 on two of three (6.51 / 6.27 /
+4.49 against 6.43 / 6.04 / 4.59). The protocol check reproduces Inco's own numbers (5.24 / 4.98 / 4.53 against 5.21 /
+4.90 / 4.41 on SGLang). On this card a verify row costs ~8.5 ms of the CPU's cold experts, so eklow runs short blocks
+(the server's sweep: block 4 best, 56.3 tok/s on GSM8K at 8k against 53.1 at 8 and 42.7 at 16), where the drafts tie on
+Ornith. The owner's rule ("use Inco's, the community one if it is better") gives **Inco's draft for both models**: one
+draft file. Worth revisiting if verify rows get cheap enough for blocks of 16.
+
+**The files** (the owner: no "eklow" in the names, the quant style instead; public, so fiona's Nix fetch needs no token;
+uploaded from fiona, the draft's repo created by the owner):
+- `ethanwtodd/Qwen3.6-35B-A3B-Q4_K-Q8_0-GGUF` @ 8db5016e: `Qwen3.6-35B-A3B-Q4_K-Q8_0.gguf` (EKK8), sha256 48cf98f4...
+- `ethanwtodd/Ornith-1.5-35B-A3B-Q4_K-Q8_0-GGUF` @ a89886e0: `Ornith-1.5-35B-A3B-Q4_K-Q8_0.gguf` (EKK8 with Ornith's
+  own chat template), sha256 25a68129...
+- `ethanwtodd/Qwen3.6-35B-A3B-DFlash2-Q8_0-GGUF` @ 65aaab95: `Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf` (Inco's draft through
+  the pinned converter), sha256 986b8f24...
+
+The model cards carry the KL tables: each file beats the published Q4_K_M of its model (stock 0.0134 against bartowski's
+0.0168 at 4k; Ornith 0.0354 against bartowski's 0.0460 and the official 0.0596). Working copies live on fiona
+(`~/models`, `~/models/drafts`); e-desktop's home filesystem was at 99% and the owner had them deleted there after their
+sha256 matched fiona's.
