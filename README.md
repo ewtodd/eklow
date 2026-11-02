@@ -155,7 +155,12 @@ an exact CPU emulation of the quantized arithmetic (`eklow-kernel-test`, `eklow-
   long prefill; image inputs to `/v1/embeddings` with its projector (`--embed-mmproj`).
 - **Mixture of experts on 16 GB**: routing, grouping and the experts' GEMVs and GEMMs on the card; a placement by routing
   profile, with cold experts on the CPU (AVX-VNNI, Q4_K and Q4_0) at decode and streamed over PCIe for prefill.
-- **No image input to chat** (Qwen's vision encoder is not ported): image parts get a clear error.
+- **Image input to chat** (`--mmproj`, llama.cpp's projector GGUF of Qwen3.6's vision tower, which Ornith-1.5 shares
+  unchanged): OpenAI `image_url` parts (base64 `data:` URLs; JPEG, PNG, GIF, BMP), preprocessed as llama.cpp does and
+  encoded on the matrix units (0.1-0.4 s an image at the default budget of 1,024 tokens, `--image-max-tokens`), the
+  encoder's weights streamed from host memory; the image's rows enter the prompt with Qwen's 3D rotary positions, and
+  prefix reuse tells images apart. Against llama.cpp the logits after an image stay within its own CPU-CUDA band
+  (DECISIONS 2026-11-02).
 
 ## Building
 
@@ -178,9 +183,9 @@ drivers, so it runs on any host.
 ## Running
 
 ```sh
-eklow-server --model stock-EKK8.gguf --alias qwen3.6-35b-a3b \
-  --slots 2 --ctx 262144 --kv-int8 --expert-profile share/eklow/qwen36-experts.json \
-  --draft Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf --snapshot-mib 4096 \
+eklow-server --model Ornith-1.5-35B-A3B-Q4_K-Q8_0.gguf --alias ornith-1.5-35b-a3b \
+  --slots 2 --ctx 262144 --kv-int8 --expert-profile share/eklow/ornith-1.5-experts.json \
+  --draft Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --mmproj mmproj-Ornith-1.5-35B-A3B-bf16.gguf --snapshot-mib 4096 \
   --embed-model embeddinggemma-2-Q8_0.gguf --embed-port 8082 --host 0.0.0.0 --port 8081
 ```
 
