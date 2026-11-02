@@ -1,0 +1,99 @@
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.46 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 71 of 256 per layer on the card (free 7.16 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.19 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.60 s,   1281.2 tok/s
+    cold experts: 0.43 s waiting on the card's routing, 1.11 s computing on the CPU, 70.2% of pairs cold, 40 of 40 layers with the card finished first; streamed 2521 experts in 40 layers (84.2% of the cold pairs)
+    stream_copy_repack     639.0 ms  40.8%
+    moe_sum                144.2 ms   9.2%
+    moe_gate_up            136.6 ms   8.7%
+    stream_gemm            112.4 ms   7.2%
+    moe_down                85.4 ms   5.5%
+    gdn                     80.9 ms   5.2%
+    shexp                   63.8 ms   4.1%
+    router                  61.2 ms   3.9%
+    qkvz                    60.7 ms   3.9%
+    attn                    32.7 ms   2.1%
+    moe_group               29.4 ms   1.9%
+    ssm_out                 22.9 ms   1.5%
+    post_attn               21.9 ms   1.4%
+    tail                    20.3 ms   1.3%
+    qkv                     15.4 ms   1.0%
+    attn_out                11.2 ms   0.7%
+    moe_gather              11.0 ms   0.7%
+    alpha_beta               9.8 ms   0.6%
+    attn_heads               4.4 ms   0.3%
+    head                     1.3 ms   0.1%
+    moe_route                0.9 ms   0.1%
+    embed                    0.5 ms   0.0%
+prefill at depth      0:    3.20 s for 4096 tokens,   1281.7 tok/s
+    cold experts: 0.91 s waiting on the card's routing, 2.19 s computing on the CPU, 69.2% of pairs cold, 80 of 80 layers with the card finished first; streamed 5125 experts in 80 layers (83.9% of the cold pairs)
+    stream_copy_repack    1305.7 ms  41.4%
+    moe_gate_up            275.1 ms   8.7%
+    moe_sum                232.2 ms   7.4%
+    stream_gemm            223.5 ms   7.1%
+    moe_down               172.3 ms   5.5%
+    gdn                    162.1 ms   5.1%
+    shexp                  127.3 ms   4.0%
+    router                 122.9 ms   3.9%
+    qkvz                   121.7 ms   3.9%
+    attn                   116.5 ms   3.7%
+    moe_group               58.9 ms   1.9%
+    ssm_out                 45.8 ms   1.5%
+    post_attn               43.7 ms   1.4%
+    tail                    40.5 ms   1.3%
+    qkv                     31.0 ms   1.0%
+    attn_out                22.6 ms   0.7%
+    moe_gather              22.2 ms   0.7%
+    alpha_beta              19.5 ms   0.6%
+    attn_heads               8.7 ms   0.3%
+    moe_route                1.9 ms   0.1%
+    head                     1.3 ms   0.0%
+    embed                    1.0 ms   0.0%
+decode, 1 slot, at      0:   27.49 ms/step (25.75 ms enqueueing),   36.4 tok/s per sequence
+    cold experts per step: 10.49 ms waiting on the card's routing, 8.63 ms computing on the CPU, 47.2% of pairs on the CPU; 29.5 of 40.0 cold layers had the card finished before the CPU; CPU phases gate|up 5.24, glu 0.44, down 2.52 ms, 151.1 distinct experts a step
+    tail                   326.8 ms  20.4%
+    qkvz                   290.7 ms  18.2%
+    moe_gate_up            191.7 ms  12.0%
+    shexp                  127.1 ms   7.9%
+    qkv                     85.6 ms   5.4%
+    moe_down                84.7 ms   5.3%
+    head                    83.4 ms   5.2%
+    ssm_out                 79.3 ms   5.0%
+    gdn                     59.5 ms   3.7%
+    moe_route               58.2 ms   3.6%
+    post_attn               48.4 ms   3.0%
+    attn                    44.4 ms   2.8%
+    router                  41.3 ms   2.6%
+    attn_out                32.8 ms   2.1%
+    alpha_beta              30.5 ms   1.9%
+    attn_heads              10.1 ms   0.6%
+    embed                    4.2 ms   0.3%
+verify blocks of  8 at   8192:   77.88 ms/step,   54.6 accepted tokens/s (4.2 tokens accepted a block)
+    cold experts per step: 17.43 ms waiting on the card's routing, 43.47 ms computing on the CPU, 51.9% of pairs on the CPU; 37.7 of 40.0 cold layers had the card finished before the CPU; CPU phases gate|up 27.80, glu 1.30, down 12.83 ms, 725.3 distinct experts a step
+    moe_sum                583.0 ms  32.9%
+    moe_gate_up            238.7 ms  13.5%
+    moe_down               140.0 ms   7.9%
+    moe_group              134.5 ms   7.6%
+    attn                   115.3 ms   6.5%
+    qkvz                   105.1 ms   5.9%
+    ssm_out                 91.6 ms   5.2%
+    shexp                   77.0 ms   4.3%
+    router                  48.5 ms   2.7%
+    alpha_beta              38.4 ms   2.2%
+    gdn                     36.6 ms   2.1%
+    qkv                     31.8 ms   1.8%
+    head                    30.8 ms   1.7%
+    attn_out                24.6 ms   1.4%
+    moe_route               22.9 ms   1.3%
+    post_attn               18.0 ms   1.0%
+    tail                    16.6 ms   0.9%
+    moe_gather              12.5 ms   0.7%
+    attn_heads               4.4 ms   0.2%
+    embed                    1.5 ms   0.1%
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 5.80 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 61 of 256 per layer on the card (free 6.51 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.85 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   4096 tokens:    3.34 s,   1224.7 tok/s
+    cold experts: 0.82 s waiting on the card's routing, 2.43 s computing on the CPU, 62.8% of pairs cold, 40 of 40 layers with the card finished first; streamed 3190 experts in 40 layers (81.1% of the cold pairs)
+prefill at depth      0:    7.14 s for 8192 tokens,   1146.6 tok/s
+    cold experts: 1.84 s waiting on the card's routing, 5.15 s computing on the CPU, 67.9% of pairs cold, 80 of 80 layers with the card finished first; streamed 6384 experts in 80 layers (81.3% of the cold pairs)
+decode, 1 slot, at      0:   24.65 ms/step (23.41 ms enqueueing),   40.6 tok/s per sequence
+    cold experts per step: 10.28 ms waiting on the card's routing, 9.45 ms computing on the CPU, 52.4% of pairs on the CPU; 36.0 of 40.0 cold layers had the card finished before the CPU; CPU phases gate|up 5.68, glu 0.49, down 2.88 ms, 167.8 distinct experts a step
+verify blocks of  8 at   8192:   75.00 ms/step,   56.7 accepted tokens/s (4.2 tokens accepted a block)
+    cold experts per step: 18.01 ms waiting on the card's routing, 44.43 ms computing on the CPU, 57.6% of pairs on the CPU; 39.7 of 40.0 cold layers had the card finished before the CPU; CPU phases gate|up 28.45, glu 1.31, down 13.14 ms, 752.4 distinct experts a step

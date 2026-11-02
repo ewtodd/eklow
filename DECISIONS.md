@@ -1518,3 +1518,46 @@ the CPU (43.8 ms of cold experts; the card finished first in 38 of 40 layers), w
 prefill is the streamed experts' copy and repack (41% from empty, 36% at 8k) and, deeper, the attention layers' prefill
 attention (37% at 32k, 63% at 128k: the two-GEMM segments, DECISIONS 2026-10-27, exist only for head 512, and Qwen's
 heads are 256). Those four are the levers.
+
+## 2026-11-01 — the MoE's speed for Qwen3.6: what bounds it (measured; one CPU kernel change kept)
+
+`qwen/moeperf`. Raw output in `docs/bench/qwen-moeperf-*-2026-11-01.txt`.
+
+**The cold experts' GEMVs are at the DDR wall in decode and verify.** A multithreaded AVX2 read of 2 GiB gives 38-41 GB/s
+on fiona's i7-12700H at 4-20 threads (`mb/bw.cpp`: 41.2 at 8, 38.8 at 16), and the microbenchmark of a verify layer's cold
+work (18 distinct experts, 33 pairs, `mb`) runs at 41 GB/s. In the engine a verify block of 8 reads 712 distinct cold experts a
+step (1.26 GB) in 41.7 ms of CPU: 30 GB/s; decode 160 experts in 9 ms, 33 GB/s. So the CPU phase is ~75-80% of the wall and
+what is left is barriers and imbalance between the gate|up, SwiGLU and down phases. The software prefetch and the 2-3 input
+passes of 708e456 already took what the cores' own latency left. Consequences: (1) copying a block's busiest cold experts
+to the card does not remove bytes from DDR (the copy reads them too, once, as the CPU does), it moves the compute; (2) nothing
+that is a kernel makes a verify block's CPU phase much shorter, only fewer distinct cold experts (more on the card) does;
+(3) `moe_sum` in the verify profile (33-45%) is not the combine: it is the mark after `cold_prefill`, i.e. the card
+waiting for the host (the combine is a few rows).
+
+**Prefill's CPU phase is compute-bound, not bandwidth-bound**: the pairs that are not streamed (~1.8k a layer over ~120
+experts of ~15 rows each) run at 8 GB/s and ~15 us a pair. The Q4_K dot now builds the superblock's 8 scales and minimums as
+vectors once and takes each input's scale products through the stack as broadcasts, with the minimum terms accumulated as a
+vector: **14.7 to 10.2-11.8 us a pair** (`mb`, 120 experts x 1,800 pairs; 18.9-19.2 to 16.2-16.5 at 400 pairs), results
+unchanged (`eklow-cpu-qgemv-test` vs emul 1e-6; checkq ekk8 241/256 median KL 3.5e-3, ek8 238/256 4.5e-3, oek8 201-203/256,
+all inside the DECISIONS 2026-11-01 ranges). In `engineq` it moves prefill from empty within noise (1,297 before, 1,315
+after; CPU phase 1.07 to 0.93 s, the card's wait for the routing up by the same): at this operating point the CPU and
+the card paths are balanced, so a faster CPU alone shifts the balance rather than lifting the throughput.
+
+**The streaming cost model is at its optimum** (prefill 2,048 from empty, tok/s): `stream_cpu_us` 5 / 7 / 10 / 15 / 20 / 30 =
+1,085 / 1,172 / 1,239 / 1,202 / 1,144 / 1,119; `stream_copy_us` 200 / 270 / 350 = 1,224 / ~1,240 / 1,160; `stream_min_rows` 8
+the same as 16. Streaming more makes the card's path (copies, their DMA tax on every kernel, repack) the longer one
+(waiting on the routing 0.4 to 1.0 s), streaming less the CPU's (1.1 to 1.4 s). Chunks of 4,096 do not help either:
+the activations cost ten ranks of experts (61 of 256 on the card instead of 71) and the run gives 1,225 tok/s (CPU 2.43 of 3.34 s).
+Prefill from empty: the copy of 63 experts a layer (~4.5 GB a chunk, 410 ms at the link's 10.9 GB/s) plus the repack is the
+41%; the DMA tax of DECISIONS 2026-10-27 makes it also a cost on every other kernel, so the copy bytes are the lever. A
+repacked pinned copy would remove the repack and the raw slots but needs a second 12 GiB of pinned memory; fiona has 30 GB.
+
+**Not done / left**: (a) the iGPU of the 12700H (96 EU, int8 dp4a, same DDR) as a second compute device for the
+non-streamed pairs; (b) a SYCL command graph or fused kernels for the decode layer's ~25 launches (the card's critical chain
+between two CPU phases is ~0.25 ms a layer, 10 ms a step); (c) a smaller hot KV footprint for more experts on the card, which
+is the only thing that shortens verify (each rank of 40 experts' bytes is ~1.8 MB x 40 less CPU read per ...); (d) the
+profile `--profile` of a verify block with timeline per layer.
+
+`engineq` after (no profile; before = the 2026-11-01 table): prefill 1,315 (1,297) / 8k 1,135 (1,071) / 32k 867 (848) / 128k
+395 (393) tok/s; decode 41.3 / 39.5 / 37.4 / 31.3 (41.3 / 39.6 / 36.8 / 31.4); verify 8 at 8k 72.2 (70.9) ms, 16: 113.6 (112.8). All within run-to-run noise (fiona's
+CPU is shared with the other workers' server tests): the kernel change is a CPU saving that these paths do not turn into tok/s.
