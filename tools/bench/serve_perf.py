@@ -106,11 +106,12 @@ def depth(a):
 
 
 def gsm(a):
+    """CONC at a time over the requests; --plain sends each with \"speculative\": false (decode without the draft)."""
     reqs = [json.loads(l) for l in open(a.requests) if l.strip()]
     for conc in [int(x) for x in a.concurrency.split(",")]:
         t0 = time.monotonic()
         with concurrent.futures.ThreadPoolExecutor(conc) as ex:
-            res = list(ex.map(lambda q: stream(a.url, dict(q, model=a.model)), reqs))
+            res = list(ex.map(lambda q: stream(a.url, dict(q, model=a.model, **({"speculative": False} if a.plain else {}))), reqs))
         wall = time.monotonic() - t0
         toks = sum(r[2] for r in res)
         pers = [r for r in res if r[5]]
@@ -194,6 +195,7 @@ p.add_argument("--block", type=int, default=0, help="the draft's block size for 
 p = sub.add_parser("gsm")
 p.add_argument("--requests", required=True)
 p.add_argument("--concurrency", default="1,2")
+p.add_argument("--plain", action="store_true", help="every request with \"speculative\": false")
 p = sub.add_parser("reuse")
 p.add_argument("--docs", required=True)
 p.add_argument("--conv-depth", type=int, default=10000)
