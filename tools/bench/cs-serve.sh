@@ -11,7 +11,7 @@ nix develop path:. -c ./build/eklow-server --model "$model" --alias "$alias" --p
   --expert-profile "$profile" --draft "$draft" --snapshot-mib 4096 \
   --embed-model ~/models/embeddinggemma-2-Q8_0.gguf --embed-port 18182 >"$log" 2>&1 &
 srv=$!
-trap 'pkill -P $srv 2>/dev/null; kill $srv 2>/dev/null; wait $srv 2>/dev/null' EXIT
+trap "pkill -f 'eklow-server --model.*--port 18181' 2>/dev/null; kill $srv 2>/dev/null; wait $srv 2>/dev/null" EXIT
 while kill -0 $srv 2>/dev/null; do
   sleep 30
   if [ $(( $(date +%s) - $(stat -c %Y "$log") )) -gt 1800 ]; then echo "idle for 30 min: stopping" >> "$log"; break; fi

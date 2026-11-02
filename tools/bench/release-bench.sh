@@ -15,7 +15,7 @@ nix develop path:. -c ./build/eklow-server --model "$model" --alias "$alias" --p
   --expert-profile "$profile" --draft "$draft" --snapshot-mib 4096 \
   --embed-model ~/models/embeddinggemma-2-Q8_0.gguf --embed-port $((port + 1)) >"$out/serve.log" 2>&1 &
 srv=$!
-trap 'pkill -P $srv 2>/dev/null; kill $srv 2>/dev/null; wait $srv 2>/dev/null' EXIT
+trap "pkill -f 'eklow-server --model.*--port 18181' 2>/dev/null; kill $srv 2>/dev/null; wait $srv 2>/dev/null" EXIT
 for i in $(seq 900); do curl -sf localhost:$port/health >/dev/null && break; sleep 1; done
 grep "eklow-server:" "$out/serve.log" >"$out/startup.txt" || true
 run() { nix develop path:. -c python3 tools/bench/serve_perf.py --url http://127.0.0.1:$port --model "$alias" "$@"; }
