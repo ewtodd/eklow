@@ -10,7 +10,7 @@ let
 in
 {
   options.services.eklow = {
-    enable = lib.mkEnableOption "eklow, Gemma 4 and EmbeddingGemma 2 on an Intel Arc A770M behind an OpenAI-compatible API";
+    enable = lib.mkEnableOption "eklow, Qwen3.6-35B-A3B with DFlash 2 speculative decoding and EmbeddingGemma 2 on an Intel Arc A770M behind an OpenAI-compatible API";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -21,14 +21,63 @@ in
 
     model = lib.mkOption {
       type = lib.types.path;
-      # Hugging Face's linked ETag for the file is its sha256.
-      default = pkgs.fetchurl {
-        name = "gemma-4-12b-it-qat-q4_0.gguf";
-        url = "https://huggingface.co/google/gemma-4-12B-it-qat-q4_0-gguf/resolve/29d097773436b69ff9feafd636ab4cf873786537/gemma-4-12b-it-qat-q4_0.gguf";
-        sha256 = "93567e57a8fe10b23569b9d9ec38cd005deedf71e29477c421a4b83f418a538b";
-      };
-      defaultText = "Gemma 4 12B it, QAT Q4_0 (google/gemma-4-12B-it-qat-q4_0-gguf at 29d09777)";
-      description = "The chat model's GGUF.";
+      example = lib.literalExpression "/models/stock-EKK8.gguf";
+      description = ''
+        The chat model's GGUF: Qwen3.6-35B-A3B or a finetune of it (llama.cpp's qwen35moe), in the formats the engine runs
+        (Q4_K or Q4_0 experts, Q8_0 dense matrices, a Q6_K head). Stock Qwen3.6 and Ornith-1.5 are the two served and measured.
+      '';
+    };
+
+    draft = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = lib.literalExpression "/models/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf";
+      description = ''
+        A DFlash 2 draft GGUF (arch "dflash"; Inco AI's for stock Qwen3.6, jzinno's for Ornith) for speculative decoding,
+        accepted losslessly; null decodes plain. About 1.7 GiB of the card is kept for it when set.
+      '';
+    };
+
+    draftBlock = lib.mkOption {
+      type = lib.types.nullOr (lib.types.ints.between 2 16);
+      default = null;
+      description = "Tokens of a verify block (the last sampled one and the drafted ones); null: 4, or the draft's trained block if smaller (a block costs ~8.5 ms a row beyond the first on this card; 4 measured best).";
+    };
+
+    chatTemplate = lib.mkOption {
+      type = lib.types.nullOr (
+        lib.types.enum [
+          "stock"
+          "ornith"
+        ]
+      );
+      default = null;
+      description = ''
+        Which of Qwen3.6's two chat templates the model's repo uses, when the GGUF's own is not one eklow knows (the official
+        Ornith GGUFs carry Unsloth's edit): stock drops earlier turns' reasoning from the prompt, ornith keeps it. null:
+        recognized from the GGUF, which then must carry one of the two published templates exactly.
+      '';
+    };
+
+    expertProfile = lib.mkOption {
+      type = lib.types.path;
+      default = "${cfg.package}/share/eklow/qwen36-experts.json";
+      defaultText = lib.literalExpression ''"''${cfg.package}/share/eklow/qwen36-experts.json"'';
+      example = lib.literalExpression ''"''${cfg.package}/share/eklow/ornith-1.5-experts.json"'';
+      description = ''
+        The routing profile of the model (which experts of each layer are busiest): the package's share/eklow has stock
+        Qwen3.6's (qwen36-experts.json) and Ornith-1.5's (ornith-1.5-experts.json). The experts that fit the card stay on it,
+        the rest are computed on the CPU from pinned memory.
+      '';
+    };
+
+    snapshotMiB = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 4096;
+      description = ''
+        Pinned host memory for snapshots of the DeltaNet state (64 MiB each), which let a conversation's or a document's
+        prefix be reused; 0 keeps none, and only a slot's live sequence is reused.
+      '';
     };
 
     embedModel = lib.mkOption {
@@ -40,22 +89,6 @@ in
       };
       defaultText = "EmbeddingGemma 2, Q8_0 (ggml-org/embeddinggemma-2-GGUF at 58faf909)";
       description = "The embedding model's GGUF, served on `embedPort`; null serves chat only.";
-    };
-
-    mmproj = lib.mkOption {
-      type = lib.types.nullOr lib.types.path;
-      default = null;
-      example = lib.literalExpression ''
-        pkgs.fetchurl {
-          name = "gemma-4-26b-a4b-it-mmproj.gguf";
-          url = "https://huggingface.co/google/gemma-4-26B-A4B-it-qat-q4_0-gguf/resolve/d1c082be9cf3c8a514acf63b8761f4b41935842e/gemma-4-26B-it-mmproj.gguf";
-          sha256 = "a359953a076b877db30c31dbbb4c6d93b4a6e017ee5db5784247e4d4c0dd4f3b";
-        }
-      '';
-      description = ''
-        The chat model's vision projector (a gemma4v mmproj GGUF: the 26B A4B's), for image_url parts in chat; null
-        refuses them. Its card memory (~282 MiB at 280-row images) is reserved before the experts are placed.
-      '';
     };
 
     embedMmproj = lib.mkOption {
@@ -74,7 +107,7 @@ in
     imageTokens = lib.mkOption {
       type = lib.types.ints.between 70 1120;
       default = 280;
-      description = "Rows an image becomes at most (Gemma 4's budget; Google's default is 280, the projector's maximum 1120).";
+      description = "Rows an image becomes at most in EmbeddingGemma 2's input (Google's default is 280, the projector's maximum 1120).";
     };
 
     host = lib.mkOption {
@@ -98,7 +131,7 @@ in
 
     alias = lib.mkOption {
       type = lib.types.str;
-      default = "gemma-4-12b";
+      default = "qwen3.6-35b-a3b";
       description = "Model id the chat API answers to and lists.";
     };
 
@@ -117,14 +150,14 @@ in
     contextSize = lib.mkOption {
       type = lib.types.ints.positive;
       default = 262144;
-      description = "Context of each slot, in tokens; Gemma 4's full window by default.";
+      description = "Context of each slot, in tokens; Qwen3.6's full window by default.";
     };
 
     kvInt8 = lib.mkOption {
       type = lib.types.bool;
       default = true;
       description = ''
-        Keep the global layers' K/V in int8. Needed for 2 x 262144 (fp16 would not fit beside the
+        Keep the attention layers' K/V in int8. Needed for 2 x 262144 (fp16 would not fit beside the
         weights); fp16 decodes a few percent faster at depth.
       '';
     };
@@ -152,7 +185,7 @@ in
     );
 
     systemd.services.eklow = {
-      description = "eklow: Gemma 4 and EmbeddingGemma 2 on the Arc A770M";
+      description = "eklow: Qwen3.6-35B-A3B and EmbeddingGemma 2 on the Arc A770M";
       after = [ "network-online.target" ];
       wants = [ "network-online.target" ];
       wantedBy = [ "multi-user.target" ];
@@ -173,6 +206,22 @@ in
             "--ctx"
             (toString cfg.contextSize)
             (if cfg.kvInt8 then "--kv-int8" else "--kv-fp16")
+            "--expert-profile"
+            cfg.expertProfile
+            "--snapshot-mib"
+            (toString cfg.snapshotMiB)
+          ]
+          ++ lib.optionals (cfg.draft != null) [
+            "--draft"
+            cfg.draft
+          ]
+          ++ lib.optionals (cfg.draftBlock != null) [
+            "--draft-block"
+            (toString cfg.draftBlock)
+          ]
+          ++ lib.optionals (cfg.chatTemplate != null) [
+            "--chat-template"
+            cfg.chatTemplate
           ]
           ++ lib.optionals (cfg.embedModel != null) [
             "--embed-model"
@@ -182,15 +231,11 @@ in
             "--embed-alias"
             cfg.embedAlias
           ]
-          ++ lib.optionals (cfg.mmproj != null) [
-            "--mmproj"
-            cfg.mmproj
-          ]
           ++ lib.optionals (cfg.embedMmproj != null) [
             "--embed-mmproj"
             cfg.embedMmproj
           ]
-          ++ lib.optionals (cfg.mmproj != null || cfg.embedMmproj != null) [
+          ++ lib.optionals (cfg.embedMmproj != null) [
             "--image-tokens"
             (toString cfg.imageTokens)
           ]

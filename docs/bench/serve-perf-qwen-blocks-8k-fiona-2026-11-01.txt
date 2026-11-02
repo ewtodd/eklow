@@ -1,0 +1,25 @@
+== block 3
+plain request | prompt 8131 (8116 cached), completion 256 | ttft 0.18 s, decode 33.9 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 4    tokens/verify
+8k         1030 (7.9 s)        44.0              2.41        plain 33.9
+== block 4
+plain request | prompt 8131 (8116 cached), completion 256 | ttft 0.17 s, decode 33.6 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 4    tokens/verify
+8k        44199 (0.2 s)        44.8              2.87        plain 33.6
+== block 5
+plain request | prompt 8131 (8116 cached), completion 256 | ttft 0.18 s, decode 33.6 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 4    tokens/verify
+8k        43669 (0.2 s)        37.3              3.03        plain 33.6
+== block 6
+plain request | prompt 8131 (8116 cached), completion 256 | ttft 0.17 s, decode 33.7 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 4    tokens/verify
+8k        44074 (0.2 s)        39.4              3.35        plain 33.7
+== block 8
+plain request | prompt 8131 (8116 cached), completion 256 | ttft 0.17 s, decode 33.9 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 4    tokens/verify
+8k        43991 (0.2 s)        33.4              3.86        plain 33.9

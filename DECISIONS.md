@@ -1589,3 +1589,38 @@ profile `--profile` of a verify block with timeline per layer.
 `engineq` after (no profile; before = the 2026-11-01 table): prefill 1,315 (1,297) / 8k 1,135 (1,071) / 32k 867 (848) / 128k
 395 (393) tok/s; decode 41.3 / 39.5 / 37.4 / 31.3 (41.3 / 39.6 / 36.8 / 31.4); verify 8 at 8k 72.2 (70.9) ms, 16: 113.6 (112.8). All within run-to-run noise (fiona's
 CPU is shared with the other workers' server tests): the kernel change is a CPU saving that these paths do not turn into tok/s.
+
+## 2026-11-01 — eklow-server on Qwen3.6, with DFlash 2 and snapshots of the DeltaNet state
+
+`qwen/serve`: `eklow-server` and `eklow-prompt` are back in the build on the qwen35moe engine, linking `eklow_spec` (sampler
+and acceptance). Chat uses Qwen's tokenizer, template (stock or Ornith, from the GGUF or `--chat-template`), parser and
+tool grammar; images are refused with a clear 400; sampling defaults come from `general.sampling.*`. Engine changes: none
+beyond reading `Engine::head_weight` for the draft (which shares the target's head) and a 1.3 GiB `draft_reserve_bytes`.
+
+**Speculation.** A generating slot's step is a verify chunk of its sampled token and B-1 drafted ones; `serve::verify`
+decides with the slot's sampler and a grammar and parser cloned per row; two slots draft in one pass. The block is a
+trade the card sets: a verify row beyond the first costs ~8.5 ms (the cold experts' CPU time grows with the distinct
+experts the rows touch). GSM8K, one stream at 8k: plain 35.4 tok/s, blocks of 4 / 6 / 8 / 12 / 16 56.3 / 54.5 / 53.1 /
+50.1 / 42.7 (3.5 / 4.6 / 5.3 / 6.6 / 6.5 tokens a verify); prose at 8k: 4 beats 8 by a third. Default block 4 (or the
+draft's if smaller); `"speculative": N` per request (0 or false: plain). With two streams the blocks of 4 and 8 finish
+the same 16 requests in the same time (449 against 428 s on GSM8K at temperature 1), so 4 costs nothing there.
+Acceptance with blocks of 8, temperature 1, against llama.cpp's on the same pair: GSM8K 5.75 (5.24), HumanEval 5.43
+(4.98), MT-Bench 5.02 (4.53); eklow's is higher, not lower. Through the server, 3,000 completions at temperature 1 with the
+draft against 3,000 without: chi-square 17.1 on 32 degrees of freedom, p = 0.985. At temperature 0 the outputs agree for
+hundreds of characters and then part at a near-tie (the int8 activations depend on the step's shape; a request alone and
+beside another do the same): that is the engine's noise, not the acceptance's.
+
+**Snapshots.** 64 MiB each in pinned host memory under `--snapshot-mib`, at the starts of the request's messages (the
+prefix a next turn shares), before the generation prompt, at the last two paragraph breaks before the last message (a
+document and then another question), every `--snapshot-every` tokens of a long prefill, and at the end of a generation;
+a new request takes the slot and snapshot that leave the least to prefill. A 10k conversation: 9.2 s cold, next turn 0.61 s
+(stock; 105 tokens prefilled) or 0.26 s (Ornith, which keeps the reasoning); a question on a read 100k document 0.28-0.31 s
+against 146-159 s. Finding: the end-of-generation snapshot is unusable when the template's re-rendering of the answer
+tokenizes differently from what was sampled (a sampled " D" + "amas" against the tokenizer's " Damas"; Ornith's third turn
+in the bench lost 677 tokens, +1.1 s). The server now logs where a slot's sequence and a prompt part. A snapshot every
+~256 generated tokens would bound the loss; not done (each needs the verify's pending state settled mid-generation).
+
+Gates and the tables are in README "Performance" and `docs/bench/serve-*-qwen-*`: whole and streamed chat, reasoning,
+tool calls, stop strings, seeds, two at once, cancel, reuse (`serve_test.py basic`, all ok with the draft, without it,
+and with Ornith); needle at 88k and 167k found with two requests and embeddings at once (embeddings 91-238 ms beside the
+prefills).

@@ -1,0 +1,29 @@
+ok   whole: finish_reason stop  stop
+ok   whole: reasoning_content and content  {'role': 'assistant', 'content': "The sky appears blue because Earth's atmosphere scatters shorter blue wavelengths of sunlight more effectively than longer red wavelengths, and our eyes are more sens
+ok   whole: no think tags in content
+ok   whole: usage adds up
+ok   stream: same reasoning and content as whole  2929 vs 2929
+ok   stream: finish and usage  ('stop', {'prompt_tokens': 20, 'completion_tokens': 688, 'total_tokens': 708, 'prompt_tokens_details': {'cached_tokens': 0}})
+ok   stream: many chunks  655
+ok   reasoning_effort none: no reasoning  {'role': 'assistant', 'content': "The sky appears blue because Earth's atmosphere scatters shorter wavelengths of sunlight (blue light) more effectively than longer wavelengths (red light) in a proces
+ok   tool call: get_weather with JSON arguments  [{'id': 'chatcmpl-e930632b36e49538f9c13224-call-0', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': '{"city":"Lisbon","days":3,"units":"metric"}'}}]
+ok   tool call: typed arguments  {'city': 'Lisbon', 'days': 3, 'units': 'metric'}
+ok   tool call: finish_reason tool_calls  tool_calls
+ok   tool call streamed: same call  [{'index': 0, 'id': 'chatcmpl-258409c4f18b888b4fa09a51-call-0', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': '{"city":"Lisbon","days":3,"units":"metric"}'}}]
+ok   tool result turn answers in content  {'index': 0, 'message': {'role': 'assistant', 'content': 'The weather in Lisbon for the next 3 days is expected to be sunny with a temperature of 24°C.'}, 'finish_reason': 'stop'}
+ok   stop string cuts the content  'alpha beta '
+ok   stop string streamed  'alpha beta '
+ok   max_tokens ends the request exactly  {'prompt_tokens': 20, 'completion_tokens': 7, 'total_tokens': 27, 'prompt_tokens_details': {'cached_tokens': 0}}
+ok   seed: same seed, same output  'The Sentinel’s Whisper\n\nPerched atop jagged cliffs, the Sentinel’s Whisper stands as a stoic guardian, its beam cutting through the densest fog to guide lost souls safely home.' vs 'The Sentinel’s Whisper\n\nPerched atop jagged cliffs, the Sentinel’s Whisper stands as a stoic guardian, its beam cutting through the densest fog to guide lost souls safely home.'
+ok   seed: another seed, another output
+ok   image part refused  400 {'error': {'code': 'unsupported_content', 'message': "image_url is not supported: this model is served as text only (Qwen3.6's vision encoder is not ported)", 'type': 'invalid_request_error'}}
+ok   developer role is system  22 22
+ok   two at once: request 0 complete and coherent
+     (equal to its solo run for 96 of 871 characters: the int8 rounding depends on the step's shape, so near-ties go the other way)
+ok   two at once: request 1 complete and coherent
+     (equal to its solo run for 461 of 706 characters: the int8 rounding depends on the step's shape, so near-ties go the other way)
+ok   cancel: the next request is served promptly  0.2 s
+ok   prefix reuse: the next turn is mostly cached  cached 1805 of 1870, first prompt 1812
+ok   prefix reuse: the same prompt again is cached  {'prompt_tokens': 1812, 'completion_tokens': 5, 'total_tokens': 1817, 'prompt_tokens_details': {'cached_tokens': 1805}}
+ok   document then another question: the document is cached  cached 3116 of 3132
+all ok

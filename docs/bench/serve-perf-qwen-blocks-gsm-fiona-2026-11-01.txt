@@ -1,0 +1,6 @@
+block  0: 3600 tokens, decode 35.4 tok/s (median stream 35.5)
+block  4: 3600 tokens, decode 56.3 tok/s (median stream 56.7), 3.53 tokens/verify
+block  6: 3600 tokens, decode 54.5 tok/s (median stream 54.9), 4.60 tokens/verify
+block  8: 3600 tokens, decode 53.1 tok/s (median stream 53.4), 5.29 tokens/verify
+block 12: 3600 tokens, decode 50.1 tok/s (median stream 49.4), 6.62 tokens/verify
+block 16: 3600 tokens, decode 42.7 tok/s (median stream 41.1), 6.54 tokens/verify

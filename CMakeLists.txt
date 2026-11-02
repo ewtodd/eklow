@@ -154,9 +154,21 @@ target_link_libraries(eklow-grammar-test PRIVATE eklow_grammar)
 add_executable(eklow-grammar-test-qwen tools/grammar_test/qwen.cpp)
 target_link_libraries(eklow-grammar-test-qwen PRIVATE eklow_grammar)
 
-# Serving (src/serve, eklow-server, eklow-prompt): left out of the build until the server is rewired for the qwen35moe engine (the next task):
-# its scheduler and request layer are written against the Gemma engine's chunks (images, the sliding rings, softcapped logits).
-# add_library(eklow_serve STATIC src/serve/openai.cpp src/serve/sampler.cpp src/serve/scheduler.cpp) ... add_executable(eklow-server tools/server/main.cpp) ... add_executable(eklow-prompt tools/prompt/main.cpp)
+# Serving: the request layer (OpenAI surface, Qwen3.6's chat template and tokenizer), the scheduler (continuous batching,
+# speculative decoding with a DFlash 2 draft, snapshots of the recurrent state) and the server. The sampler and the
+# acceptance are eklow_spec's.
+add_library(eklow_serve STATIC src/serve/openai.cpp src/serve/scheduler.cpp)
+target_link_libraries(eklow_serve PUBLIC eklow_spec eklow_grammar eklow_text eklow_engine)
+eklow_sycl(eklow_serve)
+
+add_executable(eklow-server tools/server/main.cpp)
+target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
+target_link_libraries(eklow-server PRIVATE eklow_serve Threads::Threads)
+eklow_sycl(eklow-server)
+
+add_executable(eklow-prompt tools/prompt/main.cpp)
+target_link_libraries(eklow-prompt PRIVATE eklow_serve)
+eklow_sycl(eklow-prompt)
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
@@ -189,9 +201,9 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-grammar-test eklow-grammar-test-qwen eklow-cpu-gemv-test RUNTIME DESTINATION bin)
-# The 26B's routing profile, for eklow-server --expert-profile (which experts stay on the card).
-install(FILES data/gemma-4-26b-a4b-experts.json DESTINATION share/eklow)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test eklow-grammar-test-qwen eklow-cpu-gemv-test RUNTIME DESTINATION bin)
+# The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
+install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
 
 # The CPU GEMVs of the Qwen formats for the cold experts, checked and timed (TASK qwen/mm).
 add_executable(eklow-cpu-qgemv-test tools/cpu_qgemv_test/main.cpp)
@@ -202,12 +214,13 @@ install(TARGETS eklow-cpu-qgemv-test RUNTIME DESTINATION bin)
 # DFlash 2 drafting and speculative decoding (TASK qwen/dflash): the draft's kernels and model, the acceptance of a
 # drafted block, and their checks. Appended here so as not to touch the lists above.
 target_sources(eklow_model PRIVATE src/kernels/ref_dflash.cpp src/kernels/dflash.cpp src/model/dflash2.cpp src/model/dflash2_fast.cpp)
-# The sampler and the acceptance of a drafted block, apart from the server (eklow_serve is out of the build until it is rewired).
+# The sampler and the acceptance of a drafted block (eklow_serve links them).
 add_library(eklow_spec STATIC src/serve/sampler.cpp src/serve/spec.cpp)
 target_link_libraries(eklow_spec PUBLIC eklow_host)
 
 # The acceptance's statistical test: host code over the sampler only.
-add_executable(eklow-spec-test tools/dflash_test/spec_test.cpp src/serve/sampler.cpp src/serve/spec.cpp)
+add_executable(eklow-spec-test tools/dflash_test/spec_test.cpp)
+target_link_libraries(eklow-spec-test PRIVATE eklow_spec)
 target_include_directories(eklow-spec-test PRIVATE src)
 install(TARGETS eklow-spec-test RUNTIME DESTINATION bin)
 

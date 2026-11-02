@@ -43,7 +43,14 @@ size_t Sampler::prepare(std::span<const float> logits, const std::vector<int32_t
     // The k best in one pass over the vocabulary, as a heap whose front is the worst kept (greedy keeps one): the
     // same set nth_element over all 262k candidates picked, at a fraction of its 1.2 ms a token.
     const size_t keep = p_.temperature <= 0 ? 1 : size_t(p_.top_k);
+    // Once k are kept, an id whose logit does not exceed the worst kept one cannot enter (ids ascend, so it would lose an
+    // equal logit to the earlier id): that test alone is the loop for nearly every id, and a verify block runs it per row.
+    float worst = std::numeric_limits<float>::infinity();
     for (int32_t id = 0, ban = next_ban(-1); id < V; ++id) {
+      if (no_counts && !(logits[size_t(id)] > worst) && cand_.size() >= keep) {
+        if (id == ban) ban = next_ban(id);
+        continue;
+      }
       if (id == ban) {
         ban = next_ban(id);
         continue;
@@ -57,6 +64,7 @@ size_t Sampler::prepare(std::span<const float> logits, const std::vector<int32_t
         cand_.back() = c;
         std::push_heap(cand_.begin(), cand_.end(), by_logit);
       }
+      if (cand_.size() >= keep) worst = cand_.front().first;
     }
   } else {
     cand_.reserve(size_t(V));

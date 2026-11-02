@@ -1,0 +1,29 @@
+ok   whole: finish_reason stop  stop
+ok   whole: reasoning_content and content  {'role': 'assistant', 'content': 'The sky is blue because the atmosphere scatters shorter blue wavelengths of sunlight more than other colors, spreading blue light across the sky in all directions.', 
+ok   whole: no think tags in content
+ok   whole: usage adds up
+ok   stream: same reasoning and content as whole  1194 vs 1194
+ok   stream: finish and usage  ('stop', {'prompt_tokens': 20, 'completion_tokens': 278, 'total_tokens': 298, 'prompt_tokens_details': {'cached_tokens': 0}, 'speculation': {'verifies': 102, 'drafted': 306, 'accepted': 176}})
+ok   stream: many chunks  271
+ok   reasoning_effort none: no reasoning  {'role': 'assistant', 'content': "The sky appears blue because sunlight scatters off the tiny gas molecules in Earth's atmosphere, and this scattering is more effective for shorter blue wavelengths th
+ok   tool call: get_weather with JSON arguments  [{'id': 'chatcmpl-bb732c6ba94c72a1a7b7dfc8-call-0', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': '{"city":"Lisbon","days":3,"units":"metric"}'}}]
+ok   tool call: typed arguments  {'city': 'Lisbon', 'days': 3, 'units': 'metric'}
+ok   tool call: finish_reason tool_calls  tool_calls
+ok   tool call streamed: same call  [{'index': 0, 'id': 'chatcmpl-61035dfba5ef5477bd67407f-call-0', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': '{"city":"Lisbon","days":3,"units":"metric"}'}}]
+ok   tool result turn answers in content  {'index': 0, 'message': {'role': 'assistant', 'content': "Here's the weather forecast for Lisbon for the next 3 days (in metric units):\n\n**Today:** Sunny, 24°C\n\nUnfortunately, I'm only able to ret
+ok   stop string cuts the content  ('one two three four five six seven eight nine ten ', 'eleven', 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty')
+ok   stop string streamed  'one two three four five six seven eight nine ten '
+ok   max_tokens ends the request exactly  {'prompt_tokens': 20, 'completion_tokens': 7, 'total_tokens': 27, 'prompt_tokens_details': {'cached_tokens': 0}, 'speculation': {'verifies': 2, 'drafted': 6, 'accepted': 4}}
+ok   seed: same seed, same output  "**The Keeper's Hope** — standing sentinel on the jagged cliff, its beam sweeps across the churning sea to guide weary sailors safely home through the darkest storms." vs "**The Keeper's Hope** — standing sentinel on the jagged cliff, its beam sweeps across the churning sea to guide weary sailors safely home through the darkest storms."
+ok   seed: another seed, another output
+ok   image part refused  400 {'error': {'code': 'unsupported_content', 'message': "image_url is not supported: this model is served as text only (Qwen3.6's vision encoder is not ported)", 'type': 'invalid_request_error'}}
+ok   developer role is system  22 22
+ok   two at once: request 0 complete and coherent
+     (equal to its solo run for 109 of 822 characters: the int8 rounding depends on the step's shape, so near-ties go the other way)
+ok   two at once: request 1 complete and coherent
+     (equal to its solo run for 486 of 511 characters: the int8 rounding depends on the step's shape, so near-ties go the other way)
+ok   cancel: the next request is served promptly  0.2 s
+ok   prefix reuse: the next turn is mostly cached  cached 1871 of 1889, first prompt 1812
+ok   prefix reuse: the same prompt again is cached  {'prompt_tokens': 1812, 'completion_tokens': 5, 'total_tokens': 1817, 'prompt_tokens_details': {'cached_tokens': 1805}, 'speculation': {'verifies': 3, 'drafted': 9, 'accepted': 2}}
+ok   document then another question: the document is cached  cached 3116 of 3132
+all ok
