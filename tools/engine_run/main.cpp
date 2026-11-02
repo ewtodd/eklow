@@ -2,12 +2,13 @@
 // tools/ref/compare_dumps.py can set it beside the oracle or the reference forward.
 //
 //   eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens 2,105,...)
-//                    [--tensors PREFIX,...] [--logits-last N] [--chunk N] [--decode-last N]
+//                    [--tensors PREFIX,...] [--logits-last N] [--chunk N] [--group N] [--decode-last N]
 //                    [--verify-last N --verify-block B --accept A,...] [--max-ctx N] [--kv-int8]
 //                    [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N]
 //                    [--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US] [--head-fp32] [--embed-on-card]
 //                    [--record-routing FILE] [--capture-check] [--snapshot-test] [--images-dir DIR]
 //
+// --group N: a prefill step takes N chunks' worth of tokens, which the engine runs layer by layer in N sub-chunks (no --tensors).
 // The prompt is fed in prefill chunks of --chunk tokens (default: one chunk), then --verify-last tokens as verify blocks of
 // --verify-block tokens whose acceptance follows the pattern --accept (a count per block, cycled; the unaccepted tokens are fed
 // again in the next block; the last block accepts all), then the last --decode-last tokens one per step, as decode would.
@@ -68,6 +69,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   std::vector<int64_t> accept_pattern = {3};
   int64_t logits_last = 1, chunk = 0, decode_last = 0, verify_last = 0, verify_block = 8, max_ctx = 0;
+  int64_t group = 1;
   bool kv_int8 = false, head_fp32 = false, embed_on_card = false, capture_check = false, snapshot_test = false;
   engine::Config ec;
   for (int i = 1; i < argc; ++i) {
@@ -80,6 +82,7 @@ int main(int argc, char** argv) {
     else if (a == "--tensors") prefixes = split(next(), ',');
     else if (a == "--logits-last") logits_last = std::atoll(next().c_str());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
+    else if (a == "--group") group = std::max<int64_t>(1, std::atoll(next().c_str()));
     else if (a == "--decode-last") decode_last = std::atoll(next().c_str());
     else if (a == "--verify-last") verify_last = std::atoll(next().c_str());
     else if (a == "--verify-block") verify_block = std::atoll(next().c_str());
@@ -107,7 +110,7 @@ int main(int argc, char** argv) {
     else if (a == "--stream-cpu-us") ec.stream_cpu_us = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens IDS) [--tensors PREFIX,...] "
-                           "[--logits-last N] [--chunk N] [--decode-last N] [--verify-last N --verify-block B --accept A,...] [--max-ctx N] "
+                           "[--logits-last N] [--chunk N] [--group N] [--decode-last N] [--verify-last N --verify-block B --accept A,...] [--max-ctx N] "
                            "[--kv-int8] [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [--stream-min-rows N] "
                            "[--stream-copy-us US] [--stream-cpu-us US] [--head-fp32] [--embed-on-card] [--record-routing FILE] [--capture-check]\n");
       return 2;
@@ -162,7 +165,7 @@ int main(int argc, char** argv) {
     };
     // The end of a prefill chunk from s of at most `chunk` tokens that does not cut an image (an image bigger than the chunk goes whole).
     auto chunk_end = [&](int64_t s, int64_t limit) {
-      int64_t e = std::min(limit, s + chunk);
+      int64_t e = std::min(limit, s + chunk * group);
       for (const Img& im : imgs)
         if (im.pos < e && im.pos + im.n > e) e = im.pos > s ? im.pos : std::min(limit, im.pos + im.n);
       return e;
@@ -181,6 +184,8 @@ int main(int argc, char** argv) {
     ec.max_ctx = max_ctx > 0 ? max_ctx : (n + 255) / 256 * 256;
     ec.max_batch = std::max<int64_t>(chunk, 16);
     ec.max_chunk = ec.max_batch;
+    ec.max_group = ec.max_chunk * group;
+    if (group > 1 && !prefixes.empty()) throw std::runtime_error("--group: layer-major prefill has no dumps (--tensors)");
     ec.max_logits = std::max<int64_t>(std::min(ec.max_batch, logits_last), verify_block);
     ec.int8_kv = kv_int8;
     ec.head_dpas = !head_fp32;

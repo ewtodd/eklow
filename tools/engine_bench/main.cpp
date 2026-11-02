@@ -69,6 +69,7 @@ int main(int argc, char** argv) {
   std::string model, json_path, tokens_json;
   std::vector<int64_t> prefill = {1024, 4096, 16384}, decode_ctx = {0, 4096, 16384}, depth, decode_slots = {1}, verify, verify_ctx = {8192};
   int64_t chunk = 2048, decode_steps = 64, verify_steps = 24, max_ctx = 0;
+  int64_t group = 1;  // sub-chunks of --chunk tokens run layer-major as one step (Config::max_group)
   int slots = 2;
   bool profile = false;
   engine::Config ec;
@@ -79,6 +80,7 @@ int main(int argc, char** argv) {
     else if (a == "--prefill") prefill = list(next());
     else if (a == "--depth") depth = list(next());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
+    else if (a == "--group") group = std::max<int64_t>(1, std::atoll(next().c_str()));
     else if (a == "--decode-ctx") decode_ctx = list(next());
     else if (a == "--decode-slots") decode_slots = list(next());
     else if (a == "--decode-steps") decode_steps = std::atoll(next().c_str());
@@ -102,7 +104,7 @@ int main(int argc, char** argv) {
     else if (a == "--stream-copy-us") ec.stream_copy_us = std::atof(next().c_str());
     else if (a == "--stream-cpu-us") ec.stream_cpu_us = std::atof(next().c_str());
     else {
-      std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--depth N,...] [--decode-ctx N,...] "
+      std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--group N] [--depth N,...] [--decode-ctx N,...] "
                            "[--decode-slots N,...] [--decode-steps N] [--verify B,...] [--verify-ctx N,...] [--verify-steps N] [--slots N] "
                            "[--max-ctx N] [--profile] [--kv-int8] [--no-capture] [--json FILE] [--tokens-json FILE] "
                            "[--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [--stream-min-rows N] "
@@ -113,13 +115,14 @@ int main(int argc, char** argv) {
   try {
     int64_t longest = 1;
     for (auto n : prefill) longest = std::max(longest, n);
-    for (auto n : depth) longest = std::max(longest, n + 2 * chunk);
+    for (auto n : depth) longest = std::max(longest, n + std::max<int64_t>(2, group) * chunk);
     for (auto n : decode_ctx) longest = std::max(longest, n + decode_steps);
     for (auto n : verify_ctx) longest = std::max(longest, n + verify_steps * 16 + 16);
     ec.n_slots = slots;
     ec.max_ctx = max_ctx > 0 ? max_ctx : (longest + 255) / 256 * 256;
     ec.max_batch = std::max<int64_t>(chunk, 16 * slots);
     ec.max_chunk = std::max<int64_t>(chunk, 16);
+    ec.max_group = ec.max_chunk * group;
     ec.max_logits = 16 * slots;
     ec.max_capture_rows = std::min<int64_t>(ec.max_batch, 2048);
 
@@ -149,8 +152,8 @@ int main(int argc, char** argv) {
     std::map<std::string, double> prof;
     auto fill = [&](int slot, int64_t n) {
       const int64_t start = eng.length(slot);
-      for (int64_t s = start; s < start + n; s += chunk) {
-        const int64_t c = std::min(chunk, start + n - s);
+      for (int64_t s = start; s < start + n; s += chunk * group) {
+        const int64_t c = std::min(chunk * group, start + n - s);
         eng.step({engine::Chunk{slot, s, tokens(c), s + c == start + n ? 1 : 0}});
       }
     };
@@ -175,6 +178,20 @@ int main(int argc, char** argv) {
                     100.0 * double(ss.pairs - ss0.pairs) / double(std::max<uint64_t>(1, eng.cold_pairs() - cp0)));
     };
     fill(0, std::min<int64_t>(chunk, 512));  // warm-up: first launches, scratch allocations
+    if (group > 1) {
+      fill(0, 2 * chunk);  // and the layer-major path's
+      eng.release(0);
+    }
+    auto group_report = [&](const engine::Engine::GroupStats& g0) {
+      const auto g = eng.group_stats();
+      if (group <= 1 || g.layers == g0.layers) return;
+      const double nl = double(g.layers - g0.layers);
+      std::printf("    layer-major: %llu group layers, per layer %.1f streamed experts in %.2f waves, %.0f streamed pairs, %.0f pairs on the CPU; host waits: routing %.1f ms, "
+                  "repack before the next copy %.1f ms; CPU task %.1f ms (of which %.1f ms waited for after the waves)\n",
+                  (unsigned long long)(g.layers - g0.layers), double(g.experts - g0.experts) / nl, double(g.waves - g0.waves) / nl,
+                  double(g.streamed_pairs - g0.streamed_pairs) / nl, double(g.cpu_pairs - g0.cpu_pairs) / nl, 1e3 * (g.ids_wait_s - g0.ids_wait_s) / nl,
+                  1e3 * (g.copy_wait_s - g0.copy_wait_s) / nl, 1e3 * (g.cpu_s - g0.cpu_s) / nl, 1e3 * (g.join_s - g0.join_s) / nl);
+    };
     eng.release(0);
 
     json::Writer w;
@@ -185,6 +202,7 @@ int main(int argc, char** argv) {
       prof.clear();
       eng.set_profile(profile ? &prof : nullptr);
       const auto ss0 = eng.stream_stats();
+      const auto gs0 = eng.group_stats();
       const auto cs0 = eng.cold_stats();
       const uint64_t pr0 = eng.pairs(), cp0 = eng.cold_pairs();
       auto t0 = std::chrono::steady_clock::now();
@@ -194,26 +212,30 @@ int main(int argc, char** argv) {
       eng.release(0);
       std::printf("prefill %6lld tokens: %7.2f s, %8.1f tok/s\n", (long long)n, s, double(n) / s);
       cold_report(cs0, pr0, cp0, ss0, 1, false);
+      group_report(gs0);
       w.begin_object().kv("tokens", n).kv("seconds", s).kv("tok_per_s", double(n) / s);
       if (profile) print_profile(prof, w);
       w.end_object();
     }
     w.end_array().key("depth").begin_array();
     for (int64_t d : depth) {
+      const int64_t timed = group > 1 ? group * chunk : 2 * chunk;  // plain: two chunks; grouped: one group
       fill(0, d);
       prof.clear();
       eng.set_profile(profile ? &prof : nullptr);
       const auto ss0 = eng.stream_stats();
+      const auto gs0 = eng.group_stats();
       const auto cs0 = eng.cold_stats();
       const uint64_t pr0 = eng.pairs(), cp0 = eng.cold_pairs();
       auto t0 = std::chrono::steady_clock::now();
-      fill(0, 2 * chunk);
+      fill(0, timed);
       const double s = since(t0);
       eng.set_profile(nullptr);
       eng.release(0);
-      std::printf("prefill at depth %6lld: %7.2f s for %lld tokens, %8.1f tok/s\n", (long long)d, s, (long long)(2 * chunk), double(2 * chunk) / s);
+      std::printf("prefill at depth %6lld: %7.2f s for %lld tokens, %8.1f tok/s\n", (long long)d, s, (long long)timed, double(timed) / s);
       cold_report(cs0, pr0, cp0, ss0, 1, false);
-      w.begin_object().kv("depth", d).kv("tokens", 2 * chunk).kv("seconds", s).kv("tok_per_s", double(2 * chunk) / s);
+      group_report(gs0);
+      w.begin_object().kv("depth", d).kv("tokens", timed).kv("seconds", s).kv("tok_per_s", double(timed) / s);
       if (profile) print_profile(prof, w);
       w.end_object();
     }
