@@ -313,6 +313,22 @@ void moe_gather(sycl::queue& q, const float* x, const int32_t* row_of_pair, int6
   });
 }
 
+void moe_gather(sycl::queue& q, const sycl::half* x, const int32_t* row_of_pair, int64_t n_pairs, int64_t n_used, int64_t cols,
+                sycl::half* out, int32_t row_base) {
+  if (cols % 16) throw std::runtime_error("fast::moe_gather: width not a multiple of 16");
+  const int32_t NU = int32_t(n_used), C = int32_t(cols), kh = C / 16;
+  q.parallel_for(sycl::range<2>(size_t(n_pairs), size_t(kh)), [=](sycl::id<2> id) {
+    const int32_t p = int32_t(id[0]), j = int32_t(id[1]);
+    const int32_t row = row_of_pair[p];
+    if (row < row_base || row < 0) return;
+    const sycl::vec<sycl::half, 4>* src = reinterpret_cast<const sycl::vec<sycl::half, 4>*>(x + int64_t(p / NU) * C + j * 16);
+    sycl::vec<sycl::half, 4>* dst = reinterpret_cast<sycl::vec<sycl::half, 4>*>(out + xmx::act16_index(row - row_base, int64_t(j) * 16, kh));
+    sycl::vec<sycl::half, 4> v[4];
+    for (int c = 0; c < 4; ++c) v[c] = src[c];
+    for (int c = 0; c < 4; ++c) dst[c] = v[c];
+  });
+}
+
 void matmul_f32(sycl::queue& q, const float* w, int64_t n, int64_t k, const float* x, int64_t n_tok, float* out) {
   constexpr int kTok = 4, kChunk = 256;  // tokens per work-group; floats of K per staged chunk
   if (k % 4 || n > 256 || n % 32) throw std::runtime_error("fast::matmul_f32: unsupported shape");

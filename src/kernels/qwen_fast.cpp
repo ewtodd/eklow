@@ -170,6 +170,31 @@ void moe_tail(sycl::queue& q, const float* x2, const float* y, const float* weig
   });
 }
 
+void moe_accumulate(sycl::queue& q, float* x, const float* y, const float* weights, const int32_t* rows, int64_t n_used, const float* extra,
+                    const int32_t* extra_row, const float* shared, const float* sgate, int64_t ld_sg, int64_t n_tok, int64_t cols) {
+  const int32_t C = int32_t(cols), NU = int32_t(n_used);
+  const int64_t LD = ld_sg;
+  q.parallel_for(sycl::range<1>(size_t(n_tok * cols)), [=](sycl::id<1> id) {
+    const int32_t t = int32_t(id[0]) / C, j = int32_t(id[0]) % C;
+    float s = 0;
+    if (y)
+      for (int i = 0; i < NU; ++i) {
+        const int32_t r = rows[t * NU + i];
+        if (r >= 0) s += weights[t * NU + i] * y[size_t(r) * C + j];
+      }
+    if (extra) {
+      const int32_t er = extra_row[t];
+      if (er >= 0) s += extra[size_t(er) * C + j];
+    }
+    if (shared) s += sigmoid(sgate[int64_t(t) * LD]) * shared[id[0]];
+    x[id[0]] += s;
+  });
+}
+
+void to_half(sycl::queue& q, const float* x, int64_t n, sycl::half* out) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) { out[id[0]] = sycl::half(x[id[0]]); });
+}
+
 void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t n, int64_t cols, float* dst, int64_t ld, int64_t col0) {
   const int32_t C = int32_t(cols);
   q.parallel_for(sycl::range<1>(size_t(n * cols)), [=](sycl::id<1> id) {

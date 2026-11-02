@@ -82,6 +82,10 @@ void moe_group(sycl::queue& q, const int32_t* ids, int64_t n_pairs, int64_t n_ex
 void moe_gather(sycl::queue& q, const float* x, const int32_t* row_of_pair, int64_t n_pairs, int64_t n_used, int64_t cols,
                 sycl::half* out, int32_t row_base = 0);
 
+// The same from fp16 rows x [token][cols] (layer-major prefill keeps the MoE input of every sub-chunk of a group in fp16).
+void moe_gather(sycl::queue& q, const sycl::half* x, const int32_t* row_of_pair, int64_t n_pairs, int64_t n_used, int64_t cols,
+                sycl::half* out, int32_t row_base = 0);
+
 // out[t][c] = w[c] . x[t] for fp32 w [n][k] and any number of tokens (n a multiple of 32, at most
 // 256; k a multiple of 4): the router at prefill, kept in fp32 because routing is sensitive to
 // its precision.
