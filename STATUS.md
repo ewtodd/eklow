@@ -146,7 +146,7 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
 - [x] reference kernels (`src/kernels/ref.cpp`) and the reference forward (`src/model/gemma4.cpp`,
       `eklow-ref-run`): on a 25-token chat prompt top-1 25/25, mean KL 3.9e-3; on 2,616 tokens top-1
       31/32, mean KL 1.9e-2, the same band as llama.cpp CUDA against CPU (DECISIONS 2026-10-24)
-- [x] streaming output parser (`src/text/output_parser.cpp`): reasoning, content and tool calls
+- [x] streaming output parser (Gemma's, `src/text/output_parser.cpp`, removed 2026-11-01 with the other Gemma chat code; Qwen's is `output_parser_qwen.cpp`): reasoning, content and tool calls
       recovered exactly from 40,000 random turns rendered by the template (DECISIONS 2026-10-24)
 - [ ] image input (bidirectional attention among an image's tokens on sliding layers): with M3
 
@@ -171,7 +171,7 @@ max_tokens 256, temperature 1.0, top_p 0.95, thinking on; decode from the stream
       8.7 s cold, 0.2 s with the prefix cached, then 27.4 tok/s (`tools/server/ttft.py`; targets
       5 s and 1 s)
 - [ ] son-of-anton's Signal probe scenarios on eklow against llama.cpp
-- [x] grammar-constrained tool calls (`src/serve/tool_grammar.cpp`, `eklow-grammar-test`)
+- [x] grammar-constrained tool calls (Gemma's, `src/serve/tool_grammar.cpp`, removed 2026-11-01; Qwen's is `tool_grammar_qwen.cpp`, `eklow-grammar-test-qwen`)
 - [ ] image input (llama.cpp's server on fiona had no projector either)
 
 ## Milestone 6 (Gemma 4 26B A4B), started 2026-10-26

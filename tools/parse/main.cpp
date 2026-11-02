@@ -1,11 +1,11 @@
-// eklow-parse: the output parsers (Gemma 4's, and Qwen3.6's) from the command line.
+// eklow-parse: Qwen3.6's output parser from the command line.
 //
 //   eklow-parse GGUF [--thinking] < IDS > RESULTS   IDS: one generated turn per line, token ids
 //                                                   separated by spaces, fed one at a time;
 //                                                   RESULTS: one JSON object per line: reasoning,
 //                                                   content, tool_calls, errors, end (token id)
 //
-// The GGUF's tokenizer picks the parser. For Qwen3.6 a line may start with the request's tools as a JSON array
+// A line may start with the request's tools as a JSON array
 // and a TAB, which say what the parameters' types are; --thinking starts the turn inside the reasoning (the
 // prompt ended "<think>\n"). Tokens are fed one at a time, as the server does.
 #include <cstdio>
@@ -18,10 +18,9 @@
 #include "core/json.hpp"
 #include "core/json_value.hpp"
 #include "model/gguf.hpp"
-#include "text/output_parser.hpp"
+#include "text/output.hpp"
 #include "text/output_parser_qwen.hpp"
 #include "text/pyfmt.hpp"
-#include "text/tokenizer.hpp"
 #include "text/tokenizer_qwen.hpp"
 
 using namespace eklow;
@@ -70,33 +69,20 @@ int main(int argc, char** argv) {
   const bool thinking = argc > 2 && !std::strcmp(argv[2], "--thinking");
   try {
     auto f = gguf::File::open(argv[1]);
-    const auto* model = f.find("tokenizer.ggml.model");
-    const bool qwen = model && model->as_string() == "gpt2";
-    std::optional<text::Tokenizer> gemma;
-    std::optional<text::QwenTokenizer> q;
-    if (qwen) q.emplace(text::QwenTokenizer::from_gguf(f));
-    else gemma.emplace(text::Tokenizer::from_gguf(f));
+    const auto q = text::QwenTokenizer::from_gguf(f);
     std::ios::sync_with_stdio(false);
     std::string line;
     while (std::getline(std::cin, line)) {
       text::ToolSpecs specs;
-      if (qwen) {
-        if (size_t tab = line.find('\t'); tab != std::string::npos) {
-          if (tab) specs = text::ToolSpecs(json::parse(line.substr(0, tab)));
-          line.erase(0, tab + 1);
-        }
+      if (size_t tab = line.find('\t'); tab != std::string::npos) {
+        if (tab) specs = text::ToolSpecs(json::parse(line.substr(0, tab)));
+        line.erase(0, tab + 1);
       }
       text::OutputDelta all;
       std::istringstream ss(line);
-      if (qwen) {
-        text::QwenOutputParser p(*q, thinking, &specs);
-        for (int32_t id; ss >> id;) take(all, p.push(id));
-        take(all, p.finish());
-      } else {
-        text::OutputParser p(*gemma, thinking);
-        for (int32_t id; ss >> id;) take(all, p.push(id));
-        take(all, p.finish());
-      }
+      text::QwenOutputParser p(q, thinking, &specs);
+      for (int32_t id; ss >> id;) take(all, p.push(id));
+      take(all, p.finish());
       json::Writer w(false);
       w.begin_object().kv("reasoning", all.reasoning).kv("content", all.content).key("tool_calls").begin_array();
       for (const auto& c : all.tool_calls) {

@@ -1,11 +1,16 @@
 # eklow — design
 
-A serving engine for **Gemma 4** on one Intel Arc A770M (DG2, 16 GB) in `fiona`, an Intel NUC with
+A serving engine for **Qwen3.6-35B-A3B** (and its finetunes) with a DFlash 2 draft, plus EmbeddingGemma 2, on one Intel Arc A770M (DG2, 16 GB) in `fiona`, an Intel NUC with
 an i7-12700H. C++20 + SYCL on Level Zero (nixpkgs `intel-llvm` 7.1.1), kernels compiled ahead of
 time for DG2, packaged with nix. Named for Eklow Labs (Silicon Valley, season 5).
 
 `STATUS.md` holds the live state and measured numbers; `DECISIONS.md` holds dated decisions with
 their evidence. This file is the target and the shape of the system.
+
+**The sections below are the 2026-10-24 design for Gemma 4 12B and 26B A4B, kept as history.** Neither is served or
+supported any more (the Qwen3.6 port of 2026-10-31 replaced them; its text layer, tools and numbers are in
+`DECISIONS.md` and `README.md`); what survives of Gemma is EmbeddingGemma 2 (its tokenizer, `src/model/embed_gemma2.*`
+and the Gemma 4 vision encoder of its mmproj).
 
 ## Why
 
@@ -29,7 +34,7 @@ this card, against ceilings of roughly 2000+ and ~60. On fiona it also cannot fi
 
 ## Shape
 
-- **One process owns the A770M** and serves Gemma 4 chat, EmbeddingGemma 2 and, later, a small
+- **One process owns the A770M** and served Gemma 4 chat, EmbeddingGemma 2 and, later, a small
   tool-call decision model, under one scheduler. Embedding batches and checks fit into the same
   steps as chat prefill and decode, so separate processes no longer fight over the GPU.
 - **Little-Titles stays on llama.cpp** on the Iris Xe iGPU (done, `/etc/nixos` 21b7c9c8). Its

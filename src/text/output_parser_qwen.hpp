@@ -24,7 +24,7 @@
 #include <string>
 #include <vector>
 
-#include "text/output_parser.hpp"  // ToolCall, OutputDelta
+#include "text/output.hpp"  // ToolCall, OutputDelta
 #include "text/tokenizer_qwen.hpp"
 #include "text/tool_schema.hpp"
 
