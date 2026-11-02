@@ -1,0 +1,4 @@
+qwen8    ctx  16384: decode    217.1 us ( 309.2 GB/s of K/V), prefill 2 x 2048    37.30 ms (27.64 TFLOPS)
+qwen8    ctx  65536: decode    684.9 us ( 392.0 GB/s of K/V), prefill 2 x 2048   156.35 ms (27.69 TFLOPS)
+qwen8    ctx 131072: decode   1126.6 us ( 476.6 GB/s of K/V), prefill 2 x 2048   316.59 ms (27.57 TFLOPS)
+qwen8    ctx 262144: decode   2013.4 us ( 533.3 GB/s of K/V), prefill 2 x 2048   634.74 ms (27.61 TFLOPS)

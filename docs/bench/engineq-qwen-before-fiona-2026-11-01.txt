@@ -1,0 +1,21 @@
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.33 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 69 of 256 per layer on the card (free 7.02 GiB before them, margin 1.00, draft 1.20), 80 streaming slots, 12.33 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   2048 tokens:    1.60 s,   1281.3 tok/s
+    cold experts: 0.44 s waiting on the card's routing, 1.11 s computing on the CPU, 71.1% of pairs cold, 40 of 40 layers with the card finished first; streamed 2545 experts in 40 layers (84.1% of the cold pairs)
+prefill at depth   8192:    3.76 s for 4096 tokens,   1090.7 tok/s
+    cold experts: 1.33 s waiting on the card's routing, 2.27 s computing on the CPU, 53.9% of pairs cold, 80 of 80 layers with the card finished first; streamed 5446 experts in 80 layers (77.6% of the cold pairs)
+prefill at depth  32768:    4.82 s for 4096 tokens,    850.5 tok/s
+    cold experts: 2.49 s waiting on the card's routing, 2.26 s computing on the CPU, 58.4% of pairs cold, 80 of 80 layers with the card finished first; streamed 5317 experts in 80 layers (80.5% of the cold pairs)
+prefill at depth 131072:   10.52 s for 4096 tokens,    389.5 tok/s
+    cold experts: 7.37 s waiting on the card's routing, 3.08 s computing on the CPU, 66.4% of pairs cold, 80 of 80 layers with the card finished first; streamed 6062 experts in 80 layers (76.9% of the cold pairs)
+decode, 1 slot, at      0:   24.51 ms/step (23.18 ms enqueueing),   40.8 tok/s per sequence
+    cold experts per step: 9.76 ms waiting on the card's routing, 9.34 ms computing on the CPU, 51.3% of pairs on the CPU; 37.0 of 40.0 cold layers had the card finished before the CPU
+decode, 1 slot, at   8192:   25.35 ms/step (24.03 ms enqueueing),   39.4 tok/s per sequence
+    cold experts per step: 10.25 ms waiting on the card's routing, 9.51 ms computing on the CPU, 51.1% of pairs on the CPU; 37.0 of 40.0 cold layers had the card finished before the CPU
+decode, 1 slot, at  32768:   25.64 ms/step (24.42 ms enqueueing),   39.0 tok/s per sequence
+    cold experts per step: 11.73 ms waiting on the card's routing, 8.69 ms computing on the CPU, 45.8% of pairs on the CPU; 35.8 of 40.0 cold layers had the card finished before the CPU
+decode, 1 slot, at 131072:   31.45 ms/step (30.11 ms enqueueing),   31.8 tok/s per sequence
+    cold experts per step: 16.80 ms waiting on the card's routing, 9.70 ms computing on the CPU, 49.2% of pairs on the CPU; 36.1 of 40.0 cold layers had the card finished before the CPU
+verify blocks of  8 at   8192:   73.44 ms/step,   57.9 accepted tokens/s (4.2 tokens accepted a block)
+    cold experts per step: 18.29 ms waiting on the card's routing, 43.65 ms computing on the CPU, 53.4% of pairs on the CPU; 38.5 of 40.0 cold layers had the card finished before the CPU
+verify blocks of 16 at   8192:  119.24 ms/step,   71.3 accepted tokens/s (8.5 tokens accepted a block)
+    cold experts per step: 23.74 ms waiting on the card's routing, 79.50 ms computing on the CPU, 55.1% of pairs on the CPU; 40.0 of 40.0 cold layers had the card finished before the CPU

@@ -3,8 +3,6 @@
 #include <sycl/ext/intel/esimd.hpp>
 
 #include <algorithm>
-#include <cstdio>
-#include <cstdlib>
 #include <functional>
 #include <limits>
 #include <stdexcept>
@@ -518,7 +516,9 @@ struct FlashGroup {
 // keys (eklow-attn-test): Q.K^T ~35 TFLOPS, P.V ~29, the whole ~31 (FlashGroup 10.3); 4,096-key segments gave 5%
 // more for twice the probabilities' memory, 1,024 10% less. P.V as 64 rows x all 512 dimensions, reading each
 // row's probabilities once instead of four times, ran slower (-10%).
-constexpr int kSeg = 2048, kSegTiles = kSeg / 128;
+// Head 256, group 8 (Qwen3.6, int8 and fp16 K/V), same path: 4,096-key segments 27.5 TFLOPS at 16k-256k keys, 2,048-key
+// ones 24-25.6 (2026-11-01), against the flash kernel's 13.4; the probabilities of a 2,048-token chunk (16,384 rows) take 128 MB.
+constexpr int kSeg = 4096, kSegTiles = kSeg / 128;
 // Chunks of fewer tokens (decode, short prompts) keep the flash kernels.
 constexpr int64_t kSegMinTokens = 64;
 
@@ -833,7 +833,6 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
   const int32_t H2 = int32_t(c.n_head_kv), tph = (rows + 7) / 8, R = (rows + 255) / 256 * 256, H = int32_t(n_head);
   const int32_t* last = tok.hi ? tok.hi : tok.pos;
   sycl::half* P = grow(q, scratch.p, scratch.p_halves, size_t(R) * kSeg);
-  std::vector<sycl::event> evs[3];
   const SegStats st(grow(q, scratch.stat, scratch.stat_floats, SegStats::floats(R, D)), R);
   for (int32_t h = 0; h < H2; ++h) {
     for (int32_t s0 = kfirst; s0 < kend; s0 += kSeg) {
@@ -841,8 +840,8 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
       SegQK<D, G, Q8> qk{qt, tok.slot, last, c.table, c.k, c.ks, P, st.mt, st.lt, st.mrun, int32_t(c.pages),
                          H2, base,     rows,    tph,     R,   s0,   kend, first, h};
       qk.lo_of = tok.lo;
-      evs[0].push_back(q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(nk * 4)), sycl::range<3>(1, 16, 4)), qk));
-      evs[1].push_back(q.parallel_for(sycl::range<1>(size_t(R)), [=](sycl::id<1> id) {
+      q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(nk * 4)), sycl::range<3>(1, 16, 4)), qk);
+      q.parallel_for(sycl::range<1>(size_t(R)), [=](sycl::id<1> id) {
         const int32_t row = int32_t(id[0]);
         const float m_old = first ? kNegBig : st.mrun[row], l_old = first ? 0.0f : st.lrun[row];
         float mn = m_old;
@@ -855,22 +854,14 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
           l += b * st.lt[t * R + row];
         }
         st.mrun[row] = mn, st.lrun[row] = l, st.alpha[row] = a;
-      }));
+      });
       SegPV<D, Q8> pv{P, st.beta, st.alpha, st.orun, tok.slot, c.table, c.v, c.vs, int32_t(c.pages), H2, base, rows, R, s0, kend, nb, first, h};
-      evs[2].push_back(q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(D / 32)), sycl::range<3>(1, 16, 4)), pv));
+      q.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, size_t(R / 16), size_t(D / 32)), sycl::range<3>(1, 16, 4)), pv);
     }
     q.parallel_for(sycl::range<2>(size_t(rows), size_t(D)), [=](sycl::id<2> id) {
       const int32_t row = int32_t(id[0]), d = int32_t(id[1]);
       out[((base + row / G) * H + h * G + row % G) * D + d] = st.orun[row * D + d] / st.lrun[row];
     });
-  }
-  if (std::getenv("SEGPROF")) {
-    q.wait();
-    using namespace sycl::info;
-    double t[3] = {0, 0, 0};
-    for (int i = 0; i < 3; ++i)
-      for (auto& e : evs[i]) t[i] += double(e.get_profiling_info<event_profiling::command_end>() - e.get_profiling_info<event_profiling::command_start>()) * 1e-6;
-    std::fprintf(stderr, "seg: qk %.2f ms, comb %.2f, pv %.2f (%zu segments)\n", t[0], t[1], t[2], evs[0].size());
   }
 }
 
@@ -907,6 +898,7 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
     const int64_t splits = std::clamp<int64_t>((8192 + n_tiles * P - 1) / (n_tiles * P), 1, std::max<int64_t>(1, max_blocks / per_split));
     int32_t sp = int32_t(splits);
     float* part = splits > 1 ? grow(q, scratch.part, scratch.part_floats, size_t(n_tiles * splits * part_stride(D))) : nullptr;
+    float* const part_in = part;
     const sycl::nd_range<2> nd(sycl::range<2>(size_t(splits), size_t(n_tiles * P)), sycl::range<2>(1, P));
     if (tok.lo) {
       Flash<D, G, Q8, S, true> k{qt, tiles, tok.slot, last, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
@@ -919,17 +911,20 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
     }
     if (splits == 1) return;
     // Each work-item of the merge below loops over every split, which at 128 splits was half of
-    // the decode time: past 32 splits, first fold each group of 8 consecutive splits into one
-    // partial in the same layout (the same rescaling as the merge), then merge those.
-    if (splits > 32) {
+    // the decode time: past 8 splits, first fold each group of 8 consecutive splits into one
+    // partial in the same layout (the same rescaling as the merge), level by level between the two partial
+    // buffers, then merge those. Dimensions run fastest across work-items so that the partials are read in
+    // 128-byte runs (with the splits fastest, the fold was 92 us of a 750 us decode step at 128k keys).
+    for (bool to2 = true; sp > 8; to2 = !to2) {
       const int32_t sp2 = (sp + 7) / 8;
-      float* part2 = grow(q, scratch.part2, scratch.part2_floats, size_t(n_tiles) * sp2 * part_stride(D));
-      q.parallel_for(sycl::range<3>(size_t(n_tiles) * kRows, D, sp2), [=](sycl::id<3> id) {
-        const int32_t tile = int32_t(id[0]) / kRows, i = int32_t(id[0]) % kRows, d = int32_t(id[1]), g = int32_t(id[2]);
+      float* dst = to2 ? grow(q, scratch.part2, scratch.part2_floats, size_t(n_tiles) * sp2 * part_stride(D)) : part_in;
+      const float* src = part;
+      q.parallel_for(sycl::range<3>(size_t(n_tiles) * kRows, size_t(sp2), D), [=](sycl::id<3> id) {
+        const int32_t tile = int32_t(id[0]) / kRows, i = int32_t(id[0]) % kRows, g = int32_t(id[1]), d = int32_t(id[2]);
         const int32_t rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i;
         if (r >= rows) return;
-        const float* p = part + tile * sp * part_stride(D);
-        float* o2 = part2 + (tile * sp2 + g) * part_stride(D);
+        const float* p = src + tile * sp * part_stride(D);
+        float* o2 = dst + (tile * sp2 + g) * part_stride(D);
         float mg = kNegBig, lg = 0, o = 0;
         for (int32_t s = g * 8; s < g * 8 + 8 && s < sp; ++s)
           if (p[s * part_stride(D) + kRows * D + kRows + i] > 0) mg = sycl::fmax(mg, p[s * part_stride(D) + kRows * D + i]);
@@ -945,7 +940,7 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
         if (d == 0) o2[kRows * D + i] = mg, o2[kRows * D + kRows + i] = lg;
       });
       sp = sp2;
-      part = part2;
+      part = dst;
     }
     q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
       const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), d = int32_t(id[2]);
