@@ -59,7 +59,43 @@ slot and snapshot that leave the least to prefill.
 
 ## Performance
 
-TODO
+Measured on that machine (2026-11-01), through `eklow-server` with the production shape: stock Qwen3.6 in EKK8, two slots
+of 262,144 tokens, int8 K/V, 2,048-token prefill chunks, Inco's DFlash 2 draft (Q8_0) in blocks of 4, 4 GiB of snapshots,
+EmbeddingGemma 2 loaded: 55 of 256 experts a layer on the card (the draft, the token table it embeds with and the
+embedding model take the rest; `eklow-engine-bench` without them holds 71), 13.25 GiB of cold experts pinned. The method
+is unholy's (`tools/bench/serve_perf.py`, unique text cut to Qwen token depths; raw output in `docs/bench/serve-perf-qwen-*`),
+against the 26B's numbers of 2026-10-27 in the last column:
+
+| | Qwen3.6-35B-A3B, plain decode | with DFlash 2 | Gemma 4 26B A4B (before) |
+|---|---|---|---|
+| prefill, one request, unique text (time to first token) | 1001 tok/s at 8k (8.1 s), 977 at 32k, 602 at 128k (218 s), 392 at 252k (643 s) | | 1865 tok/s at 8k, 1794 at 32k, 1177 at 128k, 765 at 252k (338 s) |
+| decode, one stream, at 8k / 32k / 128k / 252k | 33.9 / 31.5 / 28.1 / 23.6 tok/s | 44.1 / 40.5 / 33.1 / 24.3 tok/s (2.7-2.8 tokens a verify) | 36.6 / 34.0 / 30.5 / 26.5 tok/s |
+| GSM8K chat (48 requests, thinking on, 1024 tokens each), 1 / 2 at a time | 37.0 / 53.2 tok/s aggregate | 53.5 / 62.8 tok/s (3.5 tokens a verify) | 33.4 / 40.2 tok/s |
+
+The draft pays where the text is predictable: on reasoning and code a block of 4 gives 3.5 tokens a verify and 1.5x plain
+decode; on the Pile's prose 2.7 and 1.3x at 8k, nothing at 252k, where the verify's attention costs what the draft saves.
+The block is a trade the card sets: a verify beyond its first row costs ~8.5 ms a row (the cold experts' CPU time grows
+with the distinct experts the rows touch), so on GSM8K at 8k one stream decodes 35.4 tok/s plain, 56.3 with blocks of 4,
+54.5 of 6, 53.1 of 8, 50.1 of 12 and 42.7 of 16, and on prose 4 beats 8 by a third; hence the default of 4
+(`--draft-block`; a request may ask for its own with `"speculative": N`). Acceptance, to compare with llama.cpp's on the
+same pair (blocks of 8, temperature 1, top-p 0.95, top-k 20, thinking on, 16 requests of z-lab's prompts each,
+`docs/bench/serve-accept-*`): GSM8K 5.75 tokens a verify (llama.cpp 5.24), HumanEval 5.43 (4.98), MT-Bench 5.02 (4.53),
+and with blocks of 4: 3.54 / 3.48 / 3.34.
+
+Prefix reuse (`docs/bench/serve-perf-qwen-reuse-*`): a 10k-token conversation (a system prompt of reference text, thinking on) takes 9.2 s
+cold. Its next turn, with stock's template (which drops the earlier turn's reasoning, so the shared prefix ends before
+the generation prompt), prefills 105 of 10,057 tokens in 0.61 s; with Ornith's (which keeps it, so the whole first
+answer is shared) 20 of 10,403 in 0.26 s. A question on a 100k-token document already read takes 0.28-0.31 s instead of
+146-159 s. When a sampled answer is not what the template renders back (the model sampled " D" + "amas", the
+tokenizer says " Damas"), the end-of-generation snapshot no longer matches and the next turn falls back to the one before
+the generation prompt (Ornith's third turn: 677 tokens, 1.3 s); the server logs where such a sequence and a prompt part. Needle in a haystack through the server, two requests at once and
+embeddings beside them: the passphrase found at 88k and at 167k tokens (`docs/bench/serve-needle-qwen-*`).
+
+Prefill is behind the 26B's everywhere (a half at 252k): the streamed experts' copy and repack and, deeper, the attention
+layers' prefill attention are the levers (DECISIONS 2026-11-01); `qwen/perf` works on them. With the draft decode is faster than the 26B's to 128k and 8% behind at 252k; plain it is 7-11% behind.
+
+Embeddings do not wait for a prefill: 91-238 ms during the needle test's 88k and 167k prefills.
+
 
 ## Accuracy
 
@@ -158,7 +194,9 @@ request as it ends, a line per embedding request and per rejected request, and e
 (`--log-interval`) the engine's rates, slots, prefix hits, the draft's acceptance and where a step's time goes:
 
 ```
-TODO
+13:55:21 request chatcmpl-e081499e185e54f2768b5c68: stop | prompt 20, completion 567 | queue 0.00 s, ttft 0.21 s, prefill 94.8 tok/s, decode 45.7 tok/s | draft 3.46 tokens/verify, 404 of 492 accepted
+13:55:23 engine: prompt 2.5 tok/s, generation 46.0 tok/s | running 1, waiting 0 | kv 0.1% (693 of 524288 positions, 586 cached) | prefix hit 0.0% | draft 3.47 tokens/verify, 82.2% of 399 drafted accepted | per step: engine 63.3 ms, draft 4.9, sample 6.0, inject 0.6, snapshot 0.1 | snapshots 1 (64 MiB), 1 taken, 0 restored
+
 ```
 
 Prefill in a request's line is over the uncached part of its prompt, from the slot to the first token; cached

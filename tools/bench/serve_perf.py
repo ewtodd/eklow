@@ -129,11 +129,11 @@ def reuse(a):
     turns = ["Which person or organization is mentioned first?", "Now say the same in one short sentence."]
     print(f"conversation of about {a.conv_depth} tokens:")
     for t in range(3):
-        body = {"model": a.model, "messages": msgs, "max_tokens": 200, "temperature": 1.0, "top_p": 0.95, "seed": 7}
+        body = {"model": a.model, "messages": msgs, "max_tokens": 1500, "temperature": 1.0, "top_p": 0.95, "seed": 7}
         p, cached, n, ttft, dec, per, (reasoning, content) = stream(a.url, body, want_text=True)
         print(f"  turn {t + 1}: prompt {p}, cached {cached}, completion {n}, ttft {ttft:.2f} s ({(p - cached) / max(ttft, 1e-9):.0f} tok/s over the uncached part)", flush=True)
         if t < 2:
-            msgs = msgs + [{"role": "assistant", "content": content}, {"role": "user", "content": turns[t]}]
+            msgs = msgs + [{"role": "assistant", "reasoning_content": reasoning, "content": content}, {"role": "user", "content": turns[t]}]
     # (2) a long document, two questions.
     doc = open(f"{docs}/qwen-{a.doc_depth}.txt").read()
     print(f"document of about {a.doc_depth} tokens:")
@@ -153,6 +153,8 @@ def accept(a):
 
         def one(q):
             body = {"model": a.model, "messages": [{"role": "user", "content": q}], "max_tokens": 4096, "temperature": a.temperature, "top_p": 0.95, "top_k": 20}
+            if a.block:
+                body["speculative"] = a.block
             if a.temperature == 0:
                 body["seed"] = 0
             return stream(a.url, body)
@@ -207,5 +209,6 @@ p.add_argument("--datasets", default="gsm8k,humaneval,mt-bench")
 p.add_argument("--n", type=int, default=16)
 p.add_argument("--temperature", type=float, default=1.0)
 p.add_argument("--concurrency", type=int, default=2)
+p.add_argument("--block", type=int, default=0, help="the draft's block size for these requests (0: the server's)")
 a = ap.parse_args()
 {"depth": depth, "gsm": gsm, "reuse": reuse, "accept": accept, "blocks": blocks}[a.cmd](a)

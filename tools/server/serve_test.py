@@ -131,12 +131,17 @@ def basic(a):
         conv = tm + [{"role": "assistant", "content": None, "tool_calls": calls}, {"role": "tool", "tool_call_id": calls[0]["id"], "content": "Sunny, 24 C"}]
         j = chat(url, conv, tools=[WEATHER], max_tokens=1500, temperature=0, reasoning_effort="none")
         check("tool result turn answers in content", bool(j["choices"][0]["message"].get("content")), str(j["choices"][0])[:200])
-    # Stop strings: content ends before the stop string, finish_reason stop.
-    j = chat(url, [{"role": "user", "content": "Reply with exactly: alpha beta gamma delta epsilon"}], max_tokens=100, temperature=0, reasoning_effort="none", stop=["gamma"])
+    # Stop strings: content ends before the stop string, finish_reason stop. The stop word is one from the model's own
+    # unstopped answer (a model may refuse to echo a fixed phrase), and the stopped output is that answer's prefix.
+    sq = [{"role": "user", "content": "Write the numbers from one to twenty as words, separated by spaces, and nothing else."}]
+    t0 = chat(url, sq, max_tokens=100, temperature=0, reasoning_effort="none")["choices"][0]["message"]["content"]
+    words = t0.split()
+    stopw = words[len(words) // 2] if len(words) > 4 else "x"
+    j = chat(url, sq, max_tokens=100, temperature=0, reasoning_effort="none", stop=[stopw])
     t = j["choices"][0]["message"]["content"]
-    check("stop string cuts the content", "gamma" not in t and t.strip().startswith("alpha beta") and j["choices"][0]["finish_reason"] == "stop", repr(t))
-    r, c, _, fin, _, _ = stream_chat(url, [{"role": "user", "content": "Reply with exactly: alpha beta gamma delta epsilon"}], max_tokens=100, temperature=0, reasoning_effort="none", stop=["gamma", "zzz"])
-    check("stop string streamed", "gamma" not in c and c.strip().startswith("alpha beta") and fin == "stop", repr(c))
+    check("stop string cuts the content", stopw not in t and t0.startswith(t.rstrip()) and len(t.strip()) > 3 and j["choices"][0]["finish_reason"] == "stop", repr((t, stopw, t0)))
+    r, c, _, fin, _, _ = stream_chat(url, sq, max_tokens=100, temperature=0, reasoning_effort="none", stop=[stopw, "zzz"])
+    check("stop string streamed", stopw not in c and t0.startswith(c.rstrip()) and len(c.strip()) > 3 and fin == "stop", repr(c))
     # max_tokens.
     j = chat(url, msgs, max_tokens=7, temperature=0)
     check("max_tokens ends the request exactly", j["usage"]["completion_tokens"] == 7 and j["choices"][0]["finish_reason"] == "length", str(j["usage"]))

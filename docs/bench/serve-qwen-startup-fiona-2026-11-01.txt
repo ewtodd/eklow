@@ -1,0 +1,7 @@
+eklow-server: qwen3.6-35b-a3b on Intel(R) Arc(TM) A770M Graphics, 5.41 GiB of weights, 5.84 GiB of KV cache and state (2 slots of 262144), 10.3 s
+eklow-server: experts on the card: N = 55 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 6.23 GiB, margin 1.00 GiB, free after 2.32 GiB)
+eklow-server: prefill streams busy cold experts to the card: 80 slots, 13.25 GiB of cold experts pinned in host memory
+eklow-server: DFlash 2 draft /home/fiona/eklow-qwen-data-dflash/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf: blocks of 4 (trained for 8), window 2048, 780 MiB on the card (and the target's token table, 515 MiB); free card memory now 1.01 GiB
+eklow-server: chat template stock, sampling defaults temperature 1, top-k 20, top-p 0.95, min-p 0; snapshots of 64 MiB each, up to 4096 MiB
+eklow-server: embeddinggemma-2, 0.27 GiB, listening on 127.0.0.1:8092
+eklow-server: listening on 127.0.0.1:8091

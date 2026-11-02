@@ -1,0 +1,13 @@
+chi-square 17.1 on 32 degrees of freedom over 33 categories (32 common), p = 0.985; 3000 and 3000 samples
+   1819  1818  'Elephant'
+    166   153  'Giraffe'
+     97    95  'Cheetah'
+     81    82  'Octopus'
+     54    56  'Squirrel'
+     59    50  'Ocelot'
+     52    54  'Penguin'
+     48    53  'Sloth'
+prompt 0: differ after 269 of 1419 / 1156 characters
+prompt 1: differ after 331 of 930 / 897 characters
+prompt 2: differ after 472 of 1561 / 1657 characters
+prompt 3: differ after 1271 of 1555 / 1559 characters

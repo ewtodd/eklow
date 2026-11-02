@@ -1,0 +1,3 @@
+gsm8k temperature 1: 16 requests, 24121 tokens in 428 s, 5.745 tokens a verify (mean over requests), decode per stream median 31.0 tok/s
+humaneval temperature 1: 16 requests, 48009 tokens in 835 s, 5.433 tokens a verify (mean over requests), decode per stream median 29.7 tok/s
+mt-bench temperature 1: 16 requests, 37245 tokens in 769 s, 5.023 tokens a verify (mean over requests), decode per stream median 25.8 tok/s

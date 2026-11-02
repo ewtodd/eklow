@@ -1,6 +1,7 @@
 #include "serve/scheduler.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -125,6 +126,15 @@ bool Scheduler::admit() {
     Seq& q = seqs_[size_t(best)];
     const size_t r_prompt = r->prompt.size();
     const int64_t keep = best_keep;
+    // A slot whose live sequence parts from the prompt after a long shared stretch is a conversation whose last answer the
+    // template rendered back differently from how it was sampled (a token boundary, stripped whitespace): say where.
+    {
+      size_t lcp = 0;
+      while (lcp < q.tokens.size() && lcp < r->prompt.size() && q.tokens[lcp] == r->prompt[lcp]) ++lcp;
+      if (lcp >= 256 && lcp < q.tokens.size() && lcp < r->prompt.size())
+        std::fprintf(stderr, "eklow-server: prefix: the slot's sequence (%zu tokens) and the prompt (%zu) part at token %zu: sampled %s, prompt %s; reusing %lld\n", q.tokens.size(),
+                     r->prompt.size(), lcp, tok_.bytes(q.tokens[lcp]).c_str(), tok_.bytes(r->prompt[lcp]).c_str(), (long long)keep);
+    }
     if (keep == 0) {
       if (!q.tokens.empty()) eng_.release(best);
     } else if (best_snap) {
