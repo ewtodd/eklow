@@ -44,6 +44,25 @@ in
       description = "Tokens of a verify block (the last sampled one and the drafted ones); null: 4, or the draft's trained block if smaller (a block costs ~8.5 ms a row beyond the first on this card; 4 measured best).";
     };
 
+    prefillGroup = lib.mkOption {
+      type = lib.types.ints.positive;
+      default = 1;
+      description = ''
+        Prefill chunks a lone long prompt may run layer by layer as one group (`--group`), so that each cold expert
+        crosses PCIe once per layer per group instead of once per chunk: 8 prefills 1.2-1.4x faster for ~185 MB of card
+        memory (3 experts a layer fewer; DECISIONS 2026-11-03). 1: plain chunks.
+      '';
+    };
+
+    prefillGroupBusy = lib.mkOption {
+      type = lib.types.ints.unsigned;
+      default = 0;
+      description = ''
+        The most tokens a group may take while another slot is generating (`--group-busy`): a group stalls that stream
+        for its whole length (4096: its longest pause 4-5 s against ~2 s with plain chunks). 0: plain chunks then.
+      '';
+    };
+
     chatTemplate = lib.mkOption {
       type = lib.types.nullOr (
         lib.types.enum [
@@ -234,6 +253,12 @@ in
           ++ lib.optionals (cfg.draftBlock != null) [
             "--draft-block"
             (toString cfg.draftBlock)
+          ]
+          ++ lib.optionals (cfg.prefillGroup > 1) [
+            "--group"
+            (toString cfg.prefillGroup)
+            "--group-busy"
+            (toString cfg.prefillGroupBusy)
           ]
           ++ lib.optionals (cfg.chatTemplate != null) [
             "--chat-template"
