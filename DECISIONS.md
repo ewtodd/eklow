@@ -1847,3 +1847,83 @@ the stream's longest gap 2.1 / 2.3 s; `--group-busy 4096` 5.9 s / 24.4 s and 4.0
 layer and the first wave's copy begins after it) is not done; the copies are hidden anyway once the hot experts are enqueued behind them. The
 profile's next costs are the card's GEMMs, the fp32 router (6%) and, deep, attention. Groups pay least where attention
 dominates (the 4,096-token depth rows), and cost 3 experts a layer at G = 8. Whether to ship them (and with what `--group-busy`) is the owner's call.
+
+## 2026-11-03 — Gemma 4 26B A4B back beside Qwen3.6: one `eklow-server`, either model
+
+`gemma/restore` (off `main` 39aa4df; host-side work done on e-desktop, the card checks are listed below and not run yet).
+The owner wants the 26B servable again next to the Qwen3.6 finetunes, switched on fiona by `llm-mode` (two units of one
+package, as unholy's one engine serves DeepSeek-V4-Flash and GLM-5.3-Flash). The 26B's last state is `76d8588` (2026-10-27,
+production with image input); the Qwen port had rewritten Gemma's files in place and retired the rest (`81b3154`/`f15d04b`,
+`80fd39b`, `d8006ec`).
+
+**Beside, never instead.** Every restored file is 76d8588's, under its own name, and nothing of Qwen's changed:
+`engine/engine_gemma4.*` (`eklow::engine::gemma4::Engine`), `serve/scheduler_gemma4.*` and `serve/openai_gemma4.*`
+(`eklow::serve::gemma4`), `serve/tool_grammar_gemma4.*`, `text/output_parser_gemma4.*`, `text/chat_gemma4.*`,
+`model/gemma4.*` (config, weights, the fp32 reference forward), `kernels/gemma_fast.*` (the six kernels `fast.cpp` lost:
+`embed`, `qkv_heads`, `residual_norm_quant`, `softcap`, `residual_norm_quant3`, `moe_tail`, in `eklow::fast`, whose names
+nothing else uses), `data/gemma-4-26b-a4b-experts.json`. The types Qwen's port had pulled out of Gemma's headers are used
+as they are (`text::ChatPart`/`ChatError`/`join` in `text/chat.hpp`, `text::ToolCall`/`OutputDelta` in `text/output.hpp`,
+`model::DumpSink` in `model/dump.hpp`); the sampler, the BPE tokenizer, `embed_gemma2`, `vision_gemma4v`, `image/gemma4_image`,
+attention, xmx, `cpu/q4_gemv` and `rt` are shared. Engine, scheduler and request layer are the three that collide with
+Qwen's names, hence the `gemma4` inner namespaces; the rest has distinct names.
+
+**One binary.** `eklow-server --model X.gguf ...`: `main()` in `tools/server/main.cpp` reads `general.architecture`
+(`gguf::File::open` only parses the header) before any flag is parsed: `qwen35moe` runs today's server (its `main` is now
+`qwen_server_main`, untouched), `gemma4` runs `gemma4_server_main` (76d8588's `main`, in `tools/server/gemma4_main.cpp`),
+anything else is an error naming both. Without `--model` the Qwen server runs and says what it always said; a file whose
+header cannot be read is an error before either starts. The Gemma side names the Qwen-only flags it refuses (`--draft`: "Gemma 4 has no DFlash draft";
+`--draft-block`, `--chat-template`, `--snapshot-*`, `--group`, `--group-busy`, `--image-*`, `--vision-reserve-mib`). The
+Gemma flag set is a subset of Qwen's, so the Qwen side has nothing of Gemma's to refuse.
+
+**Tools** (own binaries, `-gemma4`, installed): `eklow-engine-run-gemma4`, `eklow-engine-bench-gemma4`,
+`eklow-grammar-test-gemma4`, `eklow-chat-gemma4`, `eklow-parse-gemma4`, `eklow-prompt-gemma4`;
+`tools/ref/gemma4_chat_compare.py` and `gemma4_parse_compare.py` call them. `serve_test.py` takes `--family auto|qwen|gemma`
+(auto: "gemma" in `/v1/models`' id) and reports instead of failing the one check Gemma's grammar cannot meet (typed
+tool arguments: its grammar fixes the structure and the name, not the schema's types); `image_test.py` ran unchanged.
+
+**Host checks** (no card; the 26B's GGUF header from Hugging Face at d1c082be, vocab-only copy in `~/eklow-qwen-data/gemma4-header/`,
+Google's tokenizer files and `chat_template.jinja` (18,683 bytes, the one `is_gemma4_template` hashes) in
+`~/eklow-qwen-data/gemma4-hf/`; transformers 5.17.0, Jinja2 3.1.6):
+- `eklow-grammar-test-gemma4`: 2,000 of 2,000 random well-formed calls accepted token by token; 1,997 random walks closed (3
+  hit the length cap), 0 failed to parse or got stuck; 96 of 96 (state, special token) pairs banned exactly when refused.
+- `gemma4_chat_compare.py --random 20000 --gguf`: 20,268 cases (264 hand-written, 4 both must reject, 20,000 random): 20,264
+  identical text, 4 rejected by both, 0 differences; 3,184,441 tokens of 20,264 prompts, 0 differences. (76d8588 added 148
+  cases from son-of-anton's real requests, files that are not in this tree.)
+- `gemma4_parse_compare.py`, seeds 5 and 6, 20,000 turns each: all recovered exactly.
+- The dispatch: both vocab-only GGUFs reach "no Level Zero GPUs" (the card is the next thing they need); an EmbeddingGemma 2
+  GGUF gets "architecture gemma-embedding2; eklow serves qwen35moe ... and gemma4 ..."; `--draft` and `--group` on the Gemma GGUF
+  are refused by name.
+
+**Shared code that changed since 76d8588 on the 26B's paths** (the checks on the card judge them):
+- `kernels/attention.cpp` (2b0b48b, be6e2b2, be4bcb0): the key segments for head 512 went from 2,048 to **4,096 keys**
+  (`kSeg`), so the global layers' long-prefill probabilities buffer doubles (32,768 rows x 4,096 halves = 268 MB at the 2 x
+  2,048-token chunks, was 134 MB; `attn::reserve` allocates it before the experts are placed, so the placement gives up ~134 MB
+  of experts instead of failing) and the softmax is accumulated over different segments (fp32 rounding only); the decode
+  split-K fold now folds by 8 at more than 8 splits instead of 32 (a different grouping of the same merge, dimension-fast
+  reads), for sliding and global layers; the fp16 P.V tail mask is a scalar dword mask per row (same values, no spill; only
+  `--kv-fp16`). `attn::reserve` gained a `group` parameter (default 0: the old test).
+- `kernels/xmx.cpp`: `WeightFormat` has five more members and `Gemm16Kernel`/`geglu` take `silu` (defaults: Gemma's GeGLU, the
+  same arithmetic as before; the old formats' instantiations carry an empty placeholder where the new formats keep their metadata). `matmul_geglu*` take `Glu act = Gelu`.
+- `kernels/fast.cpp`: `moe_route` takes `ld` (0: n_expert) and a null `down_scale` (Gemma passes both as before);
+  `matmul_f32_small` goes to 16 tokens (for 1-4 tokens the same code as before, instantiated for 4); an fp16 `moe_gather` overload.
+- `serve/sampler.cpp`: the top-k pass skips ids that cannot enter (same set), greedy returns the first of the sorted candidates
+  (same token); `ref.cpp`, `image_rows.hpp` (`nx`/`ny` default 0), `gguf.cpp` (a file with no tensors): additive.
+- Unchanged: `cpu/q4_gemv`, `rt`, `embed_gemma2`, `vision_gemma4v*`, `image/gemma4_image`, `text/tokenizer`, `pyfmt`.
+
+**Fixes since 76d8588 ported to the Gemma side**: the prefix divergence log line (655209e, in `admit`; image rows have no bytes,
+so ids below zero are skipped); the two test fixes (66e29b3 broken image part, 655209e stop string from the model's own answer)
+were already in `serve_test.py`. Left: the `developer` role as `system` (Gemma's template already reads `developer` as
+`system` in first place and 76d8588 had that test), the image error wording for video and audio parts (Gemma's 400 for any
+other part type stands), `general.sampling.*` from the GGUF (the 26B's file says temperature 1, top-k 64, top-p 0.95: what
+`SamplingParams` already defaults to), per-request `speculative`, `usage.speculation`, snapshots, groups (Qwen only).
+
+**Not run on the card.** The owner chose to try the 26B in production instead of a card window ("all them tests ain't
+necessary, let me just try it"). What a window would run, should something look wrong (fiona `~/gemma-window.sh` does it all,
+detached, from `~/eklow-wt-gemma`): `bench.sh check26` with and without the profile (band: long >= 220/256 and mean KL <=
+7.5e-2; chat >= 22/25 and <= 8e-2; 76d8588: 243/256 at 2.9e-2 with N = 51, 242/256 at 2.8e-2 with every expert on the card),
+`bench.sh attn` and `kernels`, `serve_test.py basic` and `image_test.py` against the Gemma server at the production shape and
+`basic` against the Qwen server, `serve_perf.py` at 8k and 32k against `docs/bench/serve-perf-26b-chunk2048-fiona-2026-10-27.txt`.
+
+**Serving both.** The NixOS module serves named instances (`services.eklow.instances.<name>`, unit `eklow-<name>.service`,
+each conflicting with the others; the embedding model shared on one port), and the house's `llm-mode` switches fiona between
+`ornith` (8081) and `gemma` (8083), as it switches son-of-anton between unholy's instances.

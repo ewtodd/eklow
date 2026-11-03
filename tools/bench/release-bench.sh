@@ -10,7 +10,7 @@ docs=${DOCS:-$HOME/eklow-qrelease-data}
 read -ra extra <<<"${EXTRA:-}"  # further eklow-server arguments: the deployed flags (--group, --mmproj, ...)
 port=18181
 mkdir -p "$out"
-if systemctl is-active --quiet eklow; then echo "release-bench.sh: eklow.service is running" >&2; exit 1; fi
+if systemctl is-active --quiet 'eklow*.service'; then echo "release-bench.sh: an eklow service is running" >&2; exit 1; fi
 cd "$(dirname "$0")/../.."
 nix develop path:. -c ./build/eklow-server --model "$model" --alias "$alias" --port $port --slots 2 --ctx 262144 --kv-int8 \
   --expert-profile "$profile" --draft "$draft" --snapshot-mib 4096 \

@@ -29,9 +29,9 @@ ensure() {
   sleep 3
   up && return 0
   echo "$(date +%T) starting the server for $which"
-  ssh fiona "cd ~/$fiona_tree && systemctl is-active eklow >/dev/null && exit 3; pgrep -f 'eklow-server --model' >/dev/null && exit 4
+  ssh fiona "cd ~/$fiona_tree && systemctl is-active 'eklow*.service' >/dev/null && exit 3; pgrep -f 'eklow-server --model' >/dev/null && exit 4
     setsid nohup flock ~/eklow-perf/gpu.lock bash tools/bench/cs-serve.sh ~/eklow-qrelease-out/cs-$which.serve.log ~/models/$gguf $prof ~/models/drafts/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf $alias </dev/null >/dev/null 2>&1 &"
-  rc=$?; if [ $rc -ne 0 ]; then echo "cannot start the server on fiona (rc $rc: 3 = eklow.service active, 4 = a server is already running)"; return 1; fi
+  rc=$?; if [ $rc -ne 0 ]; then echo "cannot start the server on fiona (rc $rc: 3 = an eklow service active, 4 = a server is already running)"; return 1; fi
   for i in $(seq 1800); do up && return 0; sleep 1; done
   return 1
 }

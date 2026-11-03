@@ -1,0 +1,344 @@
+#include "serve/scheduler_gemma4.hpp"
+
+#include <algorithm>
+#include <cstdio>
+#include <stdexcept>
+
+namespace eklow::serve::gemma4 {
+
+namespace {
+
+double seconds(std::chrono::steady_clock::duration d) { return std::chrono::duration<double>(d).count(); }
+
+// The image rows of a prompt (the number of positions), and where a prefix of `pos` positions cuts one: back to its start.
+int64_t image_tokens(const Request& r) {
+  int64_t n = 0;
+  for (const auto& im : r.images) n += im.n;
+  return n;
+}
+int64_t cut_before_image(const Request& r, int64_t pos) {
+  for (const auto& im : r.images)
+    if (im.start < pos && pos < im.start + im.n) return im.start;
+  return pos;
+}
+
+}  // namespace
+
+bool Request::next(Event& e, std::chrono::milliseconds wait) {
+  std::unique_lock lk(mu_);
+  if (!cv_.wait_for(lk, wait, [&] { return !events_.empty(); })) return false;
+  e = std::move(events_.front());
+  events_.pop_front();
+  return true;
+}
+
+void Request::cancel() {
+  std::lock_guard lk(mu_);
+  cancelled_ = true;
+}
+
+void Request::push(Event e) {
+  {
+    std::lock_guard lk(mu_);
+    events_.push_back(std::move(e));
+  }
+  cv_.notify_all();
+}
+
+bool Request::cancelled() const {
+  std::lock_guard lk(mu_);
+  return cancelled_;
+}
+
+Scheduler::Scheduler(engine::gemma4::Engine& eng, const text::Tokenizer& tok, const SchedulerConfig& c)
+    : eng_(eng), tok_(tok), vocab_(std::make_shared<ToolVocab>(tok)), c_(c), seqs_(size_t(eng.n_slots())) {}
+
+void Scheduler::submit(std::shared_ptr<Request> r) {
+  if (r->prompt.empty()) throw std::invalid_argument("empty prompt");
+  if (int64_t(r->prompt.size()) >= c_.max_ctx)
+    throw std::invalid_argument("the prompt is " + std::to_string(r->prompt.size()) + " tokens, the context " +
+                                std::to_string(c_.max_ctx));
+  for (const auto& im : r->images)
+    if (im.n <= 0 || im.n > c_.max_chunk || im.start < 0 || im.start + im.n > int64_t(r->prompt.size()) || !im.rows)
+      throw std::invalid_argument("an image of " + std::to_string(im.n) + " rows does not fit a prefill chunk of " + std::to_string(c_.max_chunk));
+  r->submitted = std::chrono::steady_clock::now();
+  {
+    std::lock_guard lk(mu_);
+    waiting_.push_back(std::move(r));
+    ++stats_.waiting;
+  }
+  cv_.notify_all();
+}
+
+Scheduler::Stats Scheduler::stats() const {
+  std::lock_guard lk(mu_);
+  return stats_;
+}
+
+// Gives waiting requests free slots; true if any sequence is active afterwards.
+bool Scheduler::admit() {
+  std::lock_guard lk(mu_);
+  while (!waiting_.empty() && waiting_.front()->cancelled()) {
+    if (c_.on_finish) {
+      RequestLog l;
+      l.tag = waiting_.front()->tag, l.reason = "cancelled";
+      l.prompt_tokens = int64_t(waiting_.front()->prompt.size());
+      l.queue_s = seconds(std::chrono::steady_clock::now() - waiting_.front()->submitted);
+      c_.on_finish(l);
+    }
+    waiting_.pop_front();
+    --stats_.waiting;
+  }
+  while (!waiting_.empty()) {
+    auto& r = waiting_.front();
+    int best = -1;
+    size_t best_lcp = 0;
+    for (size_t s = 0; s < seqs_.size(); ++s) {
+      if (seqs_[s].req) continue;
+      const auto& t = seqs_[s].tokens;
+      size_t lcp = 0;
+      while (lcp < t.size() && lcp < r->prompt.size() && t[lcp] == r->prompt[lcp]) ++lcp;
+      if (best < 0 || lcp > best_lcp) best = int(s), best_lcp = lcp;
+    }
+    if (best < 0) break;
+    Seq& q = seqs_[size_t(best)];
+    const size_t r_prompt = r->prompt.size();
+    // At least the prompt's last token is fed again, for its logits.
+    // A prefix never ends inside an image (its rows are prefilled together), nor, after the rewind, does the window.
+    int64_t keep = cut_before_image(*r, int64_t(std::min(best_lcp, r->prompt.size() - 1)));
+    if (int64_t(q.tokens.size()) - keep > eng_.ring_slack()) keep = cut_before_image(*r, std::max<int64_t>(0, keep - eng_.model().window));
+    // A slot whose live sequence parts from the prompt after a long shared stretch is a conversation whose last answer the
+    // template rendered back differently from how it was sampled (a token boundary, stripped whitespace): say where (the Qwen
+    // scheduler's line, 655209e; image rows, ids below zero, have no bytes).
+    if (best_lcp >= 256 && best_lcp < q.tokens.size() && best_lcp < r->prompt.size() && q.tokens[best_lcp] >= 0 && r->prompt[best_lcp] >= 0)
+      std::fprintf(stderr, "eklow-server: prefix: the slot's sequence (%zu tokens) and the prompt (%zu) part at token %zu: sampled %s, prompt %s; reusing %lld\n", q.tokens.size(),
+                   r->prompt.size(), best_lcp, tok_.bytes(q.tokens[best_lcp]).c_str(), tok_.bytes(r->prompt[best_lcp]).c_str(), (long long)keep);
+    eng_.truncate(best, keep);
+    q.tokens.resize(size_t(keep));
+    q.fed = size_t(keep);
+    q.cached = keep;
+    q.admitted = std::chrono::steady_clock::now();
+    q.next_token = -1;
+    q.generated = 0;
+    q.held.clear();
+    q.called = false;
+    q.parser = std::make_unique<text::OutputParser>(tok_, r->in_thinking);
+    q.sampler = std::make_unique<Sampler>(r->sampling);
+    q.grammar = r->tools.empty() ? nullptr : std::make_unique<ToolGrammar>(vocab_, r->tools);
+    q.req = std::move(r);
+    waiting_.pop_front();
+    --stats_.waiting;
+    ++stats_.active;
+    stats_.prompt_tokens += int64_t(r_prompt);
+    stats_.cached_tokens += keep;
+    note_positions();
+  }
+  return stats_.active > 0;
+}
+
+Scheduler::Hold::Hold(Scheduler& s) : s_(s) {
+  std::lock_guard lk(s_.hold_mu_);
+  ++s_.holds_;
+}
+
+Scheduler::Hold::~Hold() {
+  {
+    std::lock_guard lk(s_.hold_mu_);
+    --s_.holds_;
+    ++s_.releases_;
+  }
+  s_.hold_cv_.notify_all();
+}
+
+void Scheduler::run(const std::atomic<bool>& stop) {
+  uint64_t seen = 0;  // releases_ at the last step
+  while (!stop.load()) {
+    if (!admit()) {
+      std::unique_lock lk(mu_);
+      cv_.wait_for(lk, std::chrono::milliseconds(100), [&] { return !waiting_.empty() || stop.load(); });
+      continue;
+    }
+    {
+      std::unique_lock lk(hold_mu_);
+      while (holds_ > 0 && releases_ == seen && !stop.load()) hold_cv_.wait_for(lk, std::chrono::milliseconds(100));
+      seen = releases_;
+    }
+    if (stop.load()) break;
+    try {
+      step();
+    } catch (const std::exception& e) {
+      fail_all(e.what());
+    }
+  }
+}
+
+void Scheduler::step() {
+  for (size_t s = 0; s < seqs_.size(); ++s)
+    if (seqs_[s].req && seqs_[s].req->cancelled()) finish(int(s), "stop");
+  // Decode tokens first, then prefill chunks in the batch that is left.
+  std::vector<engine::gemma4::Chunk> chunks;
+  std::vector<int> owner;
+  int64_t budget = c_.max_batch;
+  for (size_t s = 0; s < seqs_.size(); ++s) {
+    Seq& q = seqs_[s];
+    if (!q.req || q.next_token < 0) continue;
+    chunks.push_back({int(s), int64_t(q.tokens.size()), {q.next_token}, 1});
+    owner.push_back(int(s));
+    --budget;
+  }
+  for (size_t s = 0; s < seqs_.size() && budget > 0; ++s) {
+    Seq& q = seqs_[s];
+    if (!q.req || q.next_token >= 0 || q.fed >= q.req->prompt.size()) continue;
+    int64_t n = std::min<int64_t>({c_.max_chunk, budget, int64_t(q.req->prompt.size() - q.fed)});
+    // An image is never split: the chunk ends before one it would cut, and an image that does not fit what is left
+    // of the step waits for the next.
+    const int64_t end = int64_t(q.fed) + n;
+    for (const auto& im : q.req->images)
+      if (im.start < end && end < im.start + im.n) {
+        n = std::max<int64_t>(0, im.start - int64_t(q.fed));
+        break;
+      }
+    if (n == 0) continue;
+    const bool last = q.fed + size_t(n) == q.req->prompt.size();
+    engine::gemma4::Chunk chunk{int(s), int64_t(q.tokens.size()),
+                        std::vector<int32_t>(q.req->prompt.begin() + std::ptrdiff_t(q.fed), q.req->prompt.begin() + std::ptrdiff_t(q.fed) + n),
+                        last ? 1 : 0};
+    for (const auto& im : q.req->images)
+      if (im.start >= int64_t(q.fed) && im.start + im.n <= int64_t(q.fed) + n) chunk.images.push_back({im.start - int64_t(q.fed), im.n, im.rows->data()});
+    for (int32_t& t : chunk.tokens) t = std::max<int32_t>(t, 0);  // image rows carry ids below zero; the engine ignores them
+    chunks.push_back(std::move(chunk));
+    owner.push_back(int(s));
+    budget -= n;
+  }
+  if (chunks.empty()) return;
+  const std::vector<float> logits = eng_.step(chunks);
+  {
+    std::lock_guard lk(mu_);
+    ++stats_.steps;
+    for (const auto& c : chunks)
+      if (seqs_[size_t(c.slot)].next_token < 0) stats_.prefill_tokens += int64_t(c.tokens.size());  // a prefill chunk
+    note_positions();
+  }
+  const size_t V = size_t(eng_.model().n_vocab);
+  size_t row = 0;
+  for (size_t i = 0; i < chunks.size(); ++i) {
+    Seq& q = seqs_[size_t(owner[i])];
+    if (q.next_token >= 0) {
+      q.tokens.insert(q.tokens.end(), chunks[i].tokens.begin(), chunks[i].tokens.end());
+      q.next_token = -1;
+    } else {
+      // The prompt's own ids (an image's rows are named by theirs), not the zeros the engine was given.
+      const auto from = q.req->prompt.begin() + std::ptrdiff_t(q.fed);
+      q.tokens.insert(q.tokens.end(), from, from + std::ptrdiff_t(chunks[i].tokens.size()));
+      q.fed += chunks[i].tokens.size();
+    }
+    if (chunks[i].logits_rows == 0) continue;
+    const std::span<const float> l(logits.data() + row * V, V);
+    // Special tokens the output parser cannot take where it stands are never sampled (OutputParser::banned).
+    const std::vector<int32_t>* banned = &q.parser->banned();
+    const int32_t t = q.grammar && q.grammar->active() ? q.sampler->sample(l, &q.grammar->allowed(), banned) : q.sampler->sample(l, nullptr, banned);
+    if (q.grammar) q.grammar->accept(t);
+    ++row;
+    on_token(owner[i], t);
+  }
+}
+
+void Scheduler::on_token(int slot, int32_t token) {
+  Seq& q = seqs_[size_t(slot)];
+  q.sampler->accept(token);
+  if (q.generated == 0) q.first = std::chrono::steady_clock::now();
+  ++q.generated;
+  {
+    std::lock_guard lk(mu_);
+    ++stats_.generated_tokens;
+  }
+  Event e;
+  e.delta = q.parser->push(token);
+  if (!e.delta.tool_calls.empty()) q.called = true;
+  // Stop strings end the content; hold back a tail that could still become one.
+  bool stopped = false;
+  if (!q.req->stop.empty() && !e.delta.content.empty()) {
+    q.held += e.delta.content;
+    size_t cut = std::string::npos, longest = 0;
+    for (const auto& s : q.req->stop) {
+      longest = std::max(longest, s.size());
+      if (const size_t at = q.held.find(s); at != std::string::npos) cut = std::min(cut, at);
+    }
+    if (cut != std::string::npos) {
+      e.delta.content = q.held.substr(0, cut);
+      q.held.clear();
+      stopped = true;
+    } else {
+      size_t keep = std::min(q.held.size(), longest - 1);
+      size_t emit = q.held.size() - keep;
+      while (emit > 0 && emit < q.held.size() && (uint8_t(q.held[emit]) & 0xC0) == 0x80) --emit;  // whole characters
+      e.delta.content = q.held.substr(0, emit);
+      q.held.erase(0, emit);
+    }
+  }
+  const bool any = !e.delta.reasoning.empty() || !e.delta.content.empty() || !e.delta.tool_calls.empty() || !e.delta.errors.empty();
+  const bool ended = e.delta.done || stopped;
+  if (any) q.req->push(std::move(e));
+  if (ended) return finish(slot, q.called ? "tool_calls" : "stop");
+  const int64_t cap = q.req->max_tokens > 0 ? q.req->max_tokens : c_.max_ctx;
+  if (q.generated >= cap || int64_t(q.tokens.size()) + 1 >= c_.max_ctx) return finish(slot, "length");
+  q.next_token = token;
+}
+
+void Scheduler::finish(int slot, const std::string& reason, const std::string& error) {
+  Seq& q = seqs_[size_t(slot)];
+  if (!q.req) return;
+  Event e;
+  e.delta = q.parser->finish();
+  if (!q.held.empty()) e.delta.content = q.held + e.delta.content;
+  e.done = true;
+  e.finish_reason = reason;
+  e.error = error;
+  e.prompt_tokens = int64_t(q.req->prompt.size());
+  e.cached_tokens = q.cached;
+  e.completion_tokens = q.generated;
+  if (c_.on_finish) {
+    const auto now = std::chrono::steady_clock::now();
+    RequestLog l;
+    l.tag = q.req->tag, l.reason = q.req->cancelled() ? "cancelled" : reason, l.error = error;
+    l.prompt_tokens = e.prompt_tokens, l.cached_tokens = e.cached_tokens, l.completion_tokens = e.completion_tokens;
+    l.image_tokens = image_tokens(*q.req);
+    l.queue_s = seconds(q.admitted - q.req->submitted);
+    if (q.generated > 0) {
+      l.ttft_s = seconds(q.first - q.req->submitted);
+      l.prefill_s = seconds(q.first - q.admitted);
+      l.decode_s = seconds(now - q.first);
+    }
+    c_.on_finish(l);
+  }
+  q.req->push(std::move(e));
+  q.req.reset();
+  q.parser.reset();
+  q.sampler.reset();
+  q.grammar.reset();
+  q.held.clear();
+  q.next_token = -1;
+  std::lock_guard lk(mu_);
+  --stats_.active;
+  note_positions();
+}
+
+// The positions the slots hold, all and those of slots with no request; with mu_ held, on the engine thread.
+void Scheduler::note_positions() {
+  stats_.positions = stats_.idle_positions = 0;
+  for (size_t s = 0; s < seqs_.size(); ++s) {
+    stats_.positions += eng_.length(int(s));
+    if (!seqs_[s].req) stats_.idle_positions += eng_.length(int(s));
+  }
+}
+
+void Scheduler::fail_all(const std::string& error) {
+  for (size_t s = 0; s < seqs_.size(); ++s) {
+    if (seqs_[s].req) finish(int(s), "stop", error);
+    // What the engine holds for the slot is unknown after a failed step.
+    eng_.release(int(s));
+    seqs_[s].tokens.clear();
+  }
+}
+
+}  // namespace eklow::serve::gemma4

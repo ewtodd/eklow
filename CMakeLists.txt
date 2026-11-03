@@ -40,9 +40,11 @@ endfunction()
 
 # Serving text layer: the tokenizer (and, later, the chat template and output parser). No device code.
 add_library(eklow_text STATIC
+  src/text/chat_gemma4.cpp
   src/text/chat_qwen36.cpp
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
+  src/text/output_parser_gemma4.cpp
   src/text/output_parser_qwen.cpp
   src/text/tokenizer_qwen.cpp
   src/text/tool_schema.cpp
@@ -78,6 +80,7 @@ eklow_sycl(eklow_rt)
 add_library(eklow_model STATIC
   src/kernels/attention.cpp
   src/kernels/fast.cpp
+  src/kernels/gemma_fast.cpp
   src/kernels/gdn.cpp
   src/kernels/qwen_fast.cpp
   src/kernels/ref.cpp
@@ -89,6 +92,7 @@ add_library(eklow_model STATIC
   src/kernels/xmx_gemv_q6k.cpp
   src/kernels/xmx_gemv_q8.cpp
   src/model/embed_gemma2.cpp
+  src/model/gemma4.cpp
   src/model/vision_gemma4v.cpp
   src/model/vision_gemma4v_fast.cpp
   src/model/vision_qwen3vl.cpp
@@ -149,12 +153,38 @@ add_executable(eklow-engine-bench tools/engine_bench/main.cpp)
 target_link_libraries(eklow-engine-bench PRIVATE eklow_engine)
 eklow_sycl(eklow-engine-bench)
 
+# Gemma 4 26B A4B beside Qwen3.6 (TASK gemma/restore): its engine, scheduler, request layer and tools are 76d8588's, under
+# *_gemma4 names and in gemma4 inner namespaces; eklow-server dispatches on the GGUF's architecture.
+add_library(eklow_engine_gemma4 STATIC src/engine/engine_gemma4.cpp)
+target_link_libraries(eklow_engine_gemma4 PUBLIC eklow_model eklow_cpu)
+eklow_sycl(eklow_engine_gemma4)
+
+add_executable(eklow-engine-run-gemma4 tools/engine_run_gemma4/main.cpp)
+target_link_libraries(eklow-engine-run-gemma4 PRIVATE eklow_engine_gemma4)
+eklow_sycl(eklow-engine-run-gemma4)
+
+add_executable(eklow-engine-bench-gemma4 tools/engine_bench_gemma4/main.cpp)
+target_link_libraries(eklow-engine-bench-gemma4 PRIVATE eklow_engine_gemma4)
+eklow_sycl(eklow-engine-bench-gemma4)
+
 # The tool-call grammar: host code over the vocabulary, tested against the output parser.
 add_library(eklow_grammar STATIC src/serve/tool_grammar_qwen.cpp)
 target_link_libraries(eklow_grammar PUBLIC eklow_text)
 
 add_executable(eklow-grammar-test-qwen tools/grammar_test/main.cpp)
 target_link_libraries(eklow-grammar-test-qwen PRIVATE eklow_grammar)
+
+add_library(eklow_grammar_gemma4 STATIC src/serve/tool_grammar_gemma4.cpp)
+target_link_libraries(eklow_grammar_gemma4 PUBLIC eklow_text)
+
+add_executable(eklow-grammar-test-gemma4 tools/grammar_test_gemma4/main.cpp)
+target_link_libraries(eklow-grammar-test-gemma4 PRIVATE eklow_grammar_gemma4)
+
+add_executable(eklow-chat-gemma4 tools/chat_gemma4/main.cpp)
+target_link_libraries(eklow-chat-gemma4 PRIVATE eklow_text)
+
+add_executable(eklow-parse-gemma4 tools/parse_gemma4/main.cpp)
+target_link_libraries(eklow-parse-gemma4 PRIVATE eklow_text)
 
 # Serving: the request layer (OpenAI surface, Qwen3.6's chat template and tokenizer), the scheduler (continuous batching,
 # speculative decoding with a DFlash 2 draft, snapshots of the recurrent state) and the server. The sampler and the
@@ -163,14 +193,24 @@ add_library(eklow_serve STATIC src/serve/openai.cpp src/serve/scheduler.cpp)
 target_link_libraries(eklow_serve PUBLIC eklow_spec eklow_grammar eklow_text eklow_engine)
 eklow_sycl(eklow_serve)
 
-add_executable(eklow-server tools/server/main.cpp)
+# Gemma 4's request layer and scheduler (the sampler is eklow_spec's, shared).
+add_library(eklow_serve_gemma4 STATIC src/serve/openai_gemma4.cpp src/serve/scheduler_gemma4.cpp)
+target_link_libraries(eklow_serve_gemma4 PUBLIC eklow_spec eklow_grammar_gemma4 eklow_text eklow_engine_gemma4)
+eklow_sycl(eklow_serve_gemma4)
+
+# One server binary: tools/server/main.cpp is the Qwen server and the dispatch on the GGUF's architecture,
+# tools/server/gemma4_main.cpp the Gemma 4 server.
+add_executable(eklow-server tools/server/main.cpp tools/server/gemma4_main.cpp)
 target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
-target_link_libraries(eklow-server PRIVATE eklow_serve Threads::Threads)
+target_link_libraries(eklow-server PRIVATE eklow_serve eklow_serve_gemma4 Threads::Threads)
 eklow_sycl(eklow-server)
 
 add_executable(eklow-prompt tools/prompt/main.cpp)
 target_link_libraries(eklow-prompt PRIVATE eklow_serve)
 eklow_sycl(eklow-prompt)
+add_executable(eklow-prompt-gemma4 tools/prompt_gemma4/main.cpp)
+target_link_libraries(eklow-prompt-gemma4 PRIVATE eklow_serve_gemma4)
+eklow_sycl(eklow-prompt-gemma4)
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
@@ -203,9 +243,12 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test-qwen eklow-cpu-gemv-test RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-kernel-test eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test-qwen eklow-cpu-gemv-test
+  eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-grammar-test-gemma4 eklow-chat-gemma4 eklow-parse-gemma4 eklow-prompt-gemma4 RUNTIME DESTINATION bin)
 # The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
+# The 26B's (Gemma 4 26B A4B), for the same flag.
+install(FILES data/gemma-4-26b-a4b-experts.json DESTINATION share/eklow)
 
 # The CPU GEMVs of the Qwen formats for the cold experts, checked and timed (TASK qwen/mm).
 add_executable(eklow-cpu-qgemv-test tools/cpu_qgemv_test/main.cpp)

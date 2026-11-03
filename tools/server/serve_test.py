@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Tests of eklow-server on Qwen3.6 through its HTTP API (stdlib only). Start the server first (srv.sh in
-~/eklow-qwen-data/qserve on fiona, or by hand), then:
+"""Tests of eklow-server through its HTTP API (stdlib only), on Qwen3.6 or on Gemma 4 26B A4B (one binary serves both).
+Start the server first (srv.sh in ~/eklow-qwen-data/qserve on fiona, or by hand), then:
 
-  serve_test.py --url http://127.0.0.1:8091 basic [--save FILE]   whole and streamed chat, reasoning_content, a tool call
+  serve_test.py --url http://127.0.0.1:8091 [--family auto|qwen|gemma] basic [--save FILE]
+                                                                   whole and streamed chat, reasoning_content, a tool call
                                                                    (the grammar), stop strings, seeds, two at once, a
                                                                    cancelled request, prefix reuse; with --save the
                                                                    temperature-0 outputs go to FILE
@@ -11,6 +12,11 @@
   serve_test.py --url ... sample --n 1500 --out FILE               N short completions at temperature 1 of one prompt
   serve_test.py chi2 A.json B.json                                 two-sample chi-square of the sampled completions
                                                                    (the acceptance's test through the server path)
+
+--family says which server it is talking to; auto (the default) reads /v1/models and takes "gemma" in the model id for
+Gemma 4, anything else for Qwen. Qwen's checks are unchanged. Gemma 4's tool-call grammar fixes the call's structure
+and the tool's name but not the parameters' types (Qwen's does, from the schema), so for Gemma the typed-arguments
+check is reported without failing the run.
 """
 import argparse
 import concurrent.futures
@@ -68,6 +74,23 @@ def stream_chat(url, messages, **kw):
 
 
 FAILED = []
+FAMILY = "qwen"
+
+
+def detect_family(url, wanted):
+    """qwen or gemma: as asked, or from the model id /v1/models gives."""
+    if wanted != "auto":
+        return wanted
+    u = urllib.parse.urlparse(url)
+    try:
+        c = http.client.HTTPConnection(u.hostname, u.port, timeout=30)
+        c.request("GET", "/v1/models")
+        ids = [m.get("id", "") for m in json.loads(c.getresponse().read()).get("data", [])]
+        c.close()
+    except Exception as e:
+        print(f"(/v1/models unreadable: {e}; assuming qwen)")
+        return "qwen"
+    return "gemma" if any("gemma" in i.lower() for i in ids) else "qwen"
 
 
 def check(name, ok, detail=""):
@@ -90,7 +113,10 @@ GREEDY = [
 
 
 def basic(a):
+    global FAMILY
     url = a.url
+    FAMILY = detect_family(url, a.family)
+    print(f"server family: {FAMILY}")
     saved = {}
     # Whole and streamed give the same text at temperature 0; reasoning_content is separate from content.
     msgs = [{"role": "user", "content": "In one sentence, why is the sky blue?"}]
@@ -98,7 +124,7 @@ def basic(a):
     m = j["choices"][0]["message"]
     check("whole: finish_reason stop", j["choices"][0]["finish_reason"] == "stop", j["choices"][0]["finish_reason"])
     check("whole: reasoning_content and content", bool(m.get("reasoning_content")) and bool(m.get("content")), str(m)[:200])
-    check("whole: no think tags in content", "<think>" not in m["content"] and "</think>" not in m["content"])
+    check("whole: no think tags in content", all(t not in m["content"] for t in ("<think>", "</think>", "<|channel>", "<channel|>")))
     u = j["usage"]
     check("whole: usage adds up", u["total_tokens"] == u["prompt_tokens"] + u["completion_tokens"] and "cached_tokens" in u["prompt_tokens_details"])
     r, c, calls, fin, usage, chunks = stream_chat(url, msgs, max_tokens=700, temperature=0)
@@ -122,7 +148,11 @@ def basic(a):
         except Exception as e:
             ok = False
     check("tool call: get_weather with JSON arguments", ok and args.get("city") == "Lisbon", str(calls)[:300])
-    check("tool call: typed arguments", isinstance(args.get("days"), int) and args.get("units") in ("metric", "imperial"), str(args))
+    typed = isinstance(args.get("days"), int) and args.get("units") in ("metric", "imperial")
+    if FAMILY == "gemma":
+        print(f"{'ok  ' if typed else 'note'} tool call: typed arguments (Gemma's grammar does not enforce the schema)  {args}")
+    else:
+        check("tool call: typed arguments", typed, str(args))
     check("tool call: finish_reason tool_calls", ch["finish_reason"] == "tool_calls", ch["finish_reason"])
     r, c, scalls, fin, usage, _ = stream_chat(url, tm, tools=[WEATHER], max_tokens=1500, temperature=0)
     check("tool call streamed: same call", len(scalls) == len(calls) and scalls[0]["function"]["arguments"] == calls[0]["function"]["arguments"] and fin == "tool_calls", str(scalls)[:200])
@@ -272,6 +302,7 @@ def chi2(a):
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--url", default="http://127.0.0.1:8091")
+ap.add_argument("--family", choices=["auto", "qwen", "gemma"], default="auto")
 sub = ap.add_subparsers(dest="cmd", required=True)
 p = sub.add_parser("basic")
 p.add_argument("--save")
