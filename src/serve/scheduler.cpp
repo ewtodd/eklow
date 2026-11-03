@@ -316,7 +316,7 @@ void Scheduler::step() {
       else if (q.fed < q.req->prompt.size()) ++n_prefill, who = int(s);
     }
     const int64_t lim = n_gen ? std::min(c_.group_busy, c_.max_group) : c_.max_group;
-    if (n_prefill == 1 && lim > c_.max_chunk && int64_t(seqs_[size_t(who)].req->prompt.size() - seqs_[size_t(who)].fed) > c_.max_chunk) grp_slot = who, grp_limit = lim;
+    if (n_prefill == 1 && !(n_gen && grouped_last_) && lim > c_.max_chunk && int64_t(seqs_[size_t(who)].req->prompt.size() - seqs_[size_t(who)].fed) > c_.max_chunk) grp_slot = who, grp_limit = lim;
   }
   std::vector<int> gen;
   for (size_t s = 0; s < seqs_.size(); ++s)
@@ -427,6 +427,9 @@ void Scheduler::step() {
   }
   if (chunks.empty()) return;
 
+  grouped_last_ = false;
+  for (const engine::Chunk& c : chunks)
+    if (int64_t(c.tokens.size()) > c_.max_chunk) grouped_last_ = true;
   const std::vector<float> logits = [&] {
     Timer timer(mu_, stats_.engine_s);
     return eng_.step(chunks);

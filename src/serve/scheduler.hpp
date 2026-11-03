@@ -221,6 +221,7 @@ class Scheduler {
   SchedulerConfig c_;
   std::vector<Seq> seqs_;
   uint64_t tick_ = 0;
+  bool grouped_last_ = false;  // the last step was a layer-major group (a generating slot then gets a step before the next group)
   uint64_t snap_bytes_ = 0;  // held by all slots' snapshots (engine thread; mirrored into stats_)
 
   mutable std::mutex mu_;
