@@ -8,4 +8,4 @@ G=$DATA/gemma
 export RESULTS=${RESULTS:-$here/../../docs/bench/gemma-dflash} TOPK=64 N=${N:-16} CONC=1 SAMPLINGS=greedy
 label=gemma26b-zlab-b16-conc1
 rm -f "$RESULTS/$label.jsonl" "$RESULTS/$label.summary"
-bash "$here/dflash2-llamacpp.sh" "$G/target/gemma-4-26B_q4_0-it.gguf" "$G/work/gguf/drafts/gemma-4-26B-A4B-it-DFlash-zlab-Q8_0.gguf" 16 "$label" gsm8k humaneval mt-bench || echo "run $label exited $?"
+bash "$here/dflash2-llamacpp.sh" "$G/target/gemma-4-26B_q4_0-it.gguf" "$G/work/gguf/drafts/gemma-4-26B-A4B-it-DFlash-zlab-Q8_0.gguf" 16 "$label" "gsm8k humaneval mt-bench" || echo "run $label exited $?"

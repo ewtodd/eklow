@@ -1,0 +1,6 @@
+{"label": "gemma26b-zlab-b16/greedy", "dataset": "gsm8k", "requests": 16, "acceptance_mean": 5.199372070915805, "tokens": 30766, "truncated": 4, "decode_tps_median": 164.4740763895095}
+{"label": "gemma26b-zlab-b16/greedy", "dataset": "humaneval", "requests": 16, "acceptance_mean": 4.458348931061192, "tokens": 51724, "truncated": 9, "decode_tps_median": 106.83649811526314}
+{"label": "gemma26b-zlab-b16/greedy", "dataset": "mt-bench", "requests": 16, "acceptance_mean": 2.856435645410425, "tokens": 23479, "truncated": 1, "decode_tps_median": 69.27959086026361}
+{"label": "gemma26b-zlab-b16/temp", "dataset": "gsm8k", "requests": 16, "acceptance_mean": 4.064235707347268, "tokens": 20487, "truncated": 2, "decode_tps_median": 122.35597520744294}
+{"label": "gemma26b-zlab-b16/temp", "dataset": "humaneval", "requests": 16, "acceptance_mean": 3.4715863929471387, "tokens": 42141, "truncated": 6, "decode_tps_median": 91.11888229790608}
+{"label": "gemma26b-zlab-b16/temp", "dataset": "mt-bench", "requests": 16, "acceptance_mean": 2.6286593878862017, "tokens": 22850, "truncated": 1, "decode_tps_median": 59.0931792670429}

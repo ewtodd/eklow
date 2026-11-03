@@ -1,0 +1,9 @@
+deep-analysis positions 55 model.py: 3.35 cap2048: 3.22 cap512: 3.07
+deep-quote positions 55 model.py: 3.87 cap2048: 3.51 cap512: 3.42
+all model.py: 3.61 (+/- 0.24, n=110) cap2048: 3.36 (+/- 0.25, n=110) cap512: 3.25 (+/- 0.24, n=110)
+model.py accepted-length histogram [19, 31, 17, 15, 5, 6, 6, 3, 4, 2, 2, 0, 0, 0, 0, 0]
+cap2048 accepted-length histogram [30, 29, 14, 11, 3, 6, 5, 4, 4, 2, 2, 0, 0, 0, 0, 0]
+cap512 accepted-length histogram [30, 32, 13, 11, 3, 6, 4, 4, 3, 2, 2, 0, 0, 0, 0, 0]
+model.py minus model.py: +0.000 tokens per step (paired se 0.000)
+cap2048 minus model.py: -0.245 tokens per step (paired se 0.100)
+cap512 minus model.py: -0.364 tokens per step (paired se 0.121)
