@@ -1927,3 +1927,81 @@ detached, from `~/eklow-wt-gemma`): `bench.sh check26` with and without the prof
 **Serving both.** The NixOS module serves named instances (`services.eklow.instances.<name>`, unit `eklow-<name>.service`,
 each conflicting with the others; the embedding model shared on one port), and the house's `llm-mode` switches fiona between
 `ornith` (8081) and `gemma` (8083), as it switches son-of-anton between unholy's instances.
+
+## 2026-11-03 — speculative decoding for the 26B: verify blocks and capture in the Gemma engine, the draft path in its server
+
+**Built and checked on e-desktop only** (it compiles, the host checks pass; nothing of it has run on a card, which production
+holds). The card commands, and what each should show, are at the end.
+
+**The engine** (`engine_gemma4.*`, no kernel changed). `Config::capture_layers` / `max_capture_rows` and `Chunk::capture_rows`
+are Qwen's: after layer l's tail the residual stream (`l_out`, the buffer `fast::moe_tail` or `residual_norm_quant` just wrote)
+of the rows a chunk asks for (its last `capture_rows`) is gathered by `qwenk::gather_rows` into a device buffer
+[row][layers x 2816] fp32 in step order, `Engine::capture()` with the rows' slot and position. Layer numbers are the GGUF's
+`target_layers` as Qwen's engine takes them (`Dflash2Config::target_layers`, passed through unchanged). A verify chunk
+(`Chunk::verify`, 2 to 16 tokens) is a chunk with logits for every row; Gemma has no recurrent state, so there is no pending
+state: the caller rewinds with `truncate(slot, start + 1 + accepted)` after the step (the Qwen engine's `accept` field has no
+use here). Why the rewind is safe: a sliding ring holds `ring_pages x kPage` positions, window + max_chunk or more; a block of
+B tokens writes position p + j over p + j - ring, which a query at p + a + 1 (a accepted) has left behind the window if
+ring - window >= B - a - 2, and `ring_slack()` is >= max_chunk; `step` refuses a verify chunk longer than slack + 1 (it only
+matters for a max_chunk under 15). The global layers' pages past the rewound length are freed and taken again by the next
+chunk; their stale K/V is overwritten before it is read (a causal read never goes past the chunk).
+
+*Which path a verify block takes.* No new one: `step` picks by rows. T x 8 pairs <= 32 (`kFp16Rows`), that is a block of up to 4
+tokens of one slot, takes the fused decode path (grouped GEMVs, routing and the weighted sum on the card, the cold experts
+overlapped by the host); more rows (two slots' blocks of 4, blocks of 8 or 16) the prefill path (sort by expert, 64-row
+tiles, the cold pairs on the CPU: streaming needs 16 pairs for one expert, which 8 to 32 rows rarely give). The pool spins as at
+decode for a verify step. Cost I expect: a block of 4 is a decode step plus three rows of the cold experts' CPU time (the
+Qwen 35B measured 8.5 ms a row beyond the first; the 26B has 8 of 128 experts per token and N = 51 on the card, so its share
+that is cold is lower, I would guess 2 to 5 ms), the attention and dense matmuls of 4 rows costing little more than 1; two
+slots' blocks (8 rows) leave the fused path, which may cost more than two fused steps. `eklow-engine-bench-gemma4 --verify
+1,2,4,8,16` measures exactly this (per row, per row beyond the first, with the cold experts' time) at 8k and 32k with 1 or 2
+slots; if 8 rows cost more than 2 x the 4-row step, the cheaper path is to run each slot's block in its own fused pass (the MoE
+section looping over groups of 4 tokens); not done, since it cannot be judged without the card.
+
+*The head.* The draft needs the target's head as an `xmx::Weight`; Gemma's was `fast::Q6` (fp32 activations). With
+`Config::head_dpas` (off by default, so plain serving is exactly as before; `--draft` turns it on) the engine's head is
+`xmx::WeightFormat::Q6_K`, one copy (605 MB) shared with the draft through `Engine::head_weight()`; the final norm output is
+quantized to int8 per 32 and the logits come from `xmx::matmul` as Qwen's head does. The embedding lookup then reads the
+GGUF's mapped rows (a gather of T x 2,310 bytes per step into pinned memory, `ref::embed` on the card), so the table is not
+on the card either, and the draft gets the table as host memory (`Engine::embedding_table()`, `Dflash2Target::host_table`). What
+this costs in accuracy (int8 activations on the head, where the fp32 head was kept for the 26B's softcapped logits) and in speed
+is for `check26` with `--head-dpas` and the decode bench to say; if the accuracy is outside the band, the fallback is the
+draft carrying its own copy (605 MB, ~6 experts a layer).
+
+*The draft's card memory.* `Config::draft_reserve_bytes` is kept from the experts' placement as in Qwen's engine; the server's
+`--draft-reserve-mib` (default 1,200: the draft's 5 layers at hidden 2816 and its cache, to be read off the startup line and set
+tighter) and the capture buffer (min(chunk, draft window) + slots x 16 rows x 6 x 2816 fp32) are counted before the placement.
+
+**The server** (`scheduler_gemma4.*`, `openai_gemma4.*`, `gemma4_main.cpp`) ports Qwen's speculative path: the draft step (one
+pass per block size, 32 rows at most), the verify chunks, `serve::verify` with the sampler's every feature and a clone of the
+output parser and tool grammar per row (`RowState`), `on_token` returning why a request ends so that a stop string, an end token
+or `max_tokens` in an accepted block ends it at that token (the block's tail is dropped), the rewind and the draft's context
+injection of the accepted rows, per-request `"speculative"`, `usage.speculation`, the log's draft fields and per-step timings,
+`--draft`, `--draft-block` (default min(trained block, 4)), `--draft-reserve-mib`; the draft's context follows prefix reuse
+(`truncate` at admission, at the end of a request, `reset` after a failed step). Not ported, because Gemma has none of it:
+snapshots, the pending-accept protocol, layer-major groups, rotary deltas of images. Differences: the draft context takes an
+image's rows like any others (their hidden states are real); the block's rejected rows are cut by `Engine::truncate` in the step
+that verified them, not by the next chunk.
+
+**Needs `gemma/draft`.** The target's embedding for the Gemma draft is scaled by sqrt(2816) and its head's logits are softcapped
+(30), neither of which `model::Dflash2Target` on main says; `gemma4_main.cpp` builds the target as Qwen's (`{table, head, true}`)
+and must set the two new fields when that branch lands. Until it does, a Gemma draft run would embed and score wrongly.
+
+**Host checks** (e-desktop): the tree and `nix build path:.` build; `eklow-grammar-test-gemma4` (2,000 calls, 1,997 walks closed,
+96/96 bans), `eklow-grammar-test-qwen` (2,000/2,000, 828/828), `gemma4_chat_compare.py` (368 cases, 0 differences, 33,969 tokens),
+`gemma4_parse_compare.py` (100/100), `eklow-spec-test` all ok.
+
+**Card commands, in order** (fiona, in a window, from `~/eklow-wt-gspec` after building there; GGUFs and the profile as in
+`~/gemma-window.sh`): (1) `bash ~/eklow-perf/bench.sh check26` with and without `--expert-profile data/gemma-4-26b-a4b-experts.json
+--experts-on-card 51`, unchanged code path (band: long >= 220/256 at mean KL <= 7.5e-2; chat >= 22/25 at <= 8e-2; 76d8588: 243/256 at
+2.9e-2); then the same with `--head-dpas` (the shared head's accuracy). (2) `eklow-engine-run-gemma4 --model <26B> --out <dir>
+--tokens-json <a 2-3k prompt> --chunk 1024 --verify-last 64 --verify-block 4 --accept 1,2,4,3 --capture-layers 1,6,11,17,22,27
+--head-dpas [--expert-profile ... --experts-on-card 51]`, and again with `--verify-block 16 --accept 5,16,2` and `--verify-block 8`
+(the rewinds and the 8- to 16-row prefill-shaped path): expect mean KL under 0.05, top-1 agreement over 95%, captures identical
+for the prefill and relative RMS under 0.05 for verify rows. (3) `eklow-engine-bench-gemma4 --model <26B> --prefill 1024 --decode-ctx
+8192 --verify 1,2,3,4,6,8,16 --verify-ctx 8192,32768 --slots 1 [--capture --head-dpas]` and `--slots 2`, with the profile and N = 51
+(the per-row cost; compare B = 1 with the plain decode step, and with `--head-dpas` off for the head's speed). (4) `serve_test.py
+basic` against the Gemma server without `--draft` (unchanged behaviour) and with `--draft <gemma draft> --draft-block 4`
+(after `gemma/draft`). (5) the lossless check through the server: `serve_test.py sample --n 3000 --out A.json` against the server
+without the draft and with it, then `serve_test.py chi2 A.json B.json` (Qwen's was 3,000 completions each); `basic --save` on
+both and `compare`.
