@@ -41,6 +41,8 @@ struct Config {
   // A lone prefill chunk (no other chunk in the step, not a verify chunk) of up to max_group tokens, a multiple of max_chunk, runs layer
   // by layer over sub-chunks of at most max_chunk, so that a layer's cold experts cross the link once per group, not once per chunk. 0: max_chunk.
   int64_t max_group = 0;
+  // In a group, start a layer's copies once every sub-chunk is routed and run the hot experts after them (else each sub-chunk finishes its layer first).
+  bool group_early_copy = true;
   int64_t max_logits = 64;   // logits rows per step
   // The attention layers' K/V as int8 with a scale per 16 dimensions (attention.hpp): half the memory.
   bool int8_kv = false;
@@ -245,7 +247,8 @@ class Engine {
     int64_t off = 0, len = 0;
   };
   std::vector<float> step_group(const Chunk& c, int acc);
-  void cold_group(const Layer& L, const std::vector<GroupSub>& subs, sycl::event ids_ready, sycl::event routed, const std::function<void(const char*)>& mark);
+  void cold_group(const Layer& L, const std::vector<GroupSub>& subs, sycl::event ids_ready, sycl::event routed, const std::function<void(const char*)>& mark,
+                  const std::function<void()>& after_first_copy = nullptr);
   void ensure_pages(int slot, int64_t positions);
   void free_pages_beyond(Slot& s, int64_t length);
   // A slot's accepted count for a chunk's `accept` (the pending tokens when negative); throws when it does not fit.

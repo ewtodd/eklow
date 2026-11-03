@@ -80,6 +80,7 @@ int main(int argc, char** argv) {
     else if (a == "--prefill") prefill = list(next());
     else if (a == "--depth") depth = list(next());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
+    else if (a == "--no-early-copy") ec.group_early_copy = false;
     else if (a == "--group") group = std::max<int64_t>(1, std::atoll(next().c_str()));
     else if (a == "--decode-ctx") decode_ctx = list(next());
     else if (a == "--decode-slots") decode_slots = list(next());
@@ -104,7 +105,7 @@ int main(int argc, char** argv) {
     else if (a == "--stream-copy-us") ec.stream_copy_us = std::atof(next().c_str());
     else if (a == "--stream-cpu-us") ec.stream_cpu_us = std::atof(next().c_str());
     else {
-      std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--group N] [--depth N,...] [--decode-ctx N,...] "
+      std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--group N] [--no-early-copy] [--depth N,...] [--decode-ctx N,...] "
                            "[--decode-slots N,...] [--decode-steps N] [--verify B,...] [--verify-ctx N,...] [--verify-steps N] [--slots N] "
                            "[--max-ctx N] [--profile] [--kv-int8] [--no-capture] [--json FILE] [--tokens-json FILE] "
                            "[--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [--stream-min-rows N] "

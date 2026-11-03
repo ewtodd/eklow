@@ -1494,7 +1494,10 @@ std::vector<float> Engine::step_group(const Chunk& c, int acc) {
   for (int l = 0; l < cfg_.n_layer; ++l) {
     const Layer& L = layers_[size_t(l)];
     sycl::event ids_ready, routed;
-    for (int64_t k = 0; k < G; ++k) {
+    // With early copies a layer runs in two phases: every sub-chunk's mixer and routing first, the copies of the streamed set started
+    // when the whole group is routed, and the hot experts and the shared expert after, while the copies land.
+    const bool split = c_.group_early_copy && L.n_cold && n_stream_ > 0;
+    auto phase_a = [&](int64_t k) {
       const GroupSub& sb = subs[size_t(k)];
       const int64_t T = sb.len, P = T * NU;
       float* xk = x_ + sb.off * E;
@@ -1551,6 +1554,18 @@ std::vector<float> Engine::step_group(const Chunk& c, int acc) {
         routed = q_.memcpy(hp_xs_ + sb.off * kb, hqs_, size_t(T * kb) * sizeof(float));
         if (n_stream_ > 0) qwenk::to_half(q_, h_, T * E, hg_ + sb.off * E);
       }
+    };
+    auto phase_b = [&](int64_t k) {
+      const GroupSub& sb = subs[size_t(k)];
+      const int64_t T = sb.len, P = T * NU;
+      float* xk = x_ + sb.off * E;
+      int32_t* ids = gids_ + sb.off * NU;
+      float* wts = gw_ + sb.off * NU;
+      if (split) {
+        // Phase A left x = the residual after the mixer; the MoE input, its quantization and the shared gate are cheap to make again.
+        qwenk::add_norm_quant(q_, nullptr, xk, L.post_norm, cfg_.eps, T, E, nullptr, &act_, h_);
+        fast::matmul_f32(q_, L.w_rg + NE * E, 32, E, h_, T, sg_);
+      }
       fast::moe_group(q_, ids, P, NE, moe_tile_, moe_scratch_, moe_tiles_, moe_row_, L.cold_dev);
       mark("moe_group");
       fast::moe_gather(q_, h_, moe_row_, P, NU, E, moe_a_);
@@ -1565,8 +1580,12 @@ std::vector<float> Engine::step_group(const Chunk& c, int acc) {
       mark("shexp");
       qwenk::moe_accumulate(q_, xk, moe_y_, wts, moe_row_, NU, nullptr, nullptr, o_, sg_, 32, T, E);
       mark("moe_sum");
+    };
+    for (int64_t k = 0; k < G; ++k) {
+      phase_a(k);
+      if (!split) phase_b(k);
     }
-    if (L.n_cold) cold_group(L, subs, ids_ready, routed, mark);
+    if (L.n_cold) cold_group(L, subs, ids_ready, routed, mark, split ? [&] { for (int64_t k = 0; k < G; ++k) phase_b(k); } : std::function<void()>());
     if (cap_col_[size_t(l)] >= 0 && !cap_rows.empty())
       qwenk::gather_rows(q_, x_, cap_idx_, int64_t(cap_rows.size()), E, cap_, int64_t(ncap) * E, int64_t(cap_col_[size_t(l)]) * E);
     mark("tail");
@@ -1597,7 +1616,7 @@ std::vector<float> Engine::step_group(const Chunk& c, int acc) {
 // group's counts and goes through the slots in waves (the card runs a wave's GEMMs for every sub-chunk while the copy engine
 // brings the next one in); the CPU computes the pairs of the experts not streamed on a thread of its own, meanwhile.
 void Engine::cold_group(const Layer& L, const std::vector<GroupSub>& subs, sycl::event ids_ready, sycl::event routed,
-                        const std::function<void(const char*)>& mark) {
+                        const std::function<void(const char*)>& mark, const std::function<void()>& after_first_copy) {
   using Clock = std::chrono::steady_clock;
   const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NU = cfg_.n_expert_used, NE = cfg_.n_expert, kb = E / 32;
   const int64_t G = int64_t(subs.size()), Tg = subs.back().off + subs.back().len, Pg = Tg * NU;
@@ -1663,6 +1682,7 @@ void Engine::cold_group(const Layer& L, const std::vector<GroupSub>& subs, sycl:
     copied = copy_->event(copy_->fence());
   };
   if (!waves.empty()) issue(0);
+  if (after_first_copy) after_first_copy();  // the hot experts of every sub-chunk, enqueued while the first wave lands
   routed.wait();
 
   // The CPU's pairs: the cold experts not streamed.
