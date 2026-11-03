@@ -6,6 +6,7 @@
 //   eklow-dflash-test time    --draft GGUF --target GGUF: timings on the card
 //   eklow-dflash-test plain   --draft Q8_0.gguf --target GGUF --feats F.f32 --anchors a,b,.. --ctx N [--block B] [--window W] [--full-context N] [--no-int8]
 //       a plain DFlash draft (Gemma's) on fixed features: the serving forward against the reference (tools/dflash_test/ref_torch_plain.py makes the inputs)
+//   eklow-dflash-test dump    --draft GGUF --target GGUF [--ctx N] [--block B] [--window W]: hashes of the serving forward's lattices on fixed random features
 // The inputs are what ref_torch.py read: ORACLE_DIR holds eklow-oracle's l_out-N.f32 for the draft's target layers.
 #include <algorithm>
 #include <chrono>
@@ -379,6 +380,44 @@ int cmd_plain(const Args& a) {
   return 0;
 }
 
+// The serving forward's lattices on random features, as hashes: the same line from two builds means the same bytes. For
+// checking that a change to the draft code leaves a draft's output as it was (run it with both builds on the card, diff).
+int cmd_dump(const Args& a) {
+  sycl::queue q(rt::pick_device(), sycl::property::queue::in_order{});
+  const auto draft = gguf::File::open(a.draft), target = gguf::File::open(a.target);
+  const auto cfg = model::Dflash2Config::from_gguf(draft);
+  const int B = a.block ? a.block : cfg.block_size, nb = a.anchors.empty() ? 3 : int(a.anchors.size());
+  const int64_t ctx = a.ctx ? a.ctx : 200, n_rows = ctx + 3 * nb;
+  const model::OwnedTarget owned(q, target);
+  model::Dflash2::Options opt;
+  opt.max_block = B;
+  opt.window = a.window;
+  model::Dflash2 fast(q, draft, owned.view(), opt);
+  std::mt19937_64 rng(7);
+  std::normal_distribution<float> nd(0.0f, 1.0f);
+  std::vector<float> feats(size_t(n_rows) * size_t(cfg.n_feat()));
+  for (auto& f : feats) f = nd(rng);
+  float* dfeats = sycl::malloc_device<float>(feats.size(), q);
+  q.memcpy(dfeats, feats.data(), feats.size() * sizeof(float)).wait();
+  auto fnv = [](const void* p, size_t n) {
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) h = (h ^ static_cast<const uint8_t*>(p)[i]) * 1099511628211ull;
+    return h;
+  };
+  fast.inject(0, dfeats, 0, ctx);
+  int64_t next = ctx;
+  for (int b = 0; b < nb; ++b) {
+    const int32_t anchor = b < int(a.anchors.size()) ? a.anchors[size_t(b)] : int32_t(rng() % uint64_t(cfg.n_vocab));
+    const serve::Lattice l = fast.lattices({{0, anchor, next}}, B)[0];
+    std::printf("block %d anchor %d pos %lld: cand %016llx unary %016llx score %016llx\n", b, anchor, (long long)next, (unsigned long long)fnv(l.cand.data(), l.cand.size() * 4),
+                (unsigned long long)fnv(l.unary.data(), l.unary.size() * 4), (unsigned long long)fnv(l.score.data(), l.score.size() * 4));
+    fast.inject(0, dfeats + next * cfg.n_feat(), next, 3);
+    next += 3;
+  }
+  sycl::free(dfeats, q);
+  return 0;
+}
+
 // How well the draft predicts a real text, teacher forced: at every `stride`-th position of the text a block is drafted
 // from the real features of the positions before it, and the accepted length is how many of its greedy tokens agree with
 // the text that follows (the draft's acceptance if the target said the text). For the exact fp32 reference, the
@@ -542,6 +581,7 @@ int main(int argc, char** argv) {
     if (a.cmd == "torch") return cmd_torch(a);
     if (a.cmd == "fast") return cmd_fast(a);
     if (a.cmd == "plain") return cmd_plain(a);
+    if (a.cmd == "dump") return cmd_dump(a);
     if (a.cmd == "matmul") return cmd_matmul(a);
     if (a.cmd == "accept") return cmd_accept(a);
     if (a.cmd == "time") return cmd_time(a);
