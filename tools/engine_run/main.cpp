@@ -8,7 +8,7 @@
 //                    [--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US] [--head-fp32] [--embed-on-card]
 //                    [--record-routing FILE] [--capture-check] [--snapshot-test] [--images-dir DIR]
 //
-// --group N: a prefill step takes N chunks' worth of tokens, which the engine runs layer by layer in N sub-chunks (no --tensors).
+// --group N: a prefill step takes N chunks' worth of tokens, which the engine runs layer by layer in N sub-chunks (no tensor dumps).
 // The prompt is fed in prefill chunks of --chunk tokens (default: one chunk), then --verify-last tokens as verify blocks of
 // --verify-block tokens whose acceptance follows the pattern --accept (a count per block, cycled; the unaccepted tokens are fed
 // again in the next block; the last block accepts all), then the last --decode-last tokens one per step, as decode would.
@@ -185,7 +185,7 @@ int main(int argc, char** argv) {
     ec.max_batch = std::max<int64_t>(chunk, 16);
     ec.max_chunk = ec.max_batch;
     ec.max_group = ec.max_chunk * group;
-    if (group > 1 && !prefixes.empty()) throw std::runtime_error("--group: layer-major prefill has no dumps (--tensors)");
+    if (group > 1) prefixes.clear();  // layer-major prefill has no dumps; the logits are kept as with verify blocks
     ec.max_logits = std::max<int64_t>(std::min(ec.max_batch, logits_last), verify_block);
     ec.int8_kv = kv_int8;
     ec.head_dpas = !head_fp32;
