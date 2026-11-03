@@ -15,10 +15,12 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "engine/engine_gemma4.hpp"
+#include "model/dflash2.hpp"
 #include "serve/sampler.hpp"
 #include "serve/tool_grammar_gemma4.hpp"
 #include "text/output_parser_gemma4.hpp"
@@ -33,6 +35,7 @@ struct Event {
   std::string finish_reason;  // with done: "stop", "length" or "tool_calls"
   std::string error;          // with done: the request failed
   int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;  // with done
+  int64_t verifies = 0, drafted = 0, accepted = 0;  // with done: speculation (verify blocks, tokens drafted, of them accepted)
 };
 
 // An image in a prompt: its rows stand for `n` consecutive prompt positions from `start`. The prompt holds, at those
@@ -57,6 +60,7 @@ class Request {
   std::vector<std::string> stop;   // strings that end the content (not included)
   bool in_thinking = false;        // the prompt ends inside the thought channel
   std::vector<std::string> tools;  // the request's tool names; tool calls are constrained to them
+  int draft_block = -1;            // -1: the server's block size; 0: plain decode even with a draft; 2 to 16: this one (for measuring)
   std::string tag;                 // names the request in the log (the completion id)
 
   // Reader side: waits up to `wait` for the next event.
@@ -81,6 +85,7 @@ struct RequestLog {
   std::string tag, reason, error;  // reason: stop, length, tool_calls or cancelled
   int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;
   int64_t image_tokens = 0;  // of the prompt, rows of images
+  int64_t verifies = 0, drafted = 0, accepted = 0;  // speculation: verify blocks, tokens drafted, of them accepted
   double queue_s = -1, ttft_s = -1, prefill_s = -1, decode_s = -1;
 };
 
@@ -89,6 +94,9 @@ struct SchedulerConfig {
   int64_t max_chunk;  // prefill tokens per sequence per step
   int64_t max_ctx;    // positions per slot
   std::function<void(const RequestLog&)> on_finish = {};  // on the engine thread, as each request ends
+  // Speculative decoding: the draft (null: plain decode) and the block size B (anchor + B - 1 drafted tokens, 2 to engine::gemma4::kMaxVerify).
+  model::Dflash2* draft = nullptr;
+  int draft_block = 4;
 };
 
 class Scheduler {
@@ -106,6 +114,10 @@ class Scheduler {
     int64_t prompt_tokens = 0, cached_tokens = 0;      // of admitted prompts, and of those already in their slot
     int64_t prefill_tokens = 0, generated_tokens = 0;  // fed as prefill, sampled
     int64_t positions = 0, idle_positions = 0;         // held by the slots, and by those with no request (cached)
+    int64_t verifies = 0, drafted = 0, accepted = 0;   // verify blocks, tokens drafted, of them accepted
+    // Wall seconds of the engine thread in each part of a step, since the start: drafting, the engine step (the logits come
+    // back to the host in it), acceptance and sampling, the draft's context injection.
+    double draft_s = 0, engine_s = 0, sample_s = 0, inject_s = 0;
   };
   Stats stats() const;
 
@@ -133,7 +145,8 @@ class Scheduler {
     std::unique_ptr<text::OutputParser> parser;
     std::unique_ptr<Sampler> sampler;
     std::unique_ptr<ToolGrammar> grammar;
-    int64_t generated = 0, cached = 0;
+    std::mt19937_64 draft_rng;
+    int64_t generated = 0, cached = 0, verifies = 0, drafted = 0, accepted = 0;
     std::chrono::steady_clock::time_point admitted, first;  // the slot taken, the first token sampled
     std::string held;             // content held back while it could start a stop string
     bool called = false;          // a tool call came out
@@ -141,7 +154,8 @@ class Scheduler {
 
   bool admit();
   void step();
-  void on_token(int slot, int32_t token);
+  // Follows a sampled token; returns why the request ends at it ("" if it goes on).
+  std::string on_token(int slot, int32_t token);
   void finish(int slot, const std::string& reason, const std::string& error = "");
   void fail_all(const std::string& error);
   void note_positions();

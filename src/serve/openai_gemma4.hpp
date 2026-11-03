@@ -64,6 +64,7 @@ struct ChatRequest {
   bool stream = false, include_usage = false, thinking = false, tools = false;
   bool in_thinking = false;  // the prompt ends inside the thought channel
   std::vector<std::string> tool_names;
+  int draft_block = -1;      // eklow extension: "speculative": false decodes plain even when the server has a draft; an integer is a block size
 };
 
 // Renders the conversation with Gemma 4's template and tokenizes it (request text without special
