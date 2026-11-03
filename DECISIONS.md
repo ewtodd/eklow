@@ -1994,7 +1994,7 @@ and must set the two new fields when that branch lands. Until it does, a Gemma d
 **Card commands, in order** (fiona, in a window, from `~/eklow-wt-gspec` after building there; GGUFs and the profile as in
 `~/gemma-window.sh`): (1) `bash ~/eklow-perf/bench.sh check26` with and without `--expert-profile data/gemma-4-26b-a4b-experts.json
 --experts-on-card 51`, unchanged code path (band: long >= 220/256 at mean KL <= 7.5e-2; chat >= 22/25 at <= 8e-2; 76d8588: 243/256 at
-2.9e-2); then the same with `--head-dpas` (the shared head's accuracy). (2) `eklow-engine-run-gemma4 --model <26B> --out <dir>
+2.9e-2); then the same with the engine-run call inside check26 given `--head-dpas` (the shared head's accuracy; the harness script is on fiona and I could not see whether it passes extra flags through). (2) `eklow-engine-run-gemma4 --model <26B> --out <dir>
 --tokens-json <a 2-3k prompt> --chunk 1024 --verify-last 64 --verify-block 4 --accept 1,2,4,3 --capture-layers 1,6,11,17,22,27
 --head-dpas [--expert-profile ... --experts-on-card 51]`, and again with `--verify-block 16 --accept 5,16,2` and `--verify-block 8`
 (the rewinds and the 8- to 16-row prefill-shaped path): expect mean KL under 0.05, top-1 agreement over 95%, captures identical
