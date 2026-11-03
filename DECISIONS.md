@@ -1826,7 +1826,7 @@ hot GEMMs 0.78 s. Copies are no longer the cost; the card's own GEMMs are. At 12
 production flags (Ornith, draft, projector, EmbeddingGemma 2): 51 plain and at G = 2, 50 at G = 4, **48 at G = 8**; at the engine bench
 69 / 68 / 67 / 66. Decode with the smaller placement, one slot, 0 / 8k / 32k / 128k: plain 41.1 / 41.1 / 40.0 / 32.3, G = 8 40.8 / 40.7 /
 38.9 / 32.6 tok/s; verify blocks of 8 at 8k 70.9 against 68.4 ms. The loss is within noise (0-3%); through the server at the
-release shape (59 against 57 experts) decode with the draft at depth was 44.2 / 42.6 / 37.3 / 33.7 against 41.5 / 44.1 / 38.7 / 30.0.
+release shape (57 experts a layer with `--group 8`, 59 plain) decode with the draft at 8k / 32k / 128k / 252k was 44.2 / 42.6 / 37.3 / 33.7 tok/s grouped against 41.5 / 44.1 / 38.7 / 30.0 plain: the acceptance moves both ways.
 
 **Fidelity.** `checkq` ekk8 (top-1 of 256, median KL against the fp32 reference): plain chunks of 1,024 / 2,048 248 / 244, 1.9e-3 /
 2.2e-3; groups of 2 sub-chunks 246, 1.8e-3; a prompt as one group of 3 sub-chunks 247, 2.1e-3 (decoding its last 64: 247, 2.0e-3);
