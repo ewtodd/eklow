@@ -5,7 +5,7 @@
 # every 10 s while it has traffic, so a client that died leaves no idle server on the card.
 set -u
 log=${1:?}; model=${2:?}; profile=${3:?}; draft=${4:?}; alias=${5:?}
-if systemctl is-active --quiet eklow; then echo "cs-serve.sh: eklow.service is running" >&2; exit 1; fi
+if systemctl is-active --quiet 'eklow*.service'; then echo "cs-serve.sh: an eklow service is running" >&2; exit 1; fi
 cd "$(dirname "$0")/../.."
 nix develop path:. -c ./build/eklow-server --model "$model" --alias "$alias" --port 18181 --slots 2 --ctx 262144 --kv-int8 \
   --expert-profile "$profile" --draft "$draft" --snapshot-mib 4096 \
@@ -15,5 +15,5 @@ trap "pkill -f 'eklow-server --model.*--port 18181' 2>/dev/null; kill $srv 2>/de
 while kill -0 $srv 2>/dev/null; do
   sleep 30
   if [ $(( $(date +%s) - $(stat -c %Y "$log") )) -gt 1800 ]; then echo "idle for 30 min: stopping" >> "$log"; break; fi
-  if systemctl is-active --quiet eklow; then echo "eklow.service started: stopping" >> "$log"; break; fi
+  if systemctl is-active --quiet 'eklow*.service'; then echo "an eklow service started: stopping" >> "$log"; break; fi
 done

@@ -5,10 +5,10 @@
 #   tools/bench/serve-perf.sh ~/eklow-bench/qwen MODEL.gguf qwen36 --expert-profile data/qwen36-experts.json
 # DOCS (default ~/eklow-bench/data) holds qwen-DEPTH.txt and gsm48.jsonl; DEPTHS overrides serve_perf.py's depths.
 set -euo pipefail
-# A second server beside fiona's production eklow.service starves it into UR_RESULT_ERROR_OUT_OF_RESOURCES on
+# A second server beside fiona's production eklow service (eklow-<instance>.service) starves it into UR_RESULT_ERROR_OUT_OF_RESOURCES on
 # every request until it restarts (2026-10-27). To measure production itself, run serve_perf.py against it.
-if systemctl is-active --quiet eklow; then
-  echo "serve-perf.sh: eklow.service is running; stop it first, or point serve_perf.py at it" >&2
+if systemctl is-active --quiet 'eklow*.service'; then
+  echo "serve-perf.sh: an eklow service is running; stop it first, or point serve_perf.py at it" >&2
   exit 1
 fi
 out=${1:?out dir}; model=${2:?model gguf}; alias=${3:?alias}; shift 3

@@ -204,12 +204,17 @@ curl http://localhost:8081/v1/chat/completions -H 'Content-Type: application/jso
 The model files are ours (`tools/weights/` makes them: the published Qwen3.6 and Ornith checkpoints requantized to
 EKK8 or EK8); the server prints what it placed where: the weights and KV on the card, how many experts a layer stayed
 there, the streaming slots, the pinned memory, the draft and the snapshots' budget. The package installs the profiles as
-`share/eklow/qwen36-experts.json` and `ornith-1.5-experts.json`, and the flake's NixOS module runs the server as
-`services.eklow` (`model`, `draft`, `draftBlock`, `chatTemplate`, `expertProfile`, `snapshotMiB`, `alias`,
-`contextSize`, `slots`, `kvInt8`, the embedding model and its projector, `extraArgs`). The comment at the top of
-`tools/server/main.cpp` explains every flag.
+`share/eklow/qwen36-experts.json`, `ornith-1.5-experts.json` and `gemma-4-26b-a4b-experts.json`. The comment at the top
+of `tools/server/main.cpp` explains every flag.
 
-The log, on stdout (`journalctl -u eklow` under the module), is unholy's, with the speculation added: a line per chat
+The flake's NixOS module serves named instances, as unholy's does: `services.eklow.instances.<name>` (`model`, `alias`,
+`port`, `expertProfile`, `mmproj`, `contextSize`, `slots`, `kvInt8`, `extraArgs`, and for Qwen3.6 `draft`,
+`draftBlock`, `prefillGroup`, `prefillGroupBusy`, `chatTemplate`, `snapshotMiB`) is the unit `eklow-<name>.service`, with
+the embedding model and its projector shared (`embedModel`, `embedMmproj`, `embedPort`). The instances hold the one
+card, so each conflicts with the others: starting one stops the one running. `autoStart` names the one started at boot
+(by default the only one); the house switches them with `llm-mode` instead.
+
+The log, on stdout (`journalctl -u eklow-<name>` under the module), is unholy's, with the speculation added: a line per chat
 request as it ends, a line per embedding request and per rejected request, and every 10 s while there is traffic
 (`--log-interval`) the engine's rates, slots, prefix hits, the draft's acceptance and where a step's time goes:
 
