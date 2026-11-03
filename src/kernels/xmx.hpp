@@ -75,6 +75,9 @@ uint64_t weight_meta_bytes(WeightFormat f, int64_t k, int64_t n);
 Weight repack_format(sycl::queue& q, const ref::Weight& raw, WeightFormat f, bool interleave = false);
 // Into allocations the caller owns (w.k, w.n, w.format set; sizes as above); only enqueues.
 void repack_format_into(sycl::queue& q, const ref::Weight& raw, bool interleave, const Weight& w);
+// `count` matrices at once (experts in slots): matrix x reads raw.data + x * raw_stride and writes w.tiles + x * tile_stride, w.scales (bytes) + x * meta_stride. K-quant formats.
+void repack_format_batch_into(sycl::queue& q, const ref::Weight& raw, bool interleave, const Weight& w, int64_t count, uint64_t raw_stride,
+                              uint64_t tile_stride, uint64_t meta_stride);
 
 // Rows above which matmul takes fp16 activations.
 constexpr int64_t kFp16Rows = 32;

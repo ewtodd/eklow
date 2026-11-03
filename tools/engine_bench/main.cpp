@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
     else if (a == "--depth") depth = list(next());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
     else if (a == "--no-early-copy") ec.group_early_copy = false;
+    else if (a == "--no-batch-repack") ec.group_batch_repack = false;
     else if (a == "--group") group = std::max<int64_t>(1, std::atoll(next().c_str()));
     else if (a == "--decode-ctx") decode_ctx = list(next());
     else if (a == "--decode-slots") decode_slots = list(next());

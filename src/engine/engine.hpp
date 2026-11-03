@@ -43,6 +43,7 @@ struct Config {
   int64_t max_group = 0;
   // In a group, start a layer's copies once every sub-chunk is routed and run the hot experts after them (else each sub-chunk finishes its layer first).
   bool group_early_copy = true;
+  bool group_batch_repack = true;  // a wave's experts are repacked in one launch
   int64_t max_logits = 64;   // logits rows per step
   // The attention layers' K/V as int8 with a scale per 16 dimensions (attention.hpp): half the memory.
   bool int8_kv = false;

@@ -1771,10 +1771,17 @@ void Engine::cold_group(const Layer& L, const std::vector<GroupSub>& subs, sycl:
       h.depends_on(copied);
       h.single_task([] {});
     });
-    for (size_t j = 0; j < wv.experts.size(); ++j) {
+    if (c_.group_batch_repack && f_gu_ != xmx::WeightFormat::Q4_0 && f_dn_ != xmx::WeightFormat::Q4_0) {
+      // One launch for the wave: a launch per expert left the card mostly idle (225 us each for 1.8 MB).
+      const int64_t cnt = int64_t(wv.experts.size());
+      xmx::repack_format_batch_into(q_, ref::Weight{t_gu_, E, 2 * Fe, stream_raw_, gu_row_}, true, stream_w_gu_[0], cnt, raw_expert_, packed_expert_, packed_expert_);
+      xmx::repack_format_batch_into(q_, ref::Weight{t_dn_, Fe, E, stream_raw_ + raw_gu_, dn_row_}, false, stream_w_dn_[0], cnt, raw_expert_, packed_expert_, packed_expert_);
+    } else {
+      for (size_t j = 0; j < wv.experts.size(); ++j) {
       const uint8_t* raw = stream_raw_ + uint64_t(j) * raw_expert_;
       repack_into(ref::Weight{t_gu_, E, 2 * Fe, raw, gu_row_}, true, stream_w_gu_[j]);
       repack_into(ref::Weight{t_dn_, Fe, E, raw + raw_gu_, dn_row_}, false, stream_w_dn_[j]);
+    }
     }
     int32_t* smap = hp_smap_ + int64_t(w) * NE;
     for (int e = 0; e < NE; ++e) smap[e] = -1;
