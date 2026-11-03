@@ -13,7 +13,8 @@ source "$(dirname "$0")/../weights/lib.sh"
 # e-desktop 2026-11-01: userspace libcuda (595.112) is newer than the loaded kernel module (595.104.02) until a reboot;
 # use the libraries matching the module (harmless once they match)
 NVLIB=/nix/store/fprgxisprl0218i079npizclrgfgfja7-nvidia-x11-595.104.02/lib
-[ -d "$NVLIB" ] && export LD_LIBRARY_PATH=$NVLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+# (only while the loaded module is that old one: after the 2026-11-03 reboot it is 595.112.07, which the system libraries match)
+grep -q 595.104.02 /proc/driver/nvidia/version 2>/dev/null && [ -d "$NVLIB" ] && export LD_LIBRARY_PATH=$NVLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 T=$1 D=$2 B=$3 LABEL=$4; DS=${5:-gsm8k humaneval mt-bench}
 N=${N:-32} CONC=${CONC:-4} PORT=${PORT:-8090} MAXTOK=${MAXTOK:-4096} CTX_PER=${CTX_PER:-6144}
 SAMPLINGS=${SAMPLINGS:-"greedy temp"}

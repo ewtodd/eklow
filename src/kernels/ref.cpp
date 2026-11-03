@@ -10,7 +10,31 @@ namespace {
 
 inline float half_at(const uint8_t* p) {
   uint16_t bits = uint16_t(p[0]) | uint16_t(p[1]) << 8;
+#ifdef EKLOW_HOST_NO_FP16
+  // tools/dflash_test/host-build.sh: SYCL's native_cpu device has no fp16 aspect; the same (exact) conversion by hand.
+  const uint32_t sign = uint32_t(bits >> 15) << 31, exp = (bits >> 10) & 31, man = bits & 1023;
+  uint32_t f;
+  if (exp == 0) {
+    if (man == 0) {
+      f = sign;
+    } else {
+      int e = -1;
+      uint32_t m = man;
+      do {
+        ++e;
+        m <<= 1;
+      } while (!(m & 1024));
+      f = sign | uint32_t(127 - 15 - e) << 23 | (m & 1023) << 13;
+    }
+  } else if (exp == 31) {
+    f = sign | 0x7f800000u | man << 13;
+  } else {
+    f = sign | (exp + 127 - 15) << 23 | man << 13;
+  }
+  return sycl::bit_cast<float>(f);
+#else
   return float(sycl::bit_cast<sycl::half>(bits));
+#endif
 }
 
 // Q4_0 (32 weights, 18 bytes): fp16 d, then 16 bytes; byte j holds weight j in its low nibble and
