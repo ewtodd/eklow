@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <cstdio>
 #include <fstream>
 #include <future>
@@ -17,6 +18,7 @@
 #include "core/json_value.hpp"
 #include "kernels/fast.hpp"
 #include "kernels/gemma_fast.hpp"
+#include "kernels/qwen_fast.hpp"
 #include "rt/device.hpp"
 
 namespace eklow::engine::gemma4 {
@@ -94,9 +96,34 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     auto* raw = sycl::malloc_device<uint8_t>(emb.nbytes, q_);
     if (!raw) throw std::runtime_error("engine: out of device memory loading token_embd.weight");
     q_.memcpy(raw, emb.data, emb.nbytes).wait();
-    head_ = fast::repack_q6k(q_, ref::Weight{emb.type, int64_t(emb.ne[0]), int64_t(emb.ne[1]), raw, emb.nbytes / emb.ne[1]});
+    const ref::Weight raw_w{emb.type, int64_t(emb.ne[0]), int64_t(emb.ne[1]), raw, emb.nbytes / emb.ne[1]};
+    if (c_.head_dpas) {
+      // One copy on the matrix units' Q6_K layout for the head, shared with the draft; the embedding rows come from the
+      // GGUF's mapping, a gather per step (the lookup table is not kept on the card).
+      head_w_ = xmx::repack_format(q_, raw_w, xmx::WeightFormat::Q6_K, false);
+      q_.wait();
+      owned_.push_back(head_w_.tiles);
+      owned_.push_back(head_w_.scales);
+      act_head_ = xmx::alloc_activations(q_, c_.max_logits, E);
+      embd_ = &emb;
+      embd_row_bytes_ = emb.nbytes / emb.ne[1];
+      const int64_t Bm = c_.max_batch;
+      emb_host_ = sycl::malloc_host<uint8_t>(size_t(Bm) * embd_row_bytes_, q_);
+      emb_dev_ = sycl::malloc_device<uint8_t>(size_t(Bm) * embd_row_bytes_, q_);
+      iota_ = sycl::malloc_device<int32_t>(size_t(Bm), q_);
+      if (!emb_host_ || !emb_dev_ || !iota_) throw std::runtime_error("engine: out of memory for the embedding rows");
+      owned_.push_back(emb_host_);
+      owned_.push_back(emb_dev_);
+      owned_.push_back(iota_);
+      std::vector<int32_t> iota(static_cast<size_t>(Bm));
+      for (int64_t i = 0; i < Bm; ++i) iota[size_t(i)] = int32_t(i);
+      q_.memcpy(iota_, iota.data(), iota.size() * 4).wait();
+    } else {
+      head_ = fast::repack_q6k(q_, raw_w);
+      q_.wait();
+      owned_.push_back(head_.lo);
+    }
     sycl::free(raw, q_);
-    owned_.push_back(head_.lo);
     weight_bytes_ += emb.nbytes;
   }
   output_norm_ = vec("output_norm.weight");
@@ -224,6 +251,19 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   gu_ = dev(std::min(B, xmx::kFp16Rows) * 2 * F);  // the GeGLU's int8 path only
   rows_ = dev(c_.max_logits * E);
   logits_ = dev(c_.max_logits * cfg_.n_vocab);
+  cap_col_.assign(size_t(cfg_.n_layer), -1);
+  for (size_t j = 0; j < c_.capture_layers.size(); ++j) {
+    const int l = c_.capture_layers[j];
+    if (l < 0 || l >= cfg_.n_layer) throw std::runtime_error("engine: capture layer out of range");
+    cap_col_[size_t(l)] = int(j);
+  }
+  if (!c_.capture_layers.empty() && c_.max_capture_rows > 0) {
+    cap_ = dev(c_.max_capture_rows * int64_t(c_.capture_layers.size()) * E);
+    cap_idx_ = sycl::malloc_device<int32_t>(size_t(c_.max_capture_rows), q_);
+    if (!cap_idx_) throw std::runtime_error("engine: out of device memory");
+    owned_.push_back(cap_idx_);
+    capture_.width = int64_t(c_.capture_layers.size()) * E;
+  }
   // At most one chunk per slot in a step, so at most n_slots partial tiles per K/V head.
   max_tiles_sliding_ = hkv_sliding_ * ((B * group_sliding_ + 7) / 8 + c_.n_slots);
   max_tiles_global_ = hkv_global_ * ((B * group_global_ + 7) / 8 + c_.n_slots);
@@ -320,7 +360,8 @@ void Engine::load_experts() {
     fm = rt::free_memory(q_.get_device());
     if (!fm) throw std::runtime_error("engine: the driver does not report free device memory; give experts_on_card");
     free_at_placement_ = *fm;
-    const uint64_t budget = *fm > c_.card_margin_bytes ? *fm - c_.card_margin_bytes : 0;
+    const uint64_t keep = c_.card_margin_bytes + c_.draft_reserve_bytes;
+    const uint64_t budget = *fm > keep ? *fm - keep : 0;
     if (budget >= uint64_t(want) * expert_set_bytes_) {
       n_hot = want;
     } else {
@@ -763,6 +804,7 @@ Engine::~Engine() {
   xmx::free_activations(q_, act_ffn_);
   if (act_exp_.q) xmx::free_activations(q_, act_exp_);
   if (act_exp_ffn_.q) xmx::free_activations(q_, act_exp_ffn_);
+  if (act_head_.q) xmx::free_activations(q_, act_head_);
   if (attn_scratch_.q) sycl::free(attn_scratch_.q, q_);
   if (attn_scratch_.part) sycl::free(attn_scratch_.part, q_);
   if (attn_scratch_.part2) sycl::free(attn_scratch_.part2, q_);
@@ -794,6 +836,16 @@ void Engine::truncate(int slot, int64_t length) {
   s.length = length;
 }
 
+const xmx::Weight& Engine::head_weight() const {
+  if (!c_.head_dpas) throw std::runtime_error("engine: the head is on the fp32-activation path (Config::head_dpas)");
+  return head_w_;
+}
+
+ref::Weight Engine::embedding_table() const {
+  if (!c_.head_dpas) throw std::runtime_error("engine: the embedding table is on the card (Config::head_dpas gathers it from the GGUF)");
+  return ref::Weight{embd_->type, int64_t(embd_->ne[0]), int64_t(embd_->ne[1]), embd_->data, embd_row_bytes_};
+}
+
 void Engine::release(int slot) {
   Slot& s = slots_.at(size_t(slot));
   for (int32_t p : s.pages) free_pages_.push_back(p);
@@ -803,7 +855,10 @@ void Engine::release(int slot) {
 
 std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::DumpSink* dump) {
   const int64_t E = cfg_.n_embd, H = cfg_.n_head, V = cfg_.n_vocab;
-  std::vector<int32_t> tok, slot, pos, logit_rows;
+  std::vector<int32_t> tok, slot, pos, logit_rows, cap_rows;
+  bool any_verify = false;
+  capture_.ids.clear();
+  const int ncap = int(c_.capture_layers.size());
   // Image spans make the sliding layers' key ranges per token (lo, hi); without any, tokens are causal as before.
   std::vector<int32_t> lo, hi;
   std::vector<std::pair<int64_t, const model::ImageRows*>> spans;  // batch row of the span's first token
@@ -816,6 +871,16 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     const int64_t base = int64_t(tok.size()), n = int64_t(c.tokens.size());
     if (n > c_.max_chunk) throw std::runtime_error("engine: chunk longer than max_chunk");
     if (n == 0) continue;
+    if (c.verify) {
+      // The rewind after a rejection must stay within what the sliding rings can restore (see ring_slack()).
+      if (n < 2 || n > kMaxVerify) throw std::runtime_error("engine: a verify chunk holds 2 to " + std::to_string(kMaxVerify) + " tokens");
+      if (n - 1 > ring_slack()) throw std::runtime_error("engine: verify chunk longer than the sliding rings' slack");
+    }
+    if (c.capture_rows < 0 || c.capture_rows > n || (c.capture_rows > 0 && !cap_)) throw std::runtime_error("engine: bad capture_rows");
+    for (int64_t r = n - c.capture_rows; r < n; ++r) {
+      cap_rows.push_back(int32_t(base + r));
+      capture_.ids.push_back({int32_t(c.slot), int32_t(c.start_pos + r)});
+    }
     for (int64_t i = 0; i < n; ++i) {
       tok.push_back(c.tokens[size_t(i)]);
       slot.push_back(c.slot);
@@ -843,14 +908,20 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       tiles_s.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_sliding_, hkv_sliding_, cfg_.window);
     }
     tiles_g.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_global_, hkv_global_, 0);
-    for (int64_t r = std::max<int64_t>(0, n - c.logits_rows); r < n; ++r) logit_rows.push_back(int32_t(base + r));
+    for (int64_t r = std::max<int64_t>(0, n - (c.verify ? n : c.logits_rows)); r < n; ++r) logit_rows.push_back(int32_t(base + r));
     ensure_pages(c.slot, c.start_pos + n);
+    any_verify |= c.verify;
   }
   const int64_t T = int64_t(tok.size()), R = int64_t(logit_rows.size());
+  if (int64_t(cap_rows.size()) > c_.max_capture_rows) throw std::runtime_error("engine: too many capture rows");
+  capture_.rows = int64_t(cap_rows.size());
+  capture_.data = cap_;
   // Decode calls the pool every few hundred microseconds and wants its workers spinning; prefill's phases
-  // last milliseconds and the spinning only takes the cores from the hot kernels' host thread.
-  if (pool_) pool_->set_spin_us(T * cfg_.n_expert_used <= xmx::kFp16Rows ? 400 : 0);
+  // last milliseconds and the spinning only takes the cores from the hot kernels' host thread. A verify step is
+  // decode's shape (a few rows, a layer's cold experts every few hundred microseconds).
+  if (pool_) pool_->set_spin_us(T * cfg_.n_expert_used <= xmx::kFp16Rows || (any_verify && T <= 2 * kMaxVerify) ? 400 : 0);
   if (T == 0) return {};
+  if (!cap_rows.empty()) q_.memcpy(cap_idx_, cap_rows.data(), cap_rows.size() * 4);
   const auto t_step = std::chrono::steady_clock::now();
   if (T > c_.max_batch) throw std::runtime_error("engine: step larger than max_batch");
   if (R > c_.max_logits) throw std::runtime_error("engine: too many logits rows");
@@ -905,7 +976,15 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
 
   // Each layer starts with its attention input already normed and quantized in act_: by the
   // fused kernel at the end of the layer before, or here for the first.
-  fast::embed(q_, head_, tok_, T, std::sqrt(float(E)), x_);
+  if (c_.head_dpas) {
+    // The rows come from the GGUF's mapping (no table on the card), through pinned memory.
+    for (int64_t t = 0; t < T; ++t)
+      std::memcpy(emb_host_ + uint64_t(t) * embd_row_bytes_, embd_->data + uint64_t(tok[size_t(t)]) * embd_row_bytes_, embd_row_bytes_);
+    q_.memcpy(emb_dev_, emb_host_, size_t(uint64_t(T) * embd_row_bytes_));
+    ref::embed(q_, ref::Weight{embd_->type, E, T, emb_dev_, embd_row_bytes_}, iota_, T, std::sqrt(float(E)), x_);
+  } else {
+    fast::embed(q_, head_, tok_, T, std::sqrt(float(E)), x_);
+  }
   // Image rows replace the lookups, unscaled (llama.cpp: "do not normalize weights for raw embeddings input").
   for (const auto& [row, im] : spans) q_.memcpy(x_ + row * E, im->rows, size_t(im->n * E) * sizeof(float));
   emit("inp_scaled", x_, {E, T});
@@ -1052,6 +1131,8 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     const float* next_norm = l + 1 < cfg_.n_layer ? layers_[size_t(l) + 1].attn_norm : nullptr;
     if (!fused) fast::residual_norm_quant(q_, o_, L.ffn_post_norm, x2_, L.out_scale, x_, next_norm, cfg_.eps, T, E, &act_, h_);
     emit("l_out" + s, x_, {E, T});
+    if (cap_col_[size_t(l)] >= 0 && !cap_rows.empty())
+      qwenk::gather_rows(q_, x_, cap_idx_, int64_t(cap_rows.size()), E, cap_, int64_t(ncap) * E, int64_t(cap_col_[size_t(l)]) * E);
     mark("post_ffn");
   }
 
@@ -1066,7 +1147,12 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   for (int64_t r = 0; r < R; ++r) q_.memcpy(rows_ + r * E, x_ + int64_t(logit_rows[size_t(r)]) * E, size_t(E) * sizeof(float));
   fast::rmsnorm(q_, rows_, output_norm_, R, E, cfg_.eps, rows_);
   emit("result_norm", rows_, {E, R});
-  fast::matmul_q6(q_, head_, rows_, R, logits_);
+  if (c_.head_dpas) {
+    xmx::quantize(q_, rows_, R, act_head_);
+    xmx::matmul(q_, act_head_, head_w_, logits_);
+  } else {
+    fast::matmul_q6(q_, head_, rows_, R, logits_);
+  }
   if (cfg_.softcap > 0) fast::softcap(q_, logits_, cfg_.softcap, R * V);
   mark("head");
   std::vector<float> out(size_t(R * V));
