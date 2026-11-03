@@ -13,6 +13,9 @@
 // Prefill: a fresh sequence of N tokens in chunks of --chunk; tokens per second over the whole
 // prompt. Depth (llama-bench's -d): the sequence first filled to D tokens untimed, then two chunks
 // timed; the rate of prefill at that depth. Decode: every slot prefilled to CTX tokens, then --decode-steps steps of one token per
+// slot; tokens per second per sequence. Verify (--verify 1,2,4,8,16): every slot verifies a block of B tokens (B = 1: a decode token) at
+// each --verify-ctx depth (8192,32768), then rewinds; ms per step and per row, and per row beyond the first. --capture also captures
+// the block's hidden states (the draft's layers), --head-dpas runs the head on the matrix units as a draft server does.
 // slot; tokens per second per sequence. --profile adds the card's time per section of the forward
 // pass, from timestamps of marker kernels between sections.
 #include <algorithm>
@@ -71,6 +74,9 @@ int main(int argc, char** argv) {
   std::string model, json_path, tokens_json;
   std::vector<int64_t> prefill = {1024, 4096, 16384}, decode_ctx = {0, 4096, 16384}, depth;
   int64_t chunk = 2048, decode_steps = 64;
+  std::vector<int64_t> verify_rows, verify_ctx = {8192, 32768};
+  int64_t verify_steps = 24;
+  bool capture = false, head_dpas = false;
   int slots = 1;
   bool profile = false, kv_int8 = false;
   std::string expert_profile;
@@ -88,6 +94,11 @@ int main(int argc, char** argv) {
     else if (a == "--decode-ctx") decode_ctx = list(next());
     else if (a == "--decode-steps") decode_steps = std::atoll(next().c_str());
     else if (a == "--slots") slots = std::atoi(next().c_str());
+    else if (a == "--verify") verify_rows = list(next());
+    else if (a == "--verify-ctx") verify_ctx = list(next());
+    else if (a == "--verify-steps") verify_steps = std::atoll(next().c_str());
+    else if (a == "--capture") capture = true;
+    else if (a == "--head-dpas") head_dpas = true;
     else if (a == "--profile") profile = true;
     else if (a == "--json") json_path = next();
     else if (a == "--tokens-json") tokens_json = next();
@@ -101,7 +112,7 @@ int main(int argc, char** argv) {
     else if (a == "--stream-cpu-us") stream_cpu_us = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-bench --model GGUF [--prefill N,...] [--chunk N] [--depth N,...] [--decode-ctx N,...] "
-                           "[--decode-steps N] [--slots N] [--profile] [--kv-int8] [--json FILE] [--tokens-json FILE] [--expert-profile JSON --experts-on-card N] [--cpu-threads N]\n");
+                           "[--decode-steps N] [--slots N] [--profile] [--kv-int8] [--json FILE] [--tokens-json FILE] [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--verify B,... [--verify-ctx N,...] [--verify-steps N] [--capture]] [--head-dpas]\n");
       return 2;
     }
   }
@@ -110,11 +121,15 @@ int main(int argc, char** argv) {
     for (auto n : prefill) longest = std::max(longest, n);
     for (auto n : depth) longest = std::max(longest, n + 2 * chunk);
     for (auto n : decode_ctx) longest = std::max(longest, n + decode_steps);
+    if (!verify_rows.empty())
+      for (auto n : verify_ctx) longest = std::max(longest, n + 16);
+    int64_t widest_block = 1;
+    for (auto b : verify_rows) widest_block = std::max(widest_block, b);
     engine::gemma4::Config ec;
     ec.n_slots = slots;
     ec.max_ctx = (longest + 255) / 256 * 256;
-    ec.max_batch = std::max<int64_t>(chunk, slots);
-    ec.max_chunk = chunk;
+    ec.max_batch = std::max<int64_t>({chunk, slots, slots * widest_block});
+    ec.max_chunk = std::max(chunk, widest_block);
     ec.int8_global_kv = kv_int8;
     ec.expert_profile = expert_profile;
     ec.experts_on_card = experts_on_card;
@@ -123,7 +138,12 @@ int main(int argc, char** argv) {
     ec.stream_min_rows = stream_min_rows;
     ec.stream_copy_us = stream_copy_us;
     ec.stream_cpu_us = stream_cpu_us;
-    ec.max_logits = slots;
+    ec.max_logits = slots * widest_block;
+    ec.head_dpas = head_dpas;
+    if (capture) {
+      ec.capture_layers = {1, 6, 11, 17, 22, 27};
+      ec.max_capture_rows = slots * widest_block;
+    }
 
     auto f = gguf::File::open(model);
     sycl::queue q = profile ? sycl::queue(rt::pick_device(), {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()})
@@ -240,6 +260,57 @@ int main(int argc, char** argv) {
       w.kv("tok_per_s", double(decode_steps) / s);
       if (profile) print_profile(prof, w);
       w.end_object();
+    }
+    w.end_array().key("verify").begin_array();
+    // Verify blocks (speculative decoding): every slot verifies a block of B tokens in one step, then rewinds to the depth it
+    // started at, so every step is the same shape. B = 1 is a plain decode token. The marginal cost of a row is read off the
+    // difference to B = 1 (the cold experts on the CPU make it dear: each row's routed pairs are computed apart).
+    for (int64_t ctx : verify_ctx) {
+      for (int sl = 0; sl < slots; ++sl) fill(sl, ctx);
+      double base_ms = 0;
+      for (int64_t B : verify_rows) {
+        prof.clear();
+        eng.set_profile(profile ? &prof : nullptr);
+        double enqueue = 0;
+        const auto cs0 = eng.cold_stats();
+        const uint64_t pr0 = eng.pairs(), cp0 = eng.cold_pairs();
+        auto one_step = [&] {
+          std::vector<engine::gemma4::Chunk> step;
+          for (int sl = 0; sl < slots; ++sl) {
+            engine::gemma4::Chunk c{sl, ctx, tokens(B), B};
+            c.verify = B >= 2;
+            c.capture_rows = capture ? B : 0;
+            step.push_back(std::move(c));
+          }
+          eng.step(step);
+          enqueue += eng.enqueue_seconds();
+          for (int sl = 0; sl < slots; ++sl) eng.truncate(sl, ctx);
+        };
+        for (int i = 0; i < 3; ++i) one_step();  // warm-up
+        enqueue = 0;
+        prof.clear();
+        auto t0 = std::chrono::steady_clock::now();
+        for (int64_t i = 0; i < verify_steps; ++i) one_step();
+        const double s = since(t0);
+        eng.set_profile(nullptr);
+        const double ms = 1e3 * s / double(verify_steps);
+        if (B == 1 || base_ms == 0) base_ms = ms;
+        std::printf("verify %2lld rows x %d slots at %6lld: %7.2f ms/step (%.2f ms enqueueing), %6.2f ms/row%s", (long long)B, slots, (long long)ctx, ms,
+                    1e3 * enqueue / double(verify_steps), ms / double(B), B > 1 && verify_rows.front() == 1 ? "" : "");
+        if (B > 1 && verify_rows.front() == 1) std::printf(", %6.2f ms per row beyond the first", (ms - base_ms) / double(B - 1));
+        std::printf("\n");
+        if (cold) {
+          const auto cs = eng.cold_stats();
+          const double n = double(verify_steps + 3);
+          std::printf("    cold experts per step: %.2f ms waiting on the card's routing, %.2f ms computing on the CPU, %.1f%% of pairs on the CPU\n",
+                      1e3 * (cs.wait_s - cs0.wait_s) / n, 1e3 * (cs.cpu_s - cs0.cpu_s) / n,
+                      100.0 * double(eng.cold_pairs() - cp0) / double(std::max<uint64_t>(1, eng.pairs() - pr0)));
+        }
+        w.begin_object().kv("ctx", ctx).kv("rows", B).kv("slots", int64_t(slots)).kv("ms_per_step", ms).kv("ms_per_row", ms / double(B));
+        if (profile) print_profile(prof, w);
+        w.end_object();
+      }
+      for (int sl = 0; sl < slots; ++sl) eng.release(sl);
     }
     w.end_array().end_object();
     if (!json_path.empty()) std::ofstream(json_path) << w.str() << "\n";
