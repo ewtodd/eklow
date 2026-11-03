@@ -4,13 +4,14 @@
 // stays bit-identical); with a plain DFlash draft (Gemma's) it is the run whose output tools/dflash_test/ref_torch_plain.py
 // is compared against (host_compare.py).
 //
-//   eklow-dflash-host DRAFT.gguf TARGET.gguf OUT.bin [--ctx N] [--B B] [--window W] [--seed S] [--blocks K] [--feat-scale F]
+//   eklow-dflash-host DRAFT.gguf TARGET.gguf OUT.bin [--ctx N] [--B B] [--window W] [--seed S] [--blocks K] [--feat-scale F] [--feats FILE] [--anchors a,b,...]
 // Built by tools/dflash_test/host-build.sh (clang++ -fsycl-targets=native_cpu over the plain-SYCL sources only).
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 
@@ -27,11 +28,13 @@ uint64_t fnv(const void* p, size_t n, uint64_t h = 1469598103934665603ull) {
 }  // namespace
 
 int main(int argc, char** argv) try {
-  if (argc < 4) throw std::runtime_error("usage: eklow-dflash-host DRAFT.gguf TARGET.gguf OUT.bin [--ctx N] [--B B] [--window W] [--seed S] [--blocks K] [--feat-scale F]");
+  if (argc < 4) throw std::runtime_error("usage: eklow-dflash-host DRAFT.gguf TARGET.gguf OUT.bin [--ctx N] [--B B] [--window W] [--seed S] [--blocks K] [--feat-scale F] [--feats FILE] [--anchors a,b,...]");
   const std::string draft_path = argv[1], target_path = argv[2], out_path = argv[3];
   int ctx = 48, B = 8, window = 0, blocks = 2;
   uint64_t seed = 1;
   float feat_scale = 1.0f;
+  std::string feats_path;
+  std::vector<int32_t> anchors;
   for (int i = 4; i < argc; ++i) {
     const std::string k = argv[i];
     auto val = [&]() -> std::string {
@@ -44,6 +47,11 @@ int main(int argc, char** argv) try {
     else if (k == "--seed") seed = std::stoull(val());
     else if (k == "--blocks") blocks = std::stoi(val());
     else if (k == "--feat-scale") feat_scale = std::stof(val());
+    else if (k == "--feats") feats_path = val();  // fp32 [ctx + 3 * blocks][n_feat], instead of the random ones
+    else if (k == "--anchors") {  // comma separated token ids, one per block
+      std::stringstream ss(val());
+      for (std::string t; std::getline(ss, t, ',');) anchors.push_back(std::stoi(t));
+    }
     else throw std::runtime_error("unknown argument " + k);
   }
   sycl::queue q(sycl::default_selector_v, sycl::property::queue::in_order{});
@@ -57,12 +65,18 @@ int main(int argc, char** argv) try {
   std::normal_distribution<float> nd(0.0f, feat_scale);
   std::vector<float> feats(size_t(ctx + extra) * size_t(cfg.n_feat()));
   for (auto& f : feats) f = nd(rng);
+  if (!feats_path.empty()) {
+    std::ifstream in(feats_path, std::ios::binary);
+    in.read(reinterpret_cast<char*>(feats.data()), std::streamsize(feats.size() * 4));
+    if (!in) throw std::runtime_error("short read of " + feats_path);
+  }
   ref.inject(std::span<const float>(feats.data(), size_t(ctx) * size_t(cfg.n_feat())), 0, ctx);
   std::ofstream out(out_path, std::ios::binary);
   uint64_t all = 1469598103934665603ull;
   int64_t next = ctx;
   for (int b = 0; b < blocks; ++b) {
-    const int32_t anchor = int32_t(rng() % uint64_t(cfg.n_vocab));
+    int32_t anchor = int32_t(rng() % uint64_t(cfg.n_vocab));
+    if (b < int(anchors.size())) anchor = anchors[size_t(b)];
     model::BlockDebug dbg;
     const serve::Lattice lat = ref.block(anchor, next, B, &dbg);
     const uint64_t hc = fnv(lat.cand.data(), lat.cand.size() * 4), hu = fnv(lat.unary.data(), lat.unary.size() * 4),
