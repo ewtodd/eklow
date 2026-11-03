@@ -2,6 +2,8 @@
 # model.py (fp32, CPU), for the masks the layers may have:
 #   model.py   sliding layers causal inside the block, the full layer not (z-lab's code, vLLM's: how the draft was trained)
 #   all-open   every layer not causal (how llama.cpp at the pin runs it: its GGUF has no per-layer causal flag)
+#   capW       model.py with the full layer seeing only the last W positions (cap2048, cap8192, ...)
+# (VARIANTS=model.py,cap2048 picks them; default model.py,all-open)
 # At every STRIDE-th position p of the text a block [token p, mask x 15] is drafted from the features of positions < p; the
 # accepted length is how many of its greedy tokens (the head of the target's embedding table, softcapped) agree with the text
 # that follows, i.e. the acceptance if the target said the text (greedy: the text is the target's own greedy output). The
@@ -11,6 +13,7 @@
 # ORACLE_DIR has eklow-oracle's l_out-N.f32 for the draft's target layers; FIRST the first position to draft from (the answer).
 import importlib.util
 import json
+import os
 import sys
 
 import numpy as np
@@ -46,7 +49,21 @@ def build(is_causal):
     return model.float().eval(), config
 
 
-variants = {"model.py": build(None), "all-open": build(False)}
+def variant(name):
+    if name == "model.py":
+        return build(None)
+    if name == "all-open":
+        return build(False)
+    if name.startswith("cap"):  # the full layer sees only the last W positions (a symmetric window mask, still not causal)
+        model, config = build(None)
+        for i, t in enumerate(config.layer_types):
+            if t == "full_attention":
+                model.layers[i].self_attn.sliding_window = int(name[3:])
+        return model, config
+    raise SystemExit("unknown variant " + name)
+
+
+variants = {n: variant(n) for n in os.environ.get("VARIANTS", "model.py,all-open").split(",")}
 r = gguf.GGUFReader(target_gguf)
 emb_t = next(t for t in r.tensors if t.name == "token_embd.weight")
 W = torch.from_numpy(gguf.quants.dequantize(np.asarray(emb_t.data), emb_t.tensor_type).astype(np.float32))
@@ -75,7 +92,7 @@ for name, spec_s in sets:
                 k += 1
             out[v].append(k)
             res[v].append(k)
-    print(name, "positions", len(out["model.py"]), " ".join(f"{v}: {1 + np.mean(a):.2f}" for v, a in out.items()), flush=True)
+    print(name, "positions", len(next(iter(out.values()))), " ".join(f"{v}: {1 + np.mean(a):.2f}" for v, a in out.items()), flush=True)
 print("all", " ".join(f"{v}: {1 + np.mean(a):.2f} (+/- {np.std(a) / np.sqrt(len(a)):.2f}, n={len(a)})" for v, a in res.items()))
 for v, a in res.items():
     print(v, "accepted-length histogram", np.bincount(a, minlength=B).tolist())
