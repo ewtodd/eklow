@@ -49,7 +49,7 @@ done
 for s in $SAMPLINGS; do
     case $s in greedy) samp=(--temperature 0 --top-p 1.0 --top-k 0);; temp) samp=(--temperature 1.0 --top-p 0.95 --top-k "$TOPK");; esac
     for d in $DS; do
-        python3 "$(dirname "$0")/dflash2_accept.py" --url "http://127.0.0.1:$PORT" --dataset "$d" --n "$N" "${samp[@]}" \
+        python3 "$(dirname "$0")/dflash2_accept.py" --url "http://127.0.0.1:$PORT" --dataset "$d" --n "$N" ${DOC_CHARS:+--doc-chars $DOC_CHARS} "${samp[@]}" \
             --max-tokens "$MAXTOK" --concurrency "$CONC" --label "$LABEL/$s" --out "$R/$LABEL.jsonl" | tee -a "$R/$LABEL.summary"
     done
 done

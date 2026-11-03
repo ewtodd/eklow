@@ -13,7 +13,7 @@ Raw per-request fields go to the JSONL file, so the definition can be recomputed
   dflash2_accept.py --url http://127.0.0.1:8090 --dataset gsm8k --n 32 --temperature 1.0 --top-p 0.95 \
       --top-k 20 --max-tokens 4096 --concurrency 4 --out results.jsonl
 """
-import argparse, json, random, statistics, sys, threading, time, urllib.request
+import argparse, json, os, random, statistics, sys, threading, time, urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 DATASETS = {   # copied from z-lab/dflash @ 07ebd93d dflash/benchmark.py
@@ -23,6 +23,17 @@ DATASETS = {   # copied from z-lab/dflash @ 07ebd93d dflash/benchmark.py
                   lambda x: "Write a solution to the following problem and make sure that it passes the tests:\n```python\n{prompt}\n```".format(**x)),
     "mt-bench": (("HuggingFaceH4/mt_bench_prompts",), {"split": "train"}, lambda x: x["prompt"][0]),
 }
+
+
+DOC = os.path.expanduser("~/eklow-qwen-data/data/doc-131072.txt")
+DOC_Q = "\n\nWrite a detailed, multi-paragraph analysis of the passage above: its content, style and any problems you notice."
+
+
+def load_doc(n, chars):
+    """Depth prompts: n slices of chars characters of the Pile document (spread evenly over it), then a question."""
+    text = open(DOC, encoding="utf-8", errors="replace").read()
+    step = (len(text) - chars) // max(1, n - 1) if n > 1 else 0
+    return [text[i * step:i * step + chars] + DOC_Q for i in range(n)]
 
 
 def load(name, n):
@@ -44,7 +55,8 @@ def post(url, body):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--url", default="http://127.0.0.1:8090")
-    ap.add_argument("--dataset", required=True, choices=list(DATASETS))
+    ap.add_argument("--dataset", required=True, choices=list(DATASETS) + ["doc"])
+    ap.add_argument("--doc-chars", type=int, default=32768, help="dataset doc: characters of the document in each prompt (about 3.7 per token)")
     ap.add_argument("--n", type=int, default=32)
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--top-p", type=float, default=0.95)
@@ -55,7 +67,7 @@ def main():
     ap.add_argument("--label", default="")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
-    prompts = load(a.dataset, a.n)
+    prompts = load_doc(a.n, a.doc_chars) if a.dataset == "doc" else load(a.dataset, a.n)
     lock = threading.Lock()
     out = open(a.out, "a")
 
