@@ -2,13 +2,15 @@
 // behind an OpenAI-compatible HTTP API.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
-//                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
+//                [--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
 //                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF [--image-max-tokens N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
 //                [--log-interval S]
 //
 // --ctx is the context of each slot (positions), 262,144 by default; --batch the tokens of one engine step and --chunk
-// the prefill tokens of one sequence in a step (2,048). The attention layers' K/V are int8 by default, which is what lets
+// the prefill tokens of one sequence in a step (2,048); --group N lets a lone prefilling sequence take up to N chunks of prompt in one
+// layer-major step (engine::Config::max_group), a long prompt prefilling about 1.4x faster; while another slot generates a group
+// would stall it, so then --group-busy TOKENS (default 0: none) is the most a step may take. The attention layers' K/V are int8 by default, which is what lets
 // 2 x 262k fit beside the weights; --kv-fp16 decodes a little faster at depth but cannot hold 2 x 262k.
 // --expert-profile: the experts of each layer that the routing profile says are busiest stay on the card and the rest are
 // computed on the CPU (the model's 256 experts a layer do not fit). How many (--experts-on-card) is, by default, as many as
@@ -485,6 +487,7 @@ int main(int argc, char** argv) {
   int image_tokens = 280;
   int port = 8081, slots = 2, embed_port = 8082, draft_block = 0;
   int64_t ctx = 262144, batch = 2048, chunk = 2048;
+  int64_t group = 1, group_busy = 0;  // layer-major prefill: sub-chunks of --chunk a group may hold; tokens of one while another slot generates
   bool kv_int8 = true;
   std::string expert_profile;
   int64_t experts_on_card = -2;  // as many as fit, once there is a profile
@@ -503,6 +506,8 @@ int main(int argc, char** argv) {
     else if (a == "--ctx") ctx = std::atoll(next().c_str());
     else if (a == "--batch") batch = std::atoll(next().c_str());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
+    else if (a == "--group") group = std::max<int64_t>(1, std::atoll(next().c_str()));
+    else if (a == "--group-busy") group_busy = std::atoll(next().c_str());
     else if (a == "--expert-profile") expert_profile = next();
     else if (a == "--experts-on-card") experts_on_card = std::atoll(next().c_str());
     else if (a == "--card-margin-mib") card_margin_mib = std::atoll(next().c_str());
@@ -527,7 +532,7 @@ int main(int argc, char** argv) {
     else if (a == "--log-interval") log_interval = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
-                           "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
+                           "[--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
                            "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] "
                            "[--mmproj GGUF [--image-max-tokens N]] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S]\n");
       return 2;
@@ -590,6 +595,7 @@ int main(int argc, char** argv) {
     ec.max_ctx = (ctx + attn::kPage - 1) / attn::kPage * attn::kPage;
     ec.max_batch = batch;
     ec.max_chunk = chunk;
+    ec.max_group = chunk * group;
     ec.max_logits = int64_t(slots) * 17;  // a verify block of up to 16 rows each
     ec.int8_kv = kv_int8;
     ec.expert_profile = expert_profile;
@@ -723,6 +729,8 @@ int main(int argc, char** argv) {
     sc.draft_block = draft_block;
     sc.snapshot_bytes = uint64_t(std::max<int64_t>(snapshot_mib, 0)) << 20;
     sc.snapshot_every = snapshot_every;
+    sc.max_group = ec.max_group;
+    sc.group_busy = std::min(group_busy, ec.max_group);
     serve::Scheduler sched(eng, tok, sc);
     std::fprintf(stderr, "eklow-server: chat template %s, sampling defaults temperature %g, top-k %d, top-p %g, min-p %g; snapshots of %.0f MiB each, up to %lld MiB\n",
                  text::qwen36_template_name(tmpl), double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p),
