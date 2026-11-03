@@ -1950,7 +1950,7 @@ or selector keys, no embedding or output tensor (the target's, tied: the 26B has
 the same (`causal_attn_metadata` for the sliding layers): the four sliding layers see the block's earlier positions only, the full
 layer sees all of it, the draft embeds with the target's table times sqrt(hidden) and applies the final softcap. llama.cpp at the
 pin has one flag for the whole model, unset here, so it runs all five layers non-causal. Its draft is also deterministic: it takes
-the top candidate of each position and the target's own sampler decides (`common_sampler_sample_and_accept_n`), so at
+the top candidate of each position and the target's own sampler decides (`common_sampler_sample_and_accept_n`; the rejection variant is for drafters that fill a q, this one does not), so at
 temperature > 0 a drafted token is kept with probability p(d).
 
 **Acceptance, llama.cpp** (pin ea0c4c2c CUDA on the 4090; 26B Q4_0 QAT target, draft Q8_0 with `dflash.block_size` rewritten for 8
@@ -1980,7 +1980,7 @@ hidden states from `eklow-oracle` on the same GGUF, answers of 400 to 700 tokens
 HumanEval 7.01, prose 3.28; block 8: 5.99 / 5.19 / 3.24; block 4: 3.60 / 3.39 / 2.64 (the same with every layer non-causal, as
 llama.cpp runs them: 7.64 / 6.78 / 3.15 at 16, no difference at 8 and 4). So the draft does what z-lab's card says on this QAT
 target, llama.cpp with one request at a time gets 80 to 90% of the reference on code and math (more on MT-Bench-like prose), the
-non-causal sliding layers cost 2 to 3% at block 16, and what eklow's forward must reproduce is model.py's, which the code now does
+non-causal sliding layers cost 2 to 4% at block 16, and what eklow's forward must reproduce is model.py's, which the code now does
 (below). Not measured: the serving forward's int8 activations (the card check), more than three prompts.
 
 **The full layer at depth.** The one full-attention layer sees the slot's whole context; eklow's draft cache for the other
