@@ -7,9 +7,13 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
 
 - **eklow serves Qwen3.6-35B-A3B finetunes** (llama.cpp's `qwen35moe`: 30 Gated DeltaNet and 10 gated-attention
   layers, 256 routed experts of 512 + one shared, 8 used) with **DFlash 2** speculative decoding and **image input**
-  (Qwen3-VL's encoder behind `--mmproj`), in place of Gemma 4 12B / 26B A4B, whose code is gone (EmbeddingGemma 2
-  stays, with Gemma's tokenizer and vision encoder). Two targets so far, same architecture: stock
+  (Qwen3-VL's encoder behind `--mmproj`). Two targets so far, same architecture: stock
   `Qwen/Qwen3.6-35B-A3B` and `ornith-ai/Ornith-1.5-35B-A3B`. `qwen/main` went into `main` on 2026-11-02.
+- **Gemma 4 26B A4B is back beside it** (DECISIONS 2026-11-03, "Gemma 4 26B A4B back beside Qwen3.6"): its engine,
+  scheduler and request layer restored from `76d8588` under `*_gemma4` names; one `eklow-server` runs whichever model
+  the GGUF's architecture names. The NixOS module serves named instances (`eklow-<name>.service`, conflicting); on
+  fiona `llm-mode ornith|gemma` switches them (`/etc/nixos`, the owner deploys). Host checks pass; the card checks were
+  not run (the owner tries it in production; `fiona:~/gemma-window.sh` runs them all if needed). The 12B is not served.
 - **In production since 2026-11-02 ~20:22**: fiona serves **Ornith-1.5** with Inco's draft and the projector at
   2 x 262k, int8 KV (51 of 256 experts a layer on the card; eklow built on its own nixpkgs, intel-llvm 7.1.1: the
   fleet's 7.2.0 left 0.8 GiB less free, 39 experts). No further evals (`check-source` stopped after stock's GSM8K:

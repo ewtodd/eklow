@@ -1870,8 +1870,8 @@ Qwen's names, hence the `gemma4` inner namespaces; the rest has distinct names.
 **One binary.** `eklow-server --model X.gguf ...`: `main()` in `tools/server/main.cpp` reads `general.architecture`
 (`gguf::File::open` only parses the header) before any flag is parsed: `qwen35moe` runs today's server (its `main` is now
 `qwen_server_main`, untouched), `gemma4` runs `gemma4_server_main` (76d8588's `main`, in `tools/server/gemma4_main.cpp`),
-anything else is an error naming both. Without `--model`, or with an unreadable file, the Qwen server runs and says what
-it always said. The Gemma side names the Qwen-only flags it refuses (`--draft`: "Gemma 4 has no DFlash draft";
+anything else is an error naming both. Without `--model` the Qwen server runs and says what it always said; a file whose
+header cannot be read is an error before either starts. The Gemma side names the Qwen-only flags it refuses (`--draft`: "Gemma 4 has no DFlash draft";
 `--draft-block`, `--chat-template`, `--snapshot-*`, `--group`, `--group-busy`, `--image-*`, `--vision-reserve-mib`). The
 Gemma flag set is a subset of Qwen's, so the Qwen side has nothing of Gemma's to refuse.
 
@@ -1917,8 +1917,13 @@ were already in `serve_test.py`. Left: the `developer` role as `system` (Gemma's
 other part type stands), `general.sampling.*` from the GGUF (the 26B's file says temperature 1, top-k 64, top-p 0.95: what
 `SamplingParams` already defaults to), per-request `speculative`, `usage.speculation`, snapshots, groups (Qwen only).
 
-**To run on the card** (window from the owner): `bench.sh check26` with and without the profile (band: long >= 220/256 and mean
-KL <= 7.5e-2; chat >= 22/25 and <= 8e-2; 76d8588: 243/256 at 2.9e-2 with N = 51, 242/256 at 2.8e-2 with every expert on the
-card), `bench.sh attn` and `kernels`, `serve_test.py basic` and `image_test.py` against the Gemma server at the production shape
-and `basic` against the Qwen server, `serve_perf.py` at 8k and 32k against
-`docs/bench/serve-perf-26b-chunk2048-fiona-2026-10-27.txt`.
+**Not run on the card.** The owner chose to try the 26B in production instead of a card window ("all them tests ain't
+necessary, let me just try it"). What a window would run, should something look wrong (fiona `~/gemma-window.sh` does it all,
+detached, from `~/eklow-wt-gemma`): `bench.sh check26` with and without the profile (band: long >= 220/256 and mean KL <=
+7.5e-2; chat >= 22/25 and <= 8e-2; 76d8588: 243/256 at 2.9e-2 with N = 51, 242/256 at 2.8e-2 with every expert on the card),
+`bench.sh attn` and `kernels`, `serve_test.py basic` and `image_test.py` against the Gemma server at the production shape and
+`basic` against the Qwen server, `serve_perf.py` at 8k and 32k against `docs/bench/serve-perf-26b-chunk2048-fiona-2026-10-27.txt`.
+
+**Serving both.** The NixOS module serves named instances (`services.eklow.instances.<name>`, unit `eklow-<name>.service`,
+each conflicting with the others; the embedding model shared on one port), and the house's `llm-mode` switches fiona between
+`ornith` (8081) and `gemma` (8083), as it switches son-of-anton between unholy's instances.

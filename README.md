@@ -9,9 +9,11 @@ full 262,144-token context.
 C++20 and SYCL/ESIMD on Level Zero; no Python at runtime; every kernel is our own (no oneDNN, no oneMKL, no
 llama.cpp). It builds with Nix against the fleet's nixpkgs (intel-llvm, compute-runtime).
 
-It is *vertical*: one model family, one card. It was built in a week by Claude (Opus 5.5 and Sonnet 5.5), with an
+It is *vertical*: one card, a model family at a time. It was built in a week by Claude (Opus 5.5 and Sonnet 5.5), with an
 engineering log (`DECISIONS.md`) that records every measurement and dead end along the way. It served Gemma 4 (26B A4B
-and 12B) until 2026-10-31; that history is in the log.
+and 12B) until 2026-10-31; since 2026-11-03 the same `eklow-server` serves **Gemma 4 26B A4B** again when given its GGUF
+(the engine of 2026-10-27, beside Qwen's), and the NixOS module switches between the two as instances. That history is
+in the log.
 
 ## The machine
 
