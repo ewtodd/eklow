@@ -1,0 +1,7 @@
+deep-analysis positions 16 model.py: 3.75 cap4096: 4.00 cap2048: 3.88 cap512: 3.56
+deep-quote positions 16 model.py: 4.19 cap4096: 3.81 cap2048: 3.88 cap512: 3.69
+all model.py: 3.97 (+/- 0.52, n=32) cap4096: 3.91 (+/- 0.52, n=32) cap2048: 3.88 (+/- 0.54, n=32) cap512: 3.62 (+/- 0.51, n=32)
+model.py accepted-length histogram [5, 10, 1, 8, 1, 1, 1, 1, 2, 0, 1, 1, 0, 0, 0, 0]
+cap4096 accepted-length histogram [5, 11, 1, 6, 2, 1, 1, 2, 1, 0, 1, 1, 0, 0, 0, 0]
+cap2048 accepted-length histogram [6, 11, 1, 5, 1, 2, 1, 1, 2, 0, 1, 1, 0, 0, 0, 0]
+cap512 accepted-length histogram [6, 12, 2, 4, 1, 2, 1, 1, 1, 0, 1, 1, 0, 0, 0, 0]

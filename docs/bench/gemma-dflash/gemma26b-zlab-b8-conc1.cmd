@@ -1,0 +1,1 @@
+/home/e-play/eklow-qwen-data/llama-cuda/bin/llama-server -m /home/e-play/eklow-qwen-data/gemma/target/gemma-4-26B_q4_0-it.gguf --host 127.0.0.1 --port 8090 -np 1 -c 6144 --fit on --spec-draft-model /home/e-play/eklow-qwen-data/gemma/work/gguf/drafts/variants/gemma-4-26B-A4B-it-DFlash-zlab-Q8_0-block8.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ngl 99

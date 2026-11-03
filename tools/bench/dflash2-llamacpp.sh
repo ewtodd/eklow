@@ -4,7 +4,7 @@
 #  - BLOCK is the draft's block size: if the draft GGUF was trained at another one, dflash.block_size is rewritten
 #    in a copy (llama.cpp reads it from there, and drafts block-1 tokens: --spec-draft-n-max is set to BLOCK-1).
 #  - BLOCK=0 serves the target alone (decode tok/s without the draft).
-#  - per dataset and per sampling (greedy, then temperature 1.0 / top-p 0.95 / top-k 20): N requests (default 32),
+#  - per dataset and per sampling (greedy, then temperature 1.0 / top-p 0.95 / top-k $TOPK, 20 unless set): N requests (default 32),
 #    thinking on, up to 4096 new tokens, CONC requests at a time (acceptance does not depend on it; run
 #    CONC=1 for decode tok/s).
 # Results: $DATA/results/dflash/LABEL.jsonl (one line per request), server log beside it; the server holds the 4090
@@ -13,12 +13,14 @@ source "$(dirname "$0")/../weights/lib.sh"
 # e-desktop 2026-11-01: userspace libcuda (595.112) is newer than the loaded kernel module (595.104.02) until a reboot;
 # use the libraries matching the module (harmless once they match)
 NVLIB=/nix/store/fprgxisprl0218i079npizclrgfgfja7-nvidia-x11-595.104.02/lib
-[ -d "$NVLIB" ] && export LD_LIBRARY_PATH=$NVLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
+# (only while the loaded module is that old one: after the 2026-11-03 reboot it is 595.112.07, which the system libraries match)
+grep -q 595.104.02 /proc/driver/nvidia/version 2>/dev/null && [ -d "$NVLIB" ] && export LD_LIBRARY_PATH=$NVLIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}
 T=$1 D=$2 B=$3 LABEL=$4; DS=${5:-gsm8k humaneval mt-bench}
 N=${N:-32} CONC=${CONC:-4} PORT=${PORT:-8090} MAXTOK=${MAXTOK:-4096} CTX_PER=${CTX_PER:-6144}
 SAMPLINGS=${SAMPLINGS:-"greedy temp"}
 LLAMA_CUDA=${LLAMA_CUDA:-$DATA/llama-cuda/bin}
-R=$DATA/results/dflash; mkdir -p "$R"
+R=${RESULTS:-$DATA/results/dflash}; mkdir -p "$R"
+TOPK=${TOPK:-20}   # temperature sampling's top-k (Qwen3.6: 20; Gemma 4: 64)
 args=(-m "$T" --host 127.0.0.1 --port "$PORT" -np "$CONC" -c $((CONC * CTX_PER)) --fit on)
 if [ "$B" != 0 ]; then
     trained=$(python3 - "$D" <<'PY'
@@ -45,9 +47,9 @@ until curl -fs "http://127.0.0.1:$PORT/health" >/dev/null 2>&1; do
     sleep 3
 done
 for s in $SAMPLINGS; do
-    case $s in greedy) samp=(--temperature 0 --top-p 1.0 --top-k 0);; temp) samp=(--temperature 1.0 --top-p 0.95 --top-k 20);; esac
+    case $s in greedy) samp=(--temperature 0 --top-p 1.0 --top-k 0);; temp) samp=(--temperature 1.0 --top-p 0.95 --top-k "$TOPK");; esac
     for d in $DS; do
-        python3 "$(dirname "$0")/dflash2_accept.py" --url "http://127.0.0.1:$PORT" --dataset "$d" --n "$N" "${samp[@]}" \
+        python3 "$(dirname "$0")/dflash2_accept.py" --url "http://127.0.0.1:$PORT" --dataset "$d" --n "$N" ${DOC_CHARS:+--doc-chars $DOC_CHARS} "${samp[@]}" \
             --max-tokens "$MAXTOK" --concurrency "$CONC" --label "$LABEL/$s" --out "$R/$LABEL.jsonl" | tee -a "$R/$LABEL.summary"
     done
 done

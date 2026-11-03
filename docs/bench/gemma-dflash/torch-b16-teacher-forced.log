@@ -1,0 +1,6 @@
+gsm8k positions 86 model.py: 7.76 all-open: 7.64
+humaneval positions 137 model.py: 7.01 all-open: 6.78
+prose positions 137 model.py: 3.28 all-open: 3.15
+all model.py: 5.77 (+/- 0.24, n=360) all-open: 5.60 (+/- 0.24, n=360)
+model.py accepted-length histogram [54, 53, 40, 37, 31, 28, 21, 18, 8, 8, 9, 7, 8, 5, 3, 30]
+all-open accepted-length histogram [62, 56, 38, 35, 27, 28, 21, 11, 14, 8, 10, 8, 8, 2, 5, 27]

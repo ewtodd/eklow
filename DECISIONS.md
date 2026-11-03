@@ -2005,3 +2005,118 @@ basic` against the Gemma server without `--draft` (unchanged behaviour) and with
 (after `gemma/draft`). (5) the lossless check through the server: `serve_test.py sample --n 3000 --out A.json` against the server
 without the draft and with it, then `serve_test.py chi2 A.json B.json` (Qwen's was 3,000 completions each); `basic --save` on
 both and `compare`.
+
+## 2026-11-03 — z-lab's DFlash draft for the 26B: llama.cpp's acceptance, the reference's, and the draft in eklow's code
+
+TASK gemma/draft (branch `gemma/draft`; the speculative path itself is `gemma/spec`'s). The owner wants speculative decoding for
+the 26B; the plan is z-lab's published `gemma-4-26B-A4B-it-DFlash` first, no training, and its acceptance at the short blocks this
+card favours before deciding on a draft of our own. The card was not touched: everything ran on e-desktop (the 4090 for
+llama.cpp, the CPU for the rest).
+
+**Files** (`~/eklow-qwen-data/gemma/`, `MANIFEST.txt` has the sha256s). Draft: `z-lab/gemma-4-26B-A4B-it-DFlash` @ 77d42027
+(plain DFlash, arXiv 2602.06036, not DFlash 2: 5 layers, 4 sliding (2,048) then 1 full, hidden 2,816, 32 heads / 8 KV of 128, ff
+5,632 silu, block 16, 0.43 B parameters, BF16). Target: `google/gemma-4-26B-A4B-it-qat-q4_0-gguf` @ d1c082be, sha256 as pinned.
+`~/eklow-qwen-data/gemma4-hf/config.json` is byte-identical to google/gemma-4-26B-A4B-it's (main @ 4d7ae498), not only the
+tokenizer. `tools/weights/make-draft.sh gemma` converts with the pinned converter (BF16 and Q8_0, 875 / 472 MB). The GGUF's
+metadata against config.json: `dflash.target_layers` [2, 7, 12, 18, 23, 28] (each id + 1, as for Qwen), `block_size` 16,
+`attention.sliding_window` 2,048, `sliding_window_pattern` [T, T, T, T, F], `embedding_scale` 53.066 (= sqrt(2,816)),
+`final_logit_softcapping` 30, `tokenizer.ggml.mask_token_id` 4, rope base 1e6, eps 1e-6; no `attention.causal` key, no convolution
+or selector keys, no embedding or output tensor (the target's, tied: the 26B has no `output.weight`, its `token_embd` is Q6_K).
+
+**What z-lab's code does that the GGUF cannot say.** model.py makes a layer causal exactly when it is sliding
+(`is_causal = layer_type == "sliding_attention"` when the config has no `is_causal`), and vLLM's Gemma 4 DFlash PR (#41703) does
+the same (`causal_attn_metadata` for the sliding layers): the four sliding layers see the block's earlier positions only, the full
+layer sees all of it, the draft embeds with the target's table times sqrt(hidden) and applies the final softcap. llama.cpp at the
+pin has one flag for the whole model, unset here, so it runs all five layers non-causal. Its draft is also deterministic: it takes
+the top candidate of each position and the target's own sampler decides (`common_sampler_sample_and_accept_n`; the rejection variant is for drafters that fill a q, this one does not), so at
+temperature > 0 a drafted token is kept with probability p(d).
+
+**Acceptance, llama.cpp** (pin ea0c4c2c CUDA on the 4090; 26B Q4_0 QAT target, draft Q8_0 with `dflash.block_size` rewritten for 8
+and 4 as the Qwen matrix did; z-lab's GSM8K / HumanEval / MT-Bench prompt sets via `dflash2_accept.py`, 16 requests each, thinking
+on, 4,096 new tokens; tokens per verification step, `(n - 1) / steps`; `tools/bench/dflash-gemma-matrix.sh`; raw in
+`docs/bench/gemma-dflash/`). **One request at a time** (these are the numbers to use):
+
+| sampling | block | GSM8K | HumanEval | MT-Bench |
+|---|---:|---:|---:|---:|
+| greedy | 16 | 6.18 | 6.38 | 4.93 |
+| greedy | 8 | 5.16 | 5.07 | 4.08 |
+| greedy | 4 | 3.42 | 3.42 | 2.98 |
+| T=1, top-k 64, top-p 0.95 | 16 | 5.28 | 5.18 | 4.55 |
+| T=1, top-k 64, top-p 0.95 | 8 | 4.94 | 4.43 | 3.85 |
+| T=1, top-k 64, top-p 0.95 | 4 | 3.24 | 3.17 | 2.91 |
+
+Four requests at a time (what Qwen's matrix did) gave much less, 5.20 / 4.46 / 2.86 at block 16 greedy and 4.06 / 3.47 / 2.63 at
+temperature 1: llama.cpp's multi-slot DFlash loses a quarter to a third of the acceptance (single requests fall to ~1.0 outright;
+the mechanism is not looked into). Those are the `gemma26b-zlab-b*` files without `-conc1`; the Qwen matrix's numbers may carry
+the same loss. z-lab's card (vLLM, bf16 target on a B300, greedy, block 16): 7.71 GSM8K, 7.80 HumanEval, 4.33 MT-Bench. Decode
+tok/s in the files is for the 4090 with this target fully on the card (330 median for GSM8K, one request, block 16); there is no
+no-draft run to divide by.
+
+**Acceptance, the reference** (z-lab's model.py in fp32 on the CPU, `tools/dflash_test/accept_torch_plain.py`; teacher forced on
+the 26B's own greedy answers to one GSM8K, one HumanEval and one prose prompt, 360 positions at stride 5, the target's real
+hidden states from `eklow-oracle` on the same GGUF, answers of 400 to 700 tokens, so short context): block 16: GSM8K 7.76,
+HumanEval 7.01, prose 3.28; block 8: 5.99 / 5.19 / 3.24; block 4: 3.60 / 3.39 / 2.64 (the same with every layer non-causal, as
+llama.cpp runs them: 7.64 / 6.78 / 3.15 at 16, no difference at 8 and 4). So the draft does what z-lab's card says on this QAT
+target, llama.cpp with one request at a time gets 80 to 90% of the reference on code and math (more on MT-Bench-like prose), the
+non-causal sliding layers cost 2 to 4% at block 16, and what eklow's forward must reproduce is model.py's, which the code now does
+(below). Not measured: the serving forward's int8 activations (the card check), more than three prompts.
+
+**The full layer at depth.** The one full-attention layer sees the slot's whole context; eklow's draft cache for the other
+layers is a 2,048 ring. llama.cpp can cap only by making every layer sliding at 2,048 (the pattern all true; `dflash-gemma-depth.sh`):
+prompts of about 7,000 and 24,000 tokens, greedy, thinking, 1,024 tokens, 8 each, block 16: acceptance 2.60 -> 2.53 at 7k and 2.77
+-> 2.68 at 24k (-3%). In model.py with the full layer's mask limited to the last W positions (`capW`; the 6.3k-token prompts of
+`accept_torch_plain.py`, 142 positions): 3.69 for the whole context, 3.48 at W = 2,048 (paired -0.21, se 0.10), 3.39 at W = 512
+(-0.30). The layer is worth 3 to 6% at these depths in prose analysis and quoting; deeper than 24k is not measured. Memory at the
+production shape (2 slots), per full-attention layer, the ring including a block and a page of slack: fp16 K/V 2.00 GiB at 262,144
+positions, 1.00 at 131,072, 0.50 at 65,536, 0.25 at 32,768; int8 (the engine's K/V format: a scale per position and 16 dims)
+1.13 / 0.57 / 0.28 / 0.14 GiB; the four sliding layers 80 MiB in fp16; the weights 0.44 GiB and the scratch ~0.15 GiB (computed from
+the allocations, not measured on the card). **Proposal: the full layer as an int8 ring of 32,768 positions per slot** (0.14 GiB,
+the default of `Options::full_context`), which keeps what the measurements say it is worth for contexts into the tens of thousands;
+262,144 in int8 (1.13 GiB, the whole context) only if a long-context acceptance measurement on the card says so, and it also needs
+the target's features for every prompt row (67.6 KB a row in fp32, 150 MFLOP a row through `fc` and the K/V projections), where
+the capped ring needs the last `reach()` rows.
+
+**The draft in eklow's code.** `Dflash2Config::from_gguf`, `Dflash2Weights`, `Dflash2Ref` and `Dflash2` take plain DFlash drafts
+(`Dflash2Config::plain`): no convolutions, no selector; per-layer sliding/full attention with their own key ranges (sliding layers
+causal in the block, the full layer not); the target's embedding times `embed_scale`; the head's logits, top 16 per position by
+`dflash::topk16`, then the softcap on the 16 on the host (monotone, so the same 16); a tied head (`token_embd.weight` when the
+target has no `output.weight`); the vocabulary from the tokenizer's length, checked against the target's table. The lattice has the
+same row of scores for every predecessor (`plain_lattice`), so `serve::walk` and `serve::verify` are unchanged: a position is
+sampled from the softmax at the request's temperature over its 16 candidates, `q` is that distribution, acceptance is the lossless
+rule of `spec.hpp` for every sampler feature (penalties, bans, grammar enter p only). One thing the spec worker should try: at
+temperature > 0 llama.cpp's deterministic draft keeps p(d) per token; sampling from q keeps sum min(p, q), which is lower when the
+draft is sharper than the target; `draft(..., temperature)` with a small value (1e-3: q is one-hot, `verify` then accepts with
+probability p(d)) is the same lossless rule with llama.cpp's draft, and the acceptance of each can be read on the card. Never
+temperature 0 with a sampling request: a greedy block carries no q. The full layer's cache is a ring of `Options::full_context`
+positions (default 32,768), int8 (`full_int8`) or fp16; a context beyond it is seen through its last positions (a capped window).
+`Dflash2::reach()` is the rows a caller must capture for the draft: that, not `window()`. `Options::sliding_causal` (-1 the draft's
+own) runs the sliding layers non-causally as llama.cpp does, for an A/B on the card. `attn::attend` takes an int8 cache for
+128-wide heads (it was fp16 only; the instantiation compiles for dg2). The public API of `model::Dflash2` is unchanged (additive
+fields and methods only). The DFlash 2 path is untouched in arithmetic: the reference forward on the host (SYCL native_cpu,
+`tools/dflash_test/host-build.sh`, 4 sources, no card) gives the same bytes before and after on Inco's draft (a random Q8_0 target
+for its embedding and head; two configurations, sha256 `2af90f70...` and `c273c410...`); the serving forward makes the same
+calls in the same order for a draft without a full layer (`r0 = 0`, one tile list, one cache shape), checked by reading and by the
+card check below, not run.
+
+**Checked against z-lab's model.py** (`tools/dflash_test/ref_torch_plain.py`, fp32 PyTorch on the CPU, the draft's BF16 weights, fixed
+random features, the 26B's Q6_K embedding dequantized as embedding and head): `Dflash2Ref` (BF16 GGUF) on the same inputs: final
+hidden rows 7e-6 relative (ctx 60, 100 with window 32 so that the sliding mask cuts, and 2,500 with the draft's own 2,048: 7e-5),
+softcapped top-16 scores 1e-4 absolute, greedy tokens equal in every block, 2 of 720 candidates swapped at a near tie; with the
+window ignored the same comparison is 0.83 relative (the test sees the masks). The card side compares the serving forward with the
+reference: `eklow-dflash-test plain`.
+
+**Card commands** (fiona, `~/eklow-wt-gdraft`; nothing was run there). Build: `nix develop path:. -c bash -c 'cmake -S . -B build -G
+Ninja -DCMAKE_CXX_COMPILER=clang++ && cmake --build build --target eklow-dflash-test eklow-server'`. Inputs from e-desktop's
+`~/eklow-qwen-data/gemma/` (the two GGUFs under `work/gguf/drafts/`, `target/`, and `host/`):
+1. Qwen identical, serving forward: build `main` (95d2912) and this branch, then with each
+   `eklow-dflash-test dump --draft Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf --target <extract_head.py's GGUF of the Qwen target> --ctx 200 --block 8`
+   and `diff` the two outputs (hashes of the lattices).
+2. Plain draft, serving against reference, random features: `eklow-dflash-test plain --draft gemma-4-26B-A4B-it-DFlash-zlab-Q8_0.gguf
+   --target gemma-4-26B_q4_0-it.gguf --feats host/t3/feats.f32 --anchors 106,5555,200000 --ctx 2500 --block 16` (the draft's own window,
+   so the ring wraps), and `... --feats host/t2/feats.f32 --anchors 2,1000,77777 --ctx 100 --window 32`.
+3. The same on the target's real features: `--feats host/real-gsm8k-ctx300.f32 --anchors 236812,236743,578 --ctx 300`, and
+   `--feats host/real-deep-analysis-ctx4500.f32 --anchors 669,26886,528 --ctx 4500 --full-context 1024` (the capped ring against the
+   whole one; `--no-int8` for fp16). Expect the three pairs of `fast` (serving vs exact within int8-activation noise, as for Qwen),
+   and every greedy token equal at the capped/whole pair only where the cap does not matter.
+4. `eklow-dflash-test dump` on the Gemma draft before and after any further change to the full layer's cache; and `Options::sliding_causal`
+   0 against -1 on real acceptance.
