@@ -211,7 +211,7 @@ void Scheduler::step() {
   for (size_t s = 0; s < seqs_.size(); ++s)
     if (seqs_[s].req && seqs_[s].req->cancelled()) finish(int(s), "stop");
   const bool spec = c_.draft != nullptr;
-  const int64_t W = spec ? c_.draft->window() : 0;
+  const int64_t W = spec ? c_.draft->reach() : 0;  // the prompt rows the draft's context can see (a full layer reaches past the window)
   int64_t cap_left = spec ? eng_.config().max_capture_rows : 0;  // rows of capture a step may ask for
   // One entry per chunk: what the step did for the slot.
   struct Item {

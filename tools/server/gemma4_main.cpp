@@ -8,7 +8,7 @@
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
 //                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [[--stream-min-rows N]]
 //                [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
-//                [--draft GGUF [--draft-block B] [--draft-reserve-mib N]] [--log-interval S]
+//                [--draft GGUF [--draft-block B] [--draft-reserve-mib N] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--log-interval S]
 //
 // --ctx is the context of each slot (positions), Gemma's full 262,144 by default; --batch the
 // tokens of one engine step and --chunk the prefill tokens of one sequence in a step (2,048: twice the rows per
@@ -386,6 +386,8 @@ int gemma4_server_main(int argc, char** argv) {
   std::string draft_path;
   int draft_block = 0;
   int64_t draft_reserve_mib = 1200;
+  int64_t draft_full_context = 0;  // a plain draft's full-attention layer: positions per slot it keeps (0: the draft code's 32,768)
+  int draft_sliding_causal = -1;   // -1 the draft's own, 0 or 1: to measure the difference (Dflash2::Options::sliding_causal)
   int port = 8081, slots = 2, embed_port = 8082;
   int64_t ctx = 262144, batch = 2048, chunk = 2048;
   bool kv_int8 = true;
@@ -422,6 +424,8 @@ int gemma4_server_main(int argc, char** argv) {
     else if (a == "--draft") draft_path = next();
     else if (a == "--draft-block") draft_block = std::atoi(next().c_str());
     else if (a == "--draft-reserve-mib") draft_reserve_mib = std::atoll(next().c_str());
+    else if (a == "--draft-full-context") draft_full_context = std::atoll(next().c_str());
+    else if (a == "--draft-sliding-causal") draft_sliding_causal = std::atoi(next().c_str());
     else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" ||
                a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib") {
       std::fprintf(stderr, "eklow-server: %s is for the Qwen3.6 models (qwen35moe); the Gemma 4 server (this GGUF is gemma4) does not take it\n", a.c_str());
@@ -429,7 +433,7 @@ int gemma4_server_main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
                            "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N]] [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] "
-                           "[--draft GGUF [--draft-block B] [--draft-reserve-mib N]] [--image-tokens N] [--log-interval S]\n");
+                           "[--draft GGUF [--draft-block B] [--draft-reserve-mib N] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] [--log-interval S]\n");
       return 2;
     }
   }
@@ -567,9 +571,11 @@ int gemma4_server_main(int argc, char** argv) {
       model::Dflash2::Options opt;
       opt.slots = slots;
       opt.max_block = int(engine::gemma4::kMaxVerify);  // a request may ask for a larger block than the default
+      opt.full_context = draft_full_context;
+      opt.sliding_causal = draft_sliding_causal;
       draft = std::make_unique<model::Dflash2>(q, *draft_file, target, opt);
-      std::fprintf(stderr, "eklow-server: DFlash 2 draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card (its token table stays on the host, its head is the engine's) of the %lld MiB kept; free card memory now %.2f GiB\n",
-                   draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0,
+      std::fprintf(stderr, "eklow-server: %s draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card (its token table stays on the host, its head is the engine's) of the %lld MiB kept; free card memory now %.2f GiB\n",
+                   draft_cfg.plain ? "DFlash" : "DFlash 2", draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0,
                    (long long)draft_reserve_mib, rt::free_memory(q.get_device()).value_or(0) / GiB);
     }
     serve::gemma4::SchedulerConfig sc{batch, chunk, ec.max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }};
