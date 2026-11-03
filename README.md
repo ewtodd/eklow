@@ -63,14 +63,17 @@ Measured on that machine (2026-11-01), through `eklow-server` with the productio
 slots of 262,144 tokens, int8 K/V, 2,048-token prefill chunks, Inco's DFlash 2 draft (Q8_0) in blocks of 4 with its
 token table on the host, 4 GiB of snapshots, EmbeddingGemma 2 loaded: 59 of 256 experts a layer on the card, 12.99 GiB
 of cold experts pinned. The method is unholy's (`tools/bench/serve_perf.py`, unique text cut to Qwen token depths; raw
-output in `docs/bench/release/{stock,ornith}/`), against the 26B's numbers of 2026-10-27:
+output in `docs/bench/release/{stock,ornith}/`), against the 26B's numbers of 2026-10-27. The stock column's prefill and
+decode rows are from 2026-11-03, with layer-major prefill groups (`--group 8`, which leaves 57 experts a layer on the
+card; DECISIONS 2026-11-03; raw output in `docs/bench/layermajor/R-g8-*`); its GSM8K rows and the Ornith column are from
+2026-11-01, before the groups (GSM8K's prompts are shorter than a group):
 
 | | stock Qwen3.6-35B-A3B | Ornith-1.5-35B-A3B | Gemma 4 26B A4B (before) |
 |---|---|---|---|
-| prefill, one request, unique text, at 8k / 32k / 128k / 252k | 1,124 / 1,151 / 749 / 564 tok/s | 1,039 / 1,043 / 726 / 546 tok/s | 1,865 / 1,794 / 1,177 / 765 tok/s |
-| time to first token at 252k | 447 s | 461 s | 338 s |
-| decode, one stream, with the draft, at 8k / 32k / 128k / 252k | 44.7 / 44.0 / 38.2 / 30.1 tok/s | 44.3 / 40.4 / 33.0 / 30.4 tok/s | 36.6 / 34.0 / 30.5 / 26.5 tok/s |
-| decode without the draft | 34.3 / 33.2 / 28.1 / 25.2 tok/s | 32.8 / 31.1 / 27.1 / 24.1 tok/s | |
+| prefill, one request, unique text, at 8k / 32k / 128k / 252k | 1,605 / 1,855 / 997 / 708 tok/s | 1,039 / 1,043 / 726 / 546 tok/s | 1,865 / 1,794 / 1,177 / 765 tok/s |
+| time to first token at 252k | 356 s | 461 s | 338 s |
+| decode, one stream, with the draft, at 8k / 32k / 128k / 252k | 44.2 / 42.6 / 37.3 / 33.7 tok/s | 44.3 / 40.4 / 33.0 / 30.4 tok/s | 36.6 / 34.0 / 30.5 / 26.5 tok/s |
+| decode without the draft | 33.9 / 33.0 / 28.3 / 25.1 tok/s | 32.8 / 31.1 / 27.1 / 24.1 tok/s | |
 | GSM8K chat (48 requests, thinking on, up to 1,024 tokens), 1 / 2 at a time, with the draft | 57.0 / 67.2 tok/s aggregate | 54.6 / 61.5 tok/s | 33.4 / 40.2 tok/s |
 | the same without the draft | 34.8 / 48.9 tok/s | 33.5 / 46.4 tok/s | |
 
@@ -100,10 +103,11 @@ and a prompt part. Needle in a haystack through the server, two requests at once
 passphrase found at 88k and at 167k tokens (`docs/bench/serve-needle-qwen-*`).
 
 With the draft, decode is faster than the 26B's at every depth (22% at 8k, 14% at 252k); plain it is 2-8% behind.
-Prefill is 60-74% of the 26B's: Qwen3.6's experts are 18 GB, only 59 of each layer's 256 fit on the card beside 2 x
-262k of K/V, and most of a chunk's expert work is cold, streamed over PCIe or computed by the CPU at its memory wall
-(DECISIONS 2026-11-01, "the MoE's speed"). The attention layers' long prefill runs in key segments as two GEMMs, as the
-26B's global layers did.
+Prefill is 85-103% of the 26B's with layer-major groups (60-74% before them): Qwen3.6's experts are 18 GB, only 57-59
+of each layer's 256 fit on the card beside 2 x 262k of K/V, and most of a chunk's expert work is cold. A long prompt
+now runs in groups of up to 8 chunks layer by layer, so each cold expert crosses PCIe once per layer per group instead of
+once per chunk, and the streamed experts are repacked in one launch (DECISIONS 2026-11-03). The attention layers' long
+prefill runs in key segments as two GEMMs, as the 26B's global layers did.
 
 Embeddings do not wait for a prefill: 91-238 ms during the needle test's 88k and 167k prefills.
 
