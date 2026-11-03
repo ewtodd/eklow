@@ -1813,8 +1813,7 @@ The plain path before the repack change was 1,253 / 1,215 / 1,151 / 981 / 497 (s
 shape (README method, `serve_perf.py depth`, one cold request, Inco's draft, EmbeddingGemma 2): plain 1,216 / 1,284 / 784 / 570 tok/s at
 8k / 32k / 128k / 252k (README before: 1,124 / 1,151 / 749 / 564), `--group 8` **1,605 / 1,855 / 997 / 708** (TTFT 5.1 s / 17.6 s /
 131 s / 356 s; 252k was 442 s). The gain over batched plain is +32% / +44% / +27% / +24%, over the README rows +43% / +61% / +33% /
-+26%. The engine bench and the server disagree at 32k (+22% against +44%) because the server's plain number is the better of
-the two, not the group's worse; both are single cold requests. Grouped runs move up to 25% between rounds while plain moves ~10%; it
++26%. The server rows are single cold requests (the engine rows are medians of 3), so the 32k gap (+44% against +22%) is partly noise. Grouped runs move up to 25% between rounds while plain moves ~10%; it
 follows the card (the host's wait for the group's routing is 218-245 ms a layer in the slow rounds and 154-173 in the fast, the CPU
 task is 45 +- 2 ms and its wait after the waves under 10 ms), and plain was slow in the same round, so I read clocks, not
 the host threads.
