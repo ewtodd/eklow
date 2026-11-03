@@ -3,19 +3,22 @@
 Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; history and evidence:
 `DECISIONS.md` (every entry from 2026-10-31 on is the Qwen3.6 port); what it is and the headline numbers: `README.md`.
 
-## Now (2026-11-02)
+## Now (2026-11-03)
 
 - **eklow serves Qwen3.6-35B-A3B finetunes** (llama.cpp's `qwen35moe`: 30 Gated DeltaNet and 10 gated-attention
   layers, 256 routed experts of 512 + one shared, 8 used) with **DFlash 2** speculative decoding and **image input**
   (Qwen3-VL's encoder behind `--mmproj`), in place of Gemma 4 12B / 26B A4B, whose code is gone (EmbeddingGemma 2
   stays, with Gemma's tokenizer and vision encoder). Two targets so far, same architecture: stock
   `Qwen/Qwen3.6-35B-A3B` and `ornith-ai/Ornith-1.5-35B-A3B`. `qwen/main` went into `main` on 2026-11-02.
-- **The switch**: fiona will serve **Ornith-1.5** (the owner's choice, 2026-11-02) with Inco's draft and the
-  projector at 2 x 262k, int8 KV (55 of 256 experts a layer on the card). `/etc/nixos` has the new eklow config
-  (model, draft, projector, profile; maitred's `eklow/ornith-1.5-35b-a3b`) together with the eklow input update; the
-  owner deploys and tests the model in production; no further evals (`check-source` stopped after stock's GSM8K:
-  293/300, 97.7% +- 1.7%, `docs/bench/check-source/stock/`). Until the deploy, `eklow.service` is stopped (since
-  2026-10-31 17:40, by agreement): a reboot starts the old 26B again.
+- **In production since 2026-11-02 ~20:22**: fiona serves **Ornith-1.5** with Inco's draft and the projector at
+  2 x 262k, int8 KV (51 of 256 experts a layer on the card; eklow built on its own nixpkgs, intel-llvm 7.1.1: the
+  fleet's 7.2.0 left 0.8 GiB less free, 39 experts). No further evals (`check-source` stopped after stock's GSM8K:
+  293/300, 97.7% +- 1.7%, `docs/bench/check-source/stock/`).
+- **Layer-major prefill** (`main` ecabbb1, DECISIONS 2026-11-03): a lone long prompt runs in groups of up to 8
+  chunks layer by layer, each cold expert crossing PCIe once per layer per group; the streamed experts are repacked in
+  one launch (+19% plain prefill on its own). Through the server, time to first token at 8k / 32k / 128k / 252k: 5.1 /
+  17.6 / 131 / 356 s (6.7 / 25.5 / 167 / 442 s plain). `/etc/nixos` 276af231 sets `prefillGroup = 8`,
+  `prefillGroupBusy = 4096` (48 experts a layer); it needs the eklow input at ecabbb1; the owner deploys.
 - **The last check before the switch** (2026-11-02, `main`'s tree on fiona): `checkq ekk8` inside the gate (242-248
   of 256 top-1, chat 27/27); the server at the production shape with Ornith, the draft, the projector and EmbeddingGemma
   2 passed `serve_test.py basic` and `image_test.py` (a screenshot, a newspaper page as PNG with alpha and as a
@@ -104,11 +107,12 @@ draft, chi-square p = 0.985); acceptance at block 8 5.75 / 5.43 / 5.02 on GSM8K 
 
 ## Open, in order
 
-1. **The owner's deploy of Ornith-1.5** (above), then what production shows.
-2. **Prefill**: 60-74% of the 26B's (the experts are 18 GB and only 59-71 of 256 a layer fit beside 2 x 262k of KV;
-   72% of a chunk's expert work is cold). The CPU's share is at its memory wall and streaming near its optimum
-   (DECISIONS 2026-11-01, "the MoE's speed"). Levers: context for experts (2 x 128k frees ~2.9 GiB, ~30 more experts a
-   layer: the owner's call), the Iris Xe as a second device for the pairs not streamed, the placement gap below.
+1. **What production shows** with Ornith-1.5 and the prefill groups.
+2. **Prefill**, the owner's order (2026-11-02): layer-major groups (done), then a microbenchmark of the DMA tax (does a
+   kernel reading pinned host memory slow the card less than copy-engine pushes?), int8 Q.K prefill attention at depth
+   (needs a long-context fidelity check first), the placement gap below. A grouped 16k profile: the card's own GEMMs
+   (stream 1.59 s, hot 0.78 s of 7.43 s), DeltaNet 1.4 s, attention 0.88 s, the fp32 router 0.53 s; copies 0.49 s.
+   Context for experts (2 x 128k frees ~2.9 GiB, ~30 experts a layer) stays the owner's call.
 3. **Placement**: the server places 59 experts a layer (52 before the draft's token table went to the host) against
    the engine bench's 71 (the embedding model, the draft, scratch): what is left to take back.
 4. **Verify rows**: each row past the first costs ~8.5 ms of the CPU's cold experts, so blocks of 4 are best; cheaper
