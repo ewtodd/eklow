@@ -1,0 +1,20 @@
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 262144; 6.13 GiB of weights on the card, 5.84 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 66 of 256 per layer on the card (free 6.84 GiB before them, margin 1.00, draft 1.20, vision 0.00), 80 streaming slots, 12.52 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   8192 tokens:    4.25 s,   1925.4 tok/s
+    cold experts: 2.60 s waiting on the card's routing, 0.28 s computing on the CPU, 65.8% of pairs cold, 0 of 40 layers with the card finished first; streamed 4791 experts in 40 layers (92.6% of the cold pairs)
+    layer-major: 40 group layers, per layer 119.8 streamed experts in 2.00 waves, 39891 streamed pairs, 3202 pairs on the CPU; host waits: routing 65.0 ms, repack before the next copy 31.2 ms; CPU task 37.8 ms (of which 7.1 ms waited for after the waves)
+prefill  16384 tokens:    8.37 s,   1956.4 tok/s
+    cold experts: 6.04 s waiting on the card's routing, 0.01 s computing on the CPU, 56.7% of pairs cold, 0 of 40 layers with the card finished first; streamed 5754 experts in 40 layers (94.9% of the cold pairs)
+    layer-major: 40 group layers, per layer 143.8 streamed experts in 2.08 waves, 70479 streamed pairs, 3825 pairs on the CPU; host waits: routing 151.0 ms, repack before the next copy 53.3 ms; CPU task 46.6 ms (of which 0.3 ms waited for after the waves)
+prefill  32768 tokens:   18.84 s,   1739.1 tok/s
+    cold experts: 14.19 s waiting on the card's routing, 0.04 s computing on the CPU, 60.5% of pairs cold, 0 of 80 layers with the card finished first; streamed 11733 experts in 80 layers (95.1% of the cold pairs)
+    layer-major: 80 group layers, per layer 146.7 streamed experts in 2.09 waves, 75466 streamed pairs, 3889 pairs on the CPU; host waits: routing 177.4 ms, repack before the next copy 52.7 ms; CPU task 46.3 ms (of which 0.5 ms waited for after the waves)
+prefill at depth  32768:   14.85 s for 16384 tokens,   1103.4 tok/s
+    cold experts: 12.22 s waiting on the card's routing, 0.00 s computing on the CPU, 60.9% of pairs cold, 0 of 40 layers with the card finished first; streamed 5810 experts in 40 layers (95.2% of the cold pairs)
+    layer-major: 40 group layers, per layer 145.2 streamed experts in 2.05 waves, 75972 streamed pairs, 3845 pairs on the CPU; host waits: routing 305.5 ms, repack before the next copy 60.2 ms; CPU task 43.5 ms (of which 0.0 ms waited for after the waves)
+prefill at depth 131072:   22.47 s for 16384 tokens,    729.1 tok/s
+    cold experts: 20.04 s waiting on the card's routing, 0.10 s computing on the CPU, 65.0% of pairs cold, 0 of 40 layers with the card finished first; streamed 5781 experts in 40 layers (95.5% of the cold pairs)
+    layer-major: 40 group layers, per layer 144.5 streamed experts in 2.12 waves, 81396 streamed pairs, 3830 pairs on the CPU; host waits: routing 500.9 ms, repack before the next copy 51.0 ms; CPU task 46.5 ms (of which 2.4 ms waited for after the waves)
+decode, 1 slot, at      0:   24.36 ms/step (23.15 ms enqueueing),   41.1 tok/s per sequence
+    cold experts per step: 9.35 ms waiting on the card's routing, 9.40 ms computing on the CPU, 55.2% of pairs on the CPU; 34.5 of 40.0 cold layers had the card finished before the CPU; CPU phases gate|up 5.47, glu 0.54, down 2.85 ms, 176.8 distinct experts a step
+verify blocks of  8 at   8192:   66.34 ms/step,   64.1 accepted tokens/s (4.2 tokens accepted a block)
+    cold experts per step: 19.66 ms waiting on the card's routing, 36.99 ms computing on the CPU, 51.1% of pairs on the CPU; 37.7 of 40.0 cold layers had the card finished before the CPU; CPU phases gate|up 23.41, glu 1.23, down 11.08 ms, 702.7 distinct experts a step

@@ -9,7 +9,7 @@
 //
 // --ctx is the context of each slot (positions), 262,144 by default; --batch the tokens of one engine step and --chunk
 // the prefill tokens of one sequence in a step (2,048); --group N lets a lone prefilling sequence take up to N chunks of prompt in one
-// layer-major step (engine::Config::max_group), a long prompt prefilling about 1.4x faster; while another slot generates a group
+// layer-major step (engine::Config::max_group), a long prompt prefilling 1.2-1.4x faster, 3 experts a layer fewer on the card at 8; while another slot generates a group
 // would stall it, so then --group-busy TOKENS (default 0: none) is the most a step may take. The attention layers' K/V are int8 by default, which is what lets
 // 2 x 262k fit beside the weights; --kv-fp16 decodes a little faster at depth but cannot hold 2 x 262k.
 // --expert-profile: the experts of each layer that the routing profile says are busiest stay on the card and the rest are

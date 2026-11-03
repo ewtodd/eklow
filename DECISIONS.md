@@ -1772,3 +1772,79 @@ the picture's colours, one text-only follow-up after an image turn, two image re
 wide pictures told apart. Prefix reuse with images: a second turn of a 480-token prompt cached 461, a repeat 315 of 322
 (prompts under snapshot_min = 256 tokens reuse nothing, as for text). Encoding 0.12-0.31 s at 120-800 rows.
 Errors: http(s) 400, undecodable bytes 400, no `--mmproj` 400 (`image input is off`).
+
+## 2026-11-03 — layer-major prefill: a long prompt's chunks run layer by layer, so each cold expert crosses the link once per group
+
+`qwen/layermajor`. Raw output in `docs/bench/layermajor/` (`console-excerpts-lost-logs.txt` holds the runs whose files an
+`rsync --delete` removed). Tokens from `~/eklow-qe/prof/prose.json`, stock EKK8, 2 x 262,144 with int8 KV.
+
+**What it is.** `Config::max_group` (a multiple of `max_chunk`; `eklow-engine-bench --group N`, `eklow-server --group N`): a lone
+non-verify prefill chunk of up to that many tokens is cut into near-equal sub-chunks of at most `max_chunk` and run layer by
+layer (`Engine::step_group`). Each layer, every sub-chunk in turn does its mixer, router, hot experts and shared expert and
+adds them into its rows of the residual stream in place (no tail kernel; the next layer's input norm is made at the start of
+its mixer). The layer's cold experts then go once for the whole group (`Engine::cold_group`): the streamed set is chosen from the
+group's counts with no slot cap, it passes through the 80 slots in waves (~144 experts a layer at G = 8, 2.1 waves), and for
+each wave every sub-chunk's pairs of those experts run before the next wave's copy (started as soon as the wave's repack has read
+the raw slots) lands. The CPU takes what is not streamed (~3,800 pairs a layer at 16k tokens, against ~80,000 streamed) on a
+thread of its own. Kept per sub-chunk beyond the 2,048-token scratch: the residual stream in fp32, the MoE input in fp16 for the
+waves, the routing (~25 MB per 2,048 tokens). The attention and DeltaNet kernels are unchanged; a sub-chunk's layer l runs after
+the previous sub-chunk's, so the recurrent state and K/V are what plain chunks leave. New kernels: `qwenk::moe_accumulate`,
+`qwenk::to_half`, an fp16-source `fast::moe_gather`, `xmx::repack_format_batch_into`.
+
+**Two things found on the way**
+- The streamed experts were repacked by a launch per expert and matrix (~225 us for 1.8 MB: 1,024 work-items, far less than
+  the card). One launch per layer (plain path) or wave (group) took the repack from 1.29 s to 0.49 s of a 16k group, and is
+  worth **+19%** on plain prefill, with no group involved: 2,048 from empty 1,333 -> 1,576 tok/s, 4,096 at depth 8k 1,247 ->
+  1,456 (medians of 3). It ships with or without groups.
+- Starting a layer's copies once the whole group is routed and enqueueing the hot experts after (`group_early_copy`) beats finishing
+  each sub-chunk's layer first at G = 4 (1,878 / 1,742 / 1,663 against 1,637 / 1,499 / 1,466 at 8k / 16k / 32k, single runs) and
+  ties it at G = 8; kept.
+
+**Prefill** (`bench.sh engineq`, tok/s, medians of 3 alternating rounds; plain includes the batched repack; the depth rows time
+4,096 tokens for plain and one group of 16,384 for G = 8):
+
+| | 8k | 16k | 32k | depth 32k | depth 128k |
+|---|---|---|---|---|---|
+| plain | 1,486 | 1,438 | 1,292 | 1,028 | 582 |
+| G = 8 | 1,805 | 1,786 | 1,577 | 1,103 | 727 |
+| gain | +21% | +24% | +22% | +7% | +25% |
+
+The plain path before the repack change was 1,253 / 1,215 / 1,151 / 981 / 497 (same method). Through `eklow-server` at the release
+shape (README method, `serve_perf.py depth`, one cold request, Inco's draft, EmbeddingGemma 2): plain 1,216 / 1,284 / 784 / 570 tok/s at
+8k / 32k / 128k / 252k (README before: 1,124 / 1,151 / 749 / 564), `--group 8` **1,605 / 1,855 / 997 / 708** (TTFT 5.1 s / 17.6 s /
+131 s / 356 s; 252k was 442 s). The gain over batched plain is +32% / +44% / +27% / +24%, over the README rows +43% / +61% / +33% /
++26%. The engine bench and the server disagree at 32k (+22% against +44%) because the server's plain number is the better of
+the two, not the group's worse; both are single cold requests. Grouped runs move up to 25% between rounds while plain moves ~10%; it
+follows the card (the host's wait for the group's routing is 218-245 ms a layer in the slow rounds and 154-173 in the fast, the CPU
+task is 45 +- 2 ms and its wait after the waves under 10 ms), and plain was slow in the same round, so I read clocks, not
+the host threads.
+
+**Where the time goes** (profile, G = 8, 16k, after the repack fix, card time of 7.43 s): stream_gemm 1.59 s (21%), copy and repack
+0.49 s (6.5%), attention 0.88 s, DeltaNet projections and kernel 1.4 s, router 0.53 s (the fp32 256-expert matmul: 6%), moe_group 0.40 s,
+hot GEMMs 0.78 s. Copies are no longer the cost; the card's own GEMMs are. At 128k, attention is 35% of a group.
+
+**Memory and decode.** Group buffers: 185 MB at G = 8, ~25 MB per 2,048 tokens more than plain. Experts a layer on the card at the
+production flags (Ornith, draft, projector, EmbeddingGemma 2): 51 plain and at G = 2, 50 at G = 4, **48 at G = 8**; at the engine bench
+69 / 68 / 67 / 66. Decode with the smaller placement, one slot, 0 / 8k / 32k / 128k: plain 41.1 / 41.1 / 40.0 / 32.3, G = 8 40.8 / 40.7 /
+38.9 / 32.6 tok/s; verify blocks of 8 at 8k 70.9 against 68.4 ms. The loss is within noise (0-3%); through the server at the
+release shape (59 against 57 experts) decode with the draft at depth was 44.2 / 42.6 / 37.3 / 33.7 against 41.5 / 44.1 / 38.7 / 30.0.
+
+**Fidelity.** `checkq` ekk8 (top-1 of 256, median KL against the fp32 reference): plain chunks of 1,024 / 2,048 248 / 244, 1.9e-3 /
+2.2e-3; groups of 2 sub-chunks 246, 1.8e-3; a prompt as one group of 3 sub-chunks 247, 2.1e-3 (decoding its last 64: 247, 2.0e-3);
+oek8 216 / 208 plain, 216 and 215 grouped (medians 2.3e-2 to 2.6e-2 against 2.4e-2). A 23,477-token prompt, plain chunks of 2,048
+against one 16,384-token group step, last 256 positions: top-1 agreement 1.000, mean KL 3.7e-4. `eklow-gdn-test`, `eklow-qfmt-test`,
+`eklow-cpu-qgemv-test`, `eklow-spec-test`, `bench.sh attn` pass; `serve_test.py basic` and `image_test.py` pass against a server at the
+production shape with `--group 8` (both `--group-busy` settings).
+
+**The scheduler** (`--group N`, `--group-busy TOKENS`; off by default): a step whose only work is one slot's prefill with more than a chunk
+left takes up to N chunks of prompt as a group; a group is the step's only chunk. While another slot generates, the group is at
+most `group_busy` tokens (0: plain chunks, decode first) and a generating slot gets a step between two groups. A first version that
+skipped decode on every group step starved the stream for the whole prefill (longest gap 5.8 s at 8k, 21.9 s at 32k). With the
+alternation, a 1,102-token stream plus an 8k / 32k document arriving 4 s in (`tools/bench/serve_stall.py`): plain TTFT 8.2 s / 32.5 s,
+the stream's longest gap 2.1 / 2.3 s; `--group-busy 4096` 5.9 s / 24.4 s and 4.0 / 4.9 s; `--group-busy 16384` 5.6 s / 18.5 s and
+4.6 / 9.6 s. A group costs the generating slot its whole time; 4,096 buys 25-28% of the document's TTFT for a stall twice as long.
+
+**Did not pay / left.** Starting the first wave's copy from the counts of the first sub-chunks (the routing wait is 70-600 ms a
+layer and the first wave's copy begins after it) is not done; the copies are hidden anyway once the hot experts are enqueued behind them. The
+profile's next costs are the card's GEMMs, the fp32 router (6%) and, deep, attention. Groups pay least where attention
+dominates (the 4,096-token depth rows), and cost 3 experts a layer at G = 8. Whether to ship them (and with what `--group-busy`) is the owner's call.
