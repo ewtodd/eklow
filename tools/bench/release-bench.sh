@@ -7,13 +7,14 @@
 set -euo pipefail
 out=${1:?out dir}; model=${2:?}; profile=${3:?}; draft=${4:?}; alias=${5:?}
 docs=${DOCS:-$HOME/eklow-qrelease-data}
+read -ra extra <<<"${EXTRA:-}"  # further eklow-server arguments: the deployed flags (--group, --mmproj, ...)
 port=18181
 mkdir -p "$out"
 if systemctl is-active --quiet eklow; then echo "release-bench.sh: eklow.service is running" >&2; exit 1; fi
 cd "$(dirname "$0")/../.."
 nix develop path:. -c ./build/eklow-server --model "$model" --alias "$alias" --port $port --slots 2 --ctx 262144 --kv-int8 \
   --expert-profile "$profile" --draft "$draft" --snapshot-mib 4096 \
-  --embed-model ~/models/embeddinggemma-2-Q8_0.gguf --embed-port $((port + 1)) >"$out/serve.log" 2>&1 &
+  --embed-model ~/models/embeddinggemma-2-Q8_0.gguf --embed-port $((port + 1)) "${extra[@]}" >"$out/serve.log" 2>&1 &
 srv=$!
 trap "pkill -f 'eklow-server --model.*--port 18181' 2>/dev/null; kill $srv 2>/dev/null; wait $srv 2>/dev/null" EXIT
 for i in $(seq 900); do curl -sf localhost:$port/health >/dev/null && break; sleep 1; done
