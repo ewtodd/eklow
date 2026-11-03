@@ -998,9 +998,11 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
   if (c.head_dim == 256 && group == 2) {
     if (c.int8()) run<256, 2, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
     else run<256, 2, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
-  } else if (c.head_dim == 128 && group == 4 && !c.int8()) {
-    // The DFlash 2 draft's layers (src/model/dflash2_fast.cpp): 32 query heads over 8 K/V heads of 128, an fp16 ring.
-    run<128, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+  } else if (c.head_dim == 128 && group == 4) {
+    // The DFlash drafts' layers (src/model/dflash2_fast.cpp): 32 query heads over 8 K/V heads of 128, a ring in fp16 (the sliding
+    // layers) or, for the full layer of Gemma's plain draft, in int8.
+    if (c.int8()) run<128, 4, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+    else run<128, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   } else if (c.head_dim == 256 && group == 8) {
     // Qwen3.6's attention layers: 16 query heads over 2 K/V heads of 256.
     if (c.int8()) run<256, 8, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
