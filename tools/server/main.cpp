@@ -1,5 +1,10 @@
 // eklow-server: Qwen3.6-35B-A3B (stock or a finetune such as Ornith) with DFlash 2 speculative decoding on the A770M,
-// behind an OpenAI-compatible HTTP API.
+// behind an OpenAI-compatible HTTP API; or Gemma 4 26B A4B (no draft) behind the same one.
+//
+// One binary, two servers: main() reads the GGUF's general.architecture (before anything else is parsed) and runs
+// qwen35moe's server (qwen_server_main, below: this file, unchanged in flags and log) or gemma4's (gemma4_server_main,
+// tools/server/gemma4_main.cpp, which has its own flags: the Qwen-only ones, --draft among them, it refuses by name).
+// Any other architecture is an error naming both. Everything below up to main() is the Qwen server.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
 //                [--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
@@ -76,6 +81,8 @@
 #include "text/chat_qwen36.hpp"
 #include "text/tokenizer.hpp"
 #include "text/tokenizer_qwen.hpp"
+
+#include "gemma4_main.hpp"
 
 using namespace eklow;
 
@@ -479,7 +486,7 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 
 }  // namespace
 
-int main(int argc, char** argv) {
+static int qwen_server_main(int argc, char** argv) {
   std::string model_path, alias = "qwen3.6-35b-a3b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", embed_mmproj_path;
   std::string draft_path, chat_template, mmproj_path, image_rows_dir;
   int image_max_tokens = 1024;  // chat images: rows an image becomes at most (llama.cpp's image_max_tokens; 8 to 4096)
@@ -872,4 +879,28 @@ int main(int argc, char** argv) {
     return 1;
   }
   return 0;
+}
+
+// The GGUF's general.architecture picks the server. Without a readable --model the Qwen server runs and says what
+// it always said.
+int main(int argc, char** argv) {
+  std::string model_path;
+  for (int i = 1; i + 1 < argc; ++i)
+    if (std::string(argv[i]) == "--model") model_path = argv[i + 1];
+  if (model_path.empty()) return qwen_server_main(argc, argv);
+  std::string arch;
+  try {
+    auto file = gguf::File::open(model_path);
+    const gguf::Value* a = file.find("general.architecture");
+    if (!a) throw std::runtime_error(model_path + ": no general.architecture");
+    arch = a->as_string();
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "eklow-server: %s\n", e.what());
+    return 1;
+  }
+  if (arch == "qwen35moe") return qwen_server_main(argc, argv);
+  if (arch == "gemma4") return gemma4_server_main(argc, argv);
+  std::fprintf(stderr, "eklow-server: %s: architecture %s; eklow serves qwen35moe (Qwen3.6-35B-A3B and its finetunes) and gemma4 (Gemma 4 26B A4B)\n",
+               model_path.c_str(), arch.c_str());
+  return 1;
 }
