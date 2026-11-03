@@ -1,6 +1,7 @@
 #include "serve/scheduler_gemma4.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <stdexcept>
 
 namespace eklow::serve::gemma4 {
@@ -106,6 +107,12 @@ bool Scheduler::admit() {
     // A prefix never ends inside an image (its rows are prefilled together), nor, after the rewind, does the window.
     int64_t keep = cut_before_image(*r, int64_t(std::min(best_lcp, r->prompt.size() - 1)));
     if (int64_t(q.tokens.size()) - keep > eng_.ring_slack()) keep = cut_before_image(*r, std::max<int64_t>(0, keep - eng_.model().window));
+    // A slot whose live sequence parts from the prompt after a long shared stretch is a conversation whose last answer the
+    // template rendered back differently from how it was sampled (a token boundary, stripped whitespace): say where (the Qwen
+    // scheduler's line, 655209e; image rows, ids below zero, have no bytes).
+    if (best_lcp >= 256 && best_lcp < q.tokens.size() && best_lcp < r->prompt.size() && q.tokens[best_lcp] >= 0 && r->prompt[best_lcp] >= 0)
+      std::fprintf(stderr, "eklow-server: prefix: the slot's sequence (%zu tokens) and the prompt (%zu) part at token %zu: sampled %s, prompt %s; reusing %lld\n", q.tokens.size(),
+                   r->prompt.size(), best_lcp, tok_.bytes(q.tokens[best_lcp]).c_str(), tok_.bytes(r->prompt[best_lcp]).c_str(), (long long)keep);
     eng_.truncate(best, keep);
     q.tokens.resize(size_t(keep));
     q.fed = size_t(keep);

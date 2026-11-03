@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Image input through eklow-server, end to end: descriptions of pictures, a second turn that reuses the prefix with its
+# Image input through eklow-server (Qwen3.6 or Gemma 4 26B A4B; the requests are the same), end to end: descriptions of pictures, a second turn that reuses the prefix with its
 # image, two different pictures of the same size not confused, the refusals, and (with --embed-url) an embedding of a
 # picture. Prints what came back; judge the descriptions by eye.
 #   image_test.py CHAT_URL IMAGE... [--embed-url URL] [--out DIR] [--max-tokens N]

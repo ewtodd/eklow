@@ -1,9 +1,9 @@
 """Check eklow's Gemma 4 chat template port against Hugging Face's apply_chat_template.
 
-Usage: python3 tools/ref/chat_compare.py EKLOW_CHAT HF_MODEL_DIR [--gguf GGUF] [--random N] [--requests FILE ...]
+Usage: python3 tools/ref/gemma4_chat_compare.py EKLOW_CHAT HF_MODEL_DIR (EKLOW_CHAT = eklow-chat-gemma4) [--gguf GGUF] [--random N] [--requests FILE ...]
 
 HF_MODEL_DIR holds Google's tokenizer files and chat_template.jinja. Every case is rendered by
-transformers (tokenize=False) and by `eklow-chat render`; the texts must be identical, or both must
+transformers (tokenize=False) and by `eklow-chat-gemma4 render`; the texts must be identical, or both must
 fail. Cases: hand-written conversations covering each branch of the template, son-of-anton
 requests and transcripts given with --requests (JSON files holding "messages"/"tools", or a
 "transcript"), and N random conversations with random tool schemas. Tool-call arguments that

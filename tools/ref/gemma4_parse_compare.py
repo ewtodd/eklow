@@ -1,9 +1,9 @@
 """Round-trip check of eklow's Gemma 4 output parser through the chat template.
 
-Usage: python3 tools/ref/parse_compare.py EKLOW_CHAT EKLOW_PARSE GGUF [--random N]
+Usage: python3 tools/ref/gemma4_parse_compare.py EKLOW_CHAT EKLOW_PARSE GGUF (eklow-chat-gemma4, eklow-parse-gemma4) [--random N]
 
 Random assistant turns (reasoning, tool calls with arguments of every JSON kind, content) are
-rendered after a user turn by the template port (identical to Hugging Face's, see chat_compare.py)
+rendered after a user turn by the template port (identical to Hugging Face's, see gemma4_chat_compare.py)
 and tokenized; the tokens after the last "<|turn>model\\n" are what the model would have generated
 for that turn. eklow-parse reads them back one token at a time and must recover the reasoning, the
 tool calls (name and arguments, compared as values) and the content (as the template trims it).
