@@ -69,6 +69,13 @@ inline int iq4_code(const uint8_t* blk, int e) {
 }  // namespace
 
 void repack_format_into(sycl::queue& q, const ref::Weight& raw, bool interleave, const Weight& w) {
+  repack_format_batch_into(q, raw, interleave, w, 1, 0, 0, 0);
+}
+
+void repack_format_batch_into(sycl::queue& q, const ref::Weight& raw, bool interleave, const Weight& w, int64_t count, uint64_t raw_stride,
+                              uint64_t tile_stride, uint64_t meta_stride) {
+  if (count > 1 && w.format == WeightFormat::Q8_0I) throw std::runtime_error("xmx: batched repack is for the K-quant formats");
+  const uint64_t rs = raw_stride, ts = tile_stride, ms = meta_stride;
   const WeightFormat f = w.format;
   if (!fmt::is_new_format(f)) throw std::runtime_error("xmx: repack_format_into needs a Qwen weight format");
   WeightFormat want;
@@ -100,13 +107,13 @@ void repack_format_into(sycl::queue& q, const ref::Weight& raw, bool interleave,
     return;
   }
   // One work-item per (column group, superblock): eight columns' blocks into 8 tiles and the record.
-  q.parallel_for(sycl::range<2>(size_t(ng), size_t(nsb)), [=](sycl::id<2> id) {
-    const int64_t g = int64_t(id[0]), sb = int64_t(id[1]);
-    uint8_t* rec = meta + (g * nsb + sb) * G.rec_bytes;
-    uint8_t* tile0 = tiles + (g * kb + sb * 8) * 128;
+  q.parallel_for(sycl::range<3>(size_t(count), size_t(ng), size_t(nsb)), [=](sycl::id<3> id) {
+    const int64_t x = int64_t(id[0]), g = int64_t(id[1]), sb = int64_t(id[2]);
+    uint8_t* rec = meta + x * ms + (g * nsb + sb) * G.rec_bytes;
+    uint8_t* tile0 = tiles + x * ts + (g * kb + sb * 8) * 128;
     for (int n = 0; n < 8; ++n) {
       const int64_t row = interleave ? (g % 2) * half_rows + (g / 2) * 8 + n : g * 8 + n;
-      const uint8_t* blk = src + uint64_t(row) * row_bytes + uint64_t(sb) * G.block_bytes;
+      const uint8_t* blk = src + uint64_t(x) * rs + uint64_t(row) * row_bytes + uint64_t(sb) * G.block_bytes;
       if (f == WeightFormat::Q4_K || f == WeightFormat::Q5_K) {
         rec[n * 2] = blk[0];
         rec[n * 2 + 1] = blk[1];

@@ -1,0 +1,157 @@
+eklow-server: qwen36 on Intel(R) Arc(TM) A770M Graphics, 5.67 GiB of weights, 5.84 GiB of KV cache and state (2 slots of 262144), 11.6 s
+eklow-server: experts on the card: N = 59 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 6.05 GiB, margin 1.00 GiB, free after 1.87 GiB)
+eklow-server: prefill streams busy cold experts to the card: 80 slots, 12.99 GiB of cold experts pinned in host memory
+eklow-server: DFlash 2 draft /home/fiona/models/drafts/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf: blocks of 4 (trained for 8), window 2048, 780 MiB on the card (its token table stays on the host); free card memory now 1.07 GiB
+eklow-server: chat template stock, sampling defaults temperature 1, top-k 20, top-p 0.95, min-p 0; snapshots of 64 MiB each, up to 4096 MiB
+eklow-server: embeddinggemma-2, 0.27 GiB, listening on 127.0.0.1:18182
+eklow-server: listening on 127.0.0.1:18181
+23:23:02 engine: prompt 812.9 tok/s, generation 4.4 tok/s | running 1, waiting 0 | kv 1.6% (8176 of 524288 positions, 0 cached) | prefix hit 0.0% | draft 3.31 tokens/verify, 76.9% of 39 drafted accepted | per step: engine 367.3 ms, draft 3.9, sample 2.5, inject 1.0, snapshot 1.9 | snapshots 3 (193 MiB), 3 taken, 0 restored
+23:23:08 request chatcmpl-ba268917ee01c6365588e202: length | prompt 8133, completion 256 | queue 0.00 s, ttft 6.68 s, prefill 1216.9 tok/s, decode 41.8 tok/s | draft 2.79 tokens/verify, 165 of 276 accepted
+eklow-server: prefix: the slot's sequence (8388 tokens) and the prompt (8131) part at token 8116: sampled Sum, prompt List; reusing 8116
+23:23:12 engine: prompt 1.5 tok/s, generation 40.0 tok/s | running 1, waiting 0 | kv 1.6% (8319 of 524288 positions, 0 cached) | prefix hit 99.8% | draft 2.66 tokens/verify, 55.2% of 453 drafted accepted | per step: engine 56.0 ms, draft 5.3, sample 3.4, inject 0.5, snapshot 0.2 | snapshots 3 (193 MiB), 2 taken, 1 restored
+23:23:14 request chatcmpl-d91b4d51cb5363b85dadc720: length | prompt 8131 (8116 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 85.7 tok/s, decode 40.9 tok/s | draft 2.60 tokens/verify, 157 of 294 accepted
+eklow-server: prefix: the slot's sequence (8386 tokens) and the prompt (8134) part at token 8116: sampled List, prompt What; reusing 8116
+23:23:20 request chatcmpl-6e33c1cdc52aba2d67c57c94: length | prompt 8134 (8116 cached), completion 256 | queue 0.01 s, ttft 0.20 s, prefill 95.3 tok/s, decode 45.0 tok/s | draft 2.98 tokens/verify, 170 of 258 accepted
+eklow-server: prefix: the slot's sequence (8389 tokens) and the prompt (8131) part at token 8116: sampled What, prompt Write; reusing 8116
+23:23:22 engine: prompt 3.3 tok/s, generation 43.4 tok/s | running 1, waiting 0 | kv 1.6% (8243 of 524288 positions, 0 cached) | prefix hit 99.8% | draft 2.93 tokens/verify, 64.2% of 444 drafted accepted | per step: engine 55.4 ms, draft 5.3, sample 4.0, inject 0.5, snapshot 0.3 | snapshots 3 (193 MiB), 4 taken, 2 restored
+23:23:26 request chatcmpl-21a26a742f132fef81291065: length | prompt 8131 (8116 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 87.4 tok/s, decode 41.4 tok/s | draft 2.69 tokens/verify, 161 of 285 accepted
+eklow-server: prefix: the slot's sequence (8386 tokens) and the prompt (8131) part at token 8116: sampled Write, prompt Give; reusing 8116
+23:23:32 engine: prompt 1.5 tok/s, generation 38.9 tok/s | running 1, waiting 0 | kv 1.6% (8373 of 524288 positions, 0 cached) | prefix hit 99.8% | draft 2.58 tokens/verify, 52.5% of 453 drafted accepted | per step: engine 55.7 ms, draft 5.3, sample 3.6, inject 0.5, snapshot 0.2 | snapshots 3 (193 MiB), 2 taken, 1 restored
+23:23:33 request chatcmpl-2d0bf7f4d0f02bc0212e5268: length | prompt 8131 (8116 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 86.9 tok/s, decode 40.1 tok/s | draft 2.60 tokens/verify, 157 of 294 accepted
+eklow-server: prefix: the slot's sequence (8386 tokens) and the prompt (8131) part at token 8116: sampled Give, prompt List; reusing 8116
+23:23:41 request chatcmpl-38add5750fb94d9b55e9a329: length | prompt 8131 (8116 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 85.9 tok/s, decode 31.9 tok/s
+eklow-server: prefix: the slot's sequence (8386 tokens) and the prompt (8134) part at token 8116: sampled List, prompt What; reusing 8116
+23:23:42 engine: prompt 3.3 tok/s, generation 31.1 tok/s | running 1, waiting 0 | kv 1.6% (8175 of 524288 positions, 0 cached) | prefix hit 99.8% | draft 2.17 tokens/verify, 38.9% of 18 drafted accepted | per step: engine 30.9 ms, draft 0.1, sample 1.2, inject 0.5, snapshot 0.2 | snapshots 3 (193 MiB), 4 taken, 2 restored
+23:23:49 request chatcmpl-b863d98dd668e1966902abd2: length | prompt 8134 (8116 cached), completion 256 | queue 0.01 s, ttft 0.19 s, prefill 97.1 tok/s, decode 32.5 tok/s
+eklow-server: prefix: the slot's sequence (8389 tokens) and the prompt (8131) part at token 8116: sampled What, prompt Write; reusing 8116
+23:23:52 engine: prompt 1.5 tok/s, generation 31.9 tok/s | running 1, waiting 0 | kv 1.6% (8235 of 524288 positions, 0 cached) | prefix hit 99.8% | snapshots 3 (193 MiB), 2 taken, 1 restored
+23:23:57 request chatcmpl-19f77c61ffa6b12efa6370b7: length | prompt 8131 (8116 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 86.0 tok/s, decode 32.2 tok/s
+23:24:02 engine: prompt 409.4 tok/s, generation 15.1 tok/s | running 1, waiting 0 | kv 2.4% (12482 of 524288 positions, 8386 cached) | prefix hit 0.0% | snapshots 4 (257 MiB), 1 taken, 0 restored
+23:24:12 engine: prompt 1433.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 5.1% (26818 of 524288 positions, 8386 cached) | snapshots 5 (321 MiB), 1 taken, 0 restored
+23:24:22 engine: prompt 1228.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 7.5% (39106 of 524288 positions, 8386 cached) | snapshots 5 (321 MiB), 0 taken, 0 restored
+23:24:31 request chatcmpl-8b8c4987e18f39f6334584e0: length | prompt 32709, completion 256 | queue 0.00 s, ttft 25.46 s, prefill 1284.5 tok/s, decode 41.2 tok/s | draft 2.69 tokens/verify, 161 of 285 accepted
+eklow-server: prefix: the slot's sequence (32964 tokens) and the prompt (32707) part at token 32692: sampled Sum, prompt List; reusing 32692
+23:24:32 engine: prompt 200.3 tok/s, generation 32.4 tok/s | running 1, waiting 0 | kv 7.9% (41160 of 524288 positions, 8386 cached) | prefix hit 100.0% | draft 2.69 tokens/verify, 56.4% of 360 drafted accepted | per step: engine 72.6 ms, draft 5.1, sample 3.6, inject 0.6, snapshot 0.5 | snapshots 8 (514 MiB), 5 taken, 1 restored
+23:24:37 request chatcmpl-e15e22a71009550f7277a548: length | prompt 32707 (32692 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 85.3 tok/s, decode 37.9 tok/s | draft 2.48 tokens/verify, 154 of 312 accepted
+eklow-server: prefix: the slot's sequence (32962 tokens) and the prompt (32710) part at token 32692: sampled List, prompt What; reusing 32692
+23:24:42 engine: prompt 1.8 tok/s, generation 40.0 tok/s | running 1, waiting 0 | kv 7.9% (41307 of 524288 positions, 8386 cached) | prefix hit 99.9% | draft 2.66 tokens/verify, 55.4% of 453 drafted accepted | per step: engine 55.4 ms, draft 5.3, sample 3.9, inject 0.6, snapshot 0.2 | snapshots 8 (514 MiB), 2 taken, 1 restored
+23:24:43 request chatcmpl-c023e0cce5028f1e9f04e300: length | prompt 32710 (32692 cached), completion 256 | queue 0.01 s, ttft 0.20 s, prefill 93.4 tok/s, decode 44.0 tok/s | draft 2.93 tokens/verify, 170 of 264 accepted
+eklow-server: prefix: the slot's sequence (32965 tokens) and the prompt (32707) part at token 32692: sampled What, prompt Write; reusing 32692
+23:24:49 request chatcmpl-b573f4c893ad096f3d766e65: length | prompt 32707 (32692 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 88.0 tok/s, decode 47.7 tok/s | draft 3.13 tokens/verify, 175 of 246 accepted
+eklow-server: prefix: the slot's sequence (32962 tokens) and the prompt (32707) part at token 32692: sampled Write, prompt Give; reusing 32692
+23:24:52 engine: prompt 3.0 tok/s, generation 44.6 tok/s | running 1, waiting 0 | kv 7.9% (41240 of 524288 positions, 8386 cached) | prefix hit 100.0% | draft 3.03 tokens/verify, 67.8% of 444 drafted accepted | per step: engine 55.5 ms, draft 5.2, sample 4.2, inject 0.6, snapshot 0.3 | snapshots 8 (514 MiB), 4 taken, 2 restored
+23:24:55 request chatcmpl-c21cd869656f2473cb9b9854: length | prompt 32707 (32692 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 88.8 tok/s, decode 44.0 tok/s | draft 2.87 tokens/verify, 166 of 267 accepted
+eklow-server: prefix: the slot's sequence (32962 tokens) and the prompt (32707) part at token 32692: sampled Give, prompt List; reusing 32692
+23:25:02 engine: prompt 1.5 tok/s, generation 35.0 tok/s | running 1, waiting 0 | kv 7.9% (41332 of 524288 positions, 8386 cached) | prefix hit 100.0% | draft 2.82 tokens/verify, 60.7% of 117 drafted accepted | per step: engine 32.7 ms, draft 0.7, sample 1.6, inject 0.5, snapshot 0.1 | snapshots 8 (514 MiB), 2 taken, 1 restored
+23:25:03 request chatcmpl-a4b6bf8669338f5b8dedbdfe: length | prompt 32707 (32692 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 85.5 tok/s, decode 32.9 tok/s
+eklow-server: prefix: the slot's sequence (32962 tokens) and the prompt (32710) part at token 32692: sampled List, prompt What; reusing 32692
+23:25:11 request chatcmpl-9bc4cdcb428b78a68ebe490b: length | prompt 32710 (32692 cached), completion 256 | queue 0.01 s, ttft 0.20 s, prefill 95.1 tok/s, decode 33.0 tok/s
+eklow-server: prefix: the slot's sequence (32965 tokens) and the prompt (32707) part at token 32692: sampled What, prompt Write; reusing 32692
+23:25:12 engine: prompt 3.3 tok/s, generation 31.9 tok/s | running 1, waiting 0 | kv 7.8% (41139 of 524288 positions, 8386 cached) | prefix hit 99.9% | snapshots 8 (514 MiB), 4 taken, 2 restored
+23:25:19 request chatcmpl-eb06aaf37453fcee03e0affe: length | prompt 32707 (32692 cached), completion 256 | queue 0.01 s, ttft 0.18 s, prefill 87.7 tok/s, decode 33.2 tok/s
+23:25:22 engine: prompt 204.7 tok/s, generation 20.9 tok/s | running 1, waiting 0 | kv 6.7% (35010 of 524288 positions, 32962 cached) | prefix hit 0.0% | snapshots 5 (321 MiB), 1 taken, 0 restored
+23:25:32 engine: prompt 1228.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 9.0% (47298 of 524288 positions, 32962 cached) | snapshots 5 (321 MiB), 0 taken, 0 restored
+23:25:42 engine: prompt 1228.2 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 11.4% (59586 of 524288 positions, 32962 cached) | snapshots 6 (385 MiB), 1 taken, 0 restored
+23:25:52 engine: prompt 1023.5 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 13.3% (69826 of 524288 positions, 32962 cached) | snapshots 7 (450 MiB), 1 taken, 0 restored
+23:26:02 engine: prompt 1023.5 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 15.3% (80066 of 524288 positions, 32962 cached) | snapshots 7 (450 MiB), 0 taken, 0 restored
+23:26:12 engine: prompt 1023.4 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 17.2% (90306 of 524288 positions, 32962 cached) | snapshots 8 (514 MiB), 1 taken, 0 restored
+23:26:22 engine: prompt 818.8 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 18.8% (98498 of 524288 positions, 32962 cached) | snapshots 9 (578 MiB), 1 taken, 0 restored
+23:26:32 engine: prompt 818.8 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 20.3% (106690 of 524288 positions, 32962 cached) | snapshots 9 (578 MiB), 0 taken, 0 restored
+23:26:42 engine: prompt 818.8 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 21.9% (114882 of 524288 positions, 32962 cached) | snapshots 10 (642 MiB), 1 taken, 0 restored
+23:26:52 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 23.1% (121026 of 524288 positions, 32962 cached) | snapshots 10 (642 MiB), 0 taken, 0 restored
+23:27:02 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 24.3% (127170 of 524288 positions, 32962 cached) | snapshots 10 (642 MiB), 0 taken, 0 restored
+23:27:12 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 25.4% (133314 of 524288 positions, 32962 cached) | snapshots 11 (706 MiB), 1 taken, 0 restored
+23:27:23 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 26.6% (139458 of 524288 positions, 32962 cached) | snapshots 11 (706 MiB), 0 taken, 0 restored
+23:27:33 engine: prompt 614.1 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 27.8% (145602 of 524288 positions, 32962 cached) | snapshots 11 (706 MiB), 0 taken, 0 restored
+23:27:43 engine: prompt 409.4 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 28.6% (149698 of 524288 positions, 32962 cached) | snapshots 12 (771 MiB), 1 taken, 0 restored
+23:27:53 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 29.7% (155842 of 524288 positions, 32962 cached) | snapshots 12 (771 MiB), 0 taken, 0 restored
+23:28:03 engine: prompt 409.4 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 30.5% (159938 of 524288 positions, 32962 cached) | snapshots 12 (771 MiB), 0 taken, 0 restored
+23:28:13 engine: prompt 403.5 tok/s, generation 13.9 tok/s | running 1, waiting 0 | kv 31.3% (164114 of 524288 positions, 32962 cached) | draft 2.26 tokens/verify, 42.1% of 183 drafted accepted | per step: engine 196.4 ms, draft 5.1, sample 2.4, inject 0.8, snapshot 0.5 | snapshots 15 (963 MiB), 3 taken, 0 restored
+23:28:17 request chatcmpl-bbb8da0808e31aeabc0dd314: length | prompt 131013, completion 256 | queue 0.00 s, ttft 167.17 s, prefill 783.7 tok/s, decode 27.5 tok/s | draft 2.07 tokens/verify, 132 of 369 accepted
+eklow-server: prefix: the slot's sequence (131268 tokens) and the prompt (131011) part at token 130996: sampled Sum, prompt List; reusing 130996
+23:28:23 engine: prompt 1.5 tok/s, generation 32.1 tok/s | running 1, waiting 0 | kv 31.3% (164177 of 524288 positions, 32962 cached) | prefix hit 100.0% | draft 2.48 tokens/verify, 49.4% of 387 drafted accepted | per step: engine 66.5 ms, draft 5.4, sample 3.3, inject 0.5, snapshot 0.2 | snapshots 15 (963 MiB), 2 taken, 1 restored
+23:28:24 request chatcmpl-80fb84aa80e579ee04b42d4c: length | prompt 131011 (130996 cached), completion 256 | queue 0.01 s, ttft 0.23 s, prefill 65.8 tok/s, decode 39.1 tok/s | draft 3.00 tokens/verify, 172 of 258 accepted
+eklow-server: prefix: the slot's sequence (131266 tokens) and the prompt (131014) part at token 130996: sampled List, prompt What; reusing 130996
+23:28:30 request chatcmpl-003d96fb0e1cdf9408761c61: length | prompt 131014 (130996 cached), completion 256 | queue 0.01 s, ttft 0.27 s, prefill 69.6 tok/s, decode 46.6 tok/s | draft 3.69 tokens/verify, 188 of 210 accepted
+eklow-server: prefix: the slot's sequence (131269 tokens) and the prompt (131011) part at token 130996: sampled What, prompt Write; reusing 130996
+23:28:33 engine: prompt 3.3 tok/s, generation 40.4 tok/s | running 1, waiting 0 | kv 31.3% (164070 of 524288 positions, 32962 cached) | prefix hit 100.0% | draft 3.34 tokens/verify, 78.1% of 366 drafted accepted | per step: engine 67.8 ms, draft 5.1, sample 4.6, inject 0.6, snapshot 0.4 | snapshots 15 (963 MiB), 4 taken, 2 restored
+23:28:37 request chatcmpl-440579819fffb54abfa5d273: length | prompt 131011 (130996 cached), completion 256 | queue 0.01 s, ttft 0.23 s, prefill 67.8 tok/s, decode 38.7 tok/s | draft 2.97 tokens/verify, 171 of 261 accepted
+eklow-server: prefix: the slot's sequence (131266 tokens) and the prompt (131011) part at token 130996: sampled Write, prompt Give; reusing 130996
+23:28:43 engine: prompt 1.5 tok/s, generation 34.7 tok/s | running 1, waiting 0 | kv 31.3% (164162 of 524288 positions, 32962 cached) | prefix hit 100.0% | draft 2.71 tokens/verify, 56.8% of 387 drafted accepted | per step: engine 66.7 ms, draft 5.2, sample 3.6, inject 0.5, snapshot 0.2 | snapshots 15 (963 MiB), 2 taken, 1 restored
+23:28:45 request chatcmpl-8a162089e499b21c333aa9a4: length | prompt 131011 (130996 cached), completion 256 | queue 0.01 s, ttft 0.23 s, prefill 67.4 tok/s, decode 31.3 tok/s | draft 2.34 tokens/verify, 146 of 327 accepted
+eklow-server: prefix: the slot's sequence (131266 tokens) and the prompt (131011) part at token 130996: sampled Give, prompt List; reusing 130996
+23:28:53 engine: prompt 1.5 tok/s, generation 27.4 tok/s | running 1, waiting 0 | kv 31.3% (164177 of 524288 positions, 32962 cached) | prefix hit 100.0% | draft 2.03 tokens/verify, 34.3% of 102 drafted accepted | per step: engine 38.9 ms, draft 0.7, sample 1.3, inject 0.5, snapshot 0.1 | snapshots 15 (963 MiB), 2 taken, 1 restored
+23:28:54 request chatcmpl-b7d8ba93a6ff7059a71472cb: length | prompt 131011 (130996 cached), completion 256 | queue 0.01 s, ttft 0.24 s, prefill 63.4 tok/s, decode 28.0 tok/s
+eklow-server: prefix: the slot's sequence (131266 tokens) and the prompt (131014) part at token 130996: sampled List, prompt What; reusing 130996
+23:29:03 engine: prompt 1.8 tok/s, generation 27.9 tok/s | running 1, waiting 0 | kv 31.3% (164203 of 524288 positions, 32962 cached) | prefix hit 100.0% | snapshots 15 (963 MiB), 2 taken, 1 restored
+23:29:04 request chatcmpl-a3c33aa022d6ea3e49247ada: length | prompt 131014 (130996 cached), completion 256 | queue 0.01 s, ttft 0.26 s, prefill 69.9 tok/s, decode 28.8 tok/s
+eklow-server: prefix: the slot's sequence (131269 tokens) and the prompt (131011) part at token 130996: sampled What, prompt Write; reusing 130996
+23:29:13 engine: prompt 1.5 tok/s, generation 27.5 tok/s | running 1, waiting 0 | kv 31.3% (164219 of 524288 positions, 32962 cached) | prefix hit 100.0% | snapshots 15 (963 MiB), 2 taken, 1 restored
+23:29:13 request chatcmpl-4574873a82bd34cde09fb4eb: length | prompt 131011 (130996 cached), completion 256 | queue 0.01 s, ttft 0.23 s, prefill 67.0 tok/s, decode 28.1 tok/s
+23:29:23 engine: prompt 818.8 tok/s, generation 0.9 tok/s | running 1, waiting 0 | kv 26.6% (139458 of 524288 positions, 131266 cached) | prefix hit 0.0% | snapshots 11 (706 MiB), 1 taken, 0 restored
+23:29:33 engine: prompt 1228.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 28.9% (151746 of 524288 positions, 131266 cached) | snapshots 12 (771 MiB), 1 taken, 0 restored
+23:29:43 engine: prompt 1023.5 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 30.9% (161986 of 524288 positions, 131266 cached) | snapshots 12 (771 MiB), 0 taken, 0 restored
+23:29:53 engine: prompt 1023.5 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 32.8% (172226 of 524288 positions, 131266 cached) | snapshots 13 (835 MiB), 1 taken, 0 restored
+23:30:03 engine: prompt 818.7 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 34.4% (180418 of 524288 positions, 131266 cached) | snapshots 14 (899 MiB), 1 taken, 0 restored
+23:30:13 engine: prompt 614.1 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 35.6% (186562 of 524288 positions, 131266 cached) | snapshots 14 (899 MiB), 0 taken, 0 restored
+23:30:23 engine: prompt 818.8 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 37.1% (194754 of 524288 positions, 131266 cached) | snapshots 14 (899 MiB), 0 taken, 0 restored
+23:30:33 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 38.3% (200898 of 524288 positions, 131266 cached) | snapshots 15 (963 MiB), 1 taken, 0 restored
+23:30:43 engine: prompt 818.8 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 39.9% (209090 of 524288 positions, 131266 cached) | snapshots 15 (963 MiB), 0 taken, 0 restored
+23:30:53 engine: prompt 614.1 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 41.1% (215234 of 524288 positions, 131266 cached) | snapshots 16 (1028 MiB), 1 taken, 0 restored
+23:31:03 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 42.2% (221378 of 524288 positions, 131266 cached) | snapshots 16 (1028 MiB), 0 taken, 0 restored
+23:31:13 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 43.4% (227522 of 524288 positions, 131266 cached) | snapshots 16 (1028 MiB), 0 taken, 0 restored
+23:31:23 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 44.6% (233666 of 524288 positions, 131266 cached) | snapshots 17 (1092 MiB), 1 taken, 0 restored
+23:31:33 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 45.7% (239810 of 524288 positions, 131266 cached) | snapshots 17 (1092 MiB), 0 taken, 0 restored
+23:31:43 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 46.9% (245954 of 524288 positions, 131266 cached) | snapshots 18 (1156 MiB), 1 taken, 0 restored
+23:31:53 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 48.1% (252098 of 524288 positions, 131266 cached) | snapshots 18 (1156 MiB), 0 taken, 0 restored
+23:32:03 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 49.3% (258242 of 524288 positions, 131266 cached) | snapshots 18 (1156 MiB), 0 taken, 0 restored
+23:32:13 engine: prompt 614.1 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 50.4% (264386 of 524288 positions, 131266 cached) | snapshots 19 (1220 MiB), 1 taken, 0 restored
+23:32:23 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 51.2% (268482 of 524288 positions, 131266 cached) | snapshots 19 (1220 MiB), 0 taken, 0 restored
+23:32:33 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 52.4% (274626 of 524288 positions, 131266 cached) | snapshots 19 (1220 MiB), 0 taken, 0 restored
+23:32:43 engine: prompt 614.1 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 53.6% (280770 of 524288 positions, 131266 cached) | snapshots 20 (1284 MiB), 1 taken, 0 restored
+23:32:53 engine: prompt 409.5 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 54.3% (284866 of 524288 positions, 131266 cached) | snapshots 20 (1284 MiB), 0 taken, 0 restored
+23:33:03 engine: prompt 614.2 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 55.5% (291010 of 524288 positions, 131266 cached) | snapshots 20 (1284 MiB), 0 taken, 0 restored
+23:33:13 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 56.3% (295106 of 524288 positions, 131266 cached) | snapshots 21 (1349 MiB), 1 taken, 0 restored
+23:33:23 engine: prompt 409.4 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 57.1% (299202 of 524288 positions, 131266 cached) | snapshots 21 (1349 MiB), 0 taken, 0 restored
+23:33:33 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 58.2% (305346 of 524288 positions, 131266 cached) | snapshots 21 (1349 MiB), 0 taken, 0 restored
+23:33:43 engine: prompt 409.4 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 59.0% (309442 of 524288 positions, 131266 cached) | snapshots 21 (1349 MiB), 0 taken, 0 restored
+23:33:53 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 60.2% (315586 of 524288 positions, 131266 cached) | snapshots 22 (1413 MiB), 1 taken, 0 restored
+23:34:03 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 61.0% (319682 of 524288 positions, 131266 cached) | snapshots 22 (1413 MiB), 0 taken, 0 restored
+23:34:13 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 61.8% (323778 of 524288 positions, 131266 cached) | snapshots 22 (1413 MiB), 0 taken, 0 restored
+23:34:23 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 62.5% (327874 of 524288 positions, 131266 cached) | snapshots 23 (1477 MiB), 1 taken, 0 restored
+23:34:33 engine: prompt 409.4 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 63.3% (331970 of 524288 positions, 131266 cached) | snapshots 23 (1477 MiB), 0 taken, 0 restored
+23:34:43 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 64.1% (336066 of 524288 positions, 131266 cached) | snapshots 23 (1477 MiB), 0 taken, 0 restored
+23:34:53 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 64.9% (340162 of 524288 positions, 131266 cached) | snapshots 23 (1477 MiB), 0 taken, 0 restored
+23:35:03 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 65.7% (344258 of 524288 positions, 131266 cached) | snapshots 24 (1541 MiB), 1 taken, 0 restored
+23:35:13 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 66.4% (348354 of 524288 positions, 131266 cached) | snapshots 24 (1541 MiB), 0 taken, 0 restored
+23:35:23 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 67.2% (352450 of 524288 positions, 131266 cached) | snapshots 24 (1541 MiB), 0 taken, 0 restored
+23:35:33 engine: prompt 614.0 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 68.4% (358594 of 524288 positions, 131266 cached) | snapshots 24 (1541 MiB), 0 taken, 0 restored
+23:35:43 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 69.2% (362690 of 524288 positions, 131266 cached) | snapshots 25 (1605 MiB), 1 taken, 0 restored
+23:35:53 engine: prompt 409.4 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 70.0% (366786 of 524288 positions, 131266 cached) | snapshots 25 (1605 MiB), 0 taken, 0 restored
+23:36:03 engine: prompt 204.7 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 70.3% (368834 of 524288 positions, 131266 cached) | snapshots 25 (1605 MiB), 0 taken, 0 restored
+23:36:13 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 71.1% (372930 of 524288 positions, 131266 cached) | snapshots 25 (1605 MiB), 0 taken, 0 restored
+23:36:23 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 71.9% (377026 of 524288 positions, 131266 cached) | snapshots 26 (1670 MiB), 1 taken, 0 restored
+23:36:33 engine: prompt 409.3 tok/s, generation 0.0 tok/s | running 1, waiting 0 | kv 72.7% (381122 of 524288 positions, 131266 cached) | snapshots 26 (1670 MiB), 0 taken, 0 restored
+23:36:43 engine: prompt 208.4 tok/s, generation 14.6 tok/s | running 1, waiting 0 | kv 73.1% (383354 of 524288 positions, 131266 cached) | draft 2.27 tokens/verify, 42.2% of 192 drafted accepted | per step: engine 174.5 ms, draft 5.1, sample 2.5, inject 0.7, snapshot 0.6 | snapshots 29 (1862 MiB), 3 taken, 0 restored
+23:36:47 request chatcmpl-6db17bcaa5e89703f96e70b9: length | prompt 251941, completion 256 | queue 0.00 s, ttft 442.04 s, prefill 570.0 tok/s, decode 24.7 tok/s | draft 2.29 tokens/verify, 144 of 336 accepted
+eklow-server: prefix: the slot's sequence (252196 tokens) and the prompt (251939) part at token 251924: sampled Sum, prompt List; reusing 251924
+23:36:53 engine: prompt 1.5 tok/s, generation 26.6 tok/s | running 1, waiting 0 | kv 73.1% (383363 of 524288 positions, 131266 cached) | prefix hit 100.0% | draft 2.58 tokens/verify, 52.8% of 309 drafted accepted | per step: engine 85.2 ms, draft 5.2, sample 3.5, inject 0.5, snapshot 0.3 | snapshots 29 (1862 MiB), 2 taken, 1 restored
+23:36:56 request chatcmpl-c8d369eb4d4cb3bd4df37920: length | prompt 251939 (251924 cached), completion 256 | queue 0.01 s, ttft 0.32 s, prefill 48.3 tok/s, decode 29.9 tok/s | draft 2.80 tokens/verify, 164 of 273 accepted
+eklow-server: prefix: the slot's sequence (252194 tokens) and the prompt (251942) part at token 251924: sampled List, prompt What; reusing 251924
+23:37:03 engine: prompt 1.8 tok/s, generation 33.0 tok/s | running 1, waiting 0 | kv 73.1% (383437 of 524288 positions, 131266 cached) | prefix hit 100.0% | draft 3.29 tokens/verify, 76.3% of 300 drafted accepted | per step: engine 86.7 ms, draft 5.2, sample 4.7, inject 0.6, snapshot 0.2 | snapshots 29 (1862 MiB), 2 taken, 1 restored
+23:37:03 request chatcmpl-6d75776450e0d8b5310150d6: length | prompt 251942 (251924 cached), completion 256 | queue 0.01 s, ttft 0.36 s, prefill 51.6 tok/s, decode 36.6 tok/s | draft 3.61 tokens/verify, 185 of 213 accepted
+eklow-server: prefix: the slot's sequence (252197 tokens) and the prompt (251939) part at token 251924: sampled What, prompt Write; reusing 251924
+23:37:12 request chatcmpl-ad6a4bfc309f11e6193d157e: length | prompt 251939 (251924 cached), completion 256 | queue 0.01 s, ttft 0.31 s, prefill 49.4 tok/s, decode 31.3 tok/s | draft 3.06 tokens/verify, 173 of 252 accepted
+eklow-server: prefix: the slot's sequence (252194 tokens) and the prompt (251939) part at token 251924: sampled Write, prompt Give; reusing 251924
+23:37:13 engine: prompt 3.0 tok/s, generation 29.9 tok/s | running 1, waiting 0 | kv 73.1% (383221 of 524288 positions, 131266 cached) | prefix hit 100.0% | draft 3.16 tokens/verify, 71.9% of 285 drafted accepted | per step: engine 89.1 ms, draft 5.0, sample 4.5, inject 0.6, snapshot 0.5 | snapshots 29 (1862 MiB), 4 taken, 2 restored
+23:37:22 request chatcmpl-afcb2e257839e98e07ad7a3b: length | prompt 251939 (251924 cached), completion 256 | queue 0.01 s, ttft 0.31 s, prefill 49.2 tok/s, decode 27.0 tok/s | draft 2.54 tokens/verify, 156 of 303 accepted
+eklow-server: prefix: the slot's sequence (252194 tokens) and the prompt (251939) part at token 251924: sampled Give, prompt List; reusing 251924
+23:37:23 engine: prompt 1.5 tok/s, generation 25.5 tok/s | running 1, waiting 0 | kv 73.1% (383220 of 524288 positions, 131266 cached) | prefix hit 100.0% | draft 2.48 tokens/verify, 49.5% of 291 drafted accepted | per step: engine 79.2 ms, draft 4.4, sample 3.2, inject 0.6, snapshot 0.2 | snapshots 29 (1862 MiB), 2 taken, 1 restored
+23:37:32 request chatcmpl-6528c5dd8fb479ca5e53cc7e: length | prompt 251939 (251924 cached), completion 256 | queue 0.01 s, ttft 0.31 s, prefill 49.0 tok/s, decode 25.0 tok/s
+eklow-server: prefix: the slot's sequence (252194 tokens) and the prompt (251942) part at token 251924: sampled List, prompt What; reusing 251924
+23:37:33 engine: prompt 1.8 tok/s, generation 24.1 tok/s | running 1, waiting 0 | kv 73.1% (383208 of 524288 positions, 131266 cached) | prefix hit 100.0% | snapshots 29 (1862 MiB), 2 taken, 1 restored
+23:37:43 engine: prompt 0.0 tok/s, generation 25.2 tok/s | running 1, waiting 0 | kv 73.1% (383460 of 524288 positions, 131266 cached) | snapshots 29 (1862 MiB), 0 taken, 0 restored
+23:37:43 request chatcmpl-0e345ae9872e28d4340fe082: length | prompt 251942 (251924 cached), completion 256 | queue 0.01 s, ttft 0.35 s, prefill 51.8 tok/s, decode 25.2 tok/s
+eklow-server: prefix: the slot's sequence (252197 tokens) and the prompt (251939) part at token 251924: sampled What, prompt Write; reusing 251924
+23:37:53 engine: prompt 1.5 tok/s, generation 24.8 tok/s | running 1, waiting 0 | kv 73.1% (383449 of 524288 positions, 131266 cached) | prefix hit 100.0% | snapshots 29 (1862 MiB), 2 taken, 1 restored
+23:37:53 request chatcmpl-a38e173828683a9751d56b37: length | prompt 251939 (251924 cached), completion 256 | queue 0.01 s, ttft 0.31 s, prefill 49.3 tok/s, decode 25.6 tok/s

@@ -1,0 +1,2 @@
+stream: 1102 tokens; 40.9 tok/s before the document; document 8192 tokens: ttft 5.91 s; longest gap in the stream after it arrived 3.96 s; 948 tokens came out during/after
+stream: 1102 tokens; 40.6 tok/s before the document; document 32768 tokens: ttft 24.44 s; longest gap in the stream after it arrived 4.87 s; 948 tokens came out during/after

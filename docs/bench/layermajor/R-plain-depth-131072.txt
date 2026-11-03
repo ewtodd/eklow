@@ -1,0 +1,11 @@
+request | prompt 131013 (0 cached), completion 256 | ttft 167.20 s, prefill 783.6 tok/s, decode 27.5 tok/s, 2.07 tokens/verify
+request | prompt 131011 (130996 cached), completion 256 | ttft 0.26 s, prefill 56.9 tok/s, decode 39.2 tok/s, 3.00 tokens/verify
+request | prompt 131014 (130996 cached), completion 256 | ttft 0.30 s, prefill 60.9 tok/s, decode 46.7 tok/s, 3.69 tokens/verify
+request | prompt 131011 (130996 cached), completion 256 | ttft 0.26 s, prefill 57.6 tok/s, decode 38.7 tok/s, 2.97 tokens/verify
+request | prompt 131011 (130996 cached), completion 256 | ttft 0.26 s, prefill 57.9 tok/s, decode 31.3 tok/s, 2.34 tokens/verify
+plain request | prompt 131011 (130996 cached), completion 256 | ttft 0.27 s, decode 28.0 tok/s
+plain request | prompt 131014 (130996 cached), completion 256 | ttft 0.29 s, decode 28.8 tok/s
+plain request | prompt 131011 (130996 cached), completion 256 | ttft 0.26 s, decode 28.1 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 5    tokens/verify
+128k          784 (167.2 s)        38.7              2.81        plain 28.1

@@ -1,0 +1,59 @@
+Layer-major prefill (qwen/layermajor), 2026-11-02/03, fiona, A770M. The raw files of these runs were deleted by an rsync --delete
+of the worktree; what follows is copied from the console as it was read at the time (engineq = bench.sh engineq, EKK8, the
+production shape of 2 x 262,144 with int8 KV, experts by the card's free memory, tokens from ~/eklow-qe/prof/prose.json).
+
+== Smoke, engineq --prefill 2048,8192 --group 4 --depth 8192 (first run of the engine): 67 of 256 experts a layer
+prefill 2048 tokens: 1192.4 tok/s | prefill 8192: 1913.2 tok/s (plain path for 2048; one group step of 4 sub-chunks for 8192)
+layer-major: per layer 115.5 streamed experts in 2.00 waves, 34276 streamed pairs, 3084 pairs on the CPU; host waits: routing 71.5 ms,
+repack before the next copy 28.6 ms; CPU task 31.3 ms (of which 2.2 ms waited for after the waves)
+
+== B (old order of work: every sub-chunk finished its layer before the next; per-expert repack), placement 69 / 68 / 67 / 66 experts a layer
+plain  (G=1): prefill 2048 1322, 8192 1292, 16384 1292, 32768 1184; depth 8192 1193, 32768 1031, 131072 530 (4096 tokens timed)
+G=2: 8192 1460, 16384 1422, 32768 1217; depth 8192 1196, 32768 961, 131072 554
+G=4: 8192 1543, 16384 1474, 32768 1428; depth 8192 1412, 32768 939, 131072 536 (8192 tokens timed)
+G=8: 8192 1737, 16384 1886, 32768 1607; depth 8192 1447, 32768 953, 131072 612 (16384 tokens timed)
+decode, one slot, 0 / 8k / 32k / 128k: plain 41.1 / 41.1 / 40.0 / 32.3; G=2 41.3 / 41.3 / 38.8 / 33.5; G=8 40.8 / 40.7 / 38.9 / 32.6 tok/s
+verify blocks of 8 at 8k: plain 70.9 ms, G=2 70.2, G=8 68.4; of 16: 109.3, 103.9, 108.9
+
+== C (early copies against the old order, one run each, tok/s)
+G=4 early: 2048 1191, 8192 1878, 16384 1742, 32768 1663; depth 32768 1378, 131072 526
+G=4 old:   2048 1186, 8192 1637, 16384 1499, 32768 1466; depth 32768 1123, 131072 602
+G=8 early: 8192 1596, 16384 1603, 32768 1505; depth 32768 1117, 131072 588
+G=8 old:   8192 1630, 16384 1690, 32768 1561; depth 32768 1122, 131072 619
+
+== P (--profile, G=8, prefill 16384, GPU timestamps), before and after the batched repack
+before: 8.18 s (2003 tok/s)  stream_gemm 1590 ms, stream_copy_repack 1288 ms, attn 879, qkvz 694, gdn 669, router 526, moe_gate_up 491,
+        moe_group 398, moe_down 289, ssm_out 182, qkv 181, shexp 173, post_attn 154, embed 131, moe_sum 127, cold_group 125, attn_out 87
+after:  7.43 s (2206 tok/s)  stream_copy_repack 485 ms, stream_gemm 1589 ms
+        144 streamed experts a layer in 2.05 waves, 77363 streamed pairs, 3806 pairs on the CPU; host waits: routing 132 ms,
+        repack before the next copy 45 ms; CPU task 41 ms (0.2 ms waited for after the waves)
+at depth 32768 (16384 tokens): 11.13 s before (attn 3897 ms = 35%), 10.49 s after (1562 tok/s)
+
+== checkq ekk8 (top-1 of 256, mean KL, median KL against the fp32 reference; stock EKK8, 64 experts a layer)
+chunks of 1,024: 248, 1.8e-2, 1.9e-3 | chunks of 2,048: 244, 1.7e-2, 2.2e-3
+layer-major groups of 2 sub-chunks: 246, 1.5e-2, 1.8e-3 | one group of 3 (the whole prompt): 247, 1.3e-2, 2.1e-3
+group of 3, last 64 decoded: 247, 9.7e-3, 2.0e-3 | chunks of 1,024, last 64 decoded: 245, 1.3e-1 (one position at 2.1e1), 2.1e-3
+checkq oek8 (Ornith): chunks of 1,024: 216, 1.3e-1, 2.4e-2 | 2,048: 208, 1.1e-1, 2.4e-2 | groups of 2: 216, 1.1e-1, 2.3e-2 |
+one group of 3: 215, 9.9e-2, 2.6e-2 | group of 3, last 64 decoded: 216, 8.5e-2, 2.0e-2 | 1,024 last 64 decoded: 212, 9.6e-2, 2.1e-2
+
+== Long prompt, 23,477 tokens (prose.json), last 256 positions, plain chunks of 2,048 against one G=8 step (16384-token groups)
+logits: top-1 agreement 1.000, mean KL 3.741e-04, max KL 2.093e-02 over 256 positions
+
+== D, three alternating rounds of plain (per-expert repack), old order G=8, new G=8 (early copy + batched repack), tok/s:
+8k / 16k / 32k / depth 32k / depth 128k
+plain-1 1305 1282 1191 1031 528 | plain-2 1166 1122 1086 910 497 | plain-3 1253 1215 1151 981 494
+old-1   1362 1471 1353 1128 631 | old-2   1354 1502 1391 1143 655 | old-3   1692 1800 1639 1134 673
+new-1   1677 1667 1392 1063 616 | new-2   1698 1674 1557 1144 682 | new-3   1861 1883 1771 1190 701
+(grouped depth rows time 16384 tokens, plain 4096)
+Host waits per layer, new: routing 64-76 ms (8k), 154-177 ms (16k), 173-225 ms (32k), 282-318 ms (depth 32k), 524-599 ms (depth 128k);
+CPU task 38-47 ms, wait for it after the waves 0-7 ms; copy wait 31-63 ms. The slow rounds are the ones with the longer routing wait.
+gates: eklow-gdn-test, eklow-qfmt-test, eklow-cpu-qgemv-test, eklow-spec-test exit 0; bench.sh attn: no failures.
+
+== F, plain path, per-expert repack against one launch for the layer's experts (engineq --prefill 2048 --depth 8192, 3 alternating rounds)
+per-expert: 2048 1344 / 1331 / 1334, depth 8192 1254 / 1247 / 1243 tok/s
+one launch: 2048 1585 / 1574 / 1576, depth 8192 1470 / 1456 / 1435 tok/s
+
+== Production flags (Ornith, draft, projector, EmbeddingGemma 2), experts a layer on the card and free card memory after:
+plain 51 (1.86 GiB), --group 2 51 (1.83), --group 4 50 (1.85), --group 8 48 (1.89)
+stall, group scheduling rule v1 (decode skipped on every group step), --group 8 --group-busy 4096: document 8192 ttft 5.96 s, gap 5.79 s;
+32768: ttft 22.27 s, gap 21.91 s. plain: 8192 ttft 8.00 / 8.19 s, longest gap 2.08 / 2.15 s; 32768 ttft 31.43 / 32.54 s, gap 2.18 / 2.26 s.

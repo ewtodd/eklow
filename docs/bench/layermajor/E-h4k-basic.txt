@@ -1,0 +1,29 @@
+ok   whole: finish_reason stop  stop
+ok   whole: reasoning_content and content  {'role': 'assistant', 'content': "The sky is blue because sunlight scatters off the atmosphere's gas molecules, and the shorter blue wavelengths scatter more than other colors, spreading across the sk
+ok   whole: no think tags in content
+ok   whole: usage adds up
+ok   stream: same reasoning and content as whole  1110 vs 1110
+ok   stream: finish and usage  ('stop', {'prompt_tokens': 20, 'completion_tokens': 262, 'total_tokens': 282, 'prompt_tokens_details': {'cached_tokens': 0}, 'speculation': {'verifies': 94, 'drafted': 282, 'accepted': 169}})
+ok   stream: many chunks  254
+ok   reasoning_effort none: no reasoning  {'role': 'assistant', 'content': "The sky appears blue because sunlight scatters more readily off the tiny gas molecules in Earth's atmosphere, and this scattered blue light (which has a shorter wavel
+ok   tool call: get_weather with JSON arguments  [{'id': 'chatcmpl-c5e4d6c6f23c1cda249dd693-call-0', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': '{"city":"Lisbon","days":3,"units":"metric"}'}}]
+ok   tool call: typed arguments  {'city': 'Lisbon', 'days': 3, 'units': 'metric'}
+ok   tool call: finish_reason tool_calls  tool_calls
+ok   tool call streamed: same call  [{'index': 0, 'id': 'chatcmpl-b9339feb8416846fed7ef406-call-0', 'type': 'function', 'function': {'name': 'get_weather', 'arguments': '{"city":"Lisbon","days":3,"units":"metric"}'}}]
+ok   tool result turn answers in content  {'index': 0, 'message': {'role': 'assistant', 'content': "Here's the weather forecast for Lisbon for the next 3 days (in metric units):\n\n**Day 1:** Sunny, 24°C\n\nUnfortunately, I only received a si
+ok   stop string cuts the content  ('one two three four five six seven eight nine ten ', 'eleven', 'one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen seventeen eighteen nineteen twenty')
+ok   stop string streamed  'one two three four five six seven eight nine ten '
+ok   max_tokens ends the request exactly  {'prompt_tokens': 20, 'completion_tokens': 7, 'total_tokens': 27, 'prompt_tokens_details': {'cached_tokens': 0}, 'speculation': {'verifies': 2, 'drafted': 6, 'accepted': 4}}
+ok   seed: same seed, same output  "Here's an invented lighthouse name with a description:\n\n**The Emberlight**\n\nA weathered stone lighthouse perched on a rocky promontory, its lamp casting a warm, golden glow that cuts through the coastal fog like a beacon of hope for weary travelers.\n\n---\n\nIf" vs "Here's an invented lighthouse name with a description:\n\n**The Emberlight**\n\nA weathered stone lighthouse perched on a rocky promontory, its lamp casting a warm, golden glow that cuts through the coastal fog like a beacon of hope for weary travelers.\n\n---\n\nIf"
+ok   seed: another seed, another output
+ok   bad image part refused  400 {'error': {'code': 'unsupported_content', 'message': 'image_url: not a JPEG, PNG, GIF or BMP picture', 'type': 'invalid_request_error'}}
+ok   developer role is system  22 22
+ok   two at once: request 0 complete and coherent
+     (equal to its solo run for 154 of 861 characters: the int8 rounding depends on the step's shape, so near-ties go the other way)
+ok   two at once: request 1 complete and coherent
+     (equal to its solo run for 507 of 507 characters: the int8 rounding depends on the step's shape, so near-ties go the other way)
+ok   cancel: the next request is served promptly  0.3 s
+ok   prefix reuse: the next turn is mostly cached  cached 1871 of 1889, first prompt 1812
+ok   prefix reuse: the same prompt again is cached  {'prompt_tokens': 1812, 'completion_tokens': 5, 'total_tokens': 1817, 'prompt_tokens_details': {'cached_tokens': 1805}, 'speculation': {'verifies': 2, 'drafted': 6, 'accepted': 5}}
+ok   document then another question: the document is cached  cached 3116 of 3132
+all ok

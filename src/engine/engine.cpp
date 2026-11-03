@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <optional>
 #include <set>
@@ -114,6 +115,10 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
   if (NE != 256 || NU > 16 || Fe % 64 || Fs % 64) throw std::runtime_error("engine: unsupported expert shape");
   if (c_.max_pending < 0 || c_.max_pending > gdn::kMaxPendingLimit) throw std::runtime_error("engine: max_pending out of range");
   group_ = H / Hkv;
+  if (c_.max_group <= 0) c_.max_group = c_.max_chunk;
+  if (c_.max_group < c_.max_chunk || c_.max_group % c_.max_chunk) throw std::runtime_error("engine: max_group must be a multiple of max_chunk");
+  gmax_ = c_.max_group / c_.max_chunk;
+  cap_tokens_ = std::max(B, c_.max_group);
   auto need = [&](const std::string& name) -> const gguf::Tensor& {
     const gguf::Tensor* t = f.tensor(name);
     if (!t) throw std::runtime_error(f.path() + ": missing tensor " + name);
@@ -334,15 +339,15 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
   cache_bytes_ += uint64_t(gcache_.snapshot_bytes()) * uint64_t(c_.n_slots) +
                   uint64_t(c_.n_slots) * uint64_t(n_dn) * uint64_t(c_.max_pending) * (2 * gdn::kValueHeads * gdn::kHeadChannels + 64) * 4;
   books_.assign(size_t(c_.n_slots), gdn::SlotBook{});
-  plan_dev_ = sycl::malloc_device<gdn::SlotStep>(size_t(c_.n_slots), q_);
-  plan_host_ = sycl::malloc_host<gdn::SlotStep>(size_t(c_.n_slots), q_);
+  plan_dev_ = sycl::malloc_device<gdn::SlotStep>(size_t(std::max<int64_t>(c_.n_slots, gmax_)), q_);
+  plan_host_ = sycl::malloc_host<gdn::SlotStep>(size_t(std::max<int64_t>(c_.n_slots, gmax_)), q_);
   if (!plan_dev_ || !plan_host_) throw std::runtime_error("engine: out of memory for the step plan");
   owned_.push_back(plan_dev_);
   owned_.push_back(plan_host_);
   for (int s = 0; s < c_.n_slots; ++s) gdn::reset_slot(q_, gcache_, s);
 
   // Workspace.
-  x_ = dev(B * E);
+  x_ = dev(cap_tokens_ * E);  // a group's residual stream is all its sub-chunks' rows
   x2_ = dev(B * E);
   h_ = dev(B * E);
   o_ = dev(B * E);
@@ -363,7 +368,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
   rows_ = dev(c_.max_logits * E);
   logits_ = dev(c_.max_logits * cfg_.n_vocab);
   tmp_ = dev(B * 8192);
-  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}, {&rpos_, 3 * B}}) {
+  for (auto [p, n] : {std::pair{&tok_, cap_tokens_}, {&slot_, cap_tokens_}, {&pos_, cap_tokens_}, {&rpos_, 3 * cap_tokens_}}) {
     *p = sycl::malloc_device<int32_t>(size_t(n), q_);
     if (!*p) throw std::runtime_error("engine: out of device memory");
     owned_.push_back(*p);
@@ -372,9 +377,19 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
   owned_.push_back(rows_idx_);
   // At most one chunk per slot in a step, so at most n_slots partial tiles per K/V head.
   max_tiles_ = Hkv * ((B * group_ + 7) / 8 + c_.n_slots);
-  tiles_ = sycl::malloc_device<int32_t>(size_t(6 * max_tiles_), q_);
+  tiles_ = sycl::malloc_device<int32_t>(size_t(6 * max_tiles_ * gmax_), q_);  // one list per sub-chunk of a group
   if (!tiles_) throw std::runtime_error("engine: out of device memory");
   owned_.push_back(tiles_);
+  if (gmax_ > 1) {
+    // What outlives a sub-chunk in a layer-major group (allocated before the experts are placed, so that the placement counts it):
+    // the MoE inputs for the streamed waves, in fp16, and the routing. The residual stream is x_.
+    hg_ = sycl::malloc_device<sycl::half>(size_t(cap_tokens_ * E), q_);
+    gids_ = sycl::malloc_device<int32_t>(size_t(cap_tokens_ * NU), q_);
+    if (!hg_ || !gids_) throw std::runtime_error("engine: out of device memory for layer-major groups");
+    owned_.push_back(hg_);
+    owned_.push_back(gids_);
+    gw_ = dev(cap_tokens_ * NU);
+  }
   attn::reserve(q_, attn_scratch_, max_tiles_, c_.max_chunk * group_, Hkv, D, group_);
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * D));
   act_sh_ = xmx::alloc_activations(q_, B, Fs);
@@ -548,7 +563,7 @@ void Engine::load_experts() {
     for (void* p : {static_cast<void*>(stream_gu_.tiles), static_cast<void*>(stream_gu_.scales), static_cast<void*>(stream_dn_.tiles),
                     static_cast<void*>(stream_dn_.scales)})
       owned_.push_back(p);
-    stream_map_ = sycl::malloc_device<int32_t>(size_t(NE), q_);
+    stream_map_ = sycl::malloc_device<int32_t>(size_t(NE), q_);  // a wave's map: expert to slot
     stream_tiles_ = sycl::malloc_device<int32_t>(size_t(4 + 4 * ((P + moe_tile_ - 1) / moe_tile_ + S)), q_);
     stream_scratch_ = sycl::malloc_device<int32_t>(size_t((P / 256 + 2) * S), q_);
     if (!stream_map_ || !stream_tiles_ || !stream_scratch_) throw std::runtime_error("engine: out of device memory for the streaming slots");
@@ -562,7 +577,7 @@ void Engine::load_experts() {
   // there and the copy engine streams from there; the copy also brings the pages in, which a request should not wait for).
   const int threads = c_.cpu_threads > 0 ? c_.cpu_threads : 16;
   pool_ = std::make_unique<cpu::Pool>(threads);
-  const int64_t B = std::max<int64_t>(c_.max_batch, xmx::kFp16Rows), P = B * cfg_.n_expert_used;
+  const int64_t B = std::max<int64_t>(std::max<int64_t>(c_.max_batch, xmx::kFp16Rows), cap_tokens_), P = B * cfg_.n_expert_used;  // a group's tokens too
   auto host = [&](auto*& p, int64_t n) {
     p = sycl::malloc_host<std::remove_reference_t<decltype(*p)>>(size_t(n), q_);
     if (!p) throw std::runtime_error("engine: out of pinned host memory");
@@ -577,7 +592,7 @@ void Engine::load_experts() {
   host(hp_sum_, B * E);  // as many rows as tokens in the worst case
   host(hp_aq_, E / 32 * 256);
   host(hp_as_, E / 32 * 8);
-  if (n_stream_ > 0) host(hp_smap_, NE);
+  if (n_stream_ > 0) host(hp_smap_, NE * NE);  // a map per wave of a layer-major group (a wave holds at least one expert)
   cold_map_ = reinterpret_cast<int32_t*>(dev(B));
   // cold_sum_ lives in workspace that is dead during the MoE (qz_: B x 12,288 fp32).
   cold_sum_ = qz_;
@@ -738,7 +753,8 @@ void Engine::cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event route
   if (hot_done.get_info<sycl::info::event::command_execution_status>() == sycl::info::event_command_status::complete) ++cold_.late_layers;
 }
 
-std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int32_t>& cnt) const {
+// group: counts over a layer-major group; the experts go in waves, so neither the slots nor the gathered rows bound the choice.
+std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int32_t>& cnt, bool group) const {
   const int64_t NE = cfg_.n_expert;
   std::vector<int32_t> cand;
   double rest = 0;
@@ -753,11 +769,11 @@ std::vector<int32_t> Engine::choose_stream(const Layer& L, const std::vector<int
   size_t best_k = 0;
   double best = rest * c_.stream_cpu_us;
   int64_t rows = 0;
-  for (size_t k = 1; k <= cand.size() && k <= size_t(n_stream_); ++k) {
+  for (size_t k = 1; k <= cand.size() && (group || k <= size_t(n_stream_)); ++k) {
     const int32_t n = cnt[size_t(cand[k - 1])];
     rest -= n;
     rows += (n + moe_tile_ - 1) / moe_tile_ * moe_tile_;
-    if (rows > stream_rows_cap_) break;
+    if (!group && rows > stream_rows_cap_) break;
     const double cost = std::max(double(k) * c_.stream_copy_us, rest * c_.stream_cpu_us);
     if (cost < best) {
       best = cost;
@@ -784,10 +800,16 @@ void Engine::stream_experts(const Layer& L, const std::vector<int32_t>& list, in
     if (w.format == xmx::WeightFormat::Q4_0) xmx::repack_q4_0_into(q_, raw, interleave, w);
     else xmx::repack_format_into(q_, raw, interleave, w);
   };
-  for (size_t j = 0; j < list.size(); ++j) {
+  if (c_.group_batch_repack && f_gu_ != xmx::WeightFormat::Q4_0 && f_dn_ != xmx::WeightFormat::Q4_0) {
+    const int64_t cnt = int64_t(list.size());
+    xmx::repack_format_batch_into(q_, ref::Weight{t_gu_, E, 2 * Fe, stream_raw_, gu_row_}, true, stream_w_gu_[0], cnt, raw_expert_, packed_expert_, packed_expert_);
+    xmx::repack_format_batch_into(q_, ref::Weight{t_dn_, Fe, E, stream_raw_ + raw_gu_, dn_row_}, false, stream_w_dn_[0], cnt, raw_expert_, packed_expert_, packed_expert_);
+  } else {
+    for (size_t j = 0; j < list.size(); ++j) {
     const uint8_t* raw = stream_raw_ + uint64_t(j) * raw_expert_;
     repack_into(ref::Weight{t_gu_, E, 2 * Fe, raw, gu_row_}, true, stream_w_gu_[j]);
     repack_into(ref::Weight{t_dn_, Fe, E, raw + raw_gu_, dn_row_}, false, stream_w_dn_[j]);
+  }
   }
   q_.memcpy(stream_map_, hp_smap_, size_t(NE) * 4);
   mark("stream_copy_repack");
@@ -943,7 +965,7 @@ int Engine::accepted(const Slot& s, int accept) const {
   return a;
 }
 
-void Engine::upload_plan(const std::vector<gdn::SlotStep>& steps, gdn::Plan& plan) {
+void Engine::upload_plan(const std::vector<gdn::SlotStep>& steps, gdn::Plan& plan, size_t at) {
   plan = gdn::Plan{};
   plan.n_slots = int32_t(steps.size());
   int32_t shift = 0;
@@ -953,11 +975,11 @@ void Engine::upload_plan(const std::vector<gdn::SlotStep>& steps, gdn::Plan& pla
     st.shift = shift;
     plan.n_tokens += st.n;
     plan.max_n = std::max(plan.max_n, st.n);
-    plan_host_[i] = st;
+    plan_host_[at + i] = st;
   }
   plan.n_rows = plan.n_tokens + shift;
-  q_.memcpy(plan_dev_, plan_host_, steps.size() * sizeof(gdn::SlotStep));
-  plan.dev = plan_dev_;
+  q_.memcpy(plan_dev_ + at, plan_host_ + at, steps.size() * sizeof(gdn::SlotStep));
+  plan.dev = plan_dev_ + at;
 }
 
 void Engine::release(int slot) {
@@ -1031,7 +1053,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     if (!seen.insert(c.slot).second) throw std::runtime_error("engine: two chunks of one slot in a step");
     const int64_t n = int64_t(c.tokens.size());
     if (n == 0) throw std::runtime_error("engine: empty chunk (settle() commits pending tokens alone)");
-    if (n > c_.max_chunk) throw std::runtime_error("engine: chunk longer than max_chunk");
+    if (n > c_.max_chunk && !(chunks.size() == 1 && !c.verify && n <= c_.max_group)) throw std::runtime_error("engine: chunk longer than max_chunk");
     if (c.verify && n > c_.max_pending) throw std::runtime_error("engine: verify chunk longer than max_pending");
     const Slot& s = slots_[size_t(c.slot)];
     acc[i] = accepted(s, c.accept);
@@ -1054,9 +1076,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     n_logits += std::min(n, std::max<int64_t>(c.logits_rows, 0));
     n_cap += c.capture_rows;
   }
-  if (n_tok > c_.max_batch) throw std::runtime_error("engine: step larger than max_batch");
+  const bool group_step = chunks.size() == 1 && n_tok > c_.max_chunk;
+  if (n_tok > c_.max_batch && !group_step) throw std::runtime_error("engine: step larger than max_batch");
   if (n_logits > c_.max_logits) throw std::runtime_error("engine: too many logits rows");
   if (n_cap > c_.max_capture_rows) throw std::runtime_error("engine: too many capture rows");
+  if (group_step) return step_group(chunks[0], acc[0]);
 
   std::vector<int32_t> tok, slot, pos, logit_rows, cap_rows, rpos;  // rpos: [3][T] once built
   std::vector<int32_t> rpos_t, rpos_h, rpos_w;
@@ -1341,6 +1365,472 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   done.wait();
   settle_marks();
   return out;
+}
+
+// A lone prefill chunk of more than max_chunk tokens, layer by layer. The chunk is cut into sub-chunks of near-equal length (at most
+// max_chunk); for each layer every sub-chunk in turn runs the mixer, the router, the hot experts and the shared expert (what step()
+// does for a chunk) and adds them to its rows of the residual stream x_ in place; then the layer's cold experts are brought in
+// once for the whole group (cold_group). Causality holds because sub-chunk c's layer l runs after sub-chunk c-1's, which left the
+// layer's recurrent state and K/V as a plain chunk would. Not supported: dumps.
+std::vector<float> Engine::step_group(const Chunk& c, int acc) {
+  const int64_t E = cfg_.n_embd, H = cfg_.n_head, Hkv = cfg_.n_head_kv, D = cfg_.head_dim, V = cfg_.n_vocab;
+  const int64_t NE = cfg_.n_expert, NU = cfg_.n_expert_used, kb = E / 32;
+  const int ncap = int(c_.capture_layers.size());
+  const int64_t n = int64_t(c.tokens.size());
+  Slot& s = slots_[size_t(c.slot)];
+  if (s.pending) {
+    s.length = s.verify_start + acc;
+    free_pages_beyond(s, s.length);
+  }
+  const int64_t G = (n + c_.max_chunk - 1) / c_.max_chunk;
+  std::vector<GroupSub> subs(static_cast<size_t>(G));
+  for (int64_t k = 0, at = 0; k < G; ++k) {
+    subs[size_t(k)] = {at, n / G + (k < n % G ? 1 : 0)};
+    at += subs[size_t(k)].len;
+  }
+
+  std::vector<int32_t> tok, slot(size_t(n), c.slot), pos, logit_rows, cap_rows;
+  std::vector<int32_t> rpos_t, rpos_h, rpos_w;
+  for (int64_t j = 0; j < n; ++j) {
+    tok.push_back(c.tokens[size_t(j)]);
+    pos.push_back(int32_t(c.start_pos + j));
+  }
+  {
+    int64_t delta = c.rope_delta;
+    size_t k = 0;
+    for (int64_t j = 0; j < n;) {
+      if (k < c.images.size() && j == c.images[k].offset) {
+        const model::ImageRows& im = c.images[k];
+        const int64_t p = c.start_pos + j - delta;
+        for (int64_t r = 0; r < im.n; ++r) {
+          rpos_t.push_back(int32_t(p)), rpos_h.push_back(int32_t(p + r / im.nx)), rpos_w.push_back(int32_t(p + r % im.nx));
+        }
+        delta += im.n - im.n_pos();
+        j += im.n;
+        ++k;
+      } else {
+        const int32_t p = int32_t(c.start_pos + j - delta);
+        rpos_t.push_back(p), rpos_h.push_back(p), rpos_w.push_back(p);
+        ++j;
+      }
+    }
+  }
+  capture_.ids.clear();
+  for (int64_t r = std::max<int64_t>(0, n - c.logits_rows); r < n; ++r) logit_rows.push_back(int32_t(r));
+  for (int64_t r = n - c.capture_rows; r < n; ++r) {
+    cap_rows.push_back(int32_t(r));
+    capture_.ids.push_back({int32_t(c.slot), int32_t(c.start_pos + r)});
+  }
+  ensure_pages(c.slot, c.start_pos + n);
+  // Per sub-chunk: its rotary positions [3][len], its attention tiles, its DeltaNet plan (the first replays the pending tokens).
+  std::vector<std::vector<int32_t>> rblocks(static_cast<size_t>(G));
+  std::vector<attn::TileList> tiles(static_cast<size_t>(G), attn::TileList{D});
+  std::vector<gdn::Plan> plans(static_cast<size_t>(G));
+  for (int64_t k = 0; k < G; ++k) {
+    const GroupSub& sb = subs[size_t(k)];
+    auto& rb = rblocks[size_t(k)];
+    for (const auto* v : {&rpos_t, &rpos_h, &rpos_w}) rb.insert(rb.end(), v->begin() + sb.off, v->begin() + sb.off + sb.len);
+    tiles[size_t(k)].add_chunk(0, sb.len, c.start_pos + sb.off + sb.len - 1, group_, Hkv, 0);
+    const gdn::SlotStep st = books_[size_t(c.slot)].next(c.slot, 0, int32_t(sb.len), k == 0 ? acc : 0, int32_t(sb.len), c_.max_pending);
+    upload_plan({st}, plans[size_t(k)], size_t(k));
+  }
+  s.pending = 0;
+  s.verify_start = c.start_pos;
+  s.length = c.start_pos + n;
+  const int64_t R = int64_t(logit_rows.size());
+  capture_.rows = int64_t(cap_rows.size());
+  capture_.data = cap_;
+  if (pool_) pool_->set_spin_us(0);
+
+  q_.memcpy(tok_, tok.data(), size_t(n) * 4);
+  q_.memcpy(slot_, slot.data(), size_t(n) * 4);
+  q_.memcpy(pos_, pos.data(), size_t(n) * 4);
+  for (int64_t k = 0; k < G; ++k) {
+    q_.memcpy(rpos_ + 3 * subs[size_t(k)].off, rblocks[size_t(k)].data(), rblocks[size_t(k)].size() * 4);
+    const std::vector<int32_t> packed = tiles[size_t(k)].packed();
+    if (int64_t(packed.size()) > 6 * max_tiles_) throw std::runtime_error("engine: tile list larger than its buffer");
+    q_.memcpy(tiles_ + k * 6 * max_tiles_, packed.data(), packed.size() * 4).wait();
+  }
+  q_.memcpy(page_table_, page_table_host_.data(), page_table_host_.size() * 4);
+  if (R) q_.memcpy(rows_idx_, logit_rows.data(), size_t(R) * 4);
+  if (!cap_rows.empty()) q_.memcpy(cap_idx_, cap_rows.data(), cap_rows.size() * 4);
+
+  const bool gpu_marks = profile_ && q_.has_property<sycl::property::queue::enable_profiling>();
+  std::vector<std::pair<const char*, sycl::event>> marks;
+  auto settle_marks = [&] {
+    if (!gpu_marks || marks.empty()) return;
+    namespace ep = sycl::info::event_profiling;
+    uint64_t prev = marks[0].second.get_profiling_info<ep::command_end>();
+    for (size_t i = 1; i < marks.size(); ++i) {
+      const uint64_t end = marks[i].second.get_profiling_info<ep::command_end>();
+      (*profile_)[marks[i].first] += double(end - prev) * 1e-9;
+      prev = end;
+    }
+  };
+  auto t_mark = std::chrono::steady_clock::now();
+  auto mark = [&](const char* name) {
+    if (!profile_) return;
+    if (gpu_marks) {
+      marks.push_back({name, q_.single_task([] {})});
+      return;
+    }
+    q_.wait();
+    const auto now = std::chrono::steady_clock::now();
+    (*profile_)[name] += std::chrono::duration<double>(now - t_mark).count();
+    t_mark = now;
+  };
+  mark("upload");
+
+  // The embedding rows, a sub-chunk at a time (the staging buffers hold max_batch rows), into the group's residual stream.
+  for (const GroupSub& sb : subs) {
+    float* xk = x_ + sb.off * E;
+    if (c_.embed_on_card) {
+      ref::embed(q_, embd_card_, tok_ + sb.off, sb.len, 1.0f, xk);
+    } else {
+      for (int64_t t = 0; t < sb.len; ++t)
+        std::memcpy(emb_host_ + uint64_t(t) * embd_row_bytes_, embd_->data + uint64_t(tok[size_t(sb.off + t)]) * embd_row_bytes_, embd_row_bytes_);
+      q_.memcpy(emb_dev_, emb_host_, size_t(uint64_t(sb.len) * embd_row_bytes_));
+      ref::embed(q_, ref::Weight{embd_->type, E, sb.len, emb_dev_, embd_row_bytes_}, iota_, sb.len, 1.0f, xk);
+      q_.wait();
+    }
+  }
+  for (const model::ImageRows& im : c.images) q_.memcpy(x_ + im.offset * E, im.rows, size_t(im.n * E) * sizeof(float));
+  mark("embed");
+  const float attn_scale = 1.0f / std::sqrt(float(D));
+  for (int l = 0; l < cfg_.n_layer; ++l) {
+    const Layer& L = layers_[size_t(l)];
+    sycl::event ids_ready, routed;
+    // With early copies a layer runs in two phases: every sub-chunk's mixer and routing first, the copies of the streamed set started
+    // when the whole group is routed, and the hot experts and the shared expert after, while the copies land.
+    const bool split = c_.group_early_copy && L.n_cold && n_stream_ > 0;
+    auto phase_a = [&](int64_t k) {
+      const GroupSub& sb = subs[size_t(k)];
+      const int64_t T = sb.len, P = T * NU;
+      float* xk = x_ + sb.off * E;
+      int32_t* ids = gids_ + sb.off * NU;
+      float* wts = gw_ + sb.off * NU;
+      const gdn::Plan& plan = plans[size_t(k)];
+      // The layer's input norm (the plain step gets it from the previous layer's tail).
+      qwenk::add_norm_quant(q_, nullptr, xk, L.attn_norm, cfg_.eps, T, E, nullptr, &act_, L.recurrent ? h_ : nullptr);
+      if (L.recurrent) {
+        dense(act_, L.in, qz_);
+        mark("qkvz");
+        fast::matmul_f32(q_, L.w_ab, 2 * gdn::kValueHeads, E, h_, T, ab_);
+        const gdn::Inputs in{qz_, qz_ + gdn::kChannels, ab_, ab_ + gdn::kValueHeads, L.in.n, L.in.n, 2 * gdn::kValueHeads, 2 * gdn::kValueHeads};
+        mark("alpha_beta");
+        gdn::step(q_, L.gw, gcache_, L.gdn_idx, plan, in, gscratch_, act_);
+        mark("gdn");
+        dense(act_, L.out, o_);
+        mark("ssm_out");
+      } else {
+        dense(act_, L.in, qz_);
+        mark("qkv");
+        qwenk::attn_heads(q_, qz_, T, H, Hkv, D, cfg_.n_rot, L.q_norm, L.k_norm, cfg_.eps, rpos_ + 3 * sb.off, cfg_.rope_sections, inv_freq_,
+                          qb_, kb_, vb_, gt_);
+        mark("attn_heads");
+        const KvLayer& kv = kv_[size_t(L.attn_idx)];
+        const attn::Cache cache{kv.k, kv.v, page_table_, max_pages_, 0, Hkv, D, kv.ks, kv.vs};
+        const attn::Tokens toks{slot_ + sb.off, pos_ + sb.off, T};
+        attn::write(q_, kb_, vb_, toks, cache);
+        attn::attend(q_, qb_, toks, tiles[size_t(k)], tiles_ + k * 6 * max_tiles_, cache, H, attn_scale, att_, attn_scratch_);
+        mark("attn");
+        qwenk::gate_quant(q_, att_, gt_, T, H * D, act_);
+        dense(act_, L.out, o_);
+        mark("attn_out");
+      }
+      // x = x + out, in place; m = rmsnorm(x) * post_attention_norm, fp32 in h_ and quantized in act_.
+      qwenk::add_norm_quant(q_, o_, xk, L.post_norm, cfg_.eps, T, E, xk, &act_, h_);
+      mark("post_attn");
+      fast::matmul_f32(q_, L.w_rg, NE, E, h_, T, rlog_);
+      fast::matmul_f32(q_, L.w_rg + NE * E, 32, E, h_, T, sg_);
+      mark("router");
+      fast::moe_route(q_, rlog_, T, NE, NU, nullptr, ids, wts);
+      mark("moe_route");
+      if (c_.record_routing) {
+        q_.memcpy(rec_host_, ids, size_t(P) * 4).wait();
+        for (int64_t p = 0; p < P; ++p) ++counts_[size_t(l)][size_t(rec_host_[p])];
+      }
+      if (L.n_cold) {
+        // What the cold phase needs after the sub-chunk's own work: the routing and the CPU's int8 inputs on the host, the fp16 inputs
+        // of the streamed waves on the card.
+        ids_ready = q_.memcpy(hp_ids_ + sb.off * NU, ids, size_t(P) * 4);
+        q_.memcpy(hp_w_ + sb.off * NU, wts, size_t(P) * 4);
+        fast::quantize_rows(q_, h_, T, E, hq_, hqs_);
+        q_.memcpy(hp_xq_ + sb.off * E, hq_, size_t(T * E));
+        routed = q_.memcpy(hp_xs_ + sb.off * kb, hqs_, size_t(T * kb) * sizeof(float));
+        if (n_stream_ > 0) qwenk::to_half(q_, h_, T * E, hg_ + sb.off * E);
+      }
+    };
+    auto phase_b = [&](int64_t k) {
+      const GroupSub& sb = subs[size_t(k)];
+      const int64_t T = sb.len, P = T * NU;
+      float* xk = x_ + sb.off * E;
+      int32_t* ids = gids_ + sb.off * NU;
+      float* wts = gw_ + sb.off * NU;
+      if (split) {
+        // Phase A left x = the residual after the mixer; the MoE input, its quantization and the shared gate are cheap to make again.
+        qwenk::add_norm_quant(q_, nullptr, xk, L.post_norm, cfg_.eps, T, E, nullptr, &act_, h_);
+        fast::matmul_f32(q_, L.w_rg + NE * E, 32, E, h_, T, sg_);
+      }
+      fast::moe_group(q_, ids, P, NE, moe_tile_, moe_scratch_, moe_tiles_, moe_row_, L.cold_dev);
+      mark("moe_group");
+      fast::moe_gather(q_, h_, moe_row_, P, NU, E, moe_a_);
+      mark("moe_gather");
+      const int64_t max_tiles = (P + moe_tile_ - 1) / moe_tile_ + NE;
+      xmx::matmul_geglu_grouped16(q_, moe_a_, L.tab_gu, moe_tiles_, max_tiles, moe_tile_, moe_h_, xmx::Glu::Silu);
+      mark("moe_gate_up");
+      xmx::matmul_grouped16(q_, moe_h_, L.tab_dn, moe_tiles_, max_tiles, moe_tile_, moe_y_);
+      mark("moe_down");
+      xmx::matmul_geglu(q_, act_, L.shexp_gu, act_sh_, sh_gu_, xmx::Glu::Silu);
+      xmx::matmul(q_, act_sh_, L.shexp_dn, o_);
+      mark("shexp");
+      qwenk::moe_accumulate(q_, xk, moe_y_, wts, moe_row_, NU, nullptr, nullptr, o_, sg_, 32, T, E);
+      mark("moe_sum");
+    };
+    for (int64_t k = 0; k < G; ++k) {
+      phase_a(k);
+      if (!split) phase_b(k);
+    }
+    if (L.n_cold) cold_group(L, subs, ids_ready, routed, mark, split ? [&] { for (int64_t k = 0; k < G; ++k) phase_b(k); } : std::function<void()>());
+    if (cap_col_[size_t(l)] >= 0 && !cap_rows.empty())
+      qwenk::gather_rows(q_, x_, cap_idx_, int64_t(cap_rows.size()), E, cap_, int64_t(ncap) * E, int64_t(cap_col_[size_t(l)]) * E);
+    mark("tail");
+  }
+  ++grp_.groups;
+
+  if (R == 0) {
+    q_.wait();
+    settle_marks();
+    return {};
+  }
+  qwenk::gather_rows(q_, x_, rows_idx_, R, E, rows_, E, 0);
+  fast::rmsnorm(q_, rows_, output_norm_, R, E, cfg_.eps, rows_);
+  if (c_.head_dpas) {
+    xmx::quantize(q_, rows_, R, act_head_);
+    xmx::matmul(q_, act_head_, head_w_, logits_);
+  } else {
+    fast::matmul_q6(q_, head_q6_, rows_, R, logits_);
+  }
+  mark("head");
+  std::vector<float> out(size_t(R * V));
+  q_.memcpy(out.data(), logits_, out.size() * sizeof(float)).wait();
+  settle_marks();
+  return out;
+}
+
+// The layer's cold experts for a whole group, after every sub-chunk's hot work is enqueued. The streamed set is chosen from the
+// group's counts and goes through the slots in waves (the card runs a wave's GEMMs for every sub-chunk while the copy engine
+// brings the next one in); the CPU computes the pairs of the experts not streamed on a thread of its own, meanwhile.
+void Engine::cold_group(const Layer& L, const std::vector<GroupSub>& subs, sycl::event ids_ready, sycl::event routed,
+                        const std::function<void(const char*)>& mark, const std::function<void()>& after_first_copy) {
+  using Clock = std::chrono::steady_clock;
+  const int64_t E = cfg_.n_embd, Fe = cfg_.n_ff_exp, NU = cfg_.n_expert_used, NE = cfg_.n_expert, kb = E / 32;
+  const int64_t G = int64_t(subs.size()), Tg = subs.back().off + subs.back().len, Pg = Tg * NU;
+  auto since = [](Clock::time_point a) { return std::chrono::duration<double>(Clock::now() - a).count(); };
+  const auto t0 = Clock::now();
+  ids_ready.wait();  // the queue is in order: the earlier sub-chunks' routing has landed too
+  grp_.ids_wait_s += since(t0);
+  cold_.wait_s += since(t0);
+  ++grp_.layers;
+  ++cold_.layers;
+
+  std::vector<std::vector<int32_t>> cnt(size_t(G), std::vector<int32_t>(size_t(NE), 0));
+  std::vector<int32_t> tot(size_t(NE), 0);
+  for (int64_t k = 0; k < G; ++k)
+    for (int64_t p = subs[size_t(k)].off * NU; p < (subs[size_t(k)].off + subs[size_t(k)].len) * NU; ++p) ++cnt[size_t(k)][size_t(hp_ids_[p])];
+  for (int64_t k = 0; k < G; ++k)
+    for (int e = 0; e < NE; ++e) tot[size_t(e)] += cnt[size_t(k)][size_t(e)];
+  std::vector<int32_t> list;
+  if (n_stream_ > 0) list = choose_stream(L, tot, true);
+
+  // Waves: up to n_stream_ experts, and no sub-chunk's gathered rows past what att_ holds.
+  struct Wave {
+    std::vector<int32_t> experts;
+    std::vector<int64_t> tiles;  // per sub-chunk
+  };
+  std::vector<Wave> waves;
+  {
+    std::vector<int64_t> rows(size_t(G), 0);
+    Wave cur;
+    cur.tiles.assign(size_t(G), 0);
+    for (int32_t e : list) {
+      bool fit = int64_t(cur.experts.size()) < n_stream_;
+      for (int64_t k = 0; k < G && fit; ++k) {
+        const int64_t n = cnt[size_t(k)][size_t(e)];
+        fit = rows[size_t(k)] + (n + moe_tile_ - 1) / moe_tile_ * moe_tile_ <= stream_rows_cap_;
+      }
+      if (!fit && !cur.experts.empty()) {
+        waves.push_back(std::move(cur));
+        cur = Wave{};
+        cur.tiles.assign(size_t(G), 0);
+        std::fill(rows.begin(), rows.end(), 0);
+      }
+      for (int64_t k = 0; k < G; ++k) {
+        const int64_t n = cnt[size_t(k)][size_t(e)];
+        cur.tiles[size_t(k)] += (n + moe_tile_ - 1) / moe_tile_;
+        rows[size_t(k)] += (n + moe_tile_ - 1) / moe_tile_ * moe_tile_;
+      }
+      cur.experts.push_back(e);
+    }
+    if (!cur.experts.empty()) waves.push_back(std::move(cur));
+  }
+  std::vector<uint8_t> streamed(size_t(NE), 0);
+  uint64_t n_streamed_pairs = 0;
+  for (int32_t e : list) {
+    streamed[size_t(e)] = 1;
+    n_streamed_pairs += uint64_t(tot[size_t(e)]);
+  }
+
+  sycl::event copied;
+  auto issue = [&](size_t w) {
+    const auto& ex = waves[w].experts;
+    for (size_t j = 0; j < ex.size(); ++j) copy_->copy(stream_raw_ + uint64_t(j) * raw_expert_, L.cold_gu[size_t(ex[j])], raw_expert_);
+    copied = copy_->event(copy_->fence());
+  };
+  if (!waves.empty()) issue(0);
+  if (after_first_copy) after_first_copy();  // the hot experts of every sub-chunk, enqueued while the first wave lands
+  routed.wait();
+
+  // The CPU's pairs: the cold experts not streamed.
+  std::vector<int32_t> cp;
+  for (int64_t p = 0; p < Pg; ++p)
+    if (L.cold[size_t(hp_ids_[p])] && !streamed[size_t(hp_ids_[p])]) cp.push_back(int32_t(p));
+  pairs_ += uint64_t(Pg);
+  cold_pairs_ += cp.size() + n_streamed_pairs;
+  grp_.cpu_pairs += cp.size();
+  grp_.streamed_pairs += n_streamed_pairs;
+  grp_.experts += list.size();
+  grp_.waves += waves.size();
+  if (!list.empty()) {
+    ++stream_.layers;
+    stream_.experts += list.size();
+    stream_.pairs += n_streamed_pairs;
+  }
+  std::vector<int32_t> k_of(size_t(Pg), -1), dense_row(size_t(Tg), -1);
+  std::vector<char> need(size_t(Tg), 0);
+  for (size_t k = 0; k < cp.size(); ++k) {
+    k_of[size_t(cp[k])] = int32_t(k);
+    need[size_t(cp[k] / NU)] = 1;
+  }
+  std::vector<int64_t> base(size_t(G), 0), n_need(size_t(G), 0);
+  {
+    int32_t dense = 0;
+    for (int64_t k = 0; k < G; ++k) {
+      base[size_t(k)] = dense;
+      for (int64_t t = subs[size_t(k)].off; t < subs[size_t(k)].off + subs[size_t(k)].len; ++t) {
+        hp_map_[t] = need[size_t(t)] ? dense - int32_t(base[size_t(k)]) : -1;  // the row within the sub-chunk's share
+        if (need[size_t(t)]) dense_row[size_t(t)] = dense++;
+      }
+      n_need[size_t(k)] = dense - base[size_t(k)];
+    }
+  }
+  auto cpu_task = [&]() -> double {
+    const auto c0 = Clock::now();
+    std::vector<cpu::Q8Blocks> x(static_cast<size_t>(Tg));
+    pool_->for_each(Tg, 8, [&](int64_t lo, int64_t hi) {
+      for (int64_t t = lo; t < hi; ++t) {
+        if (!need[size_t(t)]) continue;
+        cpu::Q8Blocks& r = x[size_t(t)];
+        r.q.assign(hp_xq_ + t * E, hp_xq_ + (t + 1) * E);
+        r.s.assign(hp_xs_ + t * kb, hp_xs_ + (t + 1) * kb);
+        r.sum.resize(size_t(kb));
+        for (int64_t b = 0; b < kb; ++b) {
+          int32_t sum = 0;
+          for (int i = 0; i < 32; ++i) sum += r.q[size_t(b * 32 + i)];
+          r.sum[size_t(b)] = sum;
+        }
+      }
+    });
+    cold_y_.resize(cp.size() * size_t(E));
+    cold_compute(L, cp, hp_ids_, x, cold_y_.data());
+    // Each token's cold share, weighted and summed in slot order.
+    pool_->for_each(Tg, 16, [&](int64_t lo, int64_t hi) {
+      for (int64_t t = lo; t < hi; ++t) {
+        if (!need[size_t(t)]) continue;
+        float* out = hp_sum_ + int64_t(dense_row[size_t(t)]) * E;
+        bool first = true;
+        for (int64_t i = 0; i < NU; ++i) {
+          const int32_t k = k_of[size_t(t * NU + i)];
+          if (k < 0) continue;
+          const float w = hp_w_[t * NU + i];
+          const float* yk = cold_y_.data() + int64_t(k) * E;
+          if (first)
+            for (int64_t j = 0; j < E; ++j) out[j] = w * yk[j];
+          else
+            for (int64_t j = 0; j < E; ++j) out[j] += w * yk[j];
+          first = false;
+        }
+      }
+    });
+    return since(c0);
+  };
+  std::future<double> cpu_done;
+  if (!cp.empty()) cpu_done = std::async(std::launch::async, cpu_task);
+
+  auto repack_into = [&](const ref::Weight& raw, bool interleave, const xmx::Weight& w) {
+    if (w.format == xmx::WeightFormat::Q4_0) xmx::repack_q4_0_into(q_, raw, interleave, w);
+    else xmx::repack_format_into(q_, raw, interleave, w);
+  };
+  for (size_t w = 0; w < waves.size(); ++w) {
+    const Wave& wv = waves[w];
+    q_.submit([&](sycl::handler& h) {
+      h.depends_on(copied);
+      h.single_task([] {});
+    });
+    if (c_.group_batch_repack && f_gu_ != xmx::WeightFormat::Q4_0 && f_dn_ != xmx::WeightFormat::Q4_0) {
+      // One launch for the wave: a launch per expert left the card mostly idle (225 us each for 1.8 MB).
+      const int64_t cnt = int64_t(wv.experts.size());
+      xmx::repack_format_batch_into(q_, ref::Weight{t_gu_, E, 2 * Fe, stream_raw_, gu_row_}, true, stream_w_gu_[0], cnt, raw_expert_, packed_expert_, packed_expert_);
+      xmx::repack_format_batch_into(q_, ref::Weight{t_dn_, Fe, E, stream_raw_ + raw_gu_, dn_row_}, false, stream_w_dn_[0], cnt, raw_expert_, packed_expert_, packed_expert_);
+    } else {
+      for (size_t j = 0; j < wv.experts.size(); ++j) {
+      const uint8_t* raw = stream_raw_ + uint64_t(j) * raw_expert_;
+      repack_into(ref::Weight{t_gu_, E, 2 * Fe, raw, gu_row_}, true, stream_w_gu_[j]);
+      repack_into(ref::Weight{t_dn_, Fe, E, raw + raw_gu_, dn_row_}, false, stream_w_dn_[j]);
+    }
+    }
+    int32_t* smap = hp_smap_ + int64_t(w) * NE;
+    for (int e = 0; e < NE; ++e) smap[e] = -1;
+    for (size_t j = 0; j < wv.experts.size(); ++j) smap[wv.experts[j]] = int32_t(j);
+    q_.memcpy(stream_map_, smap, size_t(NE) * 4);
+    sycl::event repacked = q_.single_task([] {});
+    mark("stream_copy_repack");
+    for (int64_t k = 0; k < G; ++k) {
+      if (!wv.tiles[size_t(k)]) continue;
+      const GroupSub& sb = subs[size_t(k)];
+      const int64_t P = sb.len * NU;
+      int32_t* ids = gids_ + sb.off * NU;
+      q_.fill(moe_row_, int32_t(-1), size_t(P));
+      fast::moe_group(q_, ids, P, n_stream_, moe_tile_, stream_scratch_, stream_tiles_, moe_row_, nullptr, stream_map_, 0);
+      sycl::half* a = reinterpret_cast<sycl::half*>(att_);
+      fast::moe_gather(q_, hg_ + sb.off * E, moe_row_, P, NU, E, a);
+      xmx::matmul_geglu_grouped16(q_, a, stream_gu_, stream_tiles_, wv.tiles[size_t(k)], moe_tile_, moe_h_, xmx::Glu::Silu);
+      xmx::matmul_grouped16(q_, moe_h_, stream_dn_, stream_tiles_, wv.tiles[size_t(k)], moe_tile_, moe_y_);
+      qwenk::moe_accumulate(q_, x_ + sb.off * E, moe_y_, gw_ + sb.off * NU, moe_row_, NU, nullptr, nullptr, nullptr, nullptr, 0, sb.len, E);
+    }
+    mark("stream_gemm");
+    if (w + 1 < waves.size()) {
+      // The next wave's copy may overwrite the raw slots once this wave's repack has read them; it then runs beside the GEMMs.
+      const auto tw = Clock::now();
+      repacked.wait();
+      grp_.copy_wait_s += since(tw);
+      issue(w + 1);
+    }
+  }
+  if (cpu_done.valid()) {
+    const auto tj = Clock::now();
+    grp_.cpu_s += cpu_done.get();
+    grp_.join_s += since(tj);
+    cold_.cpu_s += since(tj);
+    for (int64_t k = 0; k < G; ++k) {
+      if (!n_need[size_t(k)]) continue;
+      const GroupSub& sb = subs[size_t(k)];
+      q_.memcpy(cold_sum_, hp_sum_ + base[size_t(k)] * E, size_t(n_need[size_t(k)] * E) * sizeof(float));
+      q_.memcpy(cold_map_, hp_map_ + sb.off, size_t(sb.len) * 4);
+      qwenk::moe_accumulate(q_, x_ + sb.off * E, nullptr, nullptr, nullptr, NU, cold_sum_, cold_map_, nullptr, nullptr, 0, sb.len, E);
+    }
+  }
+  mark("cold_group");
 }
 
 }  // namespace eklow::engine

@@ -38,6 +38,12 @@ struct Config {
   int64_t max_ctx = 262144;  // positions per slot, a multiple of attn::kPage
   int64_t max_batch = 2048;  // tokens per step
   int64_t max_chunk = 2048;  // tokens per chunk
+  // A lone prefill chunk (no other chunk in the step, not a verify chunk) of up to max_group tokens, a multiple of max_chunk, runs layer
+  // by layer over sub-chunks of at most max_chunk, so that a layer's cold experts cross the link once per group, not once per chunk. 0: max_chunk.
+  int64_t max_group = 0;
+  // In a group, start a layer's copies once every sub-chunk is routed and run the hot experts after them (else each sub-chunk finishes its layer first).
+  bool group_early_copy = true;
+  bool group_batch_repack = true;  // the streamed experts of a layer (a wave of a group) are repacked in one launch
   int64_t max_logits = 64;   // logits rows per step
   // The attention layers' K/V as int8 with a scale per 16 dimensions (attention.hpp): half the memory.
   bool int8_kv = false;
@@ -181,6 +187,12 @@ class Engine {
   };
   const StreamStats& stream_stats() const { return stream_; }
   int stream_slots() const { return n_stream_; }
+  // Layer-major groups (max_group): per layer of each group.
+  struct GroupStats {
+    uint64_t groups = 0, layers = 0, experts = 0, waves = 0, streamed_pairs = 0, cpu_pairs = 0;
+    double ids_wait_s = 0, copy_wait_s = 0, cpu_s = 0, join_s = 0;  // host waits: the group's routing; a wave's repack before the next copy; the CPU task (wall), and the wait for it after the waves
+  };
+  const GroupStats& group_stats() const { return grp_; }
   uint64_t pinned_bytes() const { return pinned_bytes_; }
   // Selections per [layer][expert] since the engine was made (Config::record_routing).
   const std::vector<std::vector<int64_t>>& routing_counts() const { return counts_; }
@@ -228,14 +240,21 @@ class Engine {
   void cold_decode(const Layer& L, int64_t T, int64_t P, sycl::event routed, sycl::event hot_done);
   void cold_prefill(const Layer& L, int64_t T, int64_t P, sycl::event ids_ready, sycl::event routed, sycl::event hot_done,
                     const std::function<void(const char*)>& mark);
-  std::vector<int32_t> choose_stream(const Layer& L, const std::vector<int32_t>& cnt) const;
+  std::vector<int32_t> choose_stream(const Layer& L, const std::vector<int32_t>& cnt, bool group = false) const;
   void stream_experts(const Layer& L, const std::vector<int32_t>& list, int64_t P, int32_t hot_rows, int64_t s_tiles,
                       const std::function<void(const char*)>& mark);
+  // Layer-major prefill of one lone chunk longer than max_chunk (step() hands it over after validating).
+  struct GroupSub {
+    int64_t off = 0, len = 0;
+  };
+  std::vector<float> step_group(const Chunk& c, int acc);
+  void cold_group(const Layer& L, const std::vector<GroupSub>& subs, sycl::event ids_ready, sycl::event routed, const std::function<void(const char*)>& mark,
+                  const std::function<void()>& after_first_copy = nullptr);
   void ensure_pages(int slot, int64_t positions);
   void free_pages_beyond(Slot& s, int64_t length);
   // A slot's accepted count for a chunk's `accept` (the pending tokens when negative); throws when it does not fit.
   int accepted(const Slot& s, int accept) const;
-  void upload_plan(const std::vector<gdn::SlotStep>& steps, gdn::Plan& plan);
+  void upload_plan(const std::vector<gdn::SlotStep>& steps, gdn::Plan& plan, size_t at = 0);
 
   sycl::queue& q_;
   Config c_;
@@ -280,6 +299,12 @@ class Engine {
   xmx::Activations act_, act_sh_, act_exp_ffn_;
   int32_t *tok_ = nullptr, *slot_ = nullptr, *pos_ = nullptr, *rpos_ = nullptr, *tiles_ = nullptr;  // pos_: K/V index; rpos_: [3][tokens] rotary
   int64_t max_tiles_ = 0;
+  // Layer-major groups: tokens a step's arrays hold, sub-chunks a group has at most, the residual stream of all of them (x_), their MoE inputs in fp16, routing.
+  int64_t cap_tokens_ = 0, gmax_ = 1;
+  sycl::half* hg_ = nullptr;
+  int32_t* gids_ = nullptr;
+  float* gw_ = nullptr;
+  GroupStats grp_;
   int32_t *moe_ids_ = nullptr, *moe_row_ = nullptr, *moe_tiles_ = nullptr, *moe_scratch_ = nullptr, *rows_idx_ = nullptr;
   float* moe_w_ = nullptr;
   int64_t moe_tile_ = 64, moe_max_tiles_ = 0;

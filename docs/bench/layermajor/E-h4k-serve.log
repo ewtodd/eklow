@@ -1,0 +1,80 @@
+eklow-server: vision encoder /nix/store/b23r16sm3j0pq7lr0lyyva2gw2swkkl6-mmproj-Ornith-1.5-35B-A3B-bf16.gguf, up to 1024 rows an image, 267 MiB on the card while encoding
+eklow-server: vision projector /nix/store/ns0n6xhg02xrc8q5dqv6ck25yavlvm4v-mmproj-embeddinggemma-2-Q8_0.gguf, 264 MiB on the card for 1120-row images
+eklow-server: ornith on Intel(R) Arc(TM) A770M Graphics, 4.94 GiB of weights, 5.84 GiB of KV cache and state (2 slots of 262144), 13.6 s
+eklow-server: experts on the card: N = 48 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 5.34 GiB, margin 1.00 GiB, free after 1.88 GiB)
+eklow-server: prefill streams busy cold experts to the card: 80 slots, 13.71 GiB of cold experts pinned in host memory
+eklow-server: DFlash 2 draft /nix/store/pfrc3qzdjv0jlsfpcky5mrz55qlfffkg-Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf: blocks of 4 (trained for 8), window 2048, 780 MiB on the card (its token table stays on the host); free card memory now 1.08 GiB
+eklow-server: chat template ornith, sampling defaults temperature 1, top-k 20, top-p 0.95, min-p 0; snapshots of 64 MiB each, up to 4096 MiB
+eklow-server: embeddinggemma-2, 0.27 GiB, listening on 127.0.0.1:18182
+eklow-server: listening on 127.0.0.1:18181
+00:18:04 request chatcmpl-2fb1231019fe4b45c3ed846b: stop | prompt 20, completion 262 | queue 0.00 s, ttft 0.25 s, prefill 81.5 tok/s, decode 42.2 tok/s | draft 2.80 tokens/verify, 169 of 282 accepted
+00:18:05 engine: prompt 4.0 tok/s, generation 28.2 tok/s | running 1, waiting 0 | kv 0.1% (322 of 524288 positions, 281 cached) | prefix hit 0.0% | draft 2.74 tokens/verify, 57.9% of 309 drafted accepted | per step: engine 59.2 ms, draft 5.4, sample 3.2, inject 0.5, snapshot 0.1 | snapshots 1 (64 MiB), 1 taken, 0 restored
+00:18:10 request chatcmpl-96bf108a07511a1c8dc39ac3: stop | prompt 20, completion 262 | queue 0.00 s, ttft 0.18 s, prefill 109.7 tok/s, decode 42.8 tok/s | draft 2.80 tokens/verify, 169 of 282 accepted
+00:18:12 request chatcmpl-26442c8513914a8f5f0dbddc: stop | prompt 22, completion 43 | queue 0.00 s, ttft 0.19 s, prefill 114.4 tok/s, decode 35.2 tok/s | draft 2.21 tokens/verify, 23 of 57 accepted
+00:18:14 request chatcmpl-c5e4d6c6f23c1cda249dd693: tool_calls | prompt 312, completion 88 | queue 0.00 s, ttft 0.84 s, prefill 370.7 tok/s, decode 45.6 tok/s | draft 3.00 tokens/verify, 58 of 87 accepted
+00:18:15 engine: prompt 33.9 tok/s, generation 39.0 tok/s | running 1, waiting 0 | kv 0.1% (392 of 524288 positions, 64 cached) | prefix hit 47.5% | draft 2.84 tokens/verify, 61.3% of 411 drafted accepted | per step: engine 61.2 ms, draft 4.8, sample 3.5, inject 0.5, snapshot 0.3 | snapshots 2 (128 MiB), 4 taken, 1 restored
+00:18:16 request chatcmpl-b9339feb8416846fed7ef406: tool_calls | prompt 312 (307 cached), completion 88 | queue 0.01 s, ttft 0.07 s, prefill 83.9 tok/s, decode 47.0 tok/s | draft 3.00 tokens/verify, 58 of 87 accepted
+eklow-server: prefix: the slot's sequence (399 tokens) and the prompt (390) part at token 311: sampled 
+, prompt 
+
+; reusing 307
+00:18:20 request chatcmpl-deb2e5704c577908cbc9cf4e: stop | prompt 390 (307 cached), completion 136 | queue 0.01 s, ttft 0.53 s, prefill 157.3 tok/s, decode 47.1 tok/s | draft 3.02 tokens/verify, 91 of 135 accepted
+00:18:20 request chatcmpl-4b491ef86ea1c0b35981cce8: stop | prompt 30, completion 21 | queue 0.00 s, ttft 0.21 s, prefill 144.2 tok/s, decode 52.1 tok/s | draft 3.14 tokens/verify, 15 of 21 accepted
+00:18:21 request chatcmpl-5ac61704dc997d5a608100f7: stop | prompt 30, completion 11 | queue 0.00 s, ttft 0.21 s, prefill 145.5 tok/s, decode 62.9 tok/s | draft 3.33 tokens/verify, 7 of 9 accepted
+00:18:21 request chatcmpl-39a9f5786c8dc179ccb48fe5: stop | prompt 30, completion 11 | queue 0.00 s, ttft 0.20 s, prefill 147.2 tok/s, decode 62.6 tok/s | draft 3.33 tokens/verify, 7 of 9 accepted
+00:18:21 request chatcmpl-cb30b7eb42fdf19ea4919354: length | prompt 20, completion 7 | queue 0.00 s, ttft 0.19 s, prefill 104.9 tok/s, decode 46.8 tok/s | draft 3.00 tokens/verify, 4 of 6 accepted
+00:18:23 request chatcmpl-9dbc7ed6270da1daea22ded5: length | prompt 27, completion 60 | queue 0.00 s, ttft 0.21 s, prefill 130.2 tok/s, decode 36.4 tok/s | draft 2.27 tokens/verify, 33 of 78 accepted
+00:18:25 engine: prompt 24.7 tok/s, generation 37.1 tok/s | running 1, waiting 0 | kv 0.0% (169 of 524288 positions, 86 cached) | prefix hit 55.4% | draft 2.76 tokens/verify, 58.6% of 399 drafted accepted | per step: engine 62.0 ms, draft 4.8, sample 2.9, inject 0.5, snapshot 0.3 | snapshots 0 (0 MiB), 4 taken, 1 restored
+00:18:25 request chatcmpl-f1b692730dca07338467fde5: length | prompt 27, completion 60 | queue 0.00 s, ttft 0.21 s, prefill 130.5 tok/s, decode 36.6 tok/s | draft 2.27 tokens/verify, 33 of 78 accepted
+00:18:27 request chatcmpl-3bb71576c9f92ce834e67974: stop | prompt 27, completion 41 | queue 0.00 s, ttft 0.21 s, prefill 128.5 tok/s, decode 31.1 tok/s | draft 1.95 tokens/verify, 20 of 63 accepted
+00:18:27 error 400 (invalid_request_error): image_url: not a JPEG, PNG, GIF or BMP picture
+00:18:27 request chatcmpl-df005e719c5f79d7113c379b: length | prompt 22, completion 1 | queue 0.00 s, ttft 0.18 s, prefill 120.9 tok/s
+00:18:27 request chatcmpl-d78944552da2f071cabb088e: length | prompt 22, completion 1 | queue 0.00 s, ttft 0.18 s, prefill 120.8 tok/s
+00:18:35 engine: prompt 11.7 tok/s, generation 53.4 tok/s | running 2, waiting 0 | kv 0.1% (529 of 524288 positions, 0 cached) | prefix hit 0.0% | draft 3.25 tokens/verify, 75.1% of 489 drafted accepted | per step: engine 89.2 ms, draft 5.2, sample 6.1, inject 0.9, snapshot 0.0
+00:18:36 request chatcmpl-712f8b6c7bee2599b5cac34a: length | prompt 21, completion 300 | queue 0.00 s, ttft 0.25 s, prefill 82.9 tok/s, decode 35.0 tok/s | draft 3.83 tokens/verify, 221 of 234 accepted
+00:18:37 request chatcmpl-790483a2fb1db4da0c0b766d: length | prompt 25, completion 300 | queue 0.00 s, ttft 0.25 s, prefill 98.2 tok/s, decode 31.4 tok/s | draft 3.23 tokens/verify, 207 of 279 accepted
+00:18:43 request chatcmpl-b1c1318c7f092c3ec5cc359c: length | prompt 25, completion 300 | queue 0.00 s, ttft 0.20 s, prefill 123.3 tok/s, decode 47.5 tok/s | draft 3.05 tokens/verify, 203 of 297 accepted
+00:18:45 engine: prompt 4.6 tok/s, generation 49.4 tok/s | running 1, waiting 0 | kv 0.1% (423 of 524288 positions, 324 cached) | prefix hit 0.0% | draft 3.24 tokens/verify, 74.7% of 459 drafted accepted | per step: engine 58.6 ms, draft 5.1, sample 4.2, inject 0.5, snapshot 0.2 | snapshots 1 (64 MiB), 3 taken, 0 restored
+00:18:49 request chatcmpl-70f823288efd3f6e71e7334c: length | prompt 21, completion 300 | queue 0.00 s, ttft 0.18 s, prefill 116.3 tok/s, decode 56.0 tok/s | draft 3.83 tokens/verify, 221 of 234 accepted
+00:18:49 request chatcmpl-252c66474e6f494c3eaddf21: cancelled | prompt 26, completion 18 | queue 0.00 s, ttft 0.20 s, prefill 132.8 tok/s, decode 51.9 tok/s | draft 3.40 tokens/verify, 12 of 15 accepted
+00:18:50 request chatcmpl-cd95481a02fee4b71c2c2283: length | prompt 15, completion 5 | queue 0.00 s, ttft 0.13 s, prefill 119.3 tok/s, decode 32.9 tok/s | draft 2.00 tokens/verify, 2 of 6 accepted
+00:18:53 request chatcmpl-903e7fcf5255fe6ecb5f259f: length | prompt 1812, completion 60 | queue 0.00 s, ttft 1.09 s, prefill 1666.1 tok/s, decode 48.8 tok/s | draft 3.11 tokens/verify, 40 of 57 accepted
+00:18:54 request chatcmpl-296f32d942df8d0670eb8564: length | prompt 1889 (1871 cached), completion 30 | queue 0.00 s, ttft 0.23 s, prefill 79.0 tok/s, decode 44.6 tok/s | draft 3.10 tokens/verify, 21 of 30 accepted
+00:18:54 request chatcmpl-59620d8e9b92af634248a6ee: length | prompt 1812 (1805 cached), completion 5 | queue 0.01 s, ttft 0.07 s, prefill 104.2 tok/s, decode 21.1 tok/s | draft 3.50 tokens/verify, 5 of 6 accepted
+00:18:55 engine: prompt 187.7 tok/s, generation 33.9 tok/s | running 1, waiting 0 | kv 0.3% (1816 of 524288 positions, 1816 cached) | prefix hit 42.3% | draft 3.57 tokens/verify, 85.6% of 285 drafted accepted | per step: engine 68.7 ms, draft 4.7, sample 3.8, inject 0.6, snapshot 1.2 | snapshots 2 (128 MiB), 7 taken, 1 restored
+00:18:57 request chatcmpl-99693ca2d8bcd11e8b6e84a2: length | prompt 3131, completion 20 | queue 0.00 s, ttft 2.21 s, prefill 1414.6 tok/s, decode 39.9 tok/s | draft 2.71 tokens/verify, 12 of 21 accepted
+eklow-server: prefix: the slot's sequence (3150 tokens) and the prompt (3132) part at token 3116: sampled How, prompt Which; reusing 3116
+00:18:57 request chatcmpl-2340bdec8e4443263a77c355: length | prompt 3132 (3116 cached), completion 20 | queue 0.01 s, ttft 0.17 s, prefill 95.2 tok/s, decode 46.5 tok/s | draft 3.67 tokens/verify, 16 of 18 accepted
+00:19:00 image: 34x29 rows | wait 0.00 s, encoded in 0.45 s
+00:19:03 request chatcmpl-cd61697ec1ddde90467ebc61: stop | prompt 1008, completion 93 | queue 0.00 s, ttft 0.99 s, prefill 1021.7 tok/s, decode 36.2 tok/s | draft 2.16 tokens/verify, 50 of 129 accepted
+00:19:04 image: 20x15 rows | wait 0.00 s, encoded in 0.15 s
+00:19:05 engine: prompt 447.5 tok/s, generation 16.9 tok/s | running 1, waiting 0 | kv 0.3% (1457 of 524288 positions, 1100 cached) | prefix hit 69.8% | draft 2.52 tokens/verify, 50.7% of 201 drafted accepted | per step: engine 95.6 ms, draft 4.8, sample 2.5, inject 0.6, snapshot 1.4 | snapshots 3 (193 MiB), 9 taken, 1 restored
+00:19:08 request chatcmpl-8b7e8dfa9439eba49f7f6cd2: length | prompt 322, completion 160 | queue 0.00 s, ttft 0.60 s, prefill 533.6 tok/s, decode 37.9 tok/s | draft 2.44 tokens/verify, 95 of 198 accepted
+00:19:09 image: 40x20 rows | wait 0.00 s, encoded in 0.31 s
+00:19:11 request chatcmpl-da5bf2275b3b49621182576e: stop | prompt 822, completion 51 | queue 0.00 s, ttft 0.95 s, prefill 861.2 tok/s, decode 32.7 tok/s | draft 2.08 tokens/verify, 26 of 72 accepted
+00:19:15 request chatcmpl-7b1a1123d4c9795125842c2d: stop | prompt 1008, completion 93 | queue 0.00 s, ttft 0.98 s, prefill 1027.4 tok/s, decode 36.7 tok/s | draft 2.16 tokens/verify, 50 of 129 accepted
+00:19:15 engine: prompt 184.5 tok/s, generation 26.8 tok/s | running 1, waiting 0 | kv 0.4% (1988 of 524288 positions, 872 cached) | prefix hit 37.3% | draft 2.20 tokens/verify, 40.2% of 366 drafted accepted | per step: engine 66.9 ms, draft 5.0, sample 2.5, inject 0.5, snapshot 0.6 | snapshots 6 (385 MiB), 7 taken, 0 restored
+00:19:18 request chatcmpl-f0cdae97adf743003fdec9f3: stop | prompt 1123 (1100 cached), completion 91 | queue 0.00 s, ttft 0.26 s, prefill 88.7 tok/s, decode 32.9 tok/s | draft 2.07 tokens/verify, 47 of 132 accepted
+00:19:18 image: 8x8 rows | wait 0.00 s, encoded in 0.11 s
+00:19:18 request chatcmpl-86f06860509587ef4bfbfb4f: stop | prompt 90, completion 16 | queue 0.00 s, ttft 0.37 s, prefill 243.2 tok/s, decode 44.5 tok/s | draft 3.20 tokens/verify, 11 of 15 accepted
+00:19:19 image: 8x8 rows | wait 0.00 s, encoded in 0.11 s
+00:19:19 request chatcmpl-854cd55f7f4a94bd20209f90: stop | prompt 90, completion 16 | queue 0.00 s, ttft 0.38 s, prefill 239.5 tok/s, decode 45.3 tok/s | draft 3.20 tokens/verify, 11 of 15 accepted
+00:19:20 request chatcmpl-7f86a64a5b39eb0802828dd7: stop | prompt 90, completion 16 | queue 0.00 s, ttft 0.37 s, prefill 243.8 tok/s, decode 45.2 tok/s | draft 3.20 tokens/verify, 11 of 15 accepted
+00:19:20 error 400 (invalid_request_error): image_url: the server does not fetch http(s) URLs; send the image as a base64 data: URL
+00:19:20 error 400 (invalid_request_error): image_url: WebP is not supported; send JPEG, PNG, GIF or BMP
+00:19:20 error 400 (invalid_request_error): image_url: the image is not in a format this server reads (JPEG, PNG, GIF, BMP, ...)
+00:19:20 image: 54x45 patches, 270 rows | wait 0.00 s, encoded in 0.09 s
+00:19:20 embeddings: 1 input, 281 tokens (270 image) | wait 0.00 s, 0.093 s, 3022 tok/s
+00:19:25 engine: prompt 30.6 tok/s, generation 29.3 tok/s | running 1, waiting 0 | kv 0.1% (287 of 524288 positions, 105 cached) | prefix hit 0.0% | draft 2.98 tokens/verify, 66.0% of 294 drafted accepted | per step: engine 65.6 ms, draft 4.9, sample 3.2, inject 0.5, snapshot 0.1 | snapshots 0 (0 MiB), 1 taken, 0 restored | embeddings 1 requests, 1 inputs, 28.1 tok/s
+00:19:32 request chatcmpl-c7583167c2a9ca7f64f80e3d: length | prompt 8131, completion 1 | queue 0.00 s, ttft 5.90 s, prefill 1377.8 tok/s
+00:19:35 engine: prompt 812.7 tok/s, generation 25.6 tok/s | running 1, waiting 0 | kv 1.6% (8568 of 524288 positions, 8131 cached) | prefix hit 0.0% | draft 3.98 tokens/verify, 99.5% of 192 drafted accepted | per step: engine 141.7 ms, draft 4.9, sample 4.4, inject 0.6, snapshot 0.7 | snapshots 4 (257 MiB), 4 taken, 0 restored
+00:19:45 engine: prompt 0.0 tok/s, generation 56.8 tok/s | running 1, waiting 0 | kv 1.7% (9136 of 524288 positions, 8131 cached) | draft 4.00 tokens/verify, 100.0% of 426 drafted accepted | per step: engine 60.1 ms, draft 5.1, sample 4.4, inject 0.5, snapshot 0.0 | snapshots 4 (257 MiB), 0 taken, 0 restored
+00:19:54 request chatcmpl-97dbf3fa3a7ab64b1244b007: length | prompt 29, completion 1500 | queue 0.00 s, ttft 0.20 s, prefill 145.6 tok/s, decode 46.9 tok/s | draft 3.99 tokens/verify, 1124 of 1128 accepted
+00:19:55 engine: prompt 0.0 tok/s, generation 52.3 tok/s | running 0, waiting 0 | kv 1.8% (9659 of 524288 positions, 9659 cached) | draft 4.00 tokens/verify, 100.0% of 393 drafted accepted | per step: engine 61.2 ms, draft 5.1, sample 4.8, inject 0.5, snapshot 0.1 | snapshots 5 (321 MiB), 1 taken, 0 restored
+00:20:05 engine: prompt 616.6 tok/s, generation 23.4 tok/s | running 2, waiting 0 | kv 1.2% (6402 of 524288 positions, 0 cached) | prefix hit 0.0% | draft 3.95 tokens/verify, 98.3% of 177 drafted accepted | per step: engine 122.7 ms, draft 4.8, sample 4.4, inject 0.5, snapshot 0.0
+00:20:15 engine: prompt 1433.4 tok/s, generation 0.8 tok/s | running 2, waiting 0 | kv 4.0% (20750 of 524288 positions, 0 cached) | draft 4.00 tokens/verify, 100.0% of 6 drafted accepted | per step: engine 1908.6 ms, draft 3.2, sample 1.9, inject 0.2, snapshot 2.3 | snapshots 1 (64 MiB), 1 taken, 0 restored
+00:20:25 request chatcmpl-764bfd5104d34003095b8aad: length | prompt 32707, completion 1 | queue 0.03 s, ttft 24.42 s, prefill 1340.6 tok/s
+00:20:25 engine: prompt 1222.2 tok/s, generation 3.6 tok/s | running 1, waiting 0 | kv 6.3% (33012 of 524288 positions, 32707 cached) | draft 3.89 tokens/verify, 96.3% of 27 drafted accepted | per step: engine 991.7 ms, draft 4.2, sample 4.9, inject 1.5, snapshot 4.2 | snapshots 5 (321 MiB), 4 taken, 0 restored
+00:20:35 engine: prompt 0.0 tok/s, generation 56.4 tok/s | running 1, waiting 0 | kv 6.4% (33576 of 524288 positions, 32707 cached) | draft 4.00 tokens/verify, 100.0% of 423 drafted accepted | per step: engine 60.4 ms, draft 5.1, sample 4.9, inject 0.5, snapshot 0.0 | snapshots 5 (321 MiB), 0 taken, 0 restored
+00:20:45 engine: prompt 0.0 tok/s, generation 55.6 tok/s | running 1, waiting 0 | kv 6.5% (34136 of 524288 positions, 32707 cached) | draft 4.00 tokens/verify, 100.0% of 417 drafted accepted | per step: engine 61.4 ms, draft 5.1, sample 4.8, inject 0.5, snapshot 0.0 | snapshots 5 (321 MiB), 0 taken, 0 restored
+00:20:47 request chatcmpl-3b55d698aa938b448318af05: length | prompt 29, completion 1500 | queue 0.00 s, ttft 0.20 s, prefill 144.9 tok/s, decode 29.8 tok/s | draft 3.99 tokens/verify, 1124 of 1128 accepted

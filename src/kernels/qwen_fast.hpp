@@ -40,6 +40,18 @@ void moe_tail(sycl::queue& q, const float* x2, const float* y, const float* weig
               const float* sgate, int64_t ld_sg, const float* shared, const float* w_next, float eps, int64_t rows, int64_t cols,
               float* x_out, xmx::Activations* act, float* h_out);
 
+// Layer-major prefill's accumulation into the residual stream, in place, per element:
+//   x[t] += (sum_i weights[t * n_used + i] * y[rows[t * n_used + i]]  over the pairs with a row >= 0)
+//         + extra[extra_row[t]]                                         (extra_row[t] >= 0)
+//         + sigmoid(sgate[t * ld_sg]) * shared[t]
+// y / weights / rows, extra / extra_row and shared / sgate are each optional (null: that part is left out). One pass for the hot
+// experts and the shared expert, one for each wave of streamed experts, one for the CPU's share.
+void moe_accumulate(sycl::queue& q, float* x, const float* y, const float* weights, const int32_t* rows, int64_t n_used, const float* extra,
+                    const int32_t* extra_row, const float* shared, const float* sgate, int64_t ld_sg, int64_t n_tok, int64_t cols);
+
+// out[i] = half(x[i]), i < n.
+void to_half(sycl::queue& q, const float* x, int64_t n, sycl::half* out);
+
 // dst[r][col0 .. col0 + cols) = x[idx[r]][0 .. cols), r < n (dst rows are ld floats apart).
 void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t n, int64_t cols, float* dst, int64_t ld, int64_t col0);
 

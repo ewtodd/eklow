@@ -1,0 +1,25 @@
+[big.jpg] 4.0 s, prompt 1008 (cached 0), completion 93
+  This is a screenshot of the Android Studio IDE showing a C++ project (llama.cpp integration) being developed. The main editor displays the `aChat.cpp` file containing C++ code with includes for Android logging, JNI, and llama.h, plus a template `join` function. The bottom panel shows the build output indicating a successful CMake configuration and build for an Android ARM backend, with the status "BUILD SUCCESSFUL in 21s".
+[gray.png] 5.0 s, prompt 322 (cached 0), completion 160
+  This is a photograph of the front page of The New York Times from Monday, July 21, 1969 — the day after the historic Apollo 11 Moon landing. The headline blares “MEN WALK ON MOON” with a subhead: “ASTRONAUTS LAND ON PLAIN: COLLECT ROCKS, PLANT FLAG.” The page includes a small black-and-white photo of astronauts on the lunar surface, a live transcript section titled “Voice From Moon: ‘Eagle Has Landed,’” and an article by John Noble Wilford headlined “A Powdery Surface Is Closely Explored.” It’s the “Late City Edition,” priced at 10 cents, and captures the euphoria and significance of humanity’s first steps on the
+[wide.png] 2.8 s, prompt 822 (cached 0), completion 51
+  This is a logo for "LLM.ai+" displayed in white and orange text on a dark background. The design features the letters "LLM" in large white font, followed by ".ai+" in orange, with the plus symbol stylized.
+[turn 1] 3.5 s, prompt 1008 (cached 0), completion 93
+  This is a screenshot of the Android Studio IDE showing a C++ project (llama.cpp integration) being developed. The main editor displays the `aChat.cpp` file containing C++ code with includes for Android logging, JNI, and llama.h, plus a template `join` function. The bottom panel shows the build output indicating a successful CMake configuration and build for an Android ARM backend, with the status "BUILD SUCCESSFUL in 21s".
+[turn 2 (cached tokens should cover turn 1)] 3.0 s, prompt 1123 (cached 1100), completion 91
+  The most prominent color in the image is **dark gray/black**, which dominates the IDE's dark theme interface—the code editor background, sidebars, panels, and toolbar all use dark shades.
+
+Secondary prominent colors include:
+- **Blue** (from the selected file highlight, active tabs, and UI accents)
+- **Green** (build success indicators, status bar)
+- **White/light gray** (code text and interface elements)
+[same size: red above blue] 0.8 s, prompt 90 (cached 0), completion 16
+  The picture contains red in the top half and blue in the bottom half.
+[same size: green left of yellow] 0.8 s, prompt 90 (cached 0), completion 16
+  The picture contains green on the left half and yellow on the right half.
+[same size: red above blue again] 0.7 s, prompt 90 (cached 0), completion 16
+  The picture contains red in the top half and blue in the bottom half.
+[refusal: http url] HTTP 400: image_url: the server does not fetch http(s) URLs; send the image as a base64 data: URL
+[refusal: webp] HTTP 400: image_url: WebP is not supported; send JPEG, PNG, GIF or BMP
+[refusal: garbage] HTTP 400: image_url: the image is not in a format this server reads (JPEG, PNG, GIF, BMP, ...)
+[embedding of big.jpg] 0.3 s, 768 dims, prompt_tokens 281

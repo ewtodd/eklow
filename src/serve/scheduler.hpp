@@ -128,6 +128,10 @@ struct SchedulerConfig {
   uint64_t snapshot_bytes = 0;
   int64_t snapshot_every = 16384;
   int64_t snapshot_min = 256;
+  // Layer-major prefill (engine::Config::max_group, at least as large): a step whose only work is one slot's prefill with more than
+  // max_chunk tokens left takes up to max_group of them as one group. While another slot generates the group would stall its decode for
+  // the whole group, so then it takes up to group_busy tokens (0: plain chunks, decode first).
+  int64_t max_group = 0, group_busy = 0;
 };
 
 class Scheduler {
@@ -217,6 +221,7 @@ class Scheduler {
   SchedulerConfig c_;
   std::vector<Seq> seqs_;
   uint64_t tick_ = 0;
+  bool grouped_last_ = false;  // the last step was a layer-major group (a generating slot then gets a step before the next group)
   uint64_t snap_bytes_ = 0;  // held by all slots' snapshots (engine thread; mirrored into stats_)
 
   mutable std::mutex mu_;

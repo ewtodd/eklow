@@ -304,9 +304,23 @@ void Scheduler::step() {
   std::vector<Item> items;
 
   // Generating slots first: a verify block (the draft's) or a decode token each.
+  // A group: the only prefilling slot, with more than a chunk left, alone in the step (the engine takes a group as the step's only chunk).
+  int grp_slot = -1;
+  int64_t grp_limit = 0;
+  if (c_.max_group > c_.max_chunk) {
+    int n_prefill = 0, n_gen = 0, who = -1;
+    for (size_t s = 0; s < seqs_.size(); ++s) {
+      const Seq& q = seqs_[s];
+      if (!q.req) continue;
+      if (q.next_token >= 0) ++n_gen;
+      else if (q.fed < q.req->prompt.size()) ++n_prefill, who = int(s);
+    }
+    const int64_t lim = n_gen ? std::min(c_.group_busy, c_.max_group) : c_.max_group;
+    if (n_prefill == 1 && !(n_gen && grouped_last_) && lim > c_.max_chunk && int64_t(seqs_[size_t(who)].req->prompt.size() - seqs_[size_t(who)].fed) > c_.max_chunk) grp_slot = who, grp_limit = lim;
+  }
   std::vector<int> gen;
   for (size_t s = 0; s < seqs_.size(); ++s)
-    if (seqs_[s].req && seqs_[s].next_token >= 0) gen.push_back(int(s));
+    if (grp_slot < 0 && seqs_[s].req && seqs_[s].next_token >= 0) gen.push_back(int(s));
   std::vector<DraftBlock> blocks(seqs_.size());
   // The block of a request: the server's, or its own (a request may ask for another, or 0 for plain decode).
   auto block_of = [&](const Seq& q) { return q.req->draft_block < 0 ? c_.draft_block : q.req->draft_block; };
@@ -364,7 +378,7 @@ void Scheduler::step() {
     Seq& q = seqs_[s];
     if (!q.req || q.next_token >= 0 || q.fed >= q.req->prompt.size()) continue;
     const int64_t fed = int64_t(q.fed), P = int64_t(q.req->prompt.size());
-    int64_t n = std::min<int64_t>({c_.max_chunk, budget, P - fed});
+    int64_t n = int(s) == grp_slot ? std::min<int64_t>(grp_limit, P - fed) : std::min<int64_t>({c_.max_chunk, budget, P - fed});
     if (c_.snapshot_bytes > 0) {
       int64_t cut = P;
       for (int64_t p : q.req->snapshot_points)
@@ -413,6 +427,9 @@ void Scheduler::step() {
   }
   if (chunks.empty()) return;
 
+  grouped_last_ = false;
+  for (const engine::Chunk& c : chunks)
+    if (int64_t(c.tokens.size()) > c_.max_chunk) grouped_last_ = true;
   const std::vector<float> logits = [&] {
     Timer timer(mu_, stats_.engine_s);
     return eng_.step(chunks);
