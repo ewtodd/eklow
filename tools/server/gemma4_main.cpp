@@ -364,7 +364,7 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 }  // namespace
 
 int gemma4_server_main(int argc, char** argv) {
-  std::string model_path, alias = "gemma-4-12b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", mmproj_path, embed_mmproj_path;
+  std::string model_path, alias = "gemma-4-26b-a4b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", mmproj_path, embed_mmproj_path;
   int image_tokens = 280;
   int port = 8081, slots = 2, embed_port = 8082;
   int64_t ctx = 262144, batch = 2048, chunk = 2048;
