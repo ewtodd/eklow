@@ -96,3 +96,7 @@ for name, spec_s in sets:
 print("all", " ".join(f"{v}: {1 + np.mean(a):.2f} (+/- {np.std(a) / np.sqrt(len(a)):.2f}, n={len(a)})" for v, a in res.items()))
 for v, a in res.items():
     print(v, "accepted-length histogram", np.bincount(a, minlength=B).tolist())
+base = np.array(res[next(iter(res))])
+for v, a in res.items():
+    d = np.array(a) - base  # paired by position
+    print(f"{v} minus {next(iter(res))}: {d.mean():+.3f} tokens per step (paired se {d.std() / np.sqrt(len(d)):.3f})")
