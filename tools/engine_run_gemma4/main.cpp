@@ -14,12 +14,22 @@
 // in the same steps, offset by one chunk, writes its logits to DIR/twin, and fails when their mean
 // KL from the first slot's exceeds --twin-tol (default 0.05). The two slots see different batch
 // shapes, so they differ by the int8 noise floor; a slot reading another's cache is far worse.
+//
+// The speculative checks (--verify-last N --verify-block B [--accept A,...] [--capture-layers L,...] [--head-dpas]): the prompt's
+// first n - N tokens are prefilled, and the last N are run twice in one slot, once decoded a token at a time (the plain run:
+// logits and captured hidden states of each position) and once as verify blocks of B tokens whose acceptance follows the pattern
+// --accept (a count per block, cycled, at least 1; the unaccepted tokens are fed again in the next block after the engine's
+// rewind with truncate; the last block accepts all). It reports each verify row's logits against the plain run's (top-1
+// agreement, mean and worst KL) and the captured rows of the accepted tokens against the plain run's (relative RMS error), and
+// fails above --verify-tol (mean KL, default 0.05) or --capture-tol (relative RMS, default 0.05). The prefill's captures are
+// compared too (the same chunks in both runs: identical). --capture-layers defaults to 1,6,11,17,22,27 (the 26B draft's).
 #include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <functional>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -85,6 +95,11 @@ int main(int argc, char** argv) {
   int stream_slots = 40, stream_min_rows = 16;
   double stream_copy_us = 300, stream_cpu_us = 22;
   double twin_tol = 0.05;
+  int64_t verify_last = 0, verify_block = 4;
+  std::vector<int64_t> accept_pattern = {1};
+  std::vector<int> capture_layers = {1, 6, 11, 17, 22, 27};
+  bool head_dpas = false;
+  double verify_tol = 0.05, capture_tol = 0.05;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -106,6 +121,17 @@ int main(int argc, char** argv) {
     else if (a == "--stream-min-rows") stream_min_rows = std::atoi(next().c_str());
     else if (a == "--stream-copy-us") stream_copy_us = std::atof(next().c_str());
     else if (a == "--stream-cpu-us") stream_cpu_us = std::atof(next().c_str());
+    else if (a == "--verify-last") verify_last = std::atoll(next().c_str());
+    else if (a == "--verify-block") verify_block = std::atoll(next().c_str());
+    else if (a == "--accept") {
+      accept_pattern.clear();
+      for (auto s : split(next(), ',')) accept_pattern.push_back(std::atoll(s.c_str()));
+    } else if (a == "--capture-layers") {
+      capture_layers.clear();
+      for (auto s : split(next(), ',')) capture_layers.push_back(std::atoi(s.c_str()));
+    } else if (a == "--head-dpas") head_dpas = true;
+    else if (a == "--verify-tol") verify_tol = std::atof(next().c_str());
+    else if (a == "--capture-tol") capture_tol = std::atof(next().c_str());
     else if (a == "--twin") twin = true;
     else if (a == "--twin-tol") twin_tol = std::atof(next().c_str());
     else if (a == "--moe-layers")
@@ -113,7 +139,8 @@ int main(int argc, char** argv) {
     else {
       std::fprintf(stderr, "usage: eklow-engine-run --model GGUF --out DIR (--tokens-json FILE | --tokens IDS) "
                            "[--tensors PREFIX,...] [--logits-last N] [--chunk N] [--decode-last N] [--twin] "
-                           "[--twin-tol KL] [--max-ctx N] [--kv-int8] [--image-rows FILE ...] [--moe-layers N,...] [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [[--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US]\n");
+                           "[--twin-tol KL] [--max-ctx N] [--kv-int8] [--image-rows FILE ...] [--moe-layers N,...] [--expert-profile JSON --experts-on-card N] [--cpu-threads N] [--stream-slots N] [[--stream-min-rows N] [--stream-copy-us US] [--stream-cpu-us US] "
+                           "[--verify-last N --verify-block B --accept A,... [--capture-layers L,...] [--head-dpas] [--verify-tol KL] [--capture-tol REL]]\n");
       return 2;
     }
   }
@@ -139,6 +166,13 @@ int main(int argc, char** argv) {
     const int64_t n = int64_t(tokens.size());
     logits_last = std::min(logits_last, n);
     decode_last = std::min(decode_last, n - 1);
+    if (verify_last) {
+      verify_last = std::min(verify_last, n - 1);
+      decode_last = verify_last;  // the plain run decodes them
+      for (int64_t a : accept_pattern)
+        if (a < 1) throw std::runtime_error("--accept counts must be at least 1");
+      if (verify_block < 2 || verify_block > engine::gemma4::kMaxVerify) throw std::runtime_error("--verify-block must be 2 to 16");
+    }
     const int64_t prefill = n - decode_last;
     if (chunk <= 0) chunk = prefill;
 
@@ -170,6 +204,14 @@ int main(int argc, char** argv) {
     ec.stream_copy_us = stream_copy_us;
     ec.stream_cpu_us = stream_cpu_us;
     ec.max_logits = twin ? 2 * std::min(widest, logits_last) : std::min(widest, logits_last);
+    ec.head_dpas = head_dpas;
+    if (verify_last) {
+      if (twin) throw std::runtime_error("--verify-last and --twin do not combine");
+      ec.max_batch = ec.max_chunk = std::max(widest, verify_block);
+      ec.capture_layers = capture_layers;
+      ec.max_capture_rows = ec.max_chunk;
+      ec.max_logits = std::max<int64_t>(ec.max_logits, verify_block);
+    }
 
     auto t0 = std::chrono::steady_clock::now();
     auto f = gguf::File::open(model);
@@ -195,6 +237,100 @@ int main(int argc, char** argv) {
     };
     std::printf("loaded %.2f GiB of weights, %.2f GiB of KV cache onto %s in %.1f s\n", eng.weight_bytes() / 1073741824.0,
                 eng.cache_bytes() / 1073741824.0, q.get_device().get_info<sycl::info::device::name>().c_str(), since(t0));
+
+    if (verify_last) {
+      // The speculative checks (see the header): the plain run, then the same tokens as verify blocks with rewinds.
+      const int64_t E = eng.model().n_embd, W = eng.capture().width, nl = int64_t(capture_layers.size());
+      const int64_t prefill_n = n - verify_last, keep_from = std::max<int64_t>(0, n - 1024);
+      std::vector<float> ref_cap(size_t((n - keep_from) * W)), ref_logits(size_t(verify_last * V)), host;
+      auto fetch = [&]() -> const engine::gemma4::Engine::Capture& {
+        const auto& cap = eng.capture();
+        host.resize(size_t(cap.rows * cap.width));
+        if (cap.rows) q.memcpy(host.data(), cap.data, host.size() * sizeof(float)).wait();
+        return cap;
+      };
+      // The prefill's chunks (those of `steps` that end within the prompt), capturing the rows from keep_from on.
+      auto prefill_run = [&](const std::function<void(int64_t pos, const float* row)>& on_row) {
+        eng.release(0);
+        for (auto [a, b] : steps) {
+          if (b > prefill_n) break;
+          engine::gemma4::Chunk c = make_chunk(0, a, b, 0);
+          c.capture_rows = std::max<int64_t>(0, std::min(b - a, b - keep_from));
+          eng.step({c});
+          const auto& cap = fetch();
+          for (int64_t r = 0; r < cap.rows; ++r) on_row(cap.ids[size_t(r)].pos, host.data() + r * cap.width);
+        }
+      };
+      // Relative RMS error of captured rows against the plain run's, per captured layer.
+      std::vector<double> num(size_t(nl), 0.0), den(size_t(nl), 0.0), pre_num(size_t(nl), 0.0), pre_den(size_t(nl), 0.0);
+      auto compare_row = [&](int64_t pos, const float* row, std::vector<double>& nu, std::vector<double>& de) {
+        if (pos < keep_from) return;
+        const float* ref = ref_cap.data() + (pos - keep_from) * W;
+        for (int64_t l = 0; l < nl; ++l)
+          for (int64_t j = 0; j < E; ++j) {
+            const double a = row[l * E + j], b = ref[l * E + j];
+            nu[size_t(l)] += (a - b) * (a - b);
+            de[size_t(l)] += b * b;
+          }
+      };
+      // The plain run: the prefill, then the last tokens a step each.
+      auto t_plain = std::chrono::steady_clock::now();
+      prefill_run([&](int64_t pos, const float* row) { std::copy(row, row + W, ref_cap.begin() + (pos - keep_from) * W); });
+      for (int64_t p = prefill_n; p < n; ++p) {
+        engine::gemma4::Chunk c = make_chunk(0, p, p + 1, 1);
+        c.capture_rows = 1;
+        const std::vector<float> l = eng.step({c});
+        std::copy(l.begin(), l.end(), ref_logits.begin() + (p - prefill_n) * V);
+        const auto& cap = fetch();
+        if (p >= keep_from) std::copy(host.begin(), host.begin() + cap.width, ref_cap.begin() + (p - keep_from) * W);
+      }
+      const double plain_s = since(t_plain);
+      // The verify run.
+      auto t_spec = std::chrono::steady_clock::now();
+      prefill_run([&](int64_t pos, const float* row) { compare_row(pos, row, pre_num, pre_den); });
+      double kl_sum = 0, kl_worst = 0, maxdiff = 0;
+      int64_t rows = 0, same = 0, blocks = 0, rewinds = 0, fed = 0;
+      size_t bi = 0;
+      for (int64_t pos = prefill_n; pos < n;) {
+        const int64_t b = std::min(verify_block, n - pos);
+        engine::gemma4::Chunk c = make_chunk(0, pos, pos + b, b);
+        c.verify = b >= 2;
+        c.capture_rows = b;
+        const std::vector<float> l = eng.step({c});
+        const int64_t a = pos + b == n ? b : std::min(b, accept_pattern[bi++ % accept_pattern.size()]);
+        const auto& cap = fetch();
+        for (int64_t r = 0; r < b; ++r) {
+          const float *x = l.data() + r * V, *y = ref_logits.data() + (pos + r - prefill_n) * V;
+          const double d = kl(y, x, V);
+          kl_sum += d, kl_worst = std::max(kl_worst, d), ++rows;
+          same += std::max_element(x, x + V) - x == std::max_element(y, y + V) - y;
+          for (int64_t v = 0; v < V; ++v) maxdiff = std::max(maxdiff, double(std::fabs(x[v] - y[v])));
+        }
+        for (int64_t r = 0; r < a; ++r) compare_row(cap.ids[size_t(r)].pos, host.data() + r * cap.width, num, den);
+        ++blocks, fed += b;
+        if (a < b) {
+          eng.truncate(0, pos + a);  // the rewind
+          ++rewinds;
+        }
+        pos += a;
+      }
+      const double spec_s = since(t_spec);
+      std::printf("verify: %lld blocks of up to %lld tokens (%lld rows fed, %lld rewinds) over the last %lld tokens; plain run %.2f s (with the prefill), verify run %.2f s\n", (long long)blocks,
+                  (long long)verify_block, (long long)fed, (long long)rewinds, (long long)verify_last, plain_s, spec_s);
+      const double mean_kl = kl_sum / double(std::max<int64_t>(rows, 1));
+      std::printf("verify rows against the same tokens decoded one at a time: top-1 agreement %lld/%lld, mean KL %.3g, worst %.3g, max logit difference %.3g\n", (long long)same,
+                  (long long)rows, mean_kl, kl_worst, maxdiff);
+      double worst_rel = 0, pre_worst = 0;
+      for (int64_t l = 0; l < nl; ++l) {
+        const double rel = std::sqrt(num[size_t(l)] / std::max(den[size_t(l)], 1e-30)), prel = std::sqrt(pre_num[size_t(l)] / std::max(pre_den[size_t(l)], 1e-30));
+        std::printf("capture of layer %d: accepted verify rows rel RMS %.3g against the plain run's, prefill rows %.3g\n", capture_layers[size_t(l)], rel, prel);
+        worst_rel = std::max(worst_rel, rel), pre_worst = std::max(pre_worst, prel);
+      }
+      if (mean_kl > verify_tol) throw std::runtime_error("verify rows disagree with decoding one at a time (mean KL above --verify-tol)");
+      if (worst_rel > capture_tol || pre_worst > capture_tol) throw std::runtime_error("captured rows differ from the plain run's (above --capture-tol)");
+      std::printf("verify and capture checks passed\n");
+      return 0;
+    }
 
     // Each step's tensors are that step's tokens; the dumps concatenate them along the token axis.
     std::map<std::string, std::pair<std::vector<float>, std::vector<int64_t>>> dumps;

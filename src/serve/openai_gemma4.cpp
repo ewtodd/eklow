@@ -263,6 +263,11 @@ ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, cons
       }
     else throw bad("stop must be a string or an array of strings");
   }
+  if (const json::Value* v = field(body, "speculative"); v && !v->is_null()) {
+    if (v->is_int()) r.draft_block = int(std::max<double>(0, std::min<double>(16, number(*v, "speculative"))));
+    else r.draft_block = v->truthy() ? -1 : 0;
+    if (r.draft_block == 1) r.draft_block = 0;
+  }
   if (const json::Value* v = field(body, "stream"); v) r.stream = v->truthy();
   if (const json::Value* so = field(body, "stream_options"); so && so->is_object())
     if (const json::Value* u = so->find("include_usage")) r.include_usage = u->truthy();
@@ -283,7 +288,10 @@ std::string ChatResponse::usage_json(const Event& e) const {
   json::Writer w(false);
   w.begin_object().kv("prompt_tokens", e.prompt_tokens).kv("completion_tokens", e.completion_tokens);
   w.kv("total_tokens", e.prompt_tokens + e.completion_tokens);
-  w.key("prompt_tokens_details").begin_object().kv("cached_tokens", e.cached_tokens).end_object().end_object();
+  w.key("prompt_tokens_details").begin_object().kv("cached_tokens", e.cached_tokens).end_object();
+  // eklow's own: what speculative decoding did for the request (absent without a draft).
+  if (e.verifies > 0) w.key("speculation").begin_object().kv("verifies", e.verifies).kv("drafted", e.drafted).kv("accepted", e.accepted).end_object();
+  w.end_object();
   return w.str();
 }
 

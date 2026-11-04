@@ -55,7 +55,20 @@ struct Config {
   int stream_min_rows = 16;
   double stream_copy_us = 300;  // one expert from pinned memory to the card (copy-bench: 307 us)
   double stream_cpu_us = 22;    // one cold pair on the CPU, 16 threads
+  // Speculative decoding (a DFlash 2 draft). Hidden states the draft reads: the outputs (l_out) of these layers for the rows
+  // a chunk asks for (Chunk::capture_rows), into a device buffer [row][layers x n_embd] fp32 in step order. Empty: no capture.
+  std::vector<int> capture_layers = {};
+  int64_t max_capture_rows = 2048;  // rows of capture a step may ask for
+  // Card memory kept from the experts' placement for the draft (its weights, cache and scratch, built after the engine).
+  uint64_t draft_reserve_bytes = 0;
+  // The head (the tied embedding) as the matrix units run it: Q6_K tiles, int8 activations (xmx), one copy shared with the
+  // draft (head_weight()), the embedding rows gathered from the GGUF's mapping per step. Off: the fp32-activation head
+  // (fast::Q6), which the draft cannot use, and the embedding lookup on the card.
+  bool head_dpas = false;
 };
+
+// A verify chunk's longest block.
+constexpr int64_t kMaxVerify = 16;
 
 struct Chunk {
   int slot;
@@ -66,6 +79,12 @@ struct Chunk {
   // tokens there are ignored. On the sliding layers each span's tokens see the whole span (llama.cpp runs an image
   // bidirectionally on those layers only; the global layers stay causal). A span lies within one chunk, in order.
   std::vector<model::ImageRows> images = {};
+  // A verify chunk (a speculative decoder's block of 2 to kMaxVerify tokens: the anchor and the drafted ones): logits for every
+  // row (logits_rows is ignored). Gemma has no recurrent state, so a rejection is a rewind: the caller calls truncate(slot,
+  // start_pos + 1 + accepted) after the step (within ring_slack() positions of the block's end).
+  bool verify = false;
+  // The last capture_rows rows of the chunk are captured (Config::capture_layers' hidden states).
+  int64_t capture_rows = 0;
 };
 
 class Engine {
@@ -78,6 +97,24 @@ class Engine {
   // Logits for each chunk's last logits_rows tokens, chunk after chunk, [row][vocab]. `dump`
   // receives the same intermediate tensors as the reference forward.
   std::vector<float> step(const std::vector<Chunk>& chunks, const model::DumpSink* dump = nullptr);
+  // The hidden states of the last step's captured rows: a device buffer [row][capture_layers.size() x n_embd] fp32, in step
+  // order (chunk after chunk), valid until the next step; ids[row] is the row's slot and position.
+  struct RowId {
+    int32_t slot, pos;
+  };
+  struct Capture {
+    const float* data = nullptr;
+    int64_t rows = 0, width = 0;
+    std::vector<RowId> ids;
+  };
+  const Capture& capture() const { return capture_; }
+  // The output head as the matrix units run it (Config::head_dpas), for the draft to project its block with the same weights
+  // instead of a second copy (605 MB), and the token embedding table as the GGUF stores it (host memory, Q6_K; the model
+  // scales the looked-up rows by sqrt(n_embd)). The GGUF must outlive both.
+  const xmx::Weight& head_weight() const;
+  ref::Weight embedding_table() const;
+  const Config& config() const { return c_; }
+
   // Forgets a slot's sequence and returns its pages.
   void release(int slot);
   // Keeps the first `length` positions of a slot's sequence (a prompt that shares only a prefix
@@ -182,7 +219,19 @@ class Engine {
   std::vector<void*> owned_;
   uint64_t weight_bytes_ = 0, cache_bytes_ = 0;
 
-  fast::Q6 head_;  // token embedding and tied output head
+  fast::Q6 head_;  // token embedding and tied output head (without head_dpas)
+  // head_dpas: the head on the matrix units, and the embedding rows gathered from the GGUF's mapping per step.
+  xmx::Weight head_w_;
+  xmx::Activations act_head_;
+  const gguf::Tensor* embd_ = nullptr;
+  uint64_t embd_row_bytes_ = 0;
+  uint8_t *emb_host_ = nullptr, *emb_dev_ = nullptr;
+  int32_t* iota_ = nullptr;
+  // Capture of hidden states.
+  float* cap_ = nullptr;
+  int32_t* cap_idx_ = nullptr;
+  Capture capture_;
+  std::vector<int> cap_col_;  // per layer: its column block in the capture, or -1
   const float* output_norm_ = nullptr;
   const float *inv_freq_sliding_ = nullptr, *inv_freq_global_ = nullptr;
   std::vector<Layer> layers_;

@@ -1,13 +1,14 @@
 // eklow-server, Gemma 4 side: Gemma 4 (the 26B A4B MoE; the 12B dense as a by-product) on the A770M behind an
 // OpenAI-compatible HTTP API. tools/server/main.cpp reads the GGUF's general.architecture and calls
 // gemma4_server_main for gemma4 (this file; a restore of main's 76d8588 version, 2026-10-27, with its main as a
-// function), its own main for qwen35moe. Gemma 4 has no DFlash draft, no DeltaNet snapshots and no layer-major prefill
+// function), its own main for qwen35moe. Gemma 4 can run a DFlash 2 draft (--draft: z-lab's gemma-4-26B-A4B-it-DFlash, speculative
+// decoding as the Qwen side does it); it has no DeltaNet snapshots and no layer-major prefill
 // groups: the Qwen side's flags for those are refused here by name.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
 //                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [[--stream-min-rows N]]
 //                [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
-//                [--log-interval S]
+//                [--draft GGUF [--draft-block B] [--draft-reserve-mib N] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--log-interval S]
 //
 // --ctx is the context of each slot (positions), Gemma's full 262,144 by default; --batch the
 // tokens of one engine step and --chunk the prefill tokens of one sequence in a step (2,048: twice the rows per
@@ -18,6 +19,11 @@
 // the card and the rest are computed on the CPU. How many (--experts-on-card) is, by default, as many as fit
 // in the card's free memory after the KV cache, the workspace and the embedding model, less
 // --card-margin-mib (1024) for what the first requests allocate and the driver keeps.
+// --draft (a DFlash 2 draft GGUF for the 26B) turns on speculative decoding: a verify block of --draft-block tokens (default the
+// draft's trained block or 4 if less, 2 to 16) per step, accepted losslessly (the sampler's every feature, the tool grammar
+// included); a request may choose its own with "speculative": N (0 or false: plain decode). The engine then runs the head on
+// the matrix units (Q6_K, one copy shared with the draft) and keeps --draft-reserve-mib (1200) of the card from the experts
+// for the draft.
 // --mmproj (the 26B's projector GGUF) lets chat requests carry images (OpenAI image_url parts with base64 data: URLs),
 // --embed-mmproj (EmbeddingGemma 2's) lets an embeddings input be an array of text and image_url parts; --image-tokens is
 // the budget of rows per image (llama.cpp's image_max_tokens, 70 to 1,120, 280 by default). Each image is encoded on its
@@ -49,6 +55,7 @@
 #include "core/json_value.hpp"
 #include "engine/engine_gemma4.hpp"
 #include "image/gemma4_image.hpp"
+#include "model/dflash2.hpp"
 #include "model/embed_gemma2.hpp"
 #include "model/gguf.hpp"
 #include "model/vision_gemma4v.hpp"
@@ -105,6 +112,9 @@ std::string request_line(const serve::gemma4::RequestLog& l) {
     if (l.prefill_s > 0) out += fmt(", prefill %.1f tok/s", double(l.prompt_tokens - l.cached_tokens) / l.prefill_s);
     if (l.completion_tokens > 1 && l.decode_s > 0) out += fmt(", decode %.1f tok/s", double(l.completion_tokens - 1) / l.decode_s);
   }
+  if (l.verifies > 0)
+    out += fmt(" | draft %.2f tokens/verify, %lld of %lld accepted", double(l.accepted + l.verifies) / double(l.verifies), (long long)l.accepted,
+               (long long)l.drafted);
   return out;
 }
 
@@ -129,6 +139,13 @@ std::string engine_line(const serve::gemma4::Scheduler::Stats& a, const serve::g
              (long long)b.positions, (long long)capacity, (long long)b.idle_positions);
   if (b.prompt_tokens > a.prompt_tokens)
     out += fmt(" | prefix hit %.1f%%", 100.0 * double(b.cached_tokens - a.cached_tokens) / double(b.prompt_tokens - a.prompt_tokens));
+  if (b.verifies > a.verifies)
+    out += fmt(" | draft %.2f tokens/verify, %.1f%% of %lld drafted accepted", double(b.accepted - a.accepted + b.verifies - a.verifies) / double(b.verifies - a.verifies),
+               100.0 * double(b.accepted - a.accepted) / double(std::max<int64_t>(b.drafted - a.drafted, 1)), (long long)(b.drafted - a.drafted));
+  if (b.steps > a.steps && b.verifies > a.verifies)
+    out += fmt(" | per step: engine %.1f ms, draft %.1f, sample %.1f, inject %.1f", 1e3 * (b.engine_s - a.engine_s) / double(b.steps - a.steps),
+               1e3 * (b.draft_s - a.draft_s) / double(b.steps - a.steps), 1e3 * (b.sample_s - a.sample_s) / double(b.steps - a.steps),
+               1e3 * (b.inject_s - a.inject_s) / double(b.steps - a.steps));
   if (eb.inputs > ea.inputs)
     out += fmt(" | embeddings %lld requests, %lld inputs, %.1f tok/s", (long long)(eb.requests - ea.requests), (long long)(eb.inputs - ea.inputs),
                double(eb.tokens - ea.tokens) / dt);
@@ -366,6 +383,11 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 int gemma4_server_main(int argc, char** argv) {
   std::string model_path, alias = "gemma-4-26b-a4b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", mmproj_path, embed_mmproj_path;
   int image_tokens = 280;
+  std::string draft_path;
+  int draft_block = 0;
+  int64_t draft_reserve_mib = 1200;
+  int64_t draft_full_context = 0;  // a plain draft's full-attention layer: positions per slot it keeps (0: the draft code's 32,768)
+  int draft_sliding_causal = -1;   // -1 the draft's own, 0 or 1: to measure the difference (Dflash2::Options::sliding_causal)
   int port = 8081, slots = 2, embed_port = 8082;
   int64_t ctx = 262144, batch = 2048, chunk = 2048;
   bool kv_int8 = true;
@@ -399,22 +421,32 @@ int gemma4_server_main(int argc, char** argv) {
     else if (a == "--kv-int8") kv_int8 = true;
     else if (a == "--kv-fp16") kv_int8 = false;
     else if (a == "--log-interval") log_interval = std::atof(next().c_str());
-    else if (a == "--draft" || a == "--draft-block") {
-      std::fprintf(stderr, "eklow-server: %s is for the Qwen3.6 models (DFlash 2 speculative decoding); Gemma 4 has no DFlash draft\n", a.c_str());
-      return 2;
-    } else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" ||
+    else if (a == "--draft") draft_path = next();
+    else if (a == "--draft-block") draft_block = std::atoi(next().c_str());
+    else if (a == "--draft-reserve-mib") draft_reserve_mib = std::atoll(next().c_str());
+    else if (a == "--draft-full-context") draft_full_context = std::atoll(next().c_str());
+    else if (a == "--draft-sliding-causal") draft_sliding_causal = std::atoi(next().c_str());
+    else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" ||
                a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib") {
       std::fprintf(stderr, "eklow-server: %s is for the Qwen3.6 models (qwen35moe); the Gemma 4 server (this GGUF is gemma4) does not take it\n", a.c_str());
       return 2;
     } else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
                            "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N]] [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] "
-                           "[--image-tokens N] [--log-interval S]\n");
+                           "[--draft GGUF [--draft-block B] [--draft-reserve-mib N] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] [--log-interval S]\n");
       return 2;
     }
   }
   if (model_path.empty()) {
     std::fprintf(stderr, "eklow-server: --model is required\n");
+    return 2;
+  }
+  if (draft_block < 0 || draft_block > int(engine::gemma4::kMaxVerify) || draft_block == 1) {
+    std::fprintf(stderr, "eklow-server: --draft-block must be 2 to %d\n", int(engine::gemma4::kMaxVerify));
+    return 2;
+  }
+  if (draft_path.empty() && (draft_block || draft_reserve_mib != 1200)) {
+    std::fprintf(stderr, "eklow-server: --draft-block and --draft-reserve-mib need --draft\n");
     return 2;
   }
   if (image_tokens < 70 || image_tokens > 1120) {
@@ -440,6 +472,27 @@ int gemma4_server_main(int argc, char** argv) {
     ec.max_chunk = chunk;
     ec.max_logits = slots;
     ec.int8_global_kv = kv_int8;
+    std::unique_ptr<gguf::File> draft_file;
+    model::Dflash2Config draft_cfg{};
+    if (!draft_path.empty()) {
+      draft_file = std::make_unique<gguf::File>(gguf::File::open(draft_path));
+      draft_cfg = model::Dflash2Config::from_gguf(*draft_file);
+      const model::Gemma4Config mcfg = model::Gemma4Config::from_gguf(file);
+      if (draft_cfg.n_embd != mcfg.n_embd || draft_cfg.n_vocab != mcfg.n_vocab)
+        throw std::runtime_error(draft_path + ": the draft is for a target of hidden " + std::to_string(draft_cfg.n_embd) + " and vocabulary " +
+                                 std::to_string(draft_cfg.n_vocab) + ", not this model's " + std::to_string(mcfg.n_embd) + " and " + std::to_string(mcfg.n_vocab));
+      // The draft's trained block is 16, but a verify row beyond the first costs the cold experts' CPU time, so the default is the
+      // lesser of the trained block and 4 (the Qwen server's reasoning, DECISIONS 2026-11-01).
+      if (draft_block == 0) draft_block = std::min(draft_cfg.block_size, 4);
+      // The draft reads the target's hidden states at its layers; a step captures the rows of its verify blocks and of the
+      // last `window` rows of a prompt. The head is the engine's Q6_K copy on the matrix units, shared with the draft (its own
+      // would be 605 MB, six experts of every layer); the draft's weights and cache are kept from the experts.
+      ec.capture_layers = draft_cfg.target_layers;
+      ec.max_capture_rows = std::min<int64_t>(chunk, draft_cfg.window) + int64_t(slots) * engine::gemma4::kMaxVerify;
+      ec.max_logits = int64_t(slots) * (engine::gemma4::kMaxVerify + 1);  // a verify block of up to 16 rows each
+      ec.head_dpas = true;
+      ec.draft_reserve_bytes = uint64_t(std::max<int64_t>(draft_reserve_mib, 0)) << 20;
+    }
     ec.expert_profile = expert_profile;
     ec.experts_on_card = expert_profile.empty() ? -1 : experts_on_card;
     ec.card_margin_bytes = uint64_t(card_margin_mib) << 20;
@@ -510,7 +563,25 @@ int gemma4_server_main(int argc, char** argv) {
       std::fprintf(stderr, "eklow-server: prefill streams busy cold experts to the card: %d slots (%.0f MiB on the card), %.2f GiB of cold experts pinned in host memory\n",
                    eng.stream_slots(), eng.stream_slot_bytes() / 1048576.0, eng.pinned_bytes() / GiB);
 
-    serve::gemma4::Scheduler sched(eng, tok, {batch, chunk, ec.max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }});
+    // The draft goes on after the engine, into the memory the engine kept for it.
+    std::unique_ptr<model::Dflash2> draft;
+    if (draft_file) {
+      // The token table stays in the mapped file (a pass copies the rows it embeds); the head is the engine's own.
+      const model::Dflash2Target target{eng.embedding_table(), eng.head_weight(), true};
+      model::Dflash2::Options opt;
+      opt.slots = slots;
+      opt.max_block = int(engine::gemma4::kMaxVerify);  // a request may ask for a larger block than the default
+      opt.full_context = draft_full_context;
+      opt.sliding_causal = draft_sliding_causal;
+      draft = std::make_unique<model::Dflash2>(q, *draft_file, target, opt);
+      std::fprintf(stderr, "eklow-server: %s draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card (its token table stays on the host, its head is the engine's) of the %lld MiB kept; free card memory now %.2f GiB\n",
+                   draft_cfg.plain ? "DFlash" : "DFlash 2", draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0,
+                   (long long)draft_reserve_mib, rt::free_memory(q.get_device()).value_or(0) / GiB);
+    }
+    serve::gemma4::SchedulerConfig sc{batch, chunk, ec.max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }};
+    sc.draft = draft.get();
+    if (draft) sc.draft_block = draft_block;
+    serve::gemma4::Scheduler sched(eng, tok, sc);
     if (images) images->bind(&sched);
     if (embed_images) embed_images->bind(&sched);
     std::thread engine_thread([&] { sched.run(g_stop); });
@@ -568,6 +639,7 @@ int gemma4_server_main(int argc, char** argv) {
       r->stop = cr.stop;
       r->in_thinking = cr.in_thinking;
       r->tools = cr.tool_names;
+      r->draft_block = cr.draft_block;
       r->tag = serve::gemma4::new_completion_id();
       try {
         sched.submit(r);

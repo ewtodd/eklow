@@ -20,6 +20,17 @@
 // forward (src/model/dflash2_fast.cpp): the matmuls on the matrix units in the draft file's own format, attention
 // through attn::attend on a ring cache with a key range per token, the convolutions and the selector as kernels of
 // src/kernels/dflash.*, the target's head on the card with the top 16 of each row taken there.
+//
+// Plain DFlash drafts (z-lab's DFlash, arXiv 2602.06036; their gemma-4-26B-A4B-it-DFlash for the Gemma 4 26B A4B; DECISIONS
+// 2026-11-03) run through the same classes: Dflash2Config::plain. Their layers have no convolutions:
+//   n = rmsnorm(x); q, k, v = n W; ...; x += o_proj(attention); n = rmsnorm(x); x += down(silu(gate n) * up n);
+// the target's embedding rows are scaled (Gemma: sqrt(hidden)) and the head's logits go through the final softcap
+// cap * tanh(x / cap) (monotone, so the top 16 are the raw logits'). There is no selector: each position has its own
+// distribution, so a Lattice has the same row of unary scores for every predecessor and serve::walk samples each
+// position from it (temperature 0: its argmax). A layer is sliding (the window of 2,048; causal inside the block, as
+// z-lab's model.py and vLLM mask it) or full (the slot's whole context; not causal inside the block). The full layer's
+// cache is Options::full_context positions per slot, a ring: the whole context when that is large enough, otherwise a
+// window of the last full_context positions.
 #pragma once
 
 #include <sycl/sycl.hpp>
@@ -41,16 +52,36 @@ namespace eklow::model {
 
 struct Dflash2Config {
   int n_layer, n_embd, n_ff, n_head, n_head_kv, head_dim, n_vocab;
-  int window;      // the sliding window (keys a query sees: positions q - window + 1 .. q)
+  int window;      // the sliding window (keys a query sees: positions q - window + 1 .. q); the full layers of a plain draft have none
   int block_size;  // B the draft was trained for
   int conv_kernel, conv_group, rank, top_k;
   int mask_token;
   std::vector<int> target_layers;  // the target's layers whose outputs it reads (the GGUF stores each plus one)
   float eps, rope_base;
+  // Plain DFlash drafts (see above): no convolutions, no selector (conv_kernel, conv_group and rank are 0, top_k 16: the
+  // candidates kept per position).
+  bool plain = false;
+  float embed_scale = 1.0f;   // the target's embedding rows are multiplied by it (dflash.embedding_scale; Gemma: sqrt(hidden))
+  float softcap = 0.0f;       // dflash.final_logit_softcapping: logits become softcap * tanh(logit / softcap); 0: none
+  bool block_causal = false;  // sliding layers attend causally inside the block (model.py: a layer is causal when it slides)
+  std::vector<uint8_t> full;  // per layer: 1 where attention is over the whole context (empty: every layer slides)
+  bool full_layer(int l) const { return !full.empty() && full[size_t(l)] != 0; }
+  bool has_full() const {
+    for (uint8_t f : full)
+      if (f) return true;
+    return false;
+  }
   int n_feat() const { return int(target_layers.size()) * n_embd; }
-  // Throws when the file is not a DFlash 2 draft this code knows how to run.
+  // Throws when the file is not a DFlash 2 or plain DFlash draft this code knows how to run. A plain draft's GGUF has no
+  // vocabulary size: n_vocab is the length of its tokenizer.ggml.tokens (the target's), which the constructors check
+  // against the target's embedding table.
   static Dflash2Config from_gguf(const gguf::File& f);
 };
+
+// A plain draft's lattice from its candidates: lat.cand and lat.unary ([P][top_k], raw head logits by descending value) are
+// set; this applies the softcap to the unary scores (0: none) and fills score[i][a][b] = unary[i][b] for every
+// predecessor a, so that serve::walk samples each position from its own distribution.
+void plain_lattice(serve::Lattice& lat, float softcap);
 
 // The draft's tensors on the card as stored (the reference's), plus the target's embedding table and head.
 class Dflash2Weights {
@@ -123,7 +154,7 @@ struct Dflash2Target {
   bool host_table = false;
 };
 
-// A Dflash2Target loaded from a GGUF holding the target's `token_embd.weight` and `output.weight` (the target file, or
+// A Dflash2Target loaded from a GGUF holding the target's `token_embd.weight` and `output.weight` (or a tied head: the table) (the target file, or
 // tools/dflash_test/extract_head.py's extract of it), for tools and tests.
 class OwnedTarget {
  public:
@@ -154,6 +185,14 @@ class Dflash2 {
     int max_block = 16;      // the largest B asked of draft()
     int max_inject = 1024;   // rows a context injection runs through the matmuls at once
     int window = 0;          // 0: the draft's own
+    // Plain drafts with a full-attention layer: the positions per slot its cache holds (0: 32,768). A ring: a context
+    // longer than this is seen by that layer through its last full_context positions only. 262,144 is the 26B's context.
+    int64_t full_context = 0;
+    // That cache in int8 (the engine's K/V format: a scale per position and 16 dims, half the bytes) rather than fp16.
+    bool full_int8 = true;
+    // The sliding layers of a plain draft inside the block: -1 the draft's own (causal, as model.py), 0 not causal (as
+    // llama.cpp runs them: its GGUF has no per-layer flag), 1 causal. To measure what the difference is worth.
+    int sliding_causal = -1;
   };
   // `draft` must stay open (its tensors are read at construction only). Formats: whatever xmx::format_of takes (Q8_0 is
   // the draft's shipped one); BF16 and F16 files only run in Dflash2Ref.
@@ -162,6 +201,10 @@ class Dflash2 {
   Dflash2(const Dflash2&) = delete;
   const Dflash2Config& config() const { return c_; }
   int window() const { return window_; }
+  // How far back the draft's context reaches, in positions per slot: the sliding window, or for a plain draft with a
+  // full layer the larger full_context. A caller that captures only the last rows of a prompt for the draft needs this
+  // many, not window().
+  int64_t reach() const { return reach_; }
 
   // A slot's context is the committed tokens' positions [first, end): reset empties it, truncate(slot, pos) drops the rows from
   // pos on (positions the next inject or block write over).
@@ -204,7 +247,8 @@ class Dflash2 {
   Dflash2Config c_;
   int window_;
   Options opt_;
-  std::vector<int64_t> end_, first_;
+  std::vector<int64_t> end_, first_, first_full_;  // first_full_: the oldest row of the full layer's cache (plain drafts)
+  int64_t full_window_ = 0, reach_ = 0;
   uint64_t bytes_ = 0;
 };
 

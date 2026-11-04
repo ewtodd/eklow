@@ -1,0 +1,1 @@
+{"label": "depth-full-30kchars/greedy", "dataset": "doc", "requests": 8, "acceptance_mean": 2.599714786092652, "tokens": 8192, "truncated": 8, "decode_tps_median": 129.75749878577224}
