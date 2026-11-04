@@ -2120,3 +2120,77 @@ Ninja -DCMAKE_CXX_COMPILER=clang++ && cmake --build build --target eklow-dflash-
    and every greedy token equal at the capped/whole pair only where the cap does not matter.
 4. `eklow-dflash-test dump` on the Gemma draft before and after any further change to the full layer's cache; and `Options::sliding_causal`
    0 against -1 on real acceptance.
+
+## 2026-11-03 — z-lab's draft on the card: correct, lossless, and not worth its memory here
+
+`gemma/dflash` (the merge of `gemma/spec` and `gemma/draft`), measured on fiona 19:28-20:31 with production paused
+(`fiona:~/gdflash-window.sh`, log `~/eklow-perf/log/gdflash-window*`). The 26B at the production shape unless said: 2 x
+262,144, int8 K/V, both image encoders, EmbeddingGemma 2; z-lab's draft in Q8_0, blocks of 4.
+
+**Correct.**
+- Qwen's draft is unchanged: `eklow-dflash-test fast` on Inco's draft (fiona's saved inputs) prints the same bytes from
+  main's build and this one.
+- The head on the matrix units (`--head-dpas`, what `--draft` turns on) keeps the 26B in its band: `check26` at 51 experts
+  a layer gives long 248/256 at mean KL 1.92e-2, chat 22/25 at 5.13e-2. On 2026-10-27: 243/256 at 2.9e-2, chat 23/25.
+- Verify blocks against the same tokens decoded one at a time (`eklow-engine-run-gemma4 --verify-last 64`):
+  - blocks of 4: top-1 90/100, mean KL 0.064 (worst 1.88);
+  - blocks of 8: 107/117, 0.034;
+  - blocks of 16: 115/125, 0.037.
+  - Captured rows drift from 0.4% (layer 1) to 9-14% (layer 27) relative RMS.
+  This is the 26B's routing magnifying a step's shape, not a wrong computation: the acceptance and the lossless test
+  through the server match the reference. It was not compared with the fp32 reference directly (the tool compares
+  verify with decode).
+- Acceptance through the server (`serve_perf.py accept`, z-lab's prompts, 8 each, two at a time, temperature 1), tokens a
+  verify against llama.cpp's one-request numbers:
+
+  | block | GSM8K | HumanEval | MT-Bench | llama.cpp |
+  |---|---:|---:|---:|---|
+  | 4 | 3.26 | 3.14 | 2.90 | 3.24 / 3.17 / 2.91 |
+  | 8 | 4.74 | 4.33 | 3.50 | 4.94 / 4.43 / 3.85 |
+
+- Lossless: 1,500 sampled completions with the draft against 1,500 without, chi-square 6.3 on 10 degrees of freedom,
+  p = 0.787.
+- `serve_test.py basic` passes with and without the draft, except "same seed, same output" in both. That test is new since
+  the 26B last served. The second request reuses the first's cached prompt, so its first step has another shape, and at
+  temperature 1 a near-tie flips; Qwen passes it.
+
+**Not worth it on this card.**
+- The draft takes the 26B from 42 experts a layer on the card to 27:
+  - the draft is 788 MiB of the 1,200 MiB reserved for it;
+  - the capture buffer (2,048 rows x 6 layers, 138 MB) and the head's move to the matrix units take the rest;
+  - cold experts pinned: 9.44 GiB instead of 8.04.
+- Without the draft, 42 is 2 fewer than on 2026-11-02, the cost of the 4,096-key attention segments inherited from Qwen's
+  port.
+- Through the server, one stream, Pile text (`serve_perf.py depth`, median of 3; tokens a verify in brackets):
+
+  | | 8k | 32k |
+  |---|---|---|
+  | decode, plain | 34.9 tok/s | 32.4 tok/s |
+  | decode, with the draft | 33.9 (2.37) | 30.3 (2.26) |
+  | prefill, plain | 1,593 tok/s (5.1 s) | 1,612 (20.3 s) |
+  | prefill, with the draft | 966 (8.5 s) | 1,040 (31.5 s) |
+
+- Two streams at block 4 decode 21.9-23.7 tok/s each on the acceptance prompts (block 8: 18.5-23.8); the 26B without a
+  draft did ~20 each on GSM8K (2026-10-27, 46 experts). Each step of two such streams:
+  - engine 112-127 ms, against 74 ms in `eklow-engine-bench-gemma4` at 51 experts;
+  - the draft 4.6 ms;
+  - host sampling 10-16 ms.
+- What a verify costs at 51 experts (`eklow-engine-bench-gemma4 --verify`):
+  - one slot at 8k: decode 23.3 ms; 2 / 3 / 4 / 6 / 8 / 16 rows 29.2 / 36.5 / 41.9 / 65.0 / 73.5 / 104.0 ms, 6.5-8.6 ms a row
+    beyond the first;
+  - one slot at 32k: decode 26.0 ms, 4 rows 45.8;
+  - two slots at 8k: decode 32.2 ms, 4 rows each 74.0, 8 each 105.3.
+
+So the draft's acceptance is what llama.cpp gets and its output is exact, but its card memory costs the 26B more than the
+draft saves. It is a wash on decode at an acceptance of ~2.3 (prose), and prefill loses ~40%. The owner (2026-11-03):
+drop z-lab's draft, and "take the sliding window draft as the win". What stays is the 26B's verify, capture and speculative
+path, and plain DFlash with per-layer sliding/full attention in the draft code, all off without `--draft`. A draft of our
+own would be shaped for this card: every layer sliding, small (z-lab's full layer is worth 3-6% at <= 24k, its 0.44 GB of
+weights about five experts a layer), and trained for blocks of 4. The reserve should be fitted to what the draft takes
+(1,200 MiB kept, 788 used: four experts a layer).
+
+Not run: the draft's serving forward against its reference (`eklow-dflash-test plain` stopped at once: `OwnedTarget` wanted an
+`output.weight`, fixed in e950282, a tied head being the table) and the sliding layers' causal A/B (skipped). The Gemma
+server does not exit on SIGTERM while a request runs or while it loads. systemd killed production after 90 s when the
+window began. A test server still loading at the end held the pinned memory, so production's first start failed ("out of
+pinned host memory") and its restart 6 s later came up clean at 42 experts.
