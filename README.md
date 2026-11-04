@@ -178,9 +178,11 @@ an exact CPU emulation of the quantized arithmetic (`eklow-kernel-test`, `eklow-
   is open (`src/serve/tool_grammar_qwen.cpp`, `tool_grammar_gemma4.cpp`, checked against the output parsers by
   `eklow-grammar-test-qwen` and `-gemma4`); inside a drafted block each row is checked against the grammar state after
   the tokens before it.
-- **Speculative decoding** (Qwen3.6, `--draft`, `--draft-block`): lossless for the sampler's every feature; two
+- **Speculative decoding** (`--draft`, `--draft-block`): lossless for the sampler's every feature; two
   generating slots verify in one step; a stop string, an end token or `max_tokens` inside an accepted block ends the
   request at that token.
+  Qwen3.6 runs Inco's DFlash 2 draft; the 26B can run a plain DFlash draft, but z-lab's costs it more card memory than it
+  saves (DECISIONS 2026-11-03), so it serves without one.
 - **Prefix reuse over a recurrent state** (Qwen3.6, `--snapshot-mib`, `--snapshot-every`): snapshots where the next
   request is likely to diverge, kept under a budget with the least recently used dropped first.
 - **Scheduling**: continuous batching of two slots with chunked prefill (2,048 tokens a sequence a step), generating

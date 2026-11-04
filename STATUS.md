@@ -12,8 +12,14 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
 - **Gemma 4 26B A4B is back beside it** (DECISIONS 2026-11-03, "Gemma 4 26B A4B back beside Qwen3.6"): its engine,
   scheduler and request layer restored from `76d8588` under `*_gemma4` names; one `eklow-server` runs whichever model
   the GGUF's architecture names. The NixOS module serves named instances (`eklow-<name>.service`, conflicting); on
-  fiona `llm-mode ornith|gemma` switches them (`/etc/nixos`, the owner deploys). Host checks pass; the card checks were
-  not run (the owner tries it in production; `fiona:~/gemma-window.sh` runs them all if needed). The 12B is not served.
+  fiona `llm-mode ornith|gemma` switches them; fiona serves the 26B in `llm-mode gemma` since 2026-11-03 14:51 (eklow
+  95d2912). The 12B is not served.
+- **Speculative decoding for the 26B works and was dropped** (DECISIONS 2026-11-03, "z-lab's draft on the card"): the
+  engine's verify blocks and capture, the server's draft path (`--draft`) and plain DFlash drafts in the draft code are on
+  `main`, off without `--draft`. z-lab's draft accepts what llama.cpp's does (3.26 / 3.14 / 2.90 at blocks of 4) and is
+  lossless (p = 0.787), but its card memory takes the 26B from 42 to 27 experts a layer: decode a wash on prose, prefill
+  -40%. The owner: a sliding-window draft of our own (every layer sliding, small, blocks of 4) is the way, perhaps trained
+  on the 4090.
 - **In production since 2026-11-02 ~20:22**: fiona serves **Ornith-1.5** with Inco's draft and the projector at
   2 x 262k, int8 KV (51 of 256 experts a layer on the card; eklow built on its own nixpkgs, intel-llvm 7.1.1: the
   fleet's 7.2.0 left 0.8 GiB less free, 39 experts). No further evals (`check-source` stopped after stock's GSM8K:
