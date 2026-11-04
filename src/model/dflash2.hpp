@@ -154,7 +154,7 @@ struct Dflash2Target {
   bool host_table = false;
 };
 
-// A Dflash2Target loaded from a GGUF holding the target's `token_embd.weight` and `output.weight` (the target file, or
+// A Dflash2Target loaded from a GGUF holding the target's `token_embd.weight` and `output.weight` (or a tied head: the table) (the target file, or
 // tools/dflash_test/extract_head.py's extract of it), for tools and tests.
 class OwnedTarget {
  public:
