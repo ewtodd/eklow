@@ -10,7 +10,7 @@
 //                [--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
 //                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF [--image-max-tokens N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
-//                [--log-interval S]
+//                [--log-interval S] [--keepalive S]
 //
 // --ctx is the context of each slot (positions), 262,144 by default; --batch the tokens of one engine step and --chunk
 // the prefill tokens of one sequence in a step (2,048); --group N lets a lone prefilling sequence take up to N chunks of prompt in one
@@ -48,6 +48,8 @@
 // seconds (10; 0 for none) while there is traffic the engine's rates, running and waiting requests, the slots' positions,
 // the prefix hit rate, the draft's acceptance and the snapshots held.
 #include <httplib.h>
+
+#include "keepalive.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -502,6 +504,7 @@ static int qwen_server_main(int argc, char** argv) {
   int64_t snapshot_mib = 4096, snapshot_every = 16384;
   int stream_slots = -1, stream_min_rows = -1;  // -1: the engine's
   double log_interval = 10;  // seconds between the engine's log lines while there is traffic; 0: none
+  double keepalive_s = 15;  // a stream silent this long gets an SSE comment (keepalive.hpp); 0: never
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -537,11 +540,12 @@ static int qwen_server_main(int argc, char** argv) {
     else if (a == "--kv-int8") kv_int8 = true;
     else if (a == "--kv-fp16") kv_int8 = false;
     else if (a == "--log-interval") log_interval = std::atof(next().c_str());
+    else if (a == "--keepalive") keepalive_s = std::atof(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
                            "[--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
                            "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] "
-                           "[--mmproj GGUF [--image-max-tokens N]] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S]\n");
+                           "[--mmproj GGUF [--image-max-tokens N]] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S] [--keepalive S]\n");
       return 2;
     }
   }
@@ -825,17 +829,24 @@ static int qwen_server_main(int argc, char** argv) {
       }
       const bool usage = cr.include_usage;
       res.set_header("Cache-Control", "no-cache");
+      auto ka = std::make_shared<serve::KeepAlive>(std::chrono::milliseconds(int64_t(keepalive_s * 1000)));
       res.set_chunked_content_provider(
           "text/event-stream",
-          [r, out, usage](size_t, httplib::DataSink& sink) {
+          [r, out, usage, ka](size_t, httplib::DataSink& sink) {
             serve::Event e;
             while (!r->next(e, std::chrono::milliseconds(1000)))
-              if (!sink.is_writable()) {
+              if (!sink.is_writable() || !ka->tick(sink)) {
                 r->cancel();
                 return false;
               }
             const std::string text = out->chunks(e, usage);
-            if (!text.empty() && !sink.write(text.data(), text.size())) {
+            if (!text.empty()) {
+              if (!sink.write(text.data(), text.size())) {
+                r->cancel();
+                return false;
+              }
+              ka->wrote();
+            } else if (!ka->tick(sink)) {  // a token that adds no text yet (a tool call is sent whole when it closes)
               r->cancel();
               return false;
             }

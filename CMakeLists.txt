@@ -204,6 +204,10 @@ add_executable(eklow-server tools/server/main.cpp tools/server/gemma4_main.cpp)
 target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
 target_link_libraries(eklow-server PRIVATE eklow_serve eklow_serve_gemma4 Threads::Threads)
 eklow_sycl(eklow-server)
+# The streams' keep-alive (tools/server/keepalive.hpp), host only.
+add_executable(eklow-keepalive-test tools/server/keepalive_test.cpp)
+target_include_directories(eklow-keepalive-test PRIVATE ${HTTPLIB_INCLUDE_DIR})
+target_link_libraries(eklow-keepalive-test PRIVATE Threads::Threads)
 
 add_executable(eklow-prompt tools/prompt/main.cpp)
 target_link_libraries(eklow-prompt PRIVATE eklow_serve)
