@@ -56,7 +56,7 @@ On Hugging Face (`ethanwtodd`, public; uploaded 2026-11-01; the model cards carr
 |---|---|---|
 | `Qwen3.6-35B-A3B-Q4_K-Q8_0-GGUF` @ 8db5016e | `Qwen3.6-35B-A3B-Q4_K-Q8_0.gguf` (20.7 GB) | 48cf98f4... |
 | `Ornith-1.5-35B-A3B-Q4_K-Q8_0-GGUF` @ a89886e0 | `Ornith-1.5-35B-A3B-Q4_K-Q8_0.gguf` (20.7 GB, Ornith's own template) | 25a68129... |
-| `Sage-A1.5-Q4_K-Q8_0-GGUF` @ b89cbc0f (2026-11-07) | `Sage-A1.5-Q4_K-Q8_0.gguf` (21.2 GB, Sage's own template, MTP block kept) | d50f428b... |
+| `Sage-A1.5-Q4_K-Q8_0-GGUF` @ d89116d8 (2026-11-07) | `Sage-A1.5-Q4_K-Q8_0.gguf` (21.2 GB, Sage's own template, MTP block kept) | 6d25f141... |
 | `Qwen3.6-35B-A3B-DFlash2-Q8_0-GGUF` @ 65aaab95 | `Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf` (570 MB, Inco's draft) | 986b8f24... |
 
 The mix (`EKK8`): routed experts Q4_K under bartowski's importance matrix, every other matrix Q8_0, head Q6_K; KL

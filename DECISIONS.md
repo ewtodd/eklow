@@ -2247,8 +2247,11 @@ cold experts would not fit fiona's 32 GB of pinned RAM at production's context a
 importance matrix for Sage (`6dd4c710`). Only the 123 expert tensors (with the MTP block's) and the head are requantized; the other 629
 come out byte-identical to the Q8_0, checked tensor by tensor. Two keys are added: `tokenizer.ggml.normalizer.nfc` (eklow's tokenizer
 requires it) and `general.sampling.*` (temperature 1.0, top-p 0.95, top-k 20; without them eklow defaulted to top-k 64). The MTP block
-stays; eklow skips it. `ethanwtodd/Sage-A1.5-Q4_K-Q8_0-GGUF` @ `b89cbc0f`, 21,170,203,264 bytes, sha256 `d50f428b`. `make-sage.sh` rebuilds it with all 753 tensors
-byte-identical; only `quantize.imatrix.file`, the imatrix's path on the machine that made it, differs.
+stays; eklow skips it. `ethanwtodd/Sage-A1.5-Q4_K-Q8_0-GGUF` @ `d89116d8`, 21,170,203,232 bytes, sha256 `6d25f141`; `make-sage.sh`
+rebuilds it byte for byte. The first upload (`b89cbc0f`, sha256 `d50f428b`) had the same tensors, but its header's
+`quantize.imatrix.file` held the imatrix's path on the machine that made it (a home directory). llama-quantize records the path it
+is given, so the script now runs from the inputs' directory with the bare file name. The file was replaced the same day; the
+repository's history still holds the first one.
 
 KL against that Q8_0, tools/weights/kl.sh's protocol (wikitext-2 at 4k, 20 chunks; a Pile document at 32k, 2 chunks):
 
