@@ -2285,3 +2285,13 @@ thinking: "why is the sky blue, in one sentence" thinks past the 700-token cap, 
 same with verification on and off, and none happened in the 162 sampled replay requests. Its developer-role check did find a bug in the default: a `developer`
 message got no trigger, because the default looked at the roles before `parse_chat` maps developer to system (22 tokens against
 27). Fixed, with two more checks in `eklow-verification-test` (20, 0 failures; 2 without the fix).
+
+**A dense model for comparison, the owner's curiosity, same day:** Qwen3.8-27B at 3 bits (unsloth's UD-Q3_K_XL, `4ca72078`, 13.1 GB) on
+the same replay, 18 requests a point, on the 4090.
+- Right moves: 10 / 6 / 7 at the three points (Sage, all 72 of its runs: 25 / 10 / 39 out of 72; Ornith 18 / 2 / 6).
+- Its best showing is point 2 (6/18 against Sage's 10/72, p = 0.081). It thinks like Ornith: medians 6,362 and 5,668 tokens, and 6 of
+  36 at the 8,000-token cap against Sage's 0 of 144 (p = 4.5e-5).
+- A dense model also reads all its weights every token. On fiona's A770M in the fleet's Vulkan llama.cpp (`149f564`; Mesa calls the
+  Xe kernel driver experimental), with every layer on the card, it ran at 3.4 tok/s decode and ~110 tok/s prefill, so it was moved to
+  the 4090.
+- The 4090 gave 59-63 tok/s at 6k and 50-52 at 45-60k, ~83% of what its 1 TB/s allows for 13.1 GB of weights plus the K/V.
