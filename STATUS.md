@@ -5,6 +5,7 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
 
 ## Now (2026-11-03)
 
+- **Sage-A1.5's chat template is known** (2026-11-07, DECISIONS "Sage-A1.5's chat template"): `--chat-template sage`, `--verification on|off`; 0 differences against Hugging Face on 28,017 cases; nothing deployed. Its GGUFs lack `tokenizer.ggml.normalizer.nfc`, which the loader requires.
 - **eklow serves Qwen3.6-35B-A3B finetunes** (llama.cpp's `qwen35moe`: 30 Gated DeltaNet and 10 gated-attention
   layers, 256 routed experts of 512 + one shared, 8 used) with **DFlash 2** speculative decoding and **image input**
   (Qwen3-VL's encoder behind `--mmproj`). Two targets so far, same architecture: stock
