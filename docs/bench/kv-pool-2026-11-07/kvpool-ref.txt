@@ -1,0 +1,4 @@
+filler line: 25.8 tokens
+trim: 5 s  A1: 5555+11 tok stop cached 0  B: 4511+24 tok length cached 0  A2: 5555+24 tok length cached 5535
+exhaust: 48 s  C: 2929+2600 tok length cached 0  D: 2929+2600 tok length cached 0
+wait: 15 s  F: 5689+24 tok length cached 0  E: 3442+1000 tok length cached 0

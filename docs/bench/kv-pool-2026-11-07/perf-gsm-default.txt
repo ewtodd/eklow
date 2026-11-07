@@ -1,0 +1,1 @@
+gsm, 48 requests, 1 at a time: 48473 completion tokens in 952.1 s, 50.9 tok/s aggregate, decode per stream median 52.8 tok/s, 3.37 tokens/verify

@@ -1,0 +1,19 @@
+filler line: 25.8 tokens
+trim: 7 s  A1: 5555+11 tok stop cached 0  B: 4511+24 tok length cached 0  A2: 5555+24 tok length cached 1490
+exhaust: 40 s  C: 2929+1165 tok length cached 0  D: 2929+2600 tok length cached 0
+wait: 16 s  E: 3442+1000 tok length cached 0  F: 5689+24 tok length cached 0
+ok   trim A1: the text is the default pool's  (differ after 31 characters)
+ok   trim B: the text is the default pool's  (differ after 85 characters)
+ok   trim A2: the text is the default pool's  (differ after 67 characters)
+ok   trim A2: the cut kept the system prompt (~1,500) and re-prefilled the rest  (cached 1490 of 5555)
+ok   exhaust: the pair outgrew the pool (the model wrote enough: the test is meaningful)  ({'C': 1165, 'D': 2600})
+ok   exhaust: at most one sequence ended early, at least one finished  (ended ['C'], finished ['D'])
+ok   exhaust D: the survivor's text is the default pool's  (differ after 2600 characters)
+ok   exhaust C: what it wrote before ending is a prefix of the default pool's  (differ after 1165 of 1165 characters)
+ok   wait: F's text is the default pool's  (differ after 85 characters)
+ok   wait: E (running when F arrived) is unchanged  (differ after 1000 characters)
+wait: F took 7.6 s here, 3.2 s at the default pool (longer here: it waited for E)
+ok   log: a line with 'kv pool: slot'
+ok   log: a line with 'waits for pages'
+ok   log: a line with 'ends at'
+all ok
