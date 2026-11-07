@@ -18,7 +18,7 @@ def log(rec):
 
 
 def chat(done):
-    body = {"model": "gemma-4-12b", "max_tokens": 32, "temperature": 0, "reasoning_effort": "none",
+    body = {"model": "qwen3.6-35b-a3b", "max_tokens": 32, "temperature": 0, "reasoning_effort": "none",
             "messages": [{"role": "user", "content": prompt}]}
     req = urllib.request.Request(chat_url + "/v1/chat/completions", json.dumps(body).encode(),
                                  {"Content-Type": "application/json"})

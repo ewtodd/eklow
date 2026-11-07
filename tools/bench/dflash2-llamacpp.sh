@@ -20,7 +20,7 @@ N=${N:-32} CONC=${CONC:-4} PORT=${PORT:-8090} MAXTOK=${MAXTOK:-4096} CTX_PER=${C
 SAMPLINGS=${SAMPLINGS:-"greedy temp"}
 LLAMA_CUDA=${LLAMA_CUDA:-$DATA/llama-cuda/bin}
 R=${RESULTS:-$DATA/results/dflash}; mkdir -p "$R"
-TOPK=${TOPK:-20}   # temperature sampling's top-k (Qwen3.6: 20; Gemma 4: 64)
+TOPK=${TOPK:-20}   # temperature sampling's top-k (Qwen3.6: 20)
 args=(-m "$T" --host 127.0.0.1 --port "$PORT" -np "$CONC" -c $((CONC * CTX_PER)) --fit on)
 if [ "$B" != 0 ]; then
     trained=$(python3 - "$D" <<'PY'

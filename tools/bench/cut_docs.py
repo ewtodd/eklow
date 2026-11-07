@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Cuts unholy's Pile documents (~/eklow-bench/data/doc-N.txt, unique text per depth) to a number of Qwen3.6 tokens, for
 serve_perf.py: writes OUT/qwen-DEPTH.txt holding the first DEPTH - SLACK tokens of the smallest doc-N.txt big enough, so that
-the chat request built around it (template, question) is DEPTH tokens, as unholy's gemma-DEPTH.txt are for Gemma.
+the chat request built around it (template, question) is DEPTH tokens.
 
   cut_docs.py --eklow-tok build/eklow-tok --model GGUF --data ~/eklow-bench/data --out DIR [--depths 8192,32768,131072,252000]
 Stdlib only; counts tokens with eklow-tok (the tokenizer under test, 26M tokens/s).

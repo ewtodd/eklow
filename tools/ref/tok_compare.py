@@ -1,4 +1,4 @@
-"""Check eklow's tokenizer against Hugging Face's on Gemma 4.
+"""Check eklow's tokenizer against Hugging Face's on the Gemma tokenizer (EmbeddingGemma 2's).
 
 Usage: python3 tools/ref/tok_compare.py EKLOW_TOK GGUF TOKENIZER_JSON [--random N] [--files FILE ...]
 
