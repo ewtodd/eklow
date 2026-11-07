@@ -1,0 +1,1 @@
+/nix/store/6nffqql6i8dfi67njl878fbhqjhzymyp-llama-cpp-cuda-0.0.0/bin/llama-server -m sage-EKK8.gguf --host 127.0.0.1 --port 8090 -np 4 -c 24576 --fit on --spec-draft-model ~/eklow-qwen-data/gguf/drafts/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf --spec-type draft-dflash --spec-draft-n-max 7 --spec-draft-ngl 99

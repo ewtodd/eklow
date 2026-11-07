@@ -1,7 +1,8 @@
-// Qwen3.6's chat templates, ported from the two chat_template.jinja files of the Qwen3.6-35B-A3B family: stock
-// Qwen/Qwen3.6-35B-A3B (revision 995ad96e) and ornith-ai/Ornith-1.5-35B-A3B (10fbf86f). They differ in one branch:
-// stock drops an assistant turn's reasoning before the last user query (unless preserve_thinking is set), Ornith
-// re-renders it always, exactly as generated. The port renders what Hugging Face's apply_chat_template renders, byte
+// Qwen3.6's chat templates, ported from the three chat_template.jinja files of the Qwen3.6-35B-A3B family: stock
+// Qwen/Qwen3.6-35B-A3B (revision 995ad96e), ornith-ai/Ornith-1.5-35B-A3B (10fbf86f) and InternScience/Sage-A1.5
+// (0e3205cf). Stock drops an assistant turn's reasoning before the last user query (unless preserve_thinking is set),
+// Ornith re-renders it always, exactly as generated. Sage is stock plus a `verification` switch: when it is on, the
+// system content (which must then exist and be non-blank) ends with "\n\nVerification protocol: enabled". The port renders what Hugging Face's apply_chat_template renders, byte
 // for byte (tools/ref/qwen_chat_compare.py), and splits the output into parts so that text from the request is
 // tokenized without added tokens: a user who writes "<think>" or "<|im_end|>" gets those characters, not the tokens.
 //
@@ -22,7 +23,7 @@
 
 namespace eklow::text {
 
-enum class QwenTemplate { Stock, Ornith };
+enum class QwenTemplate { Stock, Ornith, Sage };
 
 struct QwenChatOptions {
   bool add_generation_prompt = false;
@@ -32,15 +33,21 @@ struct QwenChatOptions {
   bool preserve_thinking = false;
   // "Picture N: " and "Video N: " before each image and video part.
   bool add_vision_id = false;
+  // Sage only: the template variable `verification` as the request gave it; nullopt is Undefined (not sent). Jinja decides
+  // what it means: truthy turns the protocol on, a string other than true/1/yes/on (any case) then raises, null is off.
+  std::optional<json::Value> verification;
 };
 
 // `tools` may be null (no tools). Throws ChatError where the template raises, or where Jinja2 would fail on the input.
 std::vector<ChatPart> render_qwen36(QwenTemplate which, const json::Value& messages, const json::Value& tools,
                                     const QwenChatOptions& opt);
 
-// Which template a GGUF's tokenizer.chat_template is, if it is one of the two published files exactly (byte for
+// Which template a GGUF's tokenizer.chat_template is, if it is one of the three published files exactly (byte for
 // byte); anything else is refused by the caller rather than rendered wrong.
 std::optional<QwenTemplate> qwen36_template_of(std::string_view tmpl);
+// Whether the first message is a system message whose content, rendered and trimmed, is not empty (false where the
+// template would raise on the content). The server applies --verification on only to such conversations.
+bool qwen36_has_system_text(const json::Value& messages);
 const char* qwen36_template_name(QwenTemplate which);
 
 }  // namespace eklow::text

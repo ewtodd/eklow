@@ -1,0 +1,7 @@
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 16384; 4.94 GiB of weights on the card, 0.57 GiB of KV and DeltaNet state; experts Q4_K/Q4_K: 48 of 256 per layer on the card (free 0.00 GiB before them, margin 1.00, draft 1.20, vision 0.00), 80 streaming slots, 13.71 GiB of cold experts in pinned host memory; head dpas GEMV
+prefill   8192 tokens:    5.04 s,   1624.7 tok/s
+    cold experts: 1.79 s waiting on the card's routing, 2.40 s computing on the CPU, 71.7% of pairs cold, 160 of 160 layers with the card finished first; streamed 8236 experts in 160 layers (88.2% of the cold pairs)
+decode, 1 slot, at   8192:   27.68 ms/step (26.36 ms enqueueing),   36.1 tok/s per sequence
+    cold experts per step: 10.51 ms waiting on the card's routing, 11.02 ms computing on the CPU, 71.5% of pairs on the CPU; 39.0 of 40.0 cold layers had the card finished before the CPU; CPU phases gate|up 6.59, glu 0.65, down 3.28 ms, 228.7 distinct experts a step
+verify blocks of  4 at   8192:   51.56 ms/step,   72.7 accepted tokens/s (3.8 tokens accepted a block)
+    cold experts per step: 12.71 ms waiting on the card's routing, 31.13 ms computing on the CPU, 72.9% of pairs on the CPU; 40.0 of 40.0 cold layers had the card finished before the CPU; CPU phases gate|up 19.40, glu 1.17, down 9.61 ms, 666.2 distinct experts a step

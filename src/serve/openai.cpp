@@ -175,13 +175,23 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
   if (r.tools) r.tool_specs = std::make_shared<const text::ToolSpecs>(tools);
 
   // Thinking is on unless the request says otherwise: reasoning_effort "none", or think / enable_thinking false (the
-  // template variable wins). preserve_thinking (stock's template only) keeps the reasoning of earlier turns.
+  // template variable wins). preserve_thinking (stock's and Sage's templates) keeps the reasoning of earlier turns.
   r.thinking = true;
   bool preserve = false;
+  // verification (Sage's template only; the others never look at it): the template variable as sent, else the server's default.
+  std::optional<json::Value> verification;
+  // The server's default (--verification on) applies only to a conversation that has system text to carry the trigger (read from
+  // the messages as the template takes them, so a `developer` message counts as the system one); for any
+  // other it is as if absent, never an error. A value the request sends keeps the template's own rules, raises included.
+  std::vector<std::vector<uint8_t>> image_data;
+  const json::Value tmsgs = template_messages(*msgs, d.images ? &image_data : nullptr);
+  if (d.verification && text::qwen36_has_system_text(tmsgs)) verification = json::Value::boolean(true);
   if (const json::Value* e = field(body, "reasoning_effort"); e && e->is_string()) r.thinking = e->as_string() != "none";
   if (const json::Value* t = field(body, "think"); t && t->is_bool()) r.thinking = t->as_bool();
   if (const json::Value* t = field(body, "preserve_thinking"); t && !t->is_null()) preserve = t->truthy();
+  if (const json::Value* t = field(body, "verification")) verification = *t;
   if (const json::Value* k = field(body, "chat_template_kwargs"); k && k->is_object()) {
+    if (const json::Value* t = k->find("verification")) verification = *t;
     if (const json::Value* e = k->find("reasoning_effort"); e && e->is_string()) r.thinking = e->as_string() != "none";
     if (const json::Value* t = k->find("enable_thinking"); t && !t->is_null()) r.thinking = t->truthy();
     if (const json::Value* t = k->find("preserve_thinking"); t && !t->is_null()) preserve = t->truthy();
@@ -191,10 +201,10 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
   opt.add_generation_prompt = true;
   opt.enable_thinking = r.thinking;
   opt.preserve_thinking = preserve;
+  opt.verification = std::move(verification);
   std::vector<text::ChatPart> parts;
-  std::vector<std::vector<uint8_t>> image_data;
   try {
-    parts = text::render_qwen36(d.chat_template, template_messages(*msgs, d.images ? &image_data : nullptr), tools, opt);
+    parts = text::render_qwen36(d.chat_template, tmsgs, tools, opt);
   } catch (const text::ChatError& e) {
     throw bad(std::string("the chat template rejects the conversation: ") + e.what());
   }

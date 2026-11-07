@@ -8,7 +8,7 @@
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
 //                [--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
-//                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF [--image-max-tokens N]]
+//                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith|sage] [--verification on|off] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF [--image-max-tokens N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
 //                [--log-interval S] [--keepalive S]
 //
@@ -24,8 +24,14 @@
 // --draft (a DFlash 2 draft GGUF) turns on speculative decoding: a verify block of --draft-block tokens (default the
 // draft's trained block or 4 if less, at most 16) per step, accepted losslessly (the sampler's every feature, the tool
 // grammar included). A request may choose its own block with "speculative": N (0 or false: plain decode).
-// --chat-template says which of Qwen3.6's two templates the model's repo uses when the GGUF's is not one eklow knows (the
-// official Ornith GGUFs carry Unsloth's edit): stock drops earlier turns' reasoning, ornith keeps it.
+// --chat-template says which of Qwen3.6's three templates the model's repo uses when the GGUF's is not one eklow knows (the
+// official Ornith GGUFs carry Unsloth's edit): stock drops earlier turns' reasoning, ornith keeps it, sage (InternScience/
+// Sage-A1.5, whose GGUFs are recognised without the flag) is stock plus a `verification` switch: a request's
+// "verification": true (top level or in chat_template_kwargs) appends "\n\nVerification protocol: enabled" to the system
+// message, and the template refuses (a 400) a request that turns it on without a non-blank system message, or sends it as a
+// string other than true/1/yes/on. --verification on|off (default off; Sage only) is the value for a request that sends none, and
+// applies only to a conversation whose first message is a system message with non-blank text (any other is rendered as if
+// the request had sent nothing, so a default never turns a request away); a request's own "verification" keeps all of the above.
 // --snapshot-mib is the pinned host memory kept for snapshots of the DeltaNet state, which make a conversation's or a
 // document's prefix reusable (taken before each prompt's generation prompt, every --snapshot-every tokens of a long
 // prefill, and at the end of a generation); 0 keeps none, and then only a slot's live sequence is reused.
@@ -490,7 +496,7 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 
 static int qwen_server_main(int argc, char** argv) {
   std::string model_path, alias = "qwen3.6-35b-a3b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", embed_mmproj_path;
-  std::string draft_path, chat_template, mmproj_path, image_rows_dir;
+  std::string draft_path, chat_template, verification, mmproj_path, image_rows_dir;
   int image_max_tokens = 1024;  // chat images: rows an image becomes at most (llama.cpp's image_max_tokens; 8 to 4096)
   int64_t vision_reserve_mib = 0;
   int image_tokens = 280;
@@ -526,6 +532,7 @@ static int qwen_server_main(int argc, char** argv) {
     else if (a == "--draft") draft_path = next();
     else if (a == "--draft-block") draft_block = std::atoi(next().c_str());
     else if (a == "--chat-template") chat_template = next();
+    else if (a == "--verification") verification = next();
     else if (a == "--snapshot-mib") snapshot_mib = std::atoll(next().c_str());
     else if (a == "--snapshot-every") snapshot_every = std::atoll(next().c_str());
     else if (a == "--embed-model") embed_path = next();
@@ -544,7 +551,7 @@ static int qwen_server_main(int argc, char** argv) {
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
                            "[--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
-                           "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] "
+                           "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith|sage] [--verification on|off] [--snapshot-mib N [--snapshot-every N]] "
                            "[--mmproj GGUF [--image-max-tokens N]] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S] [--keepalive S]\n");
       return 2;
     }
@@ -557,8 +564,12 @@ static int qwen_server_main(int argc, char** argv) {
     std::fprintf(stderr, "eklow-server: --image-tokens must be 70 to 1120\n");
     return 2;
   }
-  if (!chat_template.empty() && chat_template != "stock" && chat_template != "ornith") {
-    std::fprintf(stderr, "eklow-server: --chat-template must be stock or ornith\n");
+  if (!chat_template.empty() && chat_template != "stock" && chat_template != "ornith" && chat_template != "sage") {
+    std::fprintf(stderr, "eklow-server: --chat-template must be stock, ornith or sage\n");
+    return 2;
+  }
+  if (!verification.empty() && verification != "on" && verification != "off") {
+    std::fprintf(stderr, "eklow-server: --verification must be on or off\n");
     return 2;
   }
   if (draft_block < 0 || draft_block > 16 || draft_block == 1) {
@@ -572,18 +583,20 @@ static int qwen_server_main(int argc, char** argv) {
   try {
     auto t0 = std::chrono::steady_clock::now();
     auto file = gguf::File::open(model_path);
-    // Which of Qwen3.6's two templates renders the conversation: the flag, else the GGUF's own when it is one of the two
+    // Which of Qwen3.6's three templates renders the conversation: the flag, else the GGUF's own when it is one of the three
     // published files exactly (a third, such as Unsloth's edit in the official Ornith GGUFs, needs the flag).
     text::QwenTemplate tmpl = text::QwenTemplate::Stock;
     if (!chat_template.empty()) {
-      tmpl = chat_template == "ornith" ? text::QwenTemplate::Ornith : text::QwenTemplate::Stock;
+      tmpl = chat_template == "ornith" ? text::QwenTemplate::Ornith : chat_template == "sage" ? text::QwenTemplate::Sage : text::QwenTemplate::Stock;
     } else {
       const gguf::Value* t = file.find("tokenizer.chat_template");
       const auto known = t ? text::qwen36_template_of(t->as_string()) : std::nullopt;
       if (!known)
-        throw std::runtime_error(model_path + ": its chat template is not one of Qwen3.6's two that eklow renders (stock, ornith); say which the model uses with --chat-template");
+        throw std::runtime_error(model_path + ": its chat template is not one of Qwen3.6's three that eklow renders (stock, ornith, sage); say which the model uses with --chat-template");
       tmpl = *known;
     }
+    if (verification == "on" && tmpl != text::QwenTemplate::Sage)
+      throw std::runtime_error(std::string("--verification on needs the sage chat template (this is ") + text::qwen36_template_name(tmpl) + ")");
     const text::QwenTokenizer tok = text::QwenTokenizer::from_gguf(file);
     // The sampling defaults the model's card gives, from the GGUF (llama.cpp's general.sampling.*).
     serve::SamplingParams sampling;
@@ -743,8 +756,8 @@ static int qwen_server_main(int argc, char** argv) {
     sc.max_group = ec.max_group;
     sc.group_busy = std::min(group_busy, ec.max_group);
     serve::Scheduler sched(eng, tok, sc);
-    std::fprintf(stderr, "eklow-server: chat template %s, sampling defaults temperature %g, top-k %d, top-p %g, min-p %g; snapshots of %.0f MiB each, up to %lld MiB\n",
-                 text::qwen36_template_name(tmpl), double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p),
+    std::fprintf(stderr, "eklow-server: chat template %s%s, sampling defaults temperature %g, top-k %d, top-p %g, min-p %g; snapshots of %.0f MiB each, up to %lld MiB\n",
+                 text::qwen36_template_name(tmpl), tmpl == text::QwenTemplate::Sage ? (verification == "on" ? " (verification on by default)" : " (verification off by default)") : "", double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p),
                  double(eng.snapshot_bytes()) / 1048576.0, (long long)snapshot_mib);
     if (embed_images) embed_images->bind(&sched);
     if (chat_images) chat_images->bind(&sched);
@@ -771,7 +784,7 @@ static int qwen_server_main(int argc, char** argv) {
           was_active = active, prev = cur, eprev = ecur, t_prev = now;
         }
       });
-    serve::ChatDefaults defaults{sampling, ec.max_ctx, tmpl};
+    serve::ChatDefaults defaults{sampling, ec.max_ctx, tmpl, verification == "on"};
     const serve::ImageEncoder chat_encoder = [&](std::span<const uint8_t> bytes) { return (*chat_images)(bytes); };
     if (chat_images) defaults.images = &chat_encoder;
     defaults.max_image_rows = std::min(batch, chunk);

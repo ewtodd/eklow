@@ -1,0 +1,2 @@
+eklow-engine-bench: xmx: batched repack is for the K-quant formats
+Intel(R) Arc(TM) A770M Graphics: 2 slots of 16384; 7.87 GiB of weights on the card, 0.57 GiB of KV and DeltaNet state; experts Q8_0/Q8_0: 48 of 256 per layer on the card (free 0.00 GiB before them, margin 1.00, draft 1.20, vision 0.00), 80 streaming slots, 25.90 GiB of cold experts in pinned host memory; head dpas GEMV

@@ -2,7 +2,7 @@
 // tokens.json form, so that tools/ref/compare tooling and eklow-engine-run read it) and where the generation prompt
 // starts (the position eklow-server takes a snapshot at).
 //
-//   eklow-prompt --model GGUF --request JSON [--chat-template stock|ornith] [--image-grids NXxNY,...] --out DIR
+//   eklow-prompt --model GGUF --request JSON [--chat-template stock|ornith|sage] [--image-grids NXxNY,...] --out DIR
 //
 // Writes DIR/tokens.json ({"ids": [...], "snapshot_points": [...], "in_thinking": bool, "images": [...]}). Image parts need
 // --image-grids, the grid of rows of each image in order (no encoder runs: the rows are empty); their rows are id -1 in "ids" and
@@ -36,7 +36,7 @@ int main(int argc, char** argv) {
     else if (a == "--chat-template") tmpl_name = next();
     else if (a == "--image-grids") grids = next();
     else {
-      std::fprintf(stderr, "usage: eklow-prompt --model GGUF --request JSON [--chat-template stock|ornith] [--image-grids NXxNY,...] --out DIR\n");
+      std::fprintf(stderr, "usage: eklow-prompt --model GGUF --request JSON [--chat-template stock|ornith|sage] [--image-grids NXxNY,...] --out DIR\n");
       return 2;
     }
   }
@@ -46,11 +46,11 @@ int main(int argc, char** argv) {
     const text::QwenTokenizer tok = text::QwenTokenizer::from_gguf(file);
     text::QwenTemplate tmpl = text::QwenTemplate::Stock;
     if (!tmpl_name.empty()) {
-      tmpl = tmpl_name == "ornith" ? text::QwenTemplate::Ornith : text::QwenTemplate::Stock;
+      tmpl = tmpl_name == "ornith" ? text::QwenTemplate::Ornith : tmpl_name == "sage" ? text::QwenTemplate::Sage : text::QwenTemplate::Stock;
     } else {
       const gguf::Value* t = file.find("tokenizer.chat_template");
       const auto known = t ? text::qwen36_template_of(t->as_string()) : std::nullopt;
-      if (!known) throw std::runtime_error("the model's chat template is not one eklow knows: say --chat-template stock|ornith");
+      if (!known) throw std::runtime_error("the model's chat template is not one eklow knows: say --chat-template stock|ornith|sage");
       tmpl = *known;
     }
     std::ifstream in(request);
