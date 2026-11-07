@@ -137,14 +137,15 @@ let
             lib.types.enum [
               "stock"
               "ornith"
+              "sage"
             ]
           );
           default = null;
           description = ''
-            Qwen3.6 only: which of Qwen3.6's two chat templates the model's repo uses, when the GGUF's own is not one eklow
-            knows (the official Ornith GGUFs carry Unsloth's edit): stock drops earlier turns' reasoning from the prompt,
-            ornith keeps it. null: recognized from the GGUF, which then must carry one of the two published templates
-            exactly.
+            Qwen3.6 only: which of the Qwen3.6 chat templates eklow renders the model's repo uses, when the GGUF's own is not
+            one eklow knows (the official Ornith GGUFs carry Unsloth's edit): stock drops earlier turns' reasoning from the
+            prompt, ornith keeps it, sage is stock plus Sage-A1.5's verification switch. null: recognized from the GGUF,
+            which then must carry one of the published templates exactly.
           '';
         };
 
@@ -155,6 +156,27 @@ let
             Qwen3.6 only: pinned host memory for snapshots of the DeltaNet state (64 MiB each), which let a conversation's
             or a document's prefix be reused; 0 keeps none, and only a slot's live sequence is reused. null: the server's
             default, 4096.
+          '';
+        };
+
+        kvPool = lib.mkOption {
+          type = lib.types.nullOr lib.types.ints.unsigned;
+          default = null;
+          example = 262144;
+          description = ''
+            Qwen3.6 only: the K/V pool of all the slots together, in positions (`--kv-pool`); each slot may still use up to
+            contextSize. With 2 slots of 262144 and a pool of 262144 the K/V costs half and the card keeps that memory's
+            worth of experts more (on fiona 91 a layer instead of 48). When the pool runs out an idle slot gives its pages
+            back and re-prefills later; a request that does not fit waits. null: slots x contextSize, a pool per slot.
+          '';
+        };
+
+        verification = lib.mkOption {
+          type = lib.types.nullOr lib.types.bool;
+          default = null;
+          description = ''
+            Sage-A1.5's template only: turn its verification protocol on by default (`--verification on`) for conversations
+            with a system message; a request may still send its own `verification`. null: the server's default, off.
           '';
         };
 
@@ -379,6 +401,14 @@ in
             ++ lib.optionals (inst.chatTemplate != null) [
               "--chat-template"
               inst.chatTemplate
+            ]
+            ++ lib.optionals (inst.kvPool != null) [
+              "--kv-pool"
+              (toString inst.kvPool)
+            ]
+            ++ lib.optionals (inst.verification != null) [
+              "--verification"
+              (if inst.verification then "on" else "off")
             ]
             ++ lib.optionals (inst.mmproj != null) [
               "--mmproj"
