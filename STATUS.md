@@ -5,7 +5,12 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
 
 ## Now (2026-11-03)
 
-- **Sage-A1.5's chat template is known** (2026-11-07, DECISIONS "Sage-A1.5's chat template"): `--chat-template sage`, `--verification on|off`; 0 differences against Hugging Face on 28,017 cases; nothing deployed. Its GGUFs lack `tokenizer.ggml.normalizer.nfc`, which the loader requires.
+- **Sage-A1.5 is ready to serve, not deployed** (2026-11-07, DECISIONS "Sage-A1.5 on eklow" and "Sage-A1.5's chat template"):
+  `--chat-template sage` (recognised from the GGUF), `--verification on|off` (on only for conversations with system text);
+  0 differences against Hugging Face on 28,017 cases. Its EKK8 is on Hugging Face (below), with KL 0.0127 at 4k against its Q8_0.
+  On fiona's replay it never thought itself into the cap (Ornith 6/18) and writes about a third of the tokens. Ornith's first
+  move is better. Through the server at production's shape: 43.2 / 41.3 tok/s at 8k / 32k with Inco's draft, which accepts
+  11-30% more than Sage's own MTP head. With the shared pool (`serve/kv-pool`): 52.9 / 45.9.
 - **eklow serves Qwen3.6-35B-A3B finetunes** (llama.cpp's `qwen35moe`: 30 Gated DeltaNet and 10 gated-attention
   layers, 256 routed experts of 512 + one shared, 8 used) with **DFlash 2** speculative decoding and **image input**
   (Qwen3-VL's encoder behind `--mmproj`). Two targets so far, same architecture: stock
@@ -45,6 +50,7 @@ On Hugging Face (`ethanwtodd`, public; uploaded 2026-11-01; the model cards carr
 |---|---|---|
 | `Qwen3.6-35B-A3B-Q4_K-Q8_0-GGUF` @ 8db5016e | `Qwen3.6-35B-A3B-Q4_K-Q8_0.gguf` (20.7 GB) | 48cf98f4... |
 | `Ornith-1.5-35B-A3B-Q4_K-Q8_0-GGUF` @ a89886e0 | `Ornith-1.5-35B-A3B-Q4_K-Q8_0.gguf` (20.7 GB, Ornith's own template) | 25a68129... |
+| `Sage-A1.5-Q4_K-Q8_0-GGUF` @ b89cbc0f (2026-11-07) | `Sage-A1.5-Q4_K-Q8_0.gguf` (21.2 GB, Sage's own template, MTP block kept) | d50f428b... |
 | `Qwen3.6-35B-A3B-DFlash2-Q8_0-GGUF` @ 65aaab95 | `Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf` (570 MB, Inco's draft) | 986b8f24... |
 
 The mix (`EKK8`): routed experts Q4_K under bartowski's importance matrix, every other matrix Q8_0, head Q6_K; KL

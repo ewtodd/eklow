@@ -2208,3 +2208,80 @@ Semantics, as Jinja has them: `verification` is on when defined and truthy (true
 Compared against Hugging Face's `apply_chat_template` (transformers, `tools/ref/qwen_chat_compare.py`, 8,017 hand-written cases, of them 2,840 new: 27 conversations x 26 verification values (absent, true, false, "true", "True", "YES", "On", "1", "false", "maybe", "", "0", "no", "off", " true", 1, 0, 2, -1, 0.0, 1.5, null, [], [0], {}, {"a": 1}) x with and without tools x preserve_thinking, over plain, padded, blank, None, missing, late, part-list, image and already-triggered system messages and reasoning turns, plus the other options with the switch on; and 20,000 random conversations, half carrying a random verification value). Sage: 28,017 cases, 14,076 identical, 13,941 rejected by both, 0 differences. The same cases on the stock template (18,257 identical, 9,760 rejected by both) and on Ornith's (same counts), 0 differences each, so the old comparisons and the ignoring of `verification` hold. With tokens (3,000 random, stock's vocabulary GGUF): 6,066 prompts, 1,503,451 tokens, 0 differences. Nothing is deployed and nothing ran on the card.
 Found on the way: InternScience's Q4_K_M has no `tokenizer.ggml.normalizer.nfc` key, so `QwenTokenizer::from_gguf` (the server's loader too) refuses it ("does not say it normalizes to NFC"). A Sage GGUF made for fiona (the EKK8 script quantizes from InternScience's Q8_0) needs that key set to true, as the stock and Ornith files have it; not changed here.
 Addendum, same day (found on fiona's card): `--verification on` made every request without a system message a 400 ("verification=true requires a non-empty system message"), so serve_perf.py's depth and gsm runs, which send none, failed. A server default must not reject requests the client never asked to verify. The rule now: the default applies only when the conversation's first message is a system message whose content, rendered and trimmed, is non-empty (`text::qwen36_has_system_text`, checked in `parse_chat` where the default is filled in); for any other conversation it is as if absent (rendered like stock, no error). A value the request sends itself, top level or in `chat_template_kwargs`, keeps the template's exact semantics, both raises included, so a request's `true` without system text is still a 400. `render_qwen36` is unchanged and stays byte-for-byte Jinja. Host test `eklow-verification-test VOCAB_GGUF` (tools/prompt/verification_test.cpp; there was no harness for `parse_chat` before), 18 checks, 0 failures: default on with system text (trigger), with none and with a blank one (as without), with the request sending false (top level and kwargs; off), a request's true without system text (400, default on and off), its string "false" (400). The Hugging Face comparison is unchanged: sage 28,017 cases, 14,076 identical, 13,941 rejected by both, 0 differences; stock and Ornith 18,257 / 9,760 / 0.
+
+## 2026-11-07 — Sage-A1.5 on eklow: the behaviour test, the file, the draft, the speed
+
+The owner, before more work on Flash-Next: try dropping in Sage-A1.5, a Qwen3.6-35B-A3B finetune meant for orchestration, in Ornith's
+place on the engine as it is. This entry is the case for it, measured; the template is the entry above. Raw output:
+`docs/bench/sage-2026-11-07/`.
+
+**Behaviour, on fiona's own work.** `replay_fiona.py` (outside the repo) replays one real session of fiona's at three decision points:
+the first move, and two turns after the owner corrected how work is handed to a worker. Each request is the chat as it stood (stored
+reasoning dropped or replayed), 3 samples each, 3 passes, so 18 requests a point. A move is right if it is the one the owner wanted.
+Most runs were on the 4090 under one llama.cpp server (0.8.0-dev, CUDA), Ornith being production's own file. Counts are right
+moves out of 18 at the three points:
+
+| model | first move | point 2 | point 3 | ran out at 8,000 tokens (point 2) | median tokens, points 2 / 3 |
+|---|--:|--:|--:|--:|--:|
+| Ornith-1.5 EKK8 | 18 | 2 | 6 | 6 | 7,508 / 4,214 |
+| Sage Q4_K_M (InternScience) | 8 | 4 | 8 | 0 | 2,506 / 2,094 |
+| the same, verification on | 4 | 2 | 14 | 0 | 1,977 / 2,636 |
+| Sage Q8_0, verification on | 7 | 2 | 8 | 0 | 1,741 / 2,108 |
+| **Sage EKK8 in eklow on fiona, verification on** | 6 | 2 | 9 | 0 | 1,298 / 2,187 |
+
+Fisher exact, two-sided:
+- **Sage never thought itself into the cap** (0/72 against Ornith's 6/18, p = 1.2e-4 on the 54 llama.cpp runs) and writes about a
+  third of the tokens.
+- **Ornith's first move is better** (18/18 against 19/54, p = 5e-7).
+- **At point 3 Sage leads but not significantly**: 30/54 against 6/18, p = 0.17. Q4_K_M's 14/18 against Q8_0's 8/18 (p = 0.09) is
+  noise, and so is any step-3 gain from verification.
+- **The quant does not show**: Q8_0 is not better than Q4_K_M here, so no case for spending decode speed on bits.
+- **eklow's Sage behaves as llama.cpp's**: no errors, the same prompt length (5,901 tokens with the trigger) and the same spread.
+
+**Bits against speed, measured** (`expert-formats/`, `eklow-engine-bench` on fiona, stock Qwen3.6 at 8k, 2 slots of 16k, experts on
+the card at the bytes production's card budget or a halved K/V leaves): Q4_K 48 / 92 experts 36.1 / 40.4 tok/s; Q5_K 39 / 75 31.8 /
+36.0; Q6_K 32 / 63 29.6 / 32.8. Q8_0's streamed prefill has no batched repack (`xmx: batched repack is for the K-quant formats`), and its
+cold experts would not fit fiona's 32 GB of pinned RAM at production's context anyway. With no gain in behaviour, the experts stay Q4_K.
+
+**The file** (`tools/weights/make-sage.sh`): EKK8, from InternScience's Q8_0 (`1cbe2925`, sha256 `f7247f6f`) with mradermacher's
+importance matrix for Sage (`6dd4c710`). Only the 123 expert tensors (with the MTP block's) and the head are requantized; the other 629
+come out byte-identical to the Q8_0, checked tensor by tensor. Two keys are added: `tokenizer.ggml.normalizer.nfc` (eklow's tokenizer
+requires it) and `general.sampling.*` (temperature 1.0, top-p 0.95, top-k 20; without them eklow defaulted to top-k 64). The MTP block
+stays; eklow skips it. `ethanwtodd/Sage-A1.5-Q4_K-Q8_0-GGUF` @ `b89cbc0f`, 21,170,203,264 bytes, sha256 `d50f428b`. `make-sage.sh` rebuilds it with all 753 tensors
+byte-identical; only `quantize.imatrix.file`, the imatrix's path on the machine that made it, differs.
+
+KL against that Q8_0, tools/weights/kl.sh's protocol (wikitext-2 at 4k, 20 chunks; a Pile document at 32k, 2 chunks):
+
+| file | mean KL 4k / 32k | 99th pct 4k / 32k | same top token 4k / 32k |
+|---|---|---|---|
+| this EKK8 | 0.0127 / 0.0524 | 0.119 / 0.652 | 95.5% / 94.4% |
+| InternScience's Q4_K_M | 0.0442 / 0.1169 | 0.365 / 2.498 | 91.4% / 90.1% |
+
+**The draft: Inco's DFlash 2 stays** (`draft/`). Sage ships an MTP head trained on itself; Inco's draft was trained on stock. Measured
+in llama.cpp on the EKK8 (tokens a verify, temperature 1.0, 16 requests a dataset, GSM8K / HumanEval / MT-Bench):
+
+| draft | tokens a verify |
+|---|---|
+| DFlash, blocks of 4 | 3.29 / 2.93 / 3.06 |
+| MTP, 3 drafted | 2.83 / 2.63 / 2.74 |
+| DFlash, blocks of 8 | 4.73 / 4.05 / 4.49 |
+| MTP, 7 drafted | 3.75 / 3.18 / 3.44 |
+
+DFlash accepts 11-30% more. MTP would also cost eklow an MoE layer and the head for each drafted token, where DFlash drafts a block in
+one pass.
+
+**Images:** InternScience's `Sage-A1.5-mmproj.gguf` holds Qwen3.6's tower. Every tensor equals the projector production serves with
+Ornith within F16 rounding (222 bit for bit, the rest within 4e-7 relative), so that projector stays.
+
+**Through the server on fiona** (production's shape: 2 x 262k int8, draft, both image encoders, EmbeddingGemma 2; `--chat-template
+sage --verification on`, 48 experts a layer):
+- Decode with the draft: 43.2 tok/s at 8k, 41.3 at 32k.
+- Prefill: 1,636 tok/s at 8k, 1,922 at 32k.
+- GSM8K one at a time: 50.9 tok/s.
+- With `--kv-pool 262144` (branch `serve/kv-pool`): 52.9, 45.9 and 60.8.
+
+`serve_test.py basic` fails six checks with Sage that pass with stock. They are the test's greedy decoding against Sage's longer
+thinking: "why is the sky blue, in one sentence" thinks past the 700-token cap, and greedy tool calls repeat until 1,500. They are the
+same with verification on and off, and none happened in the 162 sampled replay requests. Its developer-role check did find a bug in the default: a `developer`
+message got no trigger, because the default looked at the roles before `parse_chat` maps developer to system (22 tokens against
+27). Fixed, with two more checks in `eklow-verification-test` (20, 0 failures; 2 without the fix).

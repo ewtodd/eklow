@@ -1,0 +1,3 @@
+{"label": "sage-inco-b8/temp", "dataset": "gsm8k", "requests": 16, "acceptance_mean": 4.730143093083947, "tokens": 27819, "truncated": 2, "decode_tps_median": 149.18840605550395}
+{"label": "sage-inco-b8/temp", "dataset": "humaneval", "requests": 16, "acceptance_mean": 4.050089089017816, "tokens": 65536, "truncated": 16, "decode_tps_median": 122.0570395581895}
+{"label": "sage-inco-b8/temp", "dataset": "mt-bench", "requests": 16, "acceptance_mean": 4.488618295571506, "tokens": 41889, "truncated": 5, "decode_tps_median": 124.697508195757}

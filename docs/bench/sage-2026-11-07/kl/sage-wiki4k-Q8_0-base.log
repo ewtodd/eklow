@@ -1,0 +1,33 @@
+0.02.298.522 W llama_model_loader: tensor overrides to CPU are used with mmap enabled - consider using --load-mode none for better performance
+0.02.305.495 W model has unused tensor blk.40.attn_norm.weight (size = 8192 bytes) -- ignoring
+0.02.305.497 W model has unused tensor blk.40.post_attention_norm.weight (size = 8192 bytes) -- ignoring
+0.02.305.501 W model has unused tensor blk.40.attn_q.weight (size = 17825792 bytes) -- ignoring
+0.02.305.503 W model has unused tensor blk.40.attn_k.weight (size = 1114112 bytes) -- ignoring
+0.02.305.504 W model has unused tensor blk.40.attn_v.weight (size = 1114112 bytes) -- ignoring
+0.02.305.508 W model has unused tensor blk.40.attn_output.weight (size = 8912896 bytes) -- ignoring
+0.02.305.510 W model has unused tensor blk.40.attn_q_norm.weight (size = 1024 bytes) -- ignoring
+0.02.305.511 W model has unused tensor blk.40.attn_k_norm.weight (size = 1024 bytes) -- ignoring
+0.02.305.512 W model has unused tensor blk.40.ffn_gate_inp.weight (size = 2097152 bytes) -- ignoring
+0.02.305.514 W model has unused tensor blk.40.ffn_down_exps.weight (size = 285212672 bytes) -- ignoring
+0.02.305.516 W model has unused tensor blk.40.ffn_gate_exps.weight (size = 285212672 bytes) -- ignoring
+0.02.305.518 W model has unused tensor blk.40.ffn_up_exps.weight (size = 285212672 bytes) -- ignoring
+0.02.305.519 W model has unused tensor blk.40.ffn_gate_inp_shexp.weight (size = 8192 bytes) -- ignoring
+0.02.305.520 W model has unused tensor blk.40.ffn_gate_shexp.weight (size = 1114112 bytes) -- ignoring
+0.02.305.522 W model has unused tensor blk.40.ffn_up_shexp.weight (size = 1114112 bytes) -- ignoring
+0.02.305.523 W model has unused tensor blk.40.ffn_down_shexp.weight (size = 1114112 bytes) -- ignoring
+0.02.305.525 W model has unused tensor blk.40.nextn.eh_proj.weight (size = 8912896 bytes) -- ignoring
+0.02.305.527 W model has unused tensor blk.40.nextn.enorm.weight (size = 8192 bytes) -- ignoring
+0.02.305.528 W model has unused tensor blk.40.nextn.hnorm.weight (size = 8192 bytes) -- ignoring
+0.02.305.532 W model has unused tensor blk.40.nextn.shared_head_norm.weight (size = 8192 bytes) -- ignoring
+0.28.050.181 I cmn          init: llama threadpool init, n_threads = 16
+0.28.161.202 I 
+0.28.161.254 I system_info: n_threads = 16 (n_threads_batch = 16) / 32 | CUDA : ARCHS = 890 | USE_GRAPHS = 1 | FA_QUANTS = q4_0-q4_0,q8_0-q8_0,f16-f16,bf16-bf16 | CPU : LLAMAFILE = 1 | OPENMP = 1 | REPACK = 1 | 
+0.28.161.300 I perplexity: saving all logits to /var/tmp/eklow-sage/work/kl/sage-wiki4k.base
+0.28.161.302 I perplexity: tokenizing the input ..
+0.28.430.351 I perplexity: tokenization took 269.042 ms
+0.28.430.405 I perplexity: calculating perplexity over 20 chunks, n_ctx=4096, batch_size=2048, n_seq=1
+0.34.802.608 I perplexity: 6.09 seconds per pass - ETA 2.02 minutes
+[1]6.6550,[2]6.8188,[3]5.6431,[4]5.5024,[5]5.7607,[6]5.9389,[7]6.1956,[8]6.3800,[9]6.4378,[10]6.1905,[11]6.2971,[12]6.3449,[13]6.3748,[14]6.6208,[15]6.5581,[16]6.3678,[17]6.3340,[18]6.2953,[19]6.1255,[20]5.9421,
+2.25.450.738 I Final estimate: PPL = 5.9421 +/- 0.07317
+
+2.25.630.419 W ~llama_context:      CUDA0 compute buffer size of 537.0039 MiB, does not match expectation of 501.0039 MiB
