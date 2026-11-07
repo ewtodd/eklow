@@ -45,6 +45,9 @@ std::vector<ChatPart> render_qwen36(QwenTemplate which, const json::Value& messa
 // Which template a GGUF's tokenizer.chat_template is, if it is one of the three published files exactly (byte for
 // byte); anything else is refused by the caller rather than rendered wrong.
 std::optional<QwenTemplate> qwen36_template_of(std::string_view tmpl);
+// Whether the first message is a system message whose content, rendered and trimmed, is not empty (false where the
+// template would raise on the content). The server applies --verification on only to such conversations.
+bool qwen36_has_system_text(const json::Value& messages);
 const char* qwen36_template_name(QwenTemplate which);
 
 }  // namespace eklow::text

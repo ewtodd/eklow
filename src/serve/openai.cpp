@@ -180,7 +180,9 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
   bool preserve = false;
   // verification (Sage's template only; the others never look at it): the template variable as sent, else the server's default.
   std::optional<json::Value> verification;
-  if (d.verification) verification = json::Value::boolean(true);
+  // The server's default (--verification on) applies only to a conversation that has system text to carry the trigger; for any
+  // other it is as if absent, never an error. A value the request sends keeps the template's own rules, raises included.
+  if (d.verification && text::qwen36_has_system_text(*msgs)) verification = json::Value::boolean(true);
   if (const json::Value* e = field(body, "reasoning_effort"); e && e->is_string()) r.thinking = e->as_string() != "none";
   if (const json::Value* t = field(body, "think"); t && t->is_bool()) r.thinking = t->as_bool();
   if (const json::Value* t = field(body, "preserve_thinking"); t && !t->is_null()) preserve = t->truthy();

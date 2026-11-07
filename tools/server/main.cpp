@@ -29,7 +29,9 @@
 // Sage-A1.5, whose GGUFs are recognised without the flag) is stock plus a `verification` switch: a request's
 // "verification": true (top level or in chat_template_kwargs) appends "\n\nVerification protocol: enabled" to the system
 // message, and the template refuses (a 400) a request that turns it on without a non-blank system message, or sends it as a
-// string other than true/1/yes/on. --verification on|off (default off; Sage only) is the value for a request that sends none.
+// string other than true/1/yes/on. --verification on|off (default off; Sage only) is the value for a request that sends none, and
+// applies only to a conversation whose first message is a system message with non-blank text (any other is rendered as if
+// the request had sent nothing, so a default never turns a request away); a request's own "verification" keeps all of the above.
 // --snapshot-mib is the pinned host memory kept for snapshots of the DeltaNet state, which make a conversation's or a
 // document's prefix reusable (taken before each prompt's generation prompt, every --snapshot-every tokens of a long
 // prefill, and at the end of a generation); 0 keeps none, and then only a slot's live sequence is reused.

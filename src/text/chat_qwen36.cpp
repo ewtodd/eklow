@@ -231,6 +231,20 @@ std::optional<QwenTemplate> qwen36_template_of(std::string_view tmpl) {
   return std::nullopt;
 }
 
+bool qwen36_has_system_text(const Value& messages) {
+  if (!messages.is_array() || messages.items().empty()) return false;
+  const Value& first = messages.items()[0];
+  if (!eq(sub(&first, "role"), "system")) return false;
+  try {
+    Counts scratch;
+    Text c = render_content(sub(&first, "content"), false, true, scratch, false);
+    c.trim();
+    return !c.parts.empty();
+  } catch (const ChatError&) {
+    return false;
+  }
+}
+
 const char* qwen36_template_name(QwenTemplate which) {
   switch (which) {
     case QwenTemplate::Stock: return "stock";

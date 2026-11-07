@@ -55,7 +55,7 @@ struct ChatDefaults {
   SamplingParams sampling;  // what a request leaves out
   int64_t max_ctx;          // positions per slot
   text::QwenTemplate chat_template = text::QwenTemplate::Stock;
-  // Sage's template: the verification protocol is on for a request that does not send `verification` (--verification on).
+  // Sage's template: the verification protocol is on for a request that does not send `verification` (--verification on), if its first message is a system message with text.
   bool verification = false;
   // Image input: encodes an image_url part's picture (null: image parts are refused with a 400). It may block (it holds the
   // scheduler for the encode) and is called on the request's thread, once per image, in conversation order.
