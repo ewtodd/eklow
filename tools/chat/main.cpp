@@ -1,10 +1,10 @@
-// eklow-chat: Qwen3.6's two chat template ports from the command line.
+// eklow-chat: Qwen3.6's three chat template ports from the command line.
 //
-//   eklow-chat render [--tokens GGUF] [--variant stock|ornith] < CASES > RESULTS
+//   eklow-chat render [--tokens GGUF] [--variant stock|ornith|sage] < CASES > RESULTS
 //                                         CASES: one JSON object per line, {"messages": [...],
 //                                         "tools": [...] or null, "add_generation_prompt": bool,
 //                                         "enable_thinking": bool, "preserve_thinking": bool,
-//                                         "add_vision_id": bool};
+//                                         "add_vision_id": bool, "verification": any (Sage)};
 //                                         RESULTS: one line per case, {"text": ..., "parts":
 //                                         [[text, is_input], ...]} or {"error": ...}; with --tokens,
 //                                         also "ids", the prompt tokenized with special tokens
@@ -45,7 +45,7 @@ int main(int argc, char** argv) {
       auto which = text::qwen36_template_of(tmpl);
       std::printf("%s: chat template %s\n", argv[2],
                   which ? (std::string("is the ported Qwen3.6 ") + text::qwen36_template_name(*which) + " template").c_str()
-                        : "DIFFERS from both ported Qwen3.6 templates");
+                        : "DIFFERS from the ported Qwen3.6 templates (stock, ornith, sage)");
       return which ? 0 : 1;
     } catch (const std::exception& e) {
       std::fprintf(stderr, "eklow-chat: %s\n", e.what());
@@ -59,8 +59,8 @@ int main(int argc, char** argv) {
     else if (!std::strcmp(argv[i], "--variant") && i + 1 < argc) variant = argv[++i];
     else usage = true;
   }
-  if (usage || (!variant.empty() && variant != "stock" && variant != "ornith")) {
-    std::fprintf(stderr, "usage: eklow-chat render [--tokens GGUF] [--variant stock|ornith] < CASES > RESULTS | eklow-chat check GGUF\n");
+  if (usage || (!variant.empty() && variant != "stock" && variant != "ornith" && variant != "sage")) {
+    std::fprintf(stderr, "usage: eklow-chat render [--tokens GGUF] [--variant stock|ornith|sage] < CASES > RESULTS | eklow-chat check GGUF\n");
     return 2;
   }
   try {
@@ -69,12 +69,13 @@ int main(int argc, char** argv) {
     std::optional<text::QwenTemplate> qwen;
     if (variant == "stock") qwen = text::QwenTemplate::Stock;
     if (variant == "ornith") qwen = text::QwenTemplate::Ornith;
+    if (variant == "sage") qwen = text::QwenTemplate::Sage;
     if (!tokens_path.empty()) {
       file.emplace(gguf::File::open(tokens_path));
       qwen_tok.emplace(text::QwenTokenizer::from_gguf(*file));
       if (!qwen) {
         qwen = text::qwen36_template_of(file->at("tokenizer.chat_template").as_string());
-        if (!qwen) throw std::runtime_error(tokens_path + ": the chat template is neither ported Qwen3.6 template");
+        if (!qwen) throw std::runtime_error(tokens_path + ": the chat template is none of the ported Qwen3.6 templates");
       }
     }
     std::ios::sync_with_stdio(false);
@@ -91,6 +92,7 @@ int main(int argc, char** argv) {
         opt.enable_thinking = flag(c, "enable_thinking", true);
         opt.preserve_thinking = flag(c, "preserve_thinking");
         opt.add_vision_id = flag(c, "add_vision_id");
+        if (const json::Value* v = c.find("verification")) opt.verification = *v;
         if (!qwen) throw std::runtime_error("no template: give --variant or --tokens");
         parts = text::render_qwen36(*qwen, messages ? *messages : json::Value::array(), tools ? *tools : json::Value(), opt);
         w.begin_object().kv("text", text::join(parts)).key("parts").begin_array();

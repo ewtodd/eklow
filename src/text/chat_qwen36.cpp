@@ -1,6 +1,7 @@
 #include "text/chat_qwen36.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 
 #include "text/pyfmt.hpp"
@@ -219,15 +220,25 @@ uint64_t fnv(std::string_view s) {
 }  // namespace
 
 std::optional<QwenTemplate> qwen36_template_of(std::string_view tmpl) {
-  // FNV-1a over the two chat_template.jinja files: stock Qwen/Qwen3.6-35B-A3B at 995ad96e (7,764 bytes, no final
-  // newline) and ornith-ai/Ornith-1.5-35B-A3B at 10fbf86f (7,536 bytes, with one).
+  // FNV-1a over the three chat_template.jinja files: stock Qwen/Qwen3.6-35B-A3B at 995ad96e (7,764 bytes, no final
+  // newline), ornith-ai/Ornith-1.5-35B-A3B at 10fbf86f (7,536 bytes, with one) and InternScience/Sage-A1.5 at 0e3205cf
+  // (9,025 bytes, no final newline; its tokenizer_config.json copy has one, 9,026 bytes, and is accepted too).
   const uint64_t h = fnv(tmpl);
   if (tmpl.size() == 7764 && h == 0x8ae3a8bc6e68f114ull) return QwenTemplate::Stock;
   if (tmpl.size() == 7536 && h == 0x94e2de6b0aac72c0ull) return QwenTemplate::Ornith;
+  if (tmpl.size() == 9025 && h == 0xf15d4bcc1307dcbaull) return QwenTemplate::Sage;
+  if (tmpl.size() == 9026 && h == 0x29647bc4565bff10ull) return QwenTemplate::Sage;
   return std::nullopt;
 }
 
-const char* qwen36_template_name(QwenTemplate which) { return which == QwenTemplate::Stock ? "stock" : "ornith"; }
+const char* qwen36_template_name(QwenTemplate which) {
+  switch (which) {
+    case QwenTemplate::Stock: return "stock";
+    case QwenTemplate::Ornith: return "ornith";
+    case QwenTemplate::Sage: return "sage";
+  }
+  return "stock";
+}
 
 std::vector<ChatPart> render_qwen36(QwenTemplate which, const Value& messages, const Value& tools_value, const QwenChatOptions& opt) {
   if (!messages.is_array()) throw ChatError("chat_template: messages must be a list");
@@ -243,6 +254,33 @@ std::vector<ChatPart> render_qwen36(QwenTemplate which, const Value& messages, c
   Counts counts;
   const size_t n = msgs.size();
   V first_role = sub(&msgs[0], "role");
+  // Sage's verification switch: `verify_on = verification is defined and verification`, and the two raises after it.
+  static constexpr std::string_view kVerifyTail = "Verification protocol: enabled";
+  bool verify_on = false;
+  if (which == QwenTemplate::Sage && opt.verification) {
+    const Value& v = *opt.verification;
+    verify_on = v.truthy();
+    if (verify_on && v.is_string()) {
+      std::string low = v.as_string();
+      for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
+      if (low != "true" && low != "1" && low != "yes" && low != "on")
+        throw ChatError("verification must be a boolean, not the string " + tojson(v) + ". Send a JSON boolean: {\"chat_template_kwargs\": {\"verification\": true}}.");
+    }
+    if (verify_on) {
+      bool blank = true;
+      if (eq(first_role, "system")) {
+        Counts scratch;
+        Text c = render_content(sub(&msgs[0], "content"), false, true, scratch, opt.add_vision_id);
+        c.trim();
+        blank = c.parts.empty();
+      }
+      if (blank) throw ChatError("verification=true requires a non-empty system message: the verification protocol trigger is appended to the end of the system content.");
+    }
+  }
+  // content = content + verify_trigger if (verify_on and not content.endswith(verify_tail)) else content
+  const auto verify = [&](Text& content) {
+    if (verify_on && !content.str().ends_with(kVerifyTail)) content.lit("\n\nVerification protocol: enabled");
+  };
   if (have_tools) {
     o.lit("<|im_start|>system\n# Tools\n\nYou have access to the following functions:\n\n<tools>");
     for (const auto& tool : tools_value.items()) {
@@ -263,6 +301,7 @@ std::vector<ChatPart> render_qwen36(QwenTemplate which, const Value& messages, c
     if (eq(first_role, "system")) {
       Text content = render_content(sub(&msgs[0], "content"), false, true, counts, opt.add_vision_id);
       content.trim();
+      verify(content);
       if (!content.parts.empty()) {
         o.lit("\n\n");
         o.append(content);
@@ -272,6 +311,7 @@ std::vector<ChatPart> render_qwen36(QwenTemplate which, const Value& messages, c
   } else if (eq(first_role, "system")) {
     Text content = render_content(sub(&msgs[0], "content"), false, true, counts, opt.add_vision_id);
     content.trim();
+    verify(content);
     o.lit("<|im_start|>system\n");
     o.append(content);
     o.lit("<|im_end|>\n");

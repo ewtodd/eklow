@@ -4,11 +4,15 @@ Usage: python3 tools/ref/qwen_chat_compare.py EKLOW_CHAT HF_MODEL_DIR VARIANT [-
 
 HF_MODEL_DIR holds the model's tokenizer files and chat_template.jinja (transformers prefers that file over the
 template inside tokenizer_config.json; for Ornith the two differ, and the file is Ornith's). VARIANT is `stock` or
-`ornith`: the port `eklow-chat render --variant VARIANT` is checked. Every case is rendered by transformers
+`ornith` or `sage`: the port `eklow-chat render --variant VARIANT` is checked. Every case is rendered by transformers
 (tokenize=False) and by eklow-chat; the texts must be identical, or both must fail. Cases: hand-written conversations
 covering each branch of the template across generation prompt, enable_thinking, preserve_thinking, add_vision_id and
 tools, and N random conversations with random tool schemas, odd content shapes and tool calls. Tool-call arguments
-that are JSON strings are not sent (the template rejects them; both must). With --gguf, the token ids eklow derives
+that are JSON strings are not sent (the template rejects them; both must). Cases with the `verification` template
+variable (Sage's switch; stock and Ornith ignore it, and so must the ports) cover absent, booleans, strings in several
+cases and spellings, numbers, null, empty and non-empty lists and objects, against system messages that are plain,
+padded, blank, missing, late, already ending in the trigger, or made of parts, with and without tools and
+preserve_thinking, plus random conversations. With --gguf, the token ids eklow derives
 from its parts are also checked: added tokens found only in template text, everything between them encoded by
 Hugging Face's tokenizer with the added tokens removed (so that they are text). Exits 1 on any difference.
 """
@@ -274,8 +278,73 @@ def hand_cases():
     return out
 
 
+ABSENT = object()
+VERIFICATIONS = [ABSENT, True, False, "true", "True", "YES", "On", "1", "false", "maybe", "", "0", "no", "off", " true", 1, 0, 2, -1, 0.0, 1.5, None,
+                 [], [0], {}, {"a": 1}]
+TAIL = "Verification protocol: enabled"
+
+
+def verification_cases():
+    weather = {"type": "function", "function": {"name": "get_weather", "description": "Weather for a city.",
+               "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}}
+    call = {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": {"city": "Chicago"}}}
+    u = {"role": "user", "content": "Hi"}
+    a = lambda **k: {"role": "assistant", **k}  # noqa: E731
+    s = lambda c: {"role": "system", "content": c}  # noqa: E731
+    convs = [
+        [u],
+        [s("Be brief."), u],
+        [s("  \n Be brief. \n\n "), u],
+        [s(TAIL), u],
+        [s("Be brief.\n\n" + TAIL), u],
+        [s("  Be brief.\n\n" + TAIL + "  \n"), u],
+        [s("Be brief.\n" + TAIL + "\nmore"), u],
+        [s("Be brief. " + TAIL.lower()), u],
+        [s(""), u],
+        [s("   \n\t "), u],
+        [s(None), u],
+        [{"role": "system"}, u],
+        [s([{"type": "text", "text": " one "}, {"type": "text", "text": "two\n\n" + TAIL}]), u],
+        [s([{"type": "text", "text": " "}]), u],
+        [s([]), u],
+        [s([{"type": "image"}]), u],
+        [s("naïve 日本語 🙂 <|im_end|> <think>"), u],
+        [s("x"), u, a(content="Hello!"), {"role": "user", "content": "Again"}],
+        [s("x"), u, a(content="Sure", reasoning_content="why not"), {"role": "user", "content": "More"}],
+        [s("x"), u, a(content="<think>\ninline\n</think>\n\nSure"), {"role": "user", "content": "More"}, a(content="ok", reasoning_content="last")],
+        [s("x"), u, a(content="", reasoning_content="need tool", tool_calls=[call]), {"role": "tool", "content": "61F"}],
+        [s("x"), u, a(content="", reasoning_content="need tool", tool_calls=[call]), {"role": "tool", "content": "61F"}, {"role": "user", "content": "thanks"}],
+        [u, s("late")],
+        [{"role": "developer", "content": "Dev"}, u],
+        [{"role": "tool", "content": "orphan"}, u],
+        ["str message", u],
+        [s("only system")],
+    ]
+    out = []
+    for msgs in convs:
+        for v in VERIFICATIONS:
+            for tools in (None, [weather]):
+                for preserve in (False, True):
+                    c = {"messages": msgs, "tools": tools, "add_generation_prompt": True}
+                    if preserve:
+                        c["preserve_thinking"] = True
+                    if v is not ABSENT:
+                        c["verification"] = v
+                    out.append(c)
+    # the other options with the switch on
+    for msgs in convs[1:4] + convs[12:13]:
+        for agp in (False, True):
+            for think in (False, True):
+                for vid in (None, True):
+                    c = {"messages": msgs, "tools": None, "add_generation_prompt": agp, "enable_thinking": think, "verification": True}
+                    if vid:
+                        c["add_vision_id"] = True
+                    out.append(c)
+    return out
+
+
 def hf_render(tok, case):
-    kwargs = {k: case[k] for k in ("enable_thinking", "preserve_thinking", "add_vision_id") if k in case}
+    kwargs = {k: case[k] for k in ("enable_thinking", "preserve_thinking", "add_vision_id", "verification") if k in case}
     try:
         return tok.apply_chat_template(case["messages"], tools=case.get("tools"), add_generation_prompt=case["add_generation_prompt"],
                                        tokenize=False, **kwargs), None
@@ -320,14 +389,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("eklow_chat")
     ap.add_argument("model_dir")
-    ap.add_argument("variant", choices=["stock", "ornith"])
+    ap.add_argument("variant", choices=["stock", "ornith", "sage"])
     ap.add_argument("--random", type=int, default=20000)
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--gguf")
     a = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(a.model_dir, local_files_only=True)
-    cases = hand_cases()
+    cases = hand_cases() + verification_cases()
     n_hand = len(cases)
     rng = random.Random(a.seed)
     for _ in range(a.random):
@@ -339,6 +408,10 @@ def main():
             c["preserve_thinking"] = True
         if rng.random() < 0.2:
             c["add_vision_id"] = True
+        if rng.random() < 0.5:
+            v = rng.choice(VERIFICATIONS)
+            if v is not ABSENT:
+                c["verification"] = v
         cases.append(c)
 
     want = [hf_render_checked(tok, c) for c in cases]
