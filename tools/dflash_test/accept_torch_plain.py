@@ -1,4 +1,4 @@
-# Teacher-forced acceptance of a plain DFlash draft (Gemma 4 26B A4B's) on the target's real hidden states, in z-lab's
+# Teacher-forced acceptance of a plain DFlash draft (z-lab's kind; built for Gemma 4 26B A4B, since removed from eklow) on the target's real hidden states, in z-lab's
 # model.py (fp32, CPU), for the masks the layers may have:
 #   model.py   sliding layers causal inside the block, the full layer not (z-lab's code, vLLM's: how the draft was trained)
 #   all-open   every layer not causal (how llama.cpp at the pin runs it: its GGUF has no per-layer causal flag)

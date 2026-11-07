@@ -1,5 +1,5 @@
-# The PyTorch reference of a plain DFlash draft (z-lab's dflash/model.py, DFlashDraftModel, in fp32 on the CPU) for Gemma 4
-# 26B A4B's draft, on fixed features and tokens, and its comparison with eklow's reference forward (eklow-dflash-host).
+# The PyTorch reference of a plain DFlash draft (z-lab's dflash/model.py, DFlashDraftModel, in fp32 on the CPU) for z-lab's plain draft kind (built for Gemma 4
+# 26B A4B, since removed from eklow), on fixed features and tokens, and its comparison with eklow's reference forward (eklow-dflash-host).
 # Fixed inputs rather than the target's real hidden states: the checks are of the draft's arithmetic (the sliding/full layer
 # pattern with its masks, the embedding scale, the head, the softcap), which random features exercise as well; the features
 # are N(0, scale^2) from a numpy seed. The embedding table and the head are the target's token_embd.weight (tied), dequantized.

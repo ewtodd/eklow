@@ -14,7 +14,7 @@
 // Outside a call nothing is constrained, and several calls in a row are allowed. Special tokens never appear inside a
 // call except the one that closes it.
 //
-// Like the Gemma grammar's, this is a byte automaton: a token is allowed if its bytes run through it, the vocabulary is
+// This is a byte automaton: a token is allowed if its bytes run through it, the vocabulary is
 // bucketed by first byte, and the allowed set of a state is cached across requests by the state (mode, what has been
 // matched, the open containers) and the tools' fingerprint, so getting the set for a token costs a lookup.
 #pragma once

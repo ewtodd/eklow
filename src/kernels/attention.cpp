@@ -1000,7 +1000,7 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
     else run<256, 2, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   } else if (c.head_dim == 128 && group == 4) {
     // The DFlash drafts' layers (src/model/dflash2_fast.cpp): 32 query heads over 8 K/V heads of 128, a ring in fp16 (the sliding
-    // layers) or, for the full layer of Gemma's plain draft, in int8.
+    // layers) or, for the full layer of a plain DFlash draft, in int8.
     if (c.int8()) run<128, 4, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
     else run<128, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   } else if (c.head_dim == 256 && group == 8) {

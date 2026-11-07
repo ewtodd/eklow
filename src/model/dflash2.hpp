@@ -21,10 +21,10 @@
 // through attn::attend on a ring cache with a key range per token, the convolutions and the selector as kernels of
 // src/kernels/dflash.*, the target's head on the card with the top 16 of each row taken there.
 //
-// Plain DFlash drafts (z-lab's DFlash, arXiv 2602.06036; their gemma-4-26B-A4B-it-DFlash for the Gemma 4 26B A4B; DECISIONS
+// Plain DFlash drafts (z-lab's DFlash, arXiv 2602.06036; z-lab also published one for Gemma 4 26B A4B, since removed from eklow; DECISIONS
 // 2026-11-03) run through the same classes: Dflash2Config::plain. Their layers have no convolutions:
 //   n = rmsnorm(x); q, k, v = n W; ...; x += o_proj(attention); n = rmsnorm(x); x += down(silu(gate n) * up n);
-// the target's embedding rows are scaled (Gemma: sqrt(hidden)) and the head's logits go through the final softcap
+// the target's embedding rows are scaled (a Gemma-family target: sqrt(hidden)) and the head's logits go through the final softcap
 // cap * tanh(x / cap) (monotone, so the top 16 are the raw logits'). There is no selector: each position has its own
 // distribution, so a Lattice has the same row of unary scores for every predecessor and serve::walk samples each
 // position from it (temperature 0: its argmax). A layer is sliding (the window of 2,048; causal inside the block, as

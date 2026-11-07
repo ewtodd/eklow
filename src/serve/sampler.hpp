@@ -12,7 +12,7 @@
 namespace eklow::serve {
 
 struct SamplingParams {
-  // Gemma 4's model card.
+  // Defaults of a request that sets none (taken from Gemma 4's model card; Qwen's request layer uses them unchanged).
   float temperature = 1.0f;
   int32_t top_k = 64;  // 0: no limit
   float top_p = 0.95f;

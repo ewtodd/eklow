@@ -5,13 +5,14 @@
 //
 // Correctness: two slots hold different random sequences of --len tokens, fed in the same steps as
 // prefill chunks of --chunk and then --decode single tokens; every output row is compared with the
-// reference over the whole sequence, for Gemma 4's sliding (head 256, 8 K/V heads, ring, window
-// 1024) and global (head 512, one K/V head, page table) layers, with fp16 caches and int8 ones
+// reference over the whole sequence, for a sliding (head 256, 8 K/V heads, ring, window
+// 1024) and a global (head 512, one K/V head, page table) layer shape (Gemma 4's, the shapes the kernels were written for; the
+// DFlash drafts' sliding and full layers run the same kernels), with fp16 caches and int8 ones
 // (sliding8, global8). Each kind runs twice, the second time (+img) with every token carrying its key range
 // (Tokens::lo, hi) and a span of each slot's second chunk, an image, seeing up to the span's end, its rows checked
 // against a host reference. Speed: the cache filled to each
 // --time-ctx, one decode token and one 1024-token prefill chunk ending there, timed on the card.
-// --heads sets the query heads (16, the 12B's; 8 with --only global or global8 gives the 26B's global
+// --heads sets the query heads (16 by default; 8 with --only global or global8 gives a global
 // group of 8 query heads per K/V head), --only runs one kind, --no-check skips the correctness pass.
 #include <sycl/sycl.hpp>
 

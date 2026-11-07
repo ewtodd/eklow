@@ -452,7 +452,7 @@ void mul(sycl::queue& q, const float* a, const float* b, int64_t n, float* out) 
 void gelu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out) {
   q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
      const float g = gate[id[0]];
-     // gelu with the tanh approximation, as Gemma's gelu_pytorch_tanh and ggml_gelu
+     // gelu with the tanh approximation, as the Gemma family's gelu_pytorch_tanh and ggml_gelu
      const float k0 = 0.7978845608028654f, k1 = 0.044715f;
      out[id[0]] = 0.5f * g * (1.0f + sycl::tanh(k0 * (g + k1 * g * g * g))) * up[id[0]];
    });

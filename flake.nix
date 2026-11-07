@@ -1,5 +1,5 @@
 {
-  description = "eklow: a serving engine for Gemma 4 on one Intel Arc A770M (DG2), in SYCL on Level Zero";
+  description = "eklow: a serving engine for Qwen3.6-35B-A3B and its finetunes on one Intel Arc A770M (DG2), in SYCL on Level Zero";
 
   inputs = {
     # The fleet's nixpkgs (/etc/nixos flake.lock), so the host and the engine agree on intel-llvm
