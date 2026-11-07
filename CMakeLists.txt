@@ -277,3 +277,7 @@ add_executable(eklow-dflash-test tools/dflash_test/main.cpp)
 target_link_libraries(eklow-dflash-test PRIVATE eklow_model eklow_spec)
 eklow_sycl(eklow-dflash-test)
 install(TARGETS eklow-dflash-test RUNTIME DESTINATION bin)
+
+# The scheduler's K/V pool decisions (src/serve/kv_pool.hpp), host only.
+add_executable(eklow-kvpool-test tools/server/kv_pool_test.cpp)
+target_include_directories(eklow-kvpool-test PRIVATE src)

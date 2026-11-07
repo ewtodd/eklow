@@ -27,6 +27,7 @@
 
 #include "engine/engine.hpp"
 #include "model/dflash2.hpp"
+#include "serve/kv_pool.hpp"
 #include "serve/sampler.hpp"
 #include "serve/tool_grammar_qwen.hpp"
 #include "text/output_parser_qwen.hpp"
@@ -74,6 +75,7 @@ class Request {
   std::vector<int64_t> snapshot_points;
   int draft_block = -1;            // -1: the server's block size; 0: plain decode even with a draft; 2 to 16: this one (for measuring)
   std::string tag;                 // names the request in the log (the completion id)
+  bool pool_waited = false;        // scheduler side: the log has said it waits for K/V pages
 
   // Reader side: waits up to `wait` for the next event.
   bool next(Event& e, std::chrono::milliseconds wait);
@@ -140,6 +142,8 @@ class Scheduler {
 
   // Queues a request. Throws std::invalid_argument for one whose prompt does not fit a slot.
   void submit(std::shared_ptr<Request> r);
+  // The K/V pool in positions (all slots together).
+  int64_t pool_positions() const { return eng_.pool_pages() * attn::kPage; }
   // The engine thread: runs until `stop` is set.
   void run(const std::atomic<bool>& stop);
 
@@ -149,6 +153,10 @@ class Scheduler {
     int64_t prompt_tokens = 0, cached_tokens = 0;      // of admitted prompts, and of those already in their slot
     int64_t prefill_tokens = 0, generated_tokens = 0;  // fed as prefill, sampled
     int64_t positions = 0, idle_positions = 0;         // held by the slots, and by those with no request (cached)
+    // The K/V pool (engine::Config::kv_pool), in positions (pages x attn::kPage): its size, held by the slots, free; and since the start the
+    // positions taken back from idle slots (reclaimed, in `kv_reclaims` cuts), requests that waited for pages, sequences ended for want of them.
+    int64_t kv_pool_positions = 0, kv_held_positions = 0, kv_free_positions = 0;
+    int64_t kv_reclaimed_positions = 0, kv_reclaims = 0, kv_waits = 0, kv_ended = 0;
     int64_t verifies = 0, drafted = 0, accepted = 0;   // verify blocks, tokens drafted, of them accepted
     int64_t snapshots = 0, snapshot_bytes = 0;         // held now (bytes: pinned host memory)
     int64_t snapshots_taken = 0, restores = 0;         // since the start
@@ -208,6 +216,13 @@ class Scheduler {
   void finish(int slot, const std::string& reason, const std::string& error = "");
   void fail_all(const std::string& error);
   void note_positions();
+  // The pool. reclaim: gives back at least `pages` more than are free from idle slots (least recently used first, each cut from its end
+  // to a snapshot's position or emptied), returns the pages freed. fit_pool: before a step, takes back pages for the chunks or ends the
+  // sequences that cannot get them (finish_reason "length").
+  int64_t reclaim(int64_t pages);
+  void trim_slot(int slot, int64_t keep);
+  // `dropped(k)` is called after chunk k is removed, for the caller's parallel lists.
+  void fit_pool(std::vector<engine::Chunk>& chunks, const std::function<void(size_t)>& dropped);
   // Snapshots.
   bool has_snapshot(const Seq& q, int64_t position) const;
   bool wants_snapshot(const Seq& q, int64_t pos) const;

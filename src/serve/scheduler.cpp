@@ -66,6 +66,7 @@ Scheduler::Scheduler(engine::Engine& eng, const text::QwenTokenizer& tok, const 
   if (c_.draft && (c_.draft_block < 2 || c_.draft_block > eng.config().max_pending))
     throw std::invalid_argument("the draft block must be 2 to " + std::to_string(eng.config().max_pending));
   if (c_.snapshot_bytes < eng.snapshot_bytes()) c_.snapshot_bytes = 0;  // not even one fits
+  stats_.kv_pool_positions = stats_.kv_free_positions = eng.pool_pages() * attn::kPage;
 }
 
 void Scheduler::submit(std::shared_ptr<Request> r) {
@@ -73,6 +74,9 @@ void Scheduler::submit(std::shared_ptr<Request> r) {
   if (int64_t(r->prompt.size()) >= c_.max_ctx)
     throw std::invalid_argument("the prompt is " + std::to_string(r->prompt.size()) + " tokens, the context " +
                                 std::to_string(c_.max_ctx));
+  // A prompt the whole pool cannot hold (with a step's growth) would wait forever.
+  if (int64_t(r->prompt.size()) + kvpool::step_growth(c_.draft != nullptr) > pool_positions())
+    throw std::invalid_argument("the prompt is " + std::to_string(r->prompt.size()) + " tokens, the K/V pool " + std::to_string(pool_positions()));
   int64_t at = 0;
   for (const ImageInput& im : r->images) {
     if (im.n <= 0 || im.nx <= 0 || im.ny <= 0 || im.nx * im.ny != im.n || im.start < at || im.start + im.n > int64_t(r->prompt.size()) || !im.rows)
@@ -134,6 +138,29 @@ bool Scheduler::admit() {
       if (best < 0 || keep > best_keep || (keep == best_keep && q.used < seqs_[size_t(best)].used)) best = int(s), best_keep = keep, best_snap = snap;
     }
     if (best < 0) break;
+    // The pool: the request needs its prompt and a step's growth in pages, less those its slot keeps; the free pages, the other idle
+    // slots' and its own beyond the kept prefix pay for it, less what the running requests still need for their prompts. Else it waits
+    // in the queue (a finishing request frees pages) rather than failing.
+    {
+      const int64_t pg = attn::kPage, growth = kvpool::step_growth(c_.draft != nullptr);
+      std::vector<kvpool::AdmitHolder> hs(seqs_.size());
+      for (size_t s = 0; s < seqs_.size(); ++s) {
+        hs[s].pages = eng_.slot_pages(int(s));
+        hs[s].idle = !seqs_[s].req;
+        if (seqs_[s].req) hs[s].want = kvpool::pages_for(pg, int64_t(seqs_[s].req->prompt.size()) + growth);
+      }
+      const int64_t want = kvpool::pages_for(pg, int64_t(r->prompt.size()) + growth);
+      if (!kvpool::admission_fits(eng_.free_pages(), hs, best, kvpool::pages_for(pg, best_keep), want)) {
+        if (!r->pool_waited) {
+          r->pool_waited = true;
+          ++stats_.kv_waits;
+          std::fprintf(stderr, "eklow-server: kv pool: %s waits for pages: its prompt of %zu tokens needs %lld, %lld of the pool's %lld are free and %lld positions are cached in idle slots\n",
+                       r->tag.c_str(), r->prompt.size(), (long long)(want * pg), (long long)(eng_.free_pages() * pg), (long long)(eng_.pool_pages() * pg),
+                       (long long)stats_.idle_positions);
+        }
+        break;
+      }
+    }
     Seq& q = seqs_[size_t(best)];
     const size_t r_prompt = r->prompt.size();
     const int64_t keep = best_keep;
@@ -426,6 +453,12 @@ void Scheduler::step() {
     cap_left -= cap;
   }
   if (chunks.empty()) return;
+  fit_pool(chunks, [&](size_t k) { items.erase(items.begin() + std::ptrdiff_t(k)); });
+  if (chunks.empty()) {
+    std::lock_guard lk(mu_);
+    note_positions();
+    return;
+  }
 
   grouped_last_ = false;
   for (const engine::Chunk& c : chunks)
@@ -652,8 +685,84 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
   note_positions();
 }
 
+// Cuts an idle slot to `keep` positions: 0 empties it, else `keep` is the position of one of its snapshots, whose state is put back
+// (the K/V can be cut anywhere, the DeltaNet state only to a snapshot), and the snapshots past it are dropped. Engine thread.
+void Scheduler::trim_slot(int slot, int64_t keep) {
+  Seq& q = seqs_[size_t(slot)];
+  const int64_t was = eng_.length(slot);
+  if (keep == 0) {
+    eng_.release(slot);
+    q.tokens.clear();
+  } else {
+    Snap* from = nullptr;
+    for (Snap& sn : q.snaps)
+      if (sn.position == keep) from = &sn;
+    if (!from || keep > int64_t(q.tokens.size())) throw std::logic_error("kv pool: a trim to a position without a snapshot");
+    eng_.restore(slot, from->state, keep);
+    from->used = ++tick_;
+    q.tokens.resize(size_t(keep));
+  }
+  std::lock_guard lk(mu_);
+  drop_snapshots_beyond(q, keep);
+  stats_.kv_reclaimed_positions += was - keep;
+  ++stats_.kv_reclaims;
+}
+
+int64_t Scheduler::reclaim(int64_t pages) {
+  std::vector<kvpool::Holder> hs(seqs_.size());
+  for (size_t s = 0; s < seqs_.size(); ++s) {
+    hs[s].pages = eng_.slot_pages(int(s));
+    hs[s].idle = !seqs_[s].req;
+    hs[s].used = seqs_[s].used;
+    for (const Snap& sn : seqs_[s].snaps) hs[s].snaps.push_back(sn.position);
+  }
+  const int64_t free = eng_.free_pages();
+  const kvpool::ReclaimPlan plan = kvpool::plan_reclaim(attn::kPage, free, free + pages, hs);
+  for (const kvpool::Trim& t : plan.trims) {
+    const int64_t was = eng_.length(t.slot);
+    trim_slot(t.slot, t.keep);
+    std::fprintf(stderr, "eklow-server: kv pool: slot %d (idle) cut from %lld to %lld positions, %lld pages back; %lld of %lld pages free\n", t.slot, (long long)was,
+                 (long long)t.keep, (long long)t.freed, (long long)eng_.free_pages(), (long long)eng_.pool_pages());
+  }
+  return plan.freed;
+}
+
+// Before a step: the pages its chunks take come from the pool's free ones, then from idle slots'. If that is not enough (both slots running
+// and the pool full), the last chunk whose removal helps is dropped and its sequence ends with "length", so the others go on.
+void Scheduler::fit_pool(std::vector<engine::Chunk>& chunks, const std::function<void(size_t)>& dropped) {
+  while (!chunks.empty()) {
+    const int64_t lack = eng_.pages_short(chunks);
+    if (lack <= 0) return;
+    if (reclaim(lack) > 0) continue;
+    size_t k = chunks.size() - 1;
+    for (size_t j = chunks.size(); j-- > 0;) {
+      std::vector<engine::Chunk> rest;
+      for (size_t i = 0; i < chunks.size(); ++i)
+        if (i != j) rest.push_back(chunks[i]);
+      if (eng_.pages_short(rest) < lack) {
+        k = j;
+        break;
+      }
+    }
+    const int slot = chunks[k].slot;
+    Seq& q = seqs_[size_t(slot)];
+    std::fprintf(stderr, "eklow-server: kv pool: out of pages (%lld of %lld free, the step needs %lld more, nothing idle to take back): %s ends at %zu positions with \"length\"\n",
+                 (long long)eng_.free_pages(), (long long)eng_.pool_pages(), (long long)lack, q.req ? q.req->tag.c_str() : "?", q.tokens.size());
+    chunks.erase(chunks.begin() + std::ptrdiff_t(k));
+    dropped(k);
+    {
+      std::lock_guard lk(mu_);
+      ++stats_.kv_ended;
+    }
+    finish(slot, "length");
+  }
+}
+
 // The positions the slots hold, all and those of slots with no request; with mu_ held, on the engine thread.
 void Scheduler::note_positions() {
+  stats_.kv_pool_positions = eng_.pool_pages() * attn::kPage;
+  stats_.kv_free_positions = eng_.free_pages() * attn::kPage;
+  stats_.kv_held_positions = stats_.kv_pool_positions - stats_.kv_free_positions;
   stats_.positions = stats_.idle_positions = 0;
   for (size_t s = 0; s < seqs_.size(); ++s) {
     stats_.positions += eng_.length(int(s));

@@ -33,9 +33,18 @@
 
 namespace eklow::engine {
 
+// A step needed more K/V pages than the pool has free (thrown before the step changes anything).
+struct KvPoolExhausted : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
+
 struct Config {
   int n_slots = 2;
   int64_t max_ctx = 262144;  // positions per slot, a multiple of attn::kPage
+  // The K/V pool, in positions for all the slots together (rounded up to whole pages, at most n_slots x max_ctx): the slots take pages
+  // from one free list, so each may use up to max_ctx while the pool lasts. 0: n_slots x max_ctx, every slot able to fill its context.
+  // The card memory the pool does not take is what the experts' placement (experts_on_card = -2) sees.
+  int64_t kv_pool = 0;
   int64_t max_batch = 2048;  // tokens per step
   int64_t max_chunk = 2048;  // tokens per chunk
   // A lone prefill chunk (no other chunk in the step, not a verify chunk) of up to max_group tokens, a multiple of max_chunk, runs layer
@@ -155,6 +164,16 @@ class Engine {
   int64_t length(int slot) const { return slots_[size_t(slot)].length; }
   int pending(int slot) const { return slots_[size_t(slot)].pending; }
 
+  // The K/V pool: pages in all, free now, held by a slot (a page is attn::kPage positions). release(), restore() and settle() give
+  // pages back; a step takes them.
+  int64_t pool_pages() const { return n_pages_; }
+  int64_t free_pages() const { return int64_t(free_pages_.size()); }
+  int64_t slot_pages(int slot) const { return int64_t(slots_[size_t(slot)].pages.size()); }
+  // How many pages short the pool is for these chunks, 0 when they fit: the pages the chunks take beyond what the pool has free,
+  // counting the pages that settling each slot's pending tokens gives back (in the chunks' order, as step() takes them). A step
+  // that is short throws KvPoolExhausted before anything changes, so a caller asks this first and reclaims or drops chunks.
+  int64_t pages_short(const std::vector<Chunk>& chunks) const;
+
   // With a profile set, step waits after each section of the forward pass and adds its wall time under the section's name.
   void set_profile(std::map<std::string, double>* p) { profile_ = p; }
 
@@ -251,6 +270,8 @@ class Engine {
   void cold_group(const Layer& L, const std::vector<GroupSub>& subs, sycl::event ids_ready, sycl::event routed, const std::function<void(const char*)>& mark,
                   const std::function<void()>& after_first_copy = nullptr);
   void ensure_pages(int slot, int64_t positions);
+  // A chunk's effect on the pool: the pages its slot gives back (pending tokens past `acc` settled) and the pages it then takes.
+  void page_delta(const Slot& s, const Chunk& c, int acc, int64_t& freed, int64_t& taken) const;
   void free_pages_beyond(Slot& s, int64_t length);
   // A slot's accepted count for a chunk's `accept` (the pending tokens when negative); throws when it does not fit.
   int accepted(const Slot& s, int accept) const;

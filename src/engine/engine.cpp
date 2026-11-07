@@ -310,6 +310,8 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
   // KV cache: a page pool for the attention layers.
   max_pages_ = c_.max_ctx / attn::kPage;
   n_pages_ = max_pages_ * c_.n_slots;
+  if (c_.kv_pool < 0) throw std::runtime_error("engine: kv_pool must not be negative");
+  if (c_.kv_pool > 0) n_pages_ = std::min(n_pages_, (c_.kv_pool + attn::kPage - 1) / attn::kPage);
   const size_t page_elems = size_t(n_pages_ * Hkv * attn::kPage * D);
   const size_t elem = c_.int8_kv ? 1 : 2;
   page_table_ = sycl::malloc_device<int32_t>(size_t(c_.n_slots * max_pages_), q_);
@@ -935,12 +937,32 @@ Engine::~Engine() {
   for (void* p : owned_) sycl::free(p, q_);
 }
 
+void Engine::page_delta(const Slot& s, const Chunk& c, int acc, int64_t& freed, int64_t& taken) const {
+  const int64_t held = int64_t(s.pages.size());
+  const int64_t have = s.pending ? std::min(held, (s.verify_start + acc + attn::kPage - 1) / attn::kPage) : held;
+  const int64_t need = (c.start_pos + int64_t(c.tokens.size()) + attn::kPage - 1) / attn::kPage;
+  freed = held - have;
+  taken = std::max<int64_t>(0, need - have);
+}
+
+int64_t Engine::pages_short(const std::vector<Chunk>& chunks) const {
+  int64_t avail = int64_t(free_pages_.size()), low = 0;
+  for (const Chunk& c : chunks) {
+    const Slot& s = slots_.at(size_t(c.slot));
+    int64_t freed = 0, taken = 0;
+    page_delta(s, c, accepted(s, c.accept), freed, taken);
+    avail += freed - taken;
+    low = std::min(low, avail);
+  }
+  return -low;
+}
+
 void Engine::ensure_pages(int slot, int64_t positions) {
   Slot& s = slots_[size_t(slot)];
   const int64_t need = (positions + attn::kPage - 1) / attn::kPage;
   if (need > max_pages_) throw std::runtime_error("engine: sequence longer than max_ctx");
   while (int64_t(s.pages.size()) < need) {
-    if (free_pages_.empty()) throw std::runtime_error("engine: out of KV pages");
+    if (free_pages_.empty()) throw KvPoolExhausted("engine: out of KV pages");
     s.pages.push_back(free_pages_.back());
     free_pages_.pop_back();
     page_table_host_[size_t(slot * max_pages_ + int64_t(s.pages.size()) - 1)] = s.pages.back();
@@ -1080,6 +1102,10 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   if (n_tok > c_.max_batch && !group_step) throw std::runtime_error("engine: step larger than max_batch");
   if (n_logits > c_.max_logits) throw std::runtime_error("engine: too many logits rows");
   if (n_cap > c_.max_capture_rows) throw std::runtime_error("engine: too many capture rows");
+  // The pool, before anything changes: a step that cannot get its pages leaves the engine as it was.
+  if (const int64_t lack = pages_short(chunks); lack > 0)
+    throw KvPoolExhausted("engine: out of KV pages: the step needs " + std::to_string(lack) + " more than the pool's " + std::to_string(free_pages_.size()) +
+                          " free of " + std::to_string(n_pages_));
   if (group_step) return step_group(chunks[0], acc[0]);
 
   std::vector<int32_t> tok, slot, pos, logit_rows, cap_rows, rpos;  // rpos: [3][T] once built

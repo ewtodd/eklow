@@ -430,7 +430,7 @@ int gemma4_server_main(int argc, char** argv) {
     else if (a == "--draft-reserve-mib") draft_reserve_mib = std::atoll(next().c_str());
     else if (a == "--draft-full-context") draft_full_context = std::atoll(next().c_str());
     else if (a == "--draft-sliding-causal") draft_sliding_causal = std::atoi(next().c_str());
-    else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" ||
+    else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" || a == "--kv-pool" ||
                a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib") {
       std::fprintf(stderr, "eklow-server: %s is for the Qwen3.6 models (qwen35moe); the Gemma 4 server (this GGUF is gemma4) does not take it\n", a.c_str());
       return 2;

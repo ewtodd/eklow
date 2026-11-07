@@ -6,13 +6,19 @@
 // tools/server/gemma4_main.cpp, which has its own flags: the Qwen-only ones, --draft among them, it refuses by name).
 // Any other architecture is an error naming both. Everything below up to main() is the Qwen server.
 //
-//   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
+//   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] [--kv-pool N]
 //                [--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
 //                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF [--image-max-tokens N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
 //                [--log-interval S] [--keepalive S]
 //
-// --ctx is the context of each slot (positions), 262,144 by default; --batch the tokens of one engine step and --chunk
+// --ctx is the context of each slot (positions), 262,144 by default. --kv-pool N is the K/V pool of all the slots together, in positions
+// (rounded up to 256; 0, the default, is slots x ctx): the slots draw pages from one pool, so with --slots 2 --ctx 262144 --kv-pool 262144
+// either may use all of it, for half the card memory, which the experts then take (more of them on the card, faster decode). When the pool
+// runs out, a slot with no request gives back pages first (least recently used, cut from its end to a snapshot's position, else emptied;
+// the conversation in it re-prefills later); a request whose prompt does not fit what is free and reclaimable waits in the queue; if both
+// slots are running and nothing can be taken back, the last sequence to need a page ends with finish_reason "length". A prompt larger than
+// the pool is refused. The stats line and the log say what the pool holds. --batch the tokens of one engine step and --chunk
 // the prefill tokens of one sequence in a step (2,048); --group N lets a lone prefilling sequence take up to N chunks of prompt in one
 // layer-major step (engine::Config::max_group), a long prompt prefilling 1.2-1.4x faster, 3 experts a layer fewer on the card at 8; while another slot generates a group
 // would stall it, so then --group-busy TOKENS (default 0: none) is the most a step may take. The attention layers' K/V are int8 by default, which is what lets
@@ -156,6 +162,11 @@ std::string engine_line(const serve::Scheduler::Stats& a, const serve::Scheduler
                         (long long)b.active, (long long)b.waiting);
   out += fmt(" | kv %.1f%% (%lld of %lld positions, %lld cached)", 100.0 * double(b.positions) / double(std::max<int64_t>(capacity, 1)),
              (long long)b.positions, (long long)capacity, (long long)b.idle_positions);
+  // The pool counts whole pages (a slot's last page is part empty), so it can be fuller than the positions say.
+  out += fmt(" | pool: %lld held, %lld free, %lld reclaimed so far", (long long)b.kv_held_positions, (long long)b.kv_free_positions,
+             (long long)b.kv_reclaimed_positions);
+  if (b.kv_waits > a.kv_waits || b.kv_ended > a.kv_ended)
+    out += fmt(", %lld waited, %lld ended", (long long)(b.kv_waits - a.kv_waits), (long long)(b.kv_ended - a.kv_ended));
   if (b.prompt_tokens > a.prompt_tokens)
     out += fmt(" | prefix hit %.1f%%", 100.0 * double(b.cached_tokens - a.cached_tokens) / double(b.prompt_tokens - a.prompt_tokens));
   if (b.verifies > a.verifies)
@@ -495,7 +506,7 @@ static int qwen_server_main(int argc, char** argv) {
   int64_t vision_reserve_mib = 0;
   int image_tokens = 280;
   int port = 8081, slots = 2, embed_port = 8082, draft_block = 0;
-  int64_t ctx = 262144, batch = 2048, chunk = 2048;
+  int64_t ctx = 262144, batch = 2048, chunk = 2048, kv_pool = 0;  // kv_pool: positions for all slots together (0: slots x ctx)
   int64_t group = 1, group_busy = 0;  // layer-major prefill: sub-chunks of --chunk a group may hold; tokens of one while another slot generates
   bool kv_int8 = true;
   std::string expert_profile;
@@ -514,6 +525,7 @@ static int qwen_server_main(int argc, char** argv) {
     else if (a == "--port") port = std::atoi(next().c_str());
     else if (a == "--slots") slots = std::atoi(next().c_str());
     else if (a == "--ctx") ctx = std::atoll(next().c_str());
+    else if (a == "--kv-pool") kv_pool = std::atoll(next().c_str());
     else if (a == "--batch") batch = std::atoll(next().c_str());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
     else if (a == "--group") group = std::max<int64_t>(1, std::atoll(next().c_str()));
@@ -542,7 +554,7 @@ static int qwen_server_main(int argc, char** argv) {
     else if (a == "--log-interval") log_interval = std::atof(next().c_str());
     else if (a == "--keepalive") keepalive_s = std::atof(next().c_str());
     else {
-      std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
+      std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] [--kv-pool N] "
                            "[--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
                            "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith] [--snapshot-mib N [--snapshot-every N]] "
                            "[--mmproj GGUF [--image-max-tokens N]] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S] [--keepalive S]\n");
@@ -563,6 +575,10 @@ static int qwen_server_main(int argc, char** argv) {
   }
   if (draft_block < 0 || draft_block > 16 || draft_block == 1) {
     std::fprintf(stderr, "eklow-server: --draft-block must be 2 to 16\n");
+    return 2;
+  }
+  if (kv_pool < 0) {
+    std::fprintf(stderr, "eklow-server: --kv-pool must not be negative\n");
     return 2;
   }
   if (snapshot_every < 1024) {
@@ -604,6 +620,7 @@ static int qwen_server_main(int argc, char** argv) {
     engine::Config ec;
     ec.n_slots = slots;
     ec.max_ctx = (ctx + attn::kPage - 1) / attn::kPage * attn::kPage;
+    ec.kv_pool = kv_pool;
     ec.max_batch = batch;
     ec.max_chunk = chunk;
     ec.max_group = chunk * group;
@@ -711,6 +728,9 @@ static int qwen_server_main(int argc, char** argv) {
                  alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / GiB,
                  eng.cache_bytes() / GiB, slots, (long long)ec.max_ctx,
                  std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    std::fprintf(stderr, "eklow-server: K/V pool of %lld positions (%lld pages of %lld) for %d slots of up to %lld each%s\n", (long long)(eng.pool_pages() * attn::kPage),
+                 (long long)eng.pool_pages(), (long long)attn::kPage, slots, (long long)ec.max_ctx,
+                 eng.pool_pages() < int64_t(slots) * (ec.max_ctx / attn::kPage) ? " (shared: an idle slot gives pages back when another needs them)" : "");
     std::fprintf(stderr,
                  "eklow-server: experts on the card: N = %lld of %lld per layer%s (one expert of every layer is %.0f MiB; free card memory before them "
                  "%.2f GiB, margin %.2f GiB, free after %.2f GiB)\n",
@@ -754,7 +774,7 @@ static int qwen_server_main(int argc, char** argv) {
     // back to zero).
     std::thread stats_thread;
     if (log_interval > 0)
-      stats_thread = std::thread([&, capacity = int64_t(slots) * ec.max_ctx] {
+      stats_thread = std::thread([&, capacity = eng.pool_pages() * attn::kPage] {
         const auto every = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(log_interval));
         auto prev = sched.stats();
         auto eprev = embed_stats.snapshot();
@@ -811,7 +831,7 @@ static int qwen_server_main(int argc, char** argv) {
       try {
         sched.submit(r);
       } catch (const std::invalid_argument&) {
-        return reply_error(res, serve::context_exceeded(int64_t(r->prompt.size()), ec.max_ctx));
+        return reply_error(res, serve::context_exceeded(int64_t(r->prompt.size()), std::min(ec.max_ctx, sched.pool_positions())));
       }
       auto out = std::make_shared<serve::ChatResponse>(r->tag, cr.model.empty() ? alias : cr.model, now_s());
       if (!cr.stream) {
