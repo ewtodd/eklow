@@ -2213,3 +2213,29 @@ Checked on the host (`eklow-keepalive-test`): the timer's rules, and a real HTTP
 **Not done.** Writing an idle slot's pages, pooled keys and snapshot to NVMe instead of dropping them (a re-prefill of a long conversation costs minutes, 3.4 GiB of Flash-Next's pool is seconds to write, estimated in its plan; its `spill.{hpp,cpp}` row). A slot whose content is cut keeps a prefix only at a snapshot, so a conversation without a snapshot before the cut is emptied; snapshots every 16k tokens and at message boundaries make the cut cheaper, but an extra snapshot at the cut point itself is not taken (the live state is at the slot's end). A verify chunk that does not fit is dropped, not shrunk to a plain token. Admission is first come first served: a big prompt at the head blocks a small one behind it.
 
 **Estimates, not measurements.** The memory freed by a pool of 262,144 for two slots is about half of the 5.84 GiB (the K/V is linear in pages; the DeltaNet state is per slot and unchanged): ~2.9 GiB, and the table above (measured, engine bench, halved K/V) is what it buys: Q4_K 48 to 92 experts on the card and 36.1 to 40.4 tok/s, Q6_K 32 to 63 and 29.6 to 32.8. The server places fewer (59 against the bench's 71), so the gain through the server will differ. Not run yet: everything on the card. The checks, `tools/server/kv_pool_test.py` (record at the default pool, check at `--kv-pool`): a pool of 2 x 4096 positions over two slots with A trimmed and re-prefilled, a pair outgrowing the pool, a request that waits; and `serve_test.py basic` at `--kv-pool 262144 --slots 2 --ctx 262144`.
+
+**Measured on fiona's card, same day** (`docs/bench/kv-pool-2026-11-07/`; this branch merged with `sage/template` as `test/sage-pool`, built
+on fiona; the owner had the card free):
+- `checkq ekk8` at the default pool (stock EKK8, eklow-engine-run): every path inside the gate. Long top-1 242-247/256, median KL
+  1.8e-3 to 3.6e-3; chat 27/27, mean KL 9.5e-4. The engine is unchanged at the default.
+- `kv_pool_test.py` with Sage-A1.5's EKK8 and the draft, a pool of 8,192 for two slots of 8,192 against the default pool: all checks ok.
+  - trim: an idle slot was cut back to its 1,490-position system-prompt snapshot and re-prefilled the rest correctly.
+  - exhaust: two 2,600-token generations outgrew the pool. One ended with "length" after 1,165 characters, a prefix of its
+    default-pool text; the other finished with its default-pool text.
+  - wait: a prompt that did not fit waited 7.6 s for the running one, then gave the default pool's text.
+  - The log has the cut, wait and end lines.
+- Production shape (`--slots 2 --ctx 262144 --kv-pool 262144`, the draft, both image encoders and EmbeddingGemma 2, Sage-A1.5 EKK8):
+  K/V and state 3.03 GiB against 5.84, and **91 experts a layer on the card against 48** (the bench's halved K/V gave 92). Through
+  the server (`serve_perf.py`), one stream with the draft:
+
+  | | default pool (48) | one pool of 262k (91) | |
+  |---|--:|--:|--:|
+  | decode at 8k | 43.2 tok/s | 52.9 tok/s | +22% |
+  | decode at 32k | 41.3 tok/s | 45.9 tok/s | +11% |
+  | prefill at 8k / 32k | 1,636 / 1,922 tok/s | 1,825 / 2,005 tok/s | +12% / +4% |
+  | GSM8K, 48 requests one at a time | 50.9 tok/s | 60.8 tok/s | +19% |
+
+  Tokens a verify are the same (2.81-2.83 at 8k, 3.37-3.41 on GSM8K).
+- `serve_test.py basic` at that shape: every check ok with stock Qwen3.6 EKK8. Sage fails six checks with the pool and without
+  (the same six with verification on and off). They come from Sage's longer thinking under the test's greedy decoding and tight caps
+  (700 tokens on "why is the sky blue, in one sentence"; repeated get_weather calls up to the 1,500-token cap), not from the server.

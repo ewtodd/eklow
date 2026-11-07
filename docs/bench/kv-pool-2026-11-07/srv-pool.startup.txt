@@ -1,0 +1,16 @@
+eklow-server: sage-a1.5 on Intel(R) Arc(TM) A770M Graphics, 12.19 GiB of weights, 0.30 GiB of KV cache and state (2 slots of 8192), 8.7 s
+eklow-server: K/V pool of 8192 positions (32 pages of 256) for 2 slots of up to 8192 each (shared: an idle slot gives pages back when another needs them)
+eklow-server: experts on the card: N = 158 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 12.55 GiB, margin 1.00 GiB, free after 1.87 GiB)
+eklow-server: prefill streams busy cold experts to the card: 80 slots, 6.46 GiB of cold experts pinned in host memory
+eklow-server: DFlash 2 draft /home/fiona/models/drafts/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf: blocks of 4 (trained for 8), window 2048, 780 MiB on the card (its token table stays on the host); free card memory now 1.04 GiB
+eklow-server: chat template sage (verification on by default), sampling defaults temperature 1, top-k 20, top-p 0.95, min-p 0; snapshots of 64 MiB each, up to 4096 MiB
+eklow-server: kv pool: slot 0 (idle) cut from 2584 to 0 positions, 11 pages back; 18 of 32 pages free
+eklow-server: kv pool: slot 1 (idle) cut from 5565 to 1490 positions, 16 pages back; 22 of 32 pages free
+eklow-server: kv pool: slot 0 (idle) cut from 4534 to 970 positions, 14 pages back; 14 of 32 pages free
+eklow-server: kv pool: out of pages (0 of 32 free, the step needs 1 more, nothing idle to take back): chatcmpl-4746164d1c1e0aaad57c93ca ends at 4093 positions with "length"
+eklow-server: kv pool: slot 0 (idle) cut from 4093 to 2922 positions, 4 pages back; 4 of 32 pages free
+eklow-server: kv pool: slot 0 (idle) cut from 2922 to 0 positions, 12 pages back; 12 of 32 pages free
+eklow-server: kv pool: slot 1 (idle) cut from 5528 to 2922 positions, 10 pages back; 12 of 32 pages free
+eklow-server: kv pool: chatcmpl-d8a05bce56b5c6d4fbea7b84 waits for pages: its prompt of 5689 tokens needs 5888, 1024 of the pool's 8192 are free and 2922 positions are cached in idle slots
+eklow-server: kv pool: slot 0 (idle) cut from 4441 to 3435 positions, 4 pages back; 10 of 32 pages free
+eklow-server: kv pool: slot 0 (idle) cut from 3435 to 0 positions, 14 pages back; 16 of 32 pages free

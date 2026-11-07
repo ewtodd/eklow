@@ -1,0 +1,63 @@
+eklow-server: vision encoder /home/fiona/models/mmproj-Ornith-1.5-35B-A3B-bf16.gguf, up to 1024 rows an image, 267 MiB on the card while encoding
+eklow-server: vision projector /home/fiona/models/mmproj-embeddinggemma-2-Q8_0.gguf, 264 MiB on the card for 1120-row images
+eklow-server: sage-a1.5 on Intel(R) Arc(TM) A770M Graphics, 4.94 GiB of weights, 5.84 GiB of KV cache and state (2 slots of 262144), 13.3 s
+eklow-server: K/V pool of 524288 positions (2048 pages of 256) for 2 slots of up to 262144 each
+eklow-server: experts on the card: N = 48 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 5.34 GiB, margin 1.00 GiB, free after 1.91 GiB)
+eklow-server: prefill streams busy cold experts to the card: 80 slots, 13.71 GiB of cold experts pinned in host memory
+eklow-server: DFlash 2 draft /home/fiona/models/drafts/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf: blocks of 4 (trained for 8), window 2048, 780 MiB on the card (its token table stays on the host); free card memory now 1.08 GiB
+eklow-server: chat template sage (verification on by default), sampling defaults temperature 1, top-k 20, top-p 0.95, min-p 0; snapshots of 64 MiB each, up to 4096 MiB
+eklow-server: prefix: the slot's sequence (8388 tokens) and the prompt (8131) part at token 8116: sampled Sum, prompt List; reusing 8116
+eklow-server: prefix: the slot's sequence (8386 tokens) and the prompt (8134) part at token 8116: sampled List, prompt What; reusing 8116
+eklow-server: prefix: the slot's sequence (8389 tokens) and the prompt (8131) part at token 8116: sampled What, prompt Write; reusing 8116
+eklow-server: prefix: the slot's sequence (8386 tokens) and the prompt (8131) part at token 8116: sampled Write, prompt Give; reusing 8116
+eklow-server: prefix: the slot's sequence (32964 tokens) and the prompt (32707) part at token 32692: sampled Sum, prompt List; reusing 32692
+eklow-server: prefix: the slot's sequence (32962 tokens) and the prompt (32710) part at token 32692: sampled List, prompt What; reusing 32692
+eklow-server: prefix: the slot's sequence (32965 tokens) and the prompt (32707) part at token 32692: sampled What, prompt Write; reusing 32692
+eklow-server: prefix: the slot's sequence (32962 tokens) and the prompt (32707) part at token 32692: sampled Write, prompt Give; reusing 32692
+eklow-server: prefix: the slot's sequence (1773 tokens) and the prompt (712) part at token 676: sampled  Janet, prompt  A; reusing 674
+eklow-server: prefix: the slot's sequence (1063 tokens) and the prompt (743) part at token 676: sampled  A, prompt  Josh; reusing 674
+eklow-server: prefix: the slot's sequence (1766 tokens) and the prompt (721) part at token 676: sampled  Josh, prompt  James; reusing 674
+eklow-server: prefix: the slot's sequence (1744 tokens) and the prompt (797) part at token 676: sampled  James, prompt  Every; reusing 674
+eklow-server: prefix: the slot's sequence (1820 tokens) and the prompt (740) part at token 676: sampled  Every, prompt  Kyl; reusing 674
+eklow-server: prefix: the slot's sequence (1763 tokens) and the prompt (726) part at token 676: sampled  Kyl, prompt  Toulouse; reusing 674
+eklow-server: prefix: the slot's sequence (1749 tokens) and the prompt (755) part at token 676: sampled  Toulouse, prompt  Carla; reusing 674
+eklow-server: prefix: the slot's sequence (1778 tokens) and the prompt (790) part at token 676: sampled  Carla, prompt  John; reusing 674
+eklow-server: prefix: the slot's sequence (1813 tokens) and the prompt (746) part at token 676: sampled  John, prompt  El; reusing 674
+eklow-server: prefix: the slot's sequence (1769 tokens) and the prompt (746) part at token 676: sampled  El, prompt  A; reusing 674
+eklow-server: prefix: the slot's sequence (1769 tokens) and the prompt (750) part at token 676: sampled  A, prompt  Tou; reusing 674
+eklow-server: prefix: the slot's sequence (1773 tokens) and the prompt (753) part at token 676: sampled  Tou, prompt  Carlos; reusing 674
+eklow-server: prefix: the slot's sequence (1776 tokens) and the prompt (743) part at token 676: sampled  Carlos, prompt  Melanie; reusing 674
+eklow-server: prefix: the slot's sequence (1766 tokens) and the prompt (738) part at token 676: sampled  Melanie, prompt  In; reusing 674
+eklow-server: prefix: the slot's sequence (1761 tokens) and the prompt (780) part at token 676: sampled  In, prompt  A; reusing 674
+eklow-server: prefix: the slot's sequence (1803 tokens) and the prompt (739) part at token 676: sampled  A, prompt  Two; reusing 674
+eklow-server: prefix: the slot's sequence (1762 tokens) and the prompt (743) part at token 676: sampled  Two, prompt  Jill; reusing 674
+eklow-server: prefix: the slot's sequence (1766 tokens) and the prompt (714) part at token 676: sampled  Jill, prompt  Claire; reusing 674
+eklow-server: prefix: the slot's sequence (1737 tokens) and the prompt (751) part at token 676: sampled  Claire, prompt  Mar; reusing 674
+eklow-server: prefix: the slot's sequence (1774 tokens) and the prompt (749) part at token 676: sampled  Mar, prompt  I; reusing 674
+eklow-server: prefix: the slot's sequence (1772 tokens) and the prompt (731) part at token 676: sampled  I, prompt  Raymond; reusing 674
+eklow-server: prefix: the slot's sequence (1754 tokens) and the prompt (741) part at token 676: sampled  Raymond, prompt  Billy; reusing 674
+eklow-server: prefix: the slot's sequence (1764 tokens) and the prompt (726) part at token 676: sampled  Billy, prompt  A; reusing 674
+eklow-server: prefix: the slot's sequence (1749 tokens) and the prompt (725) part at token 676: sampled  A, prompt  Kyle; reusing 674
+eklow-server: prefix: the slot's sequence (1748 tokens) and the prompt (753) part at token 676: sampled  Kyle, prompt  Marie; reusing 674
+eklow-server: prefix: the slot's sequence (1776 tokens) and the prompt (754) part at token 676: sampled  Marie, prompt  Mish; reusing 674
+eklow-server: prefix: the slot's sequence (1777 tokens) and the prompt (742) part at token 676: sampled  Mish, prompt  Cynthia; reusing 674
+eklow-server: prefix: the slot's sequence (1765 tokens) and the prompt (736) part at token 676: sampled  Cynthia, prompt  Henry; reusing 674
+eklow-server: prefix: the slot's sequence (1759 tokens) and the prompt (753) part at token 676: sampled  Henry, prompt  Gloria; reusing 674
+eklow-server: prefix: the slot's sequence (1776 tokens) and the prompt (725) part at token 676: sampled  Gloria, prompt  Dar; reusing 674
+eklow-server: prefix: the slot's sequence (1748 tokens) and the prompt (749) part at token 676: sampled  Dar, prompt  Gun; reusing 674
+eklow-server: prefix: the slot's sequence (1772 tokens) and the prompt (727) part at token 676: sampled  Gun, prompt  John; reusing 674
+eklow-server: prefix: the slot's sequence (1750 tokens) and the prompt (716) part at token 676: sampled  John, prompt  Gret; reusing 674
+eklow-server: prefix: the slot's sequence (1732 tokens) and the prompt (727) part at token 676: sampled  Gret, prompt  Si; reusing 674
+eklow-server: prefix: the slot's sequence (1750 tokens) and the prompt (738) part at token 676: sampled  Si, prompt  Mike; reusing 674
+eklow-server: prefix: the slot's sequence (1761 tokens) and the prompt (727) part at token 676: sampled  Mike, prompt  Terry; reusing 674
+eklow-server: prefix: the slot's sequence (1750 tokens) and the prompt (749) part at token 676: sampled  Terry, prompt  John; reusing 674
+eklow-server: prefix: the slot's sequence (1772 tokens) and the prompt (730) part at token 677: sampled  plans, prompt  runs; reusing 674
+eklow-server: prefix: the slot's sequence (1753 tokens) and the prompt (758) part at token 676: sampled  John, prompt  Dana; reusing 674
+eklow-server: prefix: the slot's sequence (1781 tokens) and the prompt (730) part at token 676: sampled  Dana, prompt  Brandon; reusing 674
+eklow-server: prefix: the slot's sequence (1753 tokens) and the prompt (813) part at token 676: sampled  Brandon, prompt  The; reusing 674
+eklow-server: prefix: the slot's sequence (1836 tokens) and the prompt (767) part at token 676: sampled  The, prompt  Grandma; reusing 674
+eklow-server: prefix: the slot's sequence (1790 tokens) and the prompt (747) part at token 676: sampled  Grandma, prompt  According; reusing 674
+eklow-server: prefix: the slot's sequence (1770 tokens) and the prompt (763) part at token 676: sampled  According, prompt  Charlie; reusing 674
+eklow-server: prefix: the slot's sequence (1786 tokens) and the prompt (778) part at token 676: sampled  Charlie, prompt  Meredith; reusing 674
+eklow-server: prefix: the slot's sequence (1801 tokens) and the prompt (779) part at token 676: sampled  Meredith, prompt  Cand; reusing 674
+eklow-server: prefix: the slot's sequence (1802 tokens) and the prompt (736) part at token 676: sampled  Cand, prompt  John; reusing 674

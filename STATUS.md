@@ -20,10 +20,12 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   lossless (p = 0.787), but its card memory takes the 26B from 42 to 27 experts a layer: decode a wash on prose, prefill
   -40%. The owner: a sliding-window draft of our own (every layer sliding, small, blocks of 4) is the way, perhaps trained
   on the 4090.
-- **One K/V pool for the slots** (branch `serve/kv-pool`, DECISIONS 2026-11-07; host-tested, not yet run on the card, not merged): `--kv-pool N` positions for all
-  slots together (default 0 = slots x ctx, unchanged), so `--slots 2 --ctx 262144 --kv-pool 262144` costs half the K/V (~2.9 GiB, estimated) and the experts
-  take it. Idle slots give pages back when a step needs them, a request that does not fit waits in the queue, a starved running sequence ends with "length".
-  Card checks waiting: `tools/server/kv_pool_test.py` and `serve_test.py basic` at the pool.
+- **One K/V pool for the slots** (branch `serve/kv-pool`, DECISIONS 2026-11-07; card-tested on fiona, not merged): `--kv-pool N`
+  positions for all slots together (default 0 = slots x ctx, unchanged). At `--slots 2 --ctx 262144 --kv-pool 262144` the K/V
+  and state take 3.03 GiB instead of 5.84 and the card keeps 91 experts a layer instead of 48: decode with the draft +22% at
+  8k, +11% at 32k, GSM8K +19% (measured, Sage-A1.5 EKK8). An idle slot gives pages back and re-prefills later; a request
+  that does not fit waits; a sequence starved with both slots busy ends with "length". checkq, kv_pool_test.py and
+  serve_test.py basic (stock) pass.
 - **In production since 2026-11-02 ~20:22**: fiona serves **Ornith-1.5** with Inco's draft and the projector at
   2 x 262k, int8 KV (51 of 256 experts a layer on the card; eklow built on its own nixpkgs, intel-llvm 7.1.1: the
   fleet's 7.2.0 left 0.8 GiB less free, 39 experts). No further evals (`check-source` stopped after stock's GSM8K:

@@ -1,0 +1,26 @@
+== ekk8 long (2,573 tokens, last 256 positions)
+chunks of 1,024: logits: top-1 agreement 0.969, mean KL 2.129e-02, max KL 1.595e+00 over 256 positions
+    256 positions: mean KL 1.816e-02, median 1.877e-03, p90 1.719e-02, max 1.461e+00; top-1 248/256; mean KL without the worst 3: 7.386e-03
+chunks of 2,048: logits: top-1 agreement 0.953, mean KL 2.214e-02, max KL 1.917e+00 over 256 positions
+    256 positions: mean KL 1.701e-02, median 2.236e-03, p90 2.729e-02, max 1.003e+00; top-1 244/256; mean KL without the worst 3: 8.883e-03
+layer-major groups of 2 sub-chunks of 1,024: logits: top-1 agreement 0.961, mean KL 1.603e-02, max KL 9.120e-01 over 256 positions
+    256 positions: mean KL 1.478e-02, median 1.849e-03, p90 1.499e-02, max 6.765e-01; top-1 246/256; mean KL without the worst 3: 7.971e-03
+layer-major group of 3 sub-chunks (the whole prompt in one group): logits: top-1 agreement 0.965, mean KL 1.189e-02, max KL 6.014e-01 over 256 positions
+    256 positions: mean KL 1.283e-02, median 2.072e-03, p90 1.993e-02, max 7.619e-01; top-1 247/256; mean KL without the worst 3: 7.237e-03
+group of 3 sub-chunks, last 64 decoded: logits: top-1 agreement 0.965, mean KL 1.022e-02, max KL 2.824e-01 over 256 positions
+    256 positions: mean KL 9.724e-03, median 1.977e-03, p90 1.965e-02, max 2.177e-01; top-1 247/256; mean KL without the worst 3: 7.428e-03
+chunks of 1,024, last 64 decoded: logits: top-1 agreement 0.957, mean KL 7.281e-02, max KL 7.196e+00 over 256 positions
+    256 positions: mean KL 1.292e-01, median 2.104e-03, p90 2.542e-02, max 2.103e+01; top-1 245/256; mean KL without the worst 3: 1.169e-02
+last 256 as verify blocks of 8, accept 3: logits: top-1 agreement 0.953, mean KL 2.507e-02, max KL 1.418e+00 over 256 positions
+    256 positions: mean KL 2.236e-02, median 3.521e-03, p90 3.099e-02, max 1.061e+00; top-1 244/256; mean KL without the worst 3: 1.158e-02
+verify blocks of 8, accept 3,8,1,5, last 16 decoded: logits: top-1 agreement 0.957, mean KL 3.652e-02, max KL 2.612e+00 over 256 positions
+    256 positions: mean KL 2.778e-02, median 3.644e-03, p90 2.391e-02, max 1.675e+00; top-1 245/256; mean KL without the worst 3: 1.122e-02
+verify blocks of 16, accept 5: logits: top-1 agreement 0.945, mean KL 3.865e-02, max KL 2.162e+00 over 256 positions
+    256 positions: mean KL 2.758e-02, median 3.330e-03, p90 2.895e-02, max 1.628e+00; top-1 242/256; mean KL without the worst 3: 1.421e-02
+== ekk8 chat (27 tokens)
+l_out-0                           1.402e-02  4.158e-03   0.999902
+l_out-5                           1.472e-02  1.561e-02   0.999893
+l_out-14                          1.033e-02  4.536e-02   0.999947
+l_out-28                          1.697e-02  7.423e-02   0.999856
+l_out-39                          1.379e-02  6.325e-01   0.999906
+logits: top-1 agreement 1.000, mean KL 9.516e-04, max KL 2.016e-02 over 27 positions
