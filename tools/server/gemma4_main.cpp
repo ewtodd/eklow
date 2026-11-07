@@ -37,6 +37,8 @@
 // there is traffic the engine's rates, running and waiting requests, the slots' positions and the prefix hit rate.
 #include <httplib.h>
 
+#include "keepalive.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -396,6 +398,7 @@ int gemma4_server_main(int argc, char** argv) {
   int64_t card_margin_mib = 1024;
   int stream_slots = 40, stream_min_rows = 16;
   double log_interval = 10;  // seconds between the engine's log lines while there is traffic; 0: none
+  double keepalive_s = 15;  // a stream silent this long gets an SSE comment (keepalive.hpp); 0: never
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -421,6 +424,7 @@ int gemma4_server_main(int argc, char** argv) {
     else if (a == "--kv-int8") kv_int8 = true;
     else if (a == "--kv-fp16") kv_int8 = false;
     else if (a == "--log-interval") log_interval = std::atof(next().c_str());
+    else if (a == "--keepalive") keepalive_s = std::atof(next().c_str());
     else if (a == "--draft") draft_path = next();
     else if (a == "--draft-block") draft_block = std::atoi(next().c_str());
     else if (a == "--draft-reserve-mib") draft_reserve_mib = std::atoll(next().c_str());
@@ -433,7 +437,7 @@ int gemma4_server_main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
                            "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N]] [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] "
-                           "[--draft GGUF [--draft-block B] [--draft-reserve-mib N] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] [--log-interval S]\n");
+                           "[--draft GGUF [--draft-block B] [--draft-reserve-mib N] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] [--log-interval S] [--keepalive S]\n");
       return 2;
     }
   }
@@ -662,17 +666,24 @@ int gemma4_server_main(int argc, char** argv) {
       }
       const bool usage = cr.include_usage;
       res.set_header("Cache-Control", "no-cache");
+      auto ka = std::make_shared<serve::KeepAlive>(std::chrono::milliseconds(int64_t(keepalive_s * 1000)));
       res.set_chunked_content_provider(
           "text/event-stream",
-          [r, out, usage](size_t, httplib::DataSink& sink) {
+          [r, out, usage, ka](size_t, httplib::DataSink& sink) {
             serve::gemma4::Event e;
             while (!r->next(e, std::chrono::milliseconds(1000)))
-              if (!sink.is_writable()) {
+              if (!sink.is_writable() || !ka->tick(sink)) {
                 r->cancel();
                 return false;
               }
             const std::string text = out->chunks(e, usage);
-            if (!text.empty() && !sink.write(text.data(), text.size())) {
+            if (!text.empty()) {
+              if (!sink.write(text.data(), text.size())) {
+                r->cancel();
+                return false;
+              }
+              ka->wrote();
+            } else if (!ka->tick(sink)) {  // a token that adds no text yet (a tool call is sent whole when it closes)
               r->cancel();
               return false;
             }
