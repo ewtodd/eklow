@@ -70,6 +70,15 @@ int main(int argc, char** argv) {
   // default on, no system message / blank one: as if absent, no error
   check(prompt(m_none, "", on) == ids(m_none, std::nullopt), "default on, no system message: renders as without");
   check(prompt(m_blank, "", on) == ids(m_blank, std::nullopt), "default on, blank system message: no trigger");
+  // a `developer` message is the system one (parse_chat maps the role before the template), so the default applies to it too
+  // (serve_test.py basic on fiona, 2026-11-07: developer 22 tokens against system 27 before the fix)
+  {
+    std::string s = m_sys.text;
+    s.replace(s.find("\"system\""), 8, "\"developer\"");
+    const Conv m_dev{s, json::parse(s)};
+    check(prompt(m_dev, "", on) == prompt(m_sys, "", on), "default on, developer message: the same prompt as a system one");
+    check(prompt(m_dev, "", on) == ids(m_sys, T), "default on, developer message: trigger");
+  }
   // default on, the request sends false (top level and in chat_template_kwargs): off
   check(prompt(m_sys, ",\"verification\":false", on) == ids(m_sys, F), "default on, request false");
   check(prompt(m_sys, ",\"chat_template_kwargs\":{\"verification\":false}", on) == ids(m_sys, F), "default on, kwargs false");
