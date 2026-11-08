@@ -263,7 +263,8 @@ and `eklow-copy-bench` what PCIe copies cost the kernels beside them: the first 
 This is not a general-purpose engine:
 - One Intel Arc DG2 card (the A770M; the kernels are tuned for its 32 Xe-cores, 128 registers a thread and 64 KB of
   shared memory a work-group), through Level Zero.
-- Its 16 GB set the shapes: at 2 x 262k, Qwen3.6 needs its cold experts in about 13 GiB of pinned host memory, a CPU with AVX-VNNI to compute them, and room for the snapshots (4 GiB by default).
+- Its 16 GB set the shapes: at 2 x 262k, Qwen3.6 needs its cold experts in about 13 GiB of pinned host memory, a CPU
+  with AVX-VNNI to compute them, and room for the snapshots (4 GiB by default).
 - Card memory is sized from the free memory the driver reports (Level Zero Sysman), because allocations succeed past
   what the card holds and the first kernels then fail. Nothing else may use the card beside the server: a second
   program on it starves the running server into `UR_RESULT_ERROR_OUT_OF_RESOURCES` until it restarts.
@@ -292,9 +293,9 @@ This is not a general-purpose engine:
 eklow links [cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT) for its HTTP server; it carries no other
 code from other projects.
 
-The models' math follows llama.cpp's qwen35moe graph (and, for EmbeddingGemma 2, its Gemma ones) (MIT), which is also the oracle (`nix/oracle.nix`
+The models' math follows llama.cpp's qwen35moe and gemma-embedding2 graphs (MIT), which is also the oracle (`nix/oracle.nix`
 builds it); the quantized layouts are ggml's. The chat templates are ports of the `chat_template.jinja` of
-Qwen/Qwen3.6-35B-A3B, ornith-ai/Ornith-1.5-35B-A3B and Sage-A1.5; the tokenizers follow Hugging Face's
+Qwen/Qwen3.6-35B-A3B, ornith-ai/Ornith-1.5-35B-A3B and InternScience/Sage-A1.5; the tokenizers follow Hugging Face's
 `tokenizer.json`. The DFlash 2 draft is Inco AI's (z-lab's `dflash/model.py` architecture). Qwen3.6's weights are
 Alibaba's (Apache-2.0), Ornith-1.5's ornith-ai's (MIT), and EmbeddingGemma 2's Google's, under their own
 licenses.

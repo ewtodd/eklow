@@ -178,8 +178,8 @@ eklow_sycl(eklow-verification-test)
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
 
-# CPU Q4_0, Q6_K and IQ4_XS GEMVs for the cold experts (TASK: m6/cpu-experts): plain host code, AVX-VNNI,
-# so the flags are per source file and there is no -fsycl.
+# CPU GEMVs for the cold experts (TASK: m6/cpu-experts): Q4_0 in q4_gemv.cpp, the Qwen formats in qgemv.cpp. Plain host
+# code, AVX-VNNI, so the flags are per source file and there is no -fsycl.
 add_library(eklow_cpu STATIC src/cpu/q4_gemv.cpp src/cpu/qgemv.cpp)
 target_include_directories(eklow_cpu PUBLIC src)
 target_compile_options(eklow_cpu PRIVATE -O3 -mavx2 -mfma -mf16c -mavxvnni)

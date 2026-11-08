@@ -8,9 +8,10 @@ time for DG2, packaged with nix. Named for Eklow Labs (Silicon Valley, season 5)
 their evidence. This file is the target and the shape of the system.
 
 **The sections below are the 2026-10-24 design for Gemma 4 12B and 26B A4B, kept as history.** Neither is served or
-supported any more (the Qwen3.6 port of 2026-10-31 replaced them; the Qwen port's text layer, tools and numbers are in
-`DECISIONS.md` and `README.md`; the 26B ran again beside Qwen from 2026-11-03 to 2026-11-07, DECISIONS 2026-11-07); what survives of Gemma is EmbeddingGemma 2 (its tokenizer, `src/model/embed_gemma2.*`
-and the Gemma 4 vision encoder of its mmproj).
+supported any more: the Qwen3.6 port of 2026-10-31 replaced them (its text layer, tools and numbers are in
+`DECISIONS.md` and `README.md`), and the 26B, back beside Qwen from 2026-11-03, was removed again on 2026-11-07. What
+survives of Gemma is EmbeddingGemma 2 (its tokenizer, `src/model/embed_gemma2.*` and the Gemma 4 vision encoder of its
+mmproj).
 
 ## Why
 
