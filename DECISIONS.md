@@ -2518,16 +2518,23 @@ message arrives, every assistant message of the turn before it loses its `<think
 holds at the first assistant message of that turn. The whole turn is prefilled again. Ornith's template always keeps the reasoning.
 - 00:15:38: the turn after one of 16 tool calls and an answer reused 5,712 of its 8,201 tokens (the system prompt and the first
   messages). The prompt was 1,315 tokens shorter than the slot's sequence.
-- 01:03: the turn after one of 500 tool calls (00:40-01:03) came with a prompt of 190,577 tokens, 4,440 shorter than the slot's
-  195,017 (the think blocks, about 9 tokens a call). Nothing was reused: 180 s to the first token.
+- The same applies to every longer turn: a new user message after a turn of N tokens of tool calls costs N tokens of prefill.
+  (Corrected the same day: the two three-minute waits at 01:03 and 02:21, first put down to this, had the cause below.)
 
 The night's other causes, not changed here:
+- The client's step cap and `tool_choice: "none"`. The model called son-of-anton's `relay` tool with `{"action": "status"}` on the
+  worker it had just started 493 times in a row (00:41-01:03, every ~2.7 s; 12 distinct results), about 374 tokens a call.
+  That is how one conversation went from 5.6k to 195k tokens. son-of-anton ends a turn after 500 tool steps with one request
+  with `tool_choice: "none"`. eklow renders no tools for `tool_choice: "none"`, so that prompt lost the system message's tool
+  block: 190,577 tokens against the slot's 195,017, parting in the system message. Nothing was reused: 180 s to the first token
+  (01:06:18). The model, with no tools in its prompt, still wrote a tool call. The client counts that as an empty reply, sent
+  the same request twice more, and closed the turn as "[response failed]". At 02:21 the next turn (a worker's report, tools
+  back) parted in the system message from the slot that held the tools-off render. The slot that held the tools-on one had
+  been emptied for it at 01:03, so that turn waited 181 s too.
 - A restart empties the cache: the reboot at 05:30 and the deploy at 07:38. At 07:51 the same 193k conversation took 184 s to its
   first token.
 - Two conversations larger than the pool together (125k + 165k against 262,144, 23:30-00:08) cut each other back on every
   turn: 60 to 300 s to the first token.
-- The model called a tool 500 times in one turn, 390 of the calls the same 70 tokens (00:42-01:03). That is how one conversation
-  reached 195k.
 
 **What.** `--preserve-thinking on|off` (module `preserveThinking`; default off, the template's own) is the template variable
 `preserve_thinking` for a request that sends none. A request's own value, top level or in `chat_template_kwargs`, wins. On,

@@ -22,8 +22,10 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   head, softcap) stays, with its tests in `tools/dflash_test`.
 - **`--preserve-thinking on`** (module `preserveThinking`; DECISIONS 2026-11-08 "keep earlier turns' reasoning"): with Sage's
   (stock's) template a new user message re-rendered the whole agentic turn before it without reasoning, and the server prefilled
-  that turn again: 180 s to the first token on fiona for a 190k conversation. On, earlier turns keep their reasoning, as Ornith's
-  template always did. Host test only; /etc/nixos sets it for sage; the owner deploys.
+  that turn again (~1,050 tok/s at 190k on fiona). On, earlier turns keep their reasoning, as Ornith's template always did. Host
+  test only; /etc/nixos sets it for sage; the owner deploys. The night's two three-minute waits were something else:
+  son-of-anton's last step of a 500-step turn sends `tool_choice: "none"`, and eklow then drops the tools from the system
+  message, so the whole prompt is prefilled again (DECISIONS 2026-11-08, not fixed).
 - **The card margin is 256 MiB, not 1 GiB** (`serve/margin`, DECISIONS 2026-11-08; deployed 2026-11-07 22:11): everything the server
   allocated lazily (attention partials at depth, the vision encoders' scratch and per-image buffers) is now sized, zero-filled and
   warmed before the experts are placed; what is left is the driver's own buffers on the engine's first launches, 108 MiB measured
