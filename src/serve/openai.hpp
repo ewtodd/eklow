@@ -75,7 +75,8 @@ struct ChatRequest {
   std::vector<std::string> stop;
   bool stream = false, include_usage = false, thinking = false, tools = false;
   bool in_thinking = false;  // the prompt ends inside the reasoning
-  std::shared_ptr<const text::ToolSpecs> tool_specs;  // the request's tools, for reading and constraining calls
+  bool calls_allowed = true;  // false for tool_choice "none": the tools are in the prompt, <tool_call> is never sampled
+  std::shared_ptr<const text::ToolSpecs> tool_specs;  // the request's tools, for reading and constraining calls (null when calls are not allowed)
   std::vector<int64_t> snapshot_points;  // see Request::snapshot_points
   int draft_block = -1;      // eklow extension: "speculative": false decodes plain even when the server has a draft; an integer is a block size
   std::vector<ImageInput> images;  // the prompt's image spans (their ids in `prompt` are image_row_id's), in order

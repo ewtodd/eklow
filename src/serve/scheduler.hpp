@@ -68,6 +68,7 @@ class Request {
   int64_t max_tokens = 0;          // 0: as far as the context allows
   std::vector<std::string> stop;   // strings that end the content (not included)
   bool in_thinking = false;        // the prompt ends inside the reasoning
+  bool calls_allowed = true;       // false (tool_choice "none"): <tool_call> is never sampled
   std::shared_ptr<const text::ToolSpecs> tool_specs;  // the request's tools (null: none); calls are constrained to them
   // Positions where a snapshot is taken in prefill (ascending): where the generation prompt starts (the prefix the next turn
   // shares, even when it drops this turn's reasoning), where the last message starts (an edited or retried message), and where

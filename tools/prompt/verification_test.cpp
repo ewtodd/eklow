@@ -1,6 +1,7 @@
 // Host test of the server defaults in parse_chat: --verification (Sage's template) and --preserve-thinking. eklow-verification-test
 // VOCAB_GGUF, any Qwen3.6 GGUF for its tokenizer. Each request's prompt must be the ids of the template's own render with the options
 // the rule gives; with preserve_thinking the next turn of an agentic conversation must share the prompt up to its generation prompt.
+#include <algorithm>
 #include <cstdio>
 #include <string>
 
@@ -8,6 +9,7 @@
 #include "model/gguf.hpp"
 #include "serve/openai.hpp"
 #include "text/chat_qwen36.hpp"
+#include "text/output_parser_qwen.hpp"
 #include "text/tokenizer_qwen.hpp"
 
 using namespace eklow;
@@ -152,6 +154,25 @@ int main(int argc, char** argv) {
     check(req(next, ",\"chat_template_kwargs\":{\"preserve_thinking\":true}", drop) == b_keep, "preserve default off, kwargs true");
     std::printf("preserve: the next turn shares %zu of %zu tokens with it, %zu without (generation prompt at %zu)\n", shared(a_keep, b_keep),
                 b_keep.size(), shared(a_drop, b_drop), gen_start(a_keep));
+
+    // tool_choice "none" (a client's last step of a long tool loop): the same prompt as with tools allowed, so the prefix stays
+    // cached, and no tool call can be sampled.
+    const auto chat = [&](const std::string& extra) {
+      return serve::parse_chat(json::parse("{\"messages\":" + first + tools + extra + "}"), tok, off);
+    };
+    const serve::ChatRequest c_auto = chat(""), c_none = chat(",\"tool_choice\":\"none\""), c_explicit = chat(",\"tool_choice\":\"auto\"");
+    check(c_none.prompt == c_auto.prompt, "tool_choice none: the prompt keeps the tools (identical to tool_choice auto's)");
+    check(c_auto.calls_allowed && c_auto.tool_specs, "no tool_choice: calls allowed, with the tools' specs");
+    check(c_explicit.calls_allowed && c_explicit.prompt == c_auto.prompt, "tool_choice auto: as without");
+    check(!c_none.calls_allowed && !c_none.tool_specs, "tool_choice none: calls not allowed, no specs to constrain them");
+    const int32_t call_open = tok.id("<tool_call>"), im_end = tok.id("<|im_end|>");
+    const auto bans = [](const text::QwenOutputParser& p, int32_t id) {
+      return std::find(p.banned().begin(), p.banned().end(), id) != p.banned().end();
+    };
+    const text::QwenOutputParser p_on(tok, false, nullptr, true), p_off(tok, false, nullptr, false);
+    check(!bans(p_on, call_open) && bans(p_off, call_open), "calls off: the parser bans <tool_call> in the content");
+    check(!bans(p_on, im_end) && !bans(p_off, im_end), "calls off: the turn can still end");
+    check(std::is_sorted(p_off.banned().begin(), p_off.banned().end()), "calls off: the banned ids stay ascending");
   }
 
   std::printf("%d checks, %d failures\n", checks, failures);

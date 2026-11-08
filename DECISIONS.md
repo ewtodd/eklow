@@ -2550,3 +2550,22 @@ template drops. Qwen3.6's template has the switch for agents, and Ornith (the sa
 **Checks.** `eklow-verification-test` (host, Qwen3.6 vocabulary) adds 7 checks. The turn's own prompt is identical either way.
 With preserve on, the next turn shares the prompt up to its generation prompt; with it off, it parts inside the turn. A
 request's `preserve_thinking`, false or true, top level or in kwargs, overrides the default. Nothing ran on the card.
+
+## 2026-11-08 — tool_choice none: the tools stay in the prompt, calls are never sampled
+
+**Why.** `tool_choice: "none"` used to leave the tools out of the template, so the system message, where Qwen3.6's template
+writes them, changed. The prompt then shared nothing with what the slot held past the first few tokens. On fiona that request
+was the last step of son-of-anton's 500-step turn (the client sends it with the same tool list on purpose, to keep the prefix
+cached). It was prefilled whole, 190,577 tokens in 180 s. The model, with no tools in its prompt, still wrote a tool call, so
+the client counted the reply as empty, retried twice, and closed the turn as failed. The next turn, with tools again, met a
+slot holding the tools-off render and was prefilled whole too (181 s). See "keep earlier turns' reasoning" above.
+
+**What.** `tool_choice: "none"` renders the tools exactly as `"auto"` does, so the prompt is the same tokens and the slot's
+prefix is reused. The request carries `calls_allowed = false`: its output parser bans `<tool_call>` in the content as well (the
+sampler never picks a banned id, in plain decode and in the draft's verify rows alike, which take the parser's ban list).
+The model can only write text or end the turn. No tool specs are attached, so no tool grammar is built. In the OpenAI API,
+`"none"` means the model will not call a tool and generates a message instead, not that it does not see the tools.
+
+**Checks.** `eklow-verification-test` (host): the `"none"` prompt is identical to `"auto"`'s and to no `tool_choice`. The
+parser with calls off bans `<tool_call>` and not `<|im_end|>`, and its ban list stays ascending (the sampler needs that).
+Nothing ran on the card.

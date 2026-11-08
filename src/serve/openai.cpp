@@ -167,12 +167,15 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
   if (!msgs || !msgs->is_array() || msgs->items().empty()) throw bad("messages must be a non-empty array");
   if (const json::Value* n = field(body, "n"); n && !n->is_null() && number(*n, "n") != 1) throw bad("only n = 1 is supported");
 
+  // tool_choice "none" keeps the tools in the prompt and forbids calls: the prompt is byte for byte the one the same conversation
+  // gets with tools allowed, so its prefix stays cached (a client's last step of a long tool loop, son-of-anton's after 500 steps,
+  // asks for an answer this way; leaving the tools out re-prefilled 190k tokens on fiona, DECISIONS 2026-11-08), and the sampler
+  // never picks <tool_call> (calls_allowed false), so the model answers in text.
   json::Value tools;
-  bool tools_off = false;
-  if (const json::Value* tc = field(body, "tool_choice"); tc && tc->is_string() && tc->as_string() == "none") tools_off = true;
-  if (const json::Value* t = field(body, "tools"); t && t->is_array() && !t->items().empty() && !tools_off) tools = *t;
+  if (const json::Value* tc = field(body, "tool_choice"); tc && tc->is_string() && tc->as_string() == "none") r.calls_allowed = false;
+  if (const json::Value* t = field(body, "tools"); t && t->is_array() && !t->items().empty()) tools = *t;
   r.tools = !tools.is_null();
-  if (r.tools) r.tool_specs = std::make_shared<const text::ToolSpecs>(tools);
+  if (r.tools && r.calls_allowed) r.tool_specs = std::make_shared<const text::ToolSpecs>(tools);
 
   // Thinking is on unless the request says otherwise: reasoning_effort "none", or think / enable_thinking false (the
   // template variable wins). preserve_thinking (stock's and Sage's templates) keeps the reasoning of earlier turns: the request's
