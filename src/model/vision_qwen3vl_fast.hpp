@@ -65,6 +65,10 @@ struct VisionQwen3VL::Fast {
   float* wide = nullptr;
   sycl::half *act_main = nullptr, *act_ffn = nullptr, *qt = nullptr, *kt = nullptr, *vt = nullptr;
   vattn::Scratch att;
+  float* small = nullptr;            // per-image: position table and RoPE angles
+  uint8_t* rgb = nullptr;            // per-image: the pixels
+  std::shared_ptr<float> out_buf;    // per-image: the rows, handed out while no caller holds the last ones
+  size_t out_floats = 0;
   int64_t wide_floats = 0;
   uint64_t held() const { return stage[0] ? uint64_t(kStages) * blob_bytes : 0; }
 };

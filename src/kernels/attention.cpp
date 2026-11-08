@@ -1,5 +1,7 @@
 #include "kernels/attention.hpp"
 
+#include "rt/device.hpp"
+
 #include <sycl/ext/intel/esimd.hpp>
 
 #include <algorithm>
@@ -47,13 +49,14 @@ constexpr int kRows = 8, kKeys = 16, kSlice = 64;
 constexpr float kNegBig = -1e30f;
 
 template <class T>
-T* grow(sycl::queue& q, T*& p, size_t& have, size_t need) {
+T* grow(sycl::queue& q, T*& p, size_t& have, size_t need, const char* what = "attention scratch") {
   if (need > have) {
     if (p) {
       q.wait();
       sycl::free(p, q);
     }
     have = std::max(need, have * 2);
+    eklow::rt::note_alloc(what, have * sizeof(T));
     p = sycl::malloc_device<T>(have, q);
     if (!p) throw std::runtime_error("attention: out of device memory for scratch");
   }
@@ -61,6 +64,16 @@ T* grow(sycl::queue& q, T*& p, size_t& have, size_t need) {
 }
 
 inline int32_t part_stride(int32_t d) { return kRows * d + 2 * kRows; }
+
+constexpr int64_t kPerSplitMax = 8;
+
+// How many splits a decode-style launch cuts its keys into: enough threads to fill the card (a tile has P threads), short splits
+// (kPerSplitMax blocks at most past 4k keys), at least 1. Shared by the launch and by reserve(), which sizes the partials by it.
+inline int64_t split_count(int64_t n_tiles, int64_t max_keys, int64_t P) {
+  const int64_t max_blocks = max_keys / kKeys + 2;
+  const int64_t per_split = std::clamp<int64_t>(max_blocks / 32, 4, kPerSplitMax);
+  return std::clamp<int64_t>((8192 + n_tiles * P - 1) / (n_tiles * P), 1, std::max<int64_t>(1, max_blocks / per_split));
+}
 
 // A K tile (8 positions x 16 dims) as an fp16 B operand: `at` is its element offset (fp16
 // elements, or the int8 bytes in the same places), `sat` the offset of its 8 scales.
@@ -832,8 +845,8 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
   const int32_t base = int32_t(ch[0]), rows = int32_t(ch[2]), kend = int32_t(ch[4] + 1), kfirst = int32_t(ch[5]) / 32 * 32;
   const int32_t H2 = int32_t(c.n_head_kv), tph = (rows + 7) / 8, R = (rows + 255) / 256 * 256, H = int32_t(n_head);
   const int32_t* last = tok.hi ? tok.hi : tok.pos;
-  sycl::half* P = grow(q, scratch.p, scratch.p_halves, size_t(R) * kSeg);
-  const SegStats st(grow(q, scratch.stat, scratch.stat_floats, SegStats::floats(R, D)), R);
+  sycl::half* P = grow(q, scratch.p, scratch.p_halves, size_t(R) * kSeg, "attention segment probabilities");
+  const SegStats st(grow(q, scratch.stat, scratch.stat_floats, SegStats::floats(R, D), "attention segment statistics"), R);
   for (int32_t h = 0; h < H2; ++h) {
     for (int32_t s0 = kfirst; s0 < kend; s0 += kSeg) {
       const int32_t kseg = std::min(kSeg, kend - s0), nk = (kseg + 127) / 128, nb = (kseg + 31) / 32, first = s0 == kfirst;
@@ -865,8 +878,6 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
   }
 }
 
-constexpr int64_t kPerSplitMax = 8;
-
 template <int D, int G, bool Q8>
 void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* tiles, const Cache& c,
          int64_t n_head, float scale, float* out, Scratch& scratch) {
@@ -879,7 +890,7 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
   const int32_t H = int32_t(n_head);
   const int32_t* last = tok.hi ? tok.hi : tok.pos;  // the last key each token sees
   // Query tiles in fp16, the A operands of Q.K^T: [tile][D/16][8 rows][16].
-  sycl::half* qt = grow(q, scratch.q, scratch.q_halves, size_t(n_tiles * kRows * D));
+  sycl::half* qt = grow(q, scratch.q, scratch.q_halves, size_t(n_tiles * kRows * D), "attention query tiles");
   q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
     const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), d = int32_t(id[2]);
     const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];
@@ -893,11 +904,9 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
   // 4 blocks, at most 32 splits); beyond, at most kPerSplitMax blocks a split, with the two-level
   // merge below (2026-10-26: global8 decode at 16k keys 470 -> 302 us; kPerSplitMax 4 gave 366).
   auto split = [&](const sycl::half* qt, const int32_t* tiles, int64_t n_tiles, int64_t max_keys) {
-    const int64_t max_blocks = max_keys / kKeys + 2;
-    const int64_t per_split = std::clamp<int64_t>(max_blocks / 32, 4, kPerSplitMax);
-    const int64_t splits = std::clamp<int64_t>((8192 + n_tiles * P - 1) / (n_tiles * P), 1, std::max<int64_t>(1, max_blocks / per_split));
+    const int64_t splits = split_count(n_tiles, max_keys, P);
     int32_t sp = int32_t(splits);
-    float* part = splits > 1 ? grow(q, scratch.part, scratch.part_floats, size_t(n_tiles * splits * part_stride(D))) : nullptr;
+    float* part = splits > 1 ? grow(q, scratch.part, scratch.part_floats, size_t(n_tiles * splits * part_stride(D)), "attention split partials") : nullptr;
     float* const part_in = part;
     const sycl::nd_range<2> nd(sycl::range<2>(size_t(splits), size_t(n_tiles * P)), sycl::range<2>(1, P));
     if (tok.lo) {
@@ -917,7 +926,7 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
     // 128-byte runs (with the splits fastest, the fold was 92 us of a 750 us decode step at 128k keys).
     for (bool to2 = true; sp > 8; to2 = !to2) {
       const int32_t sp2 = (sp + 7) / 8;
-      float* dst = to2 ? grow(q, scratch.part2, scratch.part2_floats, size_t(n_tiles) * sp2 * part_stride(D)) : part_in;
+      float* dst = to2 ? grow(q, scratch.part2, scratch.part2_floats, size_t(n_tiles) * sp2 * part_stride(D), "attention folded partials") : part_in;
       const float* src = part;
       q.parallel_for(sycl::range<3>(size_t(n_tiles) * kRows, size_t(sp2), D), [=](sycl::id<3> id) {
         const int32_t tile = int32_t(id[0]) / kRows, i = int32_t(id[0]) % kRows, g = int32_t(id[1]), d = int32_t(id[2]);
@@ -1021,12 +1030,35 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
   else throw std::runtime_error("attention: no kernel for head_dim " + std::to_string(c.head_dim) + ", group " + std::to_string(group));
 }
 
-void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim, int64_t group) {
+void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim, int64_t group,
+             int64_t max_keys) {
+  // Every buffer is written once (zeroed) so that the driver has committed it before anyone reads the card's free memory.
+  auto fill = [&](auto* p, size_t n) {
+    if (p && n) q.memset(p, 0, n * sizeof(*p));
+  };
   grow(q, s.q, s.q_halves, size_t(max_tiles * kRows * head_dim));
-  if (head_dim != 512 && !(head_dim == 256 && group == 8)) return;
-  const int64_t R = (max_chunk_rows + 255) / 256 * 256;
-  grow(q, s.p, s.p_halves, size_t(R * kSeg));
-  grow(q, s.stat, s.stat_floats, SegStats::floats(R, head_dim));
+  fill(s.q, s.q_halves);
+  if (max_keys > 0) {
+    // The split launch's partials at the largest shape it can see: any tile count up to max_tiles, keys up to max_keys. P is the
+    // threads a tile takes (head 256: 8, else D / 64); the first fold level goes to part2, later ones back to part.
+    const int64_t P = head_dim == 256 ? 8 : head_dim / kSlice, stride = part_stride(int32_t(head_dim));
+    int64_t most = 0, most2 = 0;
+    for (int64_t t = 1; t <= max_tiles; ++t) {
+      const int64_t sp = split_count(t, max_keys, P);
+      if (sp > 1) most = std::max(most, t * sp * stride);
+      if (sp > 8) most2 = std::max(most2, t * ((sp + 7) / 8) * stride);
+    }
+    if (most) grow(q, s.part, s.part_floats, size_t(most)), fill(s.part, s.part_floats);
+    if (most2) grow(q, s.part2, s.part2_floats, size_t(most2)), fill(s.part2, s.part2_floats);
+  }
+  if (head_dim == 512 || (head_dim == 256 && group == 8)) {
+    const int64_t R = (max_chunk_rows + 255) / 256 * 256;
+    grow(q, s.p, s.p_halves, size_t(R * kSeg));
+    grow(q, s.stat, s.stat_floats, SegStats::floats(R, head_dim));
+    fill(s.p, s.p_halves);
+    fill(s.stat, s.stat_floats);
+  }
+  q.wait();
 }
 
 void write(sycl::queue& q, const float* K, const float* V, const Tokens& tok, const Cache& cache) {

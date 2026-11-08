@@ -13,6 +13,8 @@
 
 #include "model/vision_qwen3vl_fast.hpp"
 
+#include "rt/device.hpp"
+
 namespace eklow::model {
 
 namespace {
@@ -233,10 +235,12 @@ void VisionQwen3VL::free_activations() {
   Fast& F = *fast_;
   q_.wait();
   for (void* p : {static_cast<void*>(F.x), static_cast<void*>(F.wide), static_cast<void*>(F.act_main), static_cast<void*>(F.act_ffn),
-                  static_cast<void*>(F.qt), static_cast<void*>(F.kt), static_cast<void*>(F.vt)})
+                  static_cast<void*>(F.qt), static_cast<void*>(F.kt), static_cast<void*>(F.vt), static_cast<void*>(F.small), static_cast<void*>(F.rgb)})
     if (p) sycl::free(p, q_);
   F.x = F.wide = nullptr;
   F.act_main = F.act_ffn = F.qt = F.kt = F.vt = nullptr;
+  F.small = nullptr, F.rgb = nullptr;
+  F.out_buf.reset();
   vattn::release(q_, F.att);
   F.n_cap = 0;
   held_ = 0;
@@ -278,6 +282,24 @@ void VisionQwen3VL::ensure(int64_t n) {
   dev(F.qt, H * R * F.Dp);
   dev(F.kt, H * R * F.Dp);
   dev(F.vt, H * R * F.Dp);
+  // What an encode needs besides the activations, at the largest image: the position table and RoPE angles, the pixels, the rows.
+  // An encode used to allocate and free these per image; the driver keeps what is freed, so every new size cost the margin.
+  const int64_t rot_half = (d_head_ / 2) / 2;
+  dev(F.small, n_pos_ * E + 2 * n * rot_half);
+  dev(F.rgb, n * patch_ * patch_ * 3);
+  {
+    const size_t out_floats = size_t(n / 4 + 1) * size_t(n_out_);
+    eklow::rt::note_alloc("vision encoder rows", out_floats * sizeof(float));
+    float* o = sycl::malloc_device<float>(out_floats, q_);
+    if (!o) {
+      free_activations();
+      throw std::runtime_error("vision encoder: out of device memory for the rows");
+    }
+    q_.memset(o, 0, out_floats * sizeof(float));
+    const sycl::context c = q_.get_context();
+    F.out_buf = std::shared_ptr<float>(o, [c](float* x) { sycl::free(x, c); });
+    F.out_floats = out_floats;
+  }
   // The padding dimensions of the attention operands are never written: zero once.
   q_.memset(F.qt, 0, size_t(H * R * F.Dp) * 2);
   q_.memset(F.kt, 0, size_t(H * R * F.Dp) * 2);
@@ -342,24 +364,25 @@ QwenImageRows VisionQwen3VL::encode_fast(const image::Rgb& pic) {
   const int64_t rot = D / 2, half = rot / 2, maxpos = std::max(cols, rows);
   const ref::RopeTables rt = ref::rope_tables(maxpos, rot, double(rope_theta_), nullptr);
   const int64_t pos_floats = n_pos_ * E, tab_floats = 2 * maxpos * half;
-  float* small = sycl::malloc_device<float>(size_t(pos_floats + tab_floats), q_);
-  uint8_t* rgb = sycl::malloc_device<uint8_t>(pic.pixels.size(), q_);
-  if (!small || !rgb) {
-    if (small) sycl::free(small, q_);
-    if (rgb) sycl::free(rgb, q_);
-    throw std::runtime_error("vision encoder: out of device memory");
-  }
-  std::shared_ptr<void> small_guard(small, [ctx](void* x) { sycl::free(x, ctx); });
-  std::shared_ptr<void> rgb_guard(rgb, [ctx](void* x) { sycl::free(x, ctx); });
+  // (ensure() sized them for the largest image.)
+  float* small = F.small;
+  uint8_t* rgb = F.rgb;
+  if (size_t(pos_floats + tab_floats) > size_t(n_pos_ * E + 2 * F.n_cap * ((D / 2) / 2)) || pic.pixels.size() > size_t(F.n_cap * patch_ * patch_ * 3))
+    throw std::runtime_error("vision encoder: the image is larger than the scratch ensure() sized");
   float *posd = small, *cos_t = small + pos_floats, *sin_t = cos_t + maxpos * half;
   q_.memcpy(posd, F.pos, size_t(pos_floats) * 4);
   q_.memcpy(cos_t, rt.cos.data(), size_t(maxpos * half) * 4);
   q_.memcpy(sin_t, rt.sin.data(), size_t(maxpos * half) * 4);
   q_.memcpy(rgb, pic.pixels.data(), pic.pixels.size());
 
-  auto* out_raw = sycl::malloc_device<float>(size_t(n_out * n_out_), q_);
-  if (!out_raw) throw std::runtime_error("vision encoder: out of device memory for the rows");
-  std::shared_ptr<float> out(out_raw, [ctx](float* x) { sycl::free(x, ctx); });
+  // The rows go in the buffer ensure() allocated, unless a caller still holds the previous encode's rows.
+  std::shared_ptr<float> out = F.out_buf;
+  if (out.use_count() > 2 || size_t(n_out * n_out_) > F.out_floats) {
+    rt::note_alloc("vision encoder rows (held by a caller)", size_t(n_out * n_out_) * sizeof(float));
+    auto* out_raw = sycl::malloc_device<float>(size_t(n_out * n_out_), q_);
+    if (!out_raw) throw std::runtime_error("vision encoder: out of device memory for the rows");
+    out = std::shared_ptr<float>(out_raw, [ctx](float* x) { sycl::free(x, ctx); });
+  }
 
   auto gemm = [&](sycl::half* a_ptr, int64_t m, int64_t k, const xmx::Weight& w, float* dst) {
     xmx::Activations a;

@@ -885,6 +885,7 @@ static int qwen_server_main(int argc, char** argv) {
           [r](bool) { r->cancel(); });
     });
 
+    rt::startup_done();  // EKLOW_ALLOC_TRACE logs the card allocations from here on
     httplib::Server embed_http;
     std::thread embed_thread;
     if (embed_model) {

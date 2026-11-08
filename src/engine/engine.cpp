@@ -392,7 +392,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg)
     owned_.push_back(gids_);
     gw_ = dev(cap_tokens_ * NU);
   }
-  attn::reserve(q_, attn_scratch_, max_tiles_, c_.max_chunk * group_, Hkv, D, group_);
+  attn::reserve(q_, attn_scratch_, max_tiles_, c_.max_chunk * group_, Hkv, D, group_, c_.max_ctx + attn::kPage);
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, H * D));
   act_sh_ = xmx::alloc_activations(q_, B, Fs);
   act_exp_ffn_ = xmx::alloc_activations(q_, xmx::kFp16Rows, Fe);

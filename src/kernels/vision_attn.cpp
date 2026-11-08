@@ -1,5 +1,7 @@
 #include "kernels/vision_attn.hpp"
 
+#include "rt/device.hpp"
+
 #include <sycl/ext/intel/esimd.hpp>
 
 #include <algorithm>
@@ -32,13 +34,14 @@ struct Stats {
 };
 
 template <class T>
-T* grow(sycl::queue& q, T*& p, size_t& have, size_t need) {
+T* grow(sycl::queue& q, T*& p, size_t& have, size_t need, const char* what = "vision attention scratch") {
   if (need > have) {
     if (p) {
       q.wait();
       sycl::free(p, q);
     }
     have = need;
+    eklow::rt::note_alloc(what, have * sizeof(T));
     p = sycl::malloc_device<T>(have, q);
     if (!p) throw std::runtime_error("vision attention: out of device memory for scratch");
   }
@@ -377,17 +380,38 @@ void run(sycl::queue& q, const sycl::half* qt, const sycl::half* kt, const sycl:
 
 }  // namespace
 
+namespace {
+
+// The plan (heads in flight, keys per segment) depends on the padded row count, so a smaller image can take a larger scratch than the
+// largest one: the largest of the scratch over every padded count up to `rows`.
+struct Sizes {
+  size_t p_halves = 0, stat_floats = 0;
+};
+
+Sizes max_sizes(int64_t rows, int64_t D, int64_t n_head) {
+  Sizes m;
+  for (int64_t R = 256; R <= rows_padded(rows); R += 256) {
+    const Plan pl = plan(R, n_head);
+    m.p_halves = std::max(m.p_halves, size_t(pl.G * R * pl.seg));
+    m.stat_floats = std::max(m.stat_floats, size_t(pl.G) * Stats::floats(R, D));
+  }
+  return m;
+}
+
+}  // namespace
+
 uint64_t scratch_bytes(int64_t rows, int64_t D, int64_t n_head) {
-  const int64_t R = rows_padded(rows);
-  const Plan pl = plan(R, n_head);
-  return uint64_t(pl.G) * (uint64_t(R) * pl.seg * sizeof(sycl::half) + Stats::floats(R, D) * sizeof(float));
+  const Sizes m = max_sizes(rows, D, n_head);
+  return uint64_t(m.p_halves) * sizeof(sycl::half) + uint64_t(m.stat_floats) * sizeof(float);
 }
 
 void reserve(sycl::queue& q, Scratch& s, int64_t rows, int64_t D, int64_t n_head) {
-  const int64_t R = rows_padded(rows);
-  const Plan pl = plan(R, n_head);
-  grow(q, s.p, s.p_halves, size_t(pl.G * R * pl.seg));
-  grow(q, s.stat, s.stat_floats, size_t(pl.G) * Stats::floats(R, D));
+  const Sizes m = max_sizes(rows, D, n_head);
+  grow(q, s.p, s.p_halves, m.p_halves);
+  grow(q, s.stat, s.stat_floats, m.stat_floats);
+  q.memset(s.p, 0, s.p_halves * sizeof(sycl::half));
+  q.memset(s.stat, 0, s.stat_floats * sizeof(float));
+  q.wait();
 }
 
 void release(sycl::queue& q, Scratch& s) {
