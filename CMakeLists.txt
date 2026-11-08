@@ -234,3 +234,8 @@ install(TARGETS eklow-dflash-test RUNTIME DESTINATION bin)
 # The scheduler's K/V pool decisions (src/serve/kv_pool.hpp), host only.
 add_executable(eklow-kvpool-test tools/server/kv_pool_test.cpp)
 target_include_directories(eklow-kvpool-test PRIVATE src)
+
+# The /metrics rendering (tools/server/metrics.hpp), host only (the scheduler's header pulls in the engine's, so it builds like the server).
+add_executable(eklow-metrics-test tools/server/metrics_test.cpp)
+target_link_libraries(eklow-metrics-test PRIVATE eklow_serve)
+eklow_sycl(eklow-metrics-test)

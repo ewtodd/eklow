@@ -50,7 +50,7 @@
 // (llama.cpp's image_max_tokens, 70 to 1,120, 280 by default). Each image is encoded on its request's thread with the
 // scheduler held, one at a time per encoder, and counts in the prompt tokens.
 // Sampling defaults come from the GGUF's general.sampling.* (temperature, top_k, top_p, min_p), each overridable per request.
-// Endpoints: POST /v1/chat/completions (streamed or whole), GET /v1/models, GET /health; with an
+// Endpoints: POST /v1/chat/completions (streamed or whole), GET /v1/models, GET /health, GET /metrics (Prometheus text, for llmtop; no auth); with an
 // embedding model, POST /v1/embeddings, GET /v1/models and GET /health on its own port (the house
 // runs chat and embeddings as separate upstreams).
 // The log (stdout, unholy's form, each line prefixed with the local time): a line per chat request as it ends
@@ -61,6 +61,7 @@
 #include <httplib.h>
 
 #include "keepalive.hpp"
+#include "metrics.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -796,6 +797,7 @@ static int qwen_server_main(int argc, char** argv) {
     if (chat_images) chat_images->bind(&sched);
     std::thread engine_thread([&] { sched.run(g_stop); });
     EmbedStats embed_stats;
+    std::atomic<int64_t> http_requests{0}, http_errors{0};  // chat requests, and those answered with an error status (/metrics)
     // The engine's line every log_interval seconds while there is traffic, and once more after it ends (rates
     // back to zero).
     std::thread stats_thread;
@@ -827,10 +829,20 @@ static int qwen_server_main(int argc, char** argv) {
     http.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
       res.set_content("{\"status\":\"ok\"}", "application/json");
     });
+    http.Get("/metrics", [&](const httplib::Request&, httplib::Response& res) {
+      const EmbedCounts ec_ = embed_stats.snapshot();
+      res.set_content(serve::render_metrics(sched.stats(), {ec_.requests, ec_.inputs, ec_.tokens}, {http_requests.load(), http_errors.load()}, {alias, slots, ec.max_ctx}),
+                      "text/plain; version=0.0.4; charset=utf-8");
+    });
     http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
       res.set_content(models_json(alias, ec.max_ctx, slots), "application/json");
     });
     http.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+      ++http_requests;
+      const auto fail = [&](const serve::ApiError& e) {
+        ++http_errors;
+        reply_error(res, e);
+      };
       serve::ChatRequest cr;
       try {
         json::Value body;
@@ -841,7 +853,7 @@ static int qwen_server_main(int argc, char** argv) {
         }
         cr = serve::parse_chat(body, tok, defaults);
       } catch (const serve::ApiError& e) {
-        return reply_error(res, e);
+        return fail(e);
       }
       auto r = std::make_shared<serve::Request>();
       r->prompt = std::move(cr.prompt);
@@ -857,7 +869,7 @@ static int qwen_server_main(int argc, char** argv) {
       try {
         sched.submit(r);
       } catch (const std::invalid_argument&) {
-        return reply_error(res, serve::context_exceeded(int64_t(r->prompt.size()), std::min(ec.max_ctx, sched.pool_positions())));
+        return fail(serve::context_exceeded(int64_t(r->prompt.size()), std::min(ec.max_ctx, sched.pool_positions())));
       }
       auto out = std::make_shared<serve::ChatResponse>(r->tag, cr.model.empty() ? alias : cr.model, now_s());
       if (!cr.stream) {
@@ -869,7 +881,7 @@ static int qwen_server_main(int argc, char** argv) {
             out->add(e);
           } while (!e.done);
         } catch (const serve::ApiError& err) {
-          return reply_error(res, err);
+          return fail(err);
         }
         return res.set_content(out->body(), "application/json");
       }

@@ -142,7 +142,7 @@ an exact CPU emulation of the quantized arithmetic (`eklow-attn-test`, `eklow-gd
 ## Features
 
 - **OpenAI-compatible server** (`eklow-server`):
-  - endpoints: `/v1/chat/completions` (streamed or whole), `/v1/models`, `/health`; with an embedding model,
+  - endpoints: `/v1/chat/completions` (streamed or whole), `/v1/models`, `/health`, `/metrics` (Prometheus text, for llmtop); with an embedding model,
     `/v1/embeddings`, `/v1/models` and `/health` on a port of its own;
   - request features: SSE streaming, `reasoning_content` (thinking on unless `reasoning_effort` is `none`), tool calls
     and `tool_choice`, stop strings, seeds, temperature / top-k / top-p / min-p and penalties, usage with
