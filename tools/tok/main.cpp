@@ -1,5 +1,5 @@
 // eklow-tok: eklow's tokenizers from the command line, for comparison against Hugging Face's. The GGUF decides which:
-// a Qwen3.6 tokenizer (gpt2 model, qwen35 pre-tokenizer) or Gemma 4's.
+// a Qwen3.6 tokenizer (gpt2 model, qwen35 pre-tokenizer) or the Gemma tokenizer (EmbeddingGemma 2's).
 //
 //   eklow-tok GGUF encode [--no-special] < STRINGS > IDS   STRINGS: NUL-separated; IDS: one line per
 //                                                          string, ids separated by spaces

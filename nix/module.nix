@@ -6,8 +6,8 @@
 }:
 
 # Each instance is a chat model served by the one eklow-server, as its own unit eklow-<name>.service: the server reads
-# the model's architecture (Qwen3.6-35B-A3B and its finetunes, llama.cpp's qwen35moe; Gemma 4 26B A4B, gemma4) and runs
-# that model's engine. The instances share the card and the embedding port, so at most one runs: each conflicts with
+# the model's architecture (Qwen3.6-35B-A3B and its finetunes, llama.cpp's qwen35moe; anything else is refused) and
+# runs its engine. The instances share the card and the embedding port, so at most one runs: each conflicts with
 # the others, and starting one stops the one running (systemctl start, or a mode switch such as the house's llm-mode).
 let
   cfg = config.services.eklow;
@@ -24,8 +24,8 @@ let
           example = lib.literalExpression "/models/stock-EKK8.gguf";
           description = ''
             The chat model's GGUF, in the formats the engines run: Qwen3.6-35B-A3B or a finetune of it (Q4_K or Q4_0
-            experts, Q8_0 dense matrices, a Q6_K head; stock Qwen3.6 and Ornith-1.5 are the two served and measured), or
-            Gemma 4 26B A4B (Google's QAT Q4_0).
+            experts, Q8_0 dense matrices, a Q6_K head; stock Qwen3.6, Ornith-1.5 and Sage-A1.5 are served and
+            measured).
           '';
         };
 
@@ -51,8 +51,8 @@ let
           example = lib.literalExpression ''"''${config.services.eklow.package}/share/eklow/ornith-1.5-experts.json"'';
           description = ''
             The routing profile of the model (which experts of each layer are busiest): the package's share/eklow has
-            stock Qwen3.6's (qwen36-experts.json), Ornith-1.5's (ornith-1.5-experts.json) and Gemma 4 26B A4B's
-            (gemma-4-26b-a4b-experts.json). The experts that fit the card stay on it, the rest are computed on the CPU from
+            stock Qwen3.6's (qwen36-experts.json) and Ornith-1.5's (ornith-1.5-experts.json). The experts that fit the card stay
+            on it, the rest are computed on the CPU from
             pinned memory. null: every expert on the card, which no MoE served here fits at long contexts.
           '';
         };
@@ -66,7 +66,7 @@ let
         contextSize = lib.mkOption {
           type = lib.types.ints.positive;
           default = 262144;
-          description = "Context of each slot, in tokens; the full window of both Qwen3.6 and Gemma 4 by default.";
+          description = "Context of each slot, in tokens; Qwen3.6's full window by default.";
         };
 
         kvInt8 = lib.mkOption {
@@ -89,7 +89,7 @@ let
             }
           '';
           description = ''
-            The chat model's vision projector (llama.cpp's mmproj GGUF: Qwen3.6's tower, or Gemma 4 26B A4B's gemma4v),
+            The chat model's vision projector (llama.cpp's mmproj GGUF: Qwen3.6's tower),
             for image_url parts in /v1/chat/completions; null refuses them. The encoder's weights and scratch come out of
             the experts' share of the card.
           '';
@@ -222,7 +222,7 @@ in
       ];
 
   options.services.eklow = {
-    enable = lib.mkEnableOption "eklow, Qwen3.6-35B-A3B finetunes (with DFlash 2 speculative decoding) or Gemma 4 26B A4B, and EmbeddingGemma 2, on an Intel Arc A770M behind an OpenAI-compatible API";
+    enable = lib.mkEnableOption "eklow, Qwen3.6-35B-A3B finetunes (with DFlash 2 speculative decoding), and EmbeddingGemma 2, on an Intel Arc A770M behind an OpenAI-compatible API";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -240,12 +240,6 @@ in
             model = /models/Ornith-1.5-35B-A3B-Q4_K-Q8_0.gguf;
             alias = "ornith-1.5-35b-a3b";
             expertProfile = "''${config.services.eklow.package}/share/eklow/ornith-1.5-experts.json";
-          };
-          gemma = {
-            model = /models/gemma-4-26B_q4_0-it.gguf;
-            alias = "gemma-4-26b-a4b";
-            port = 8083;
-            expertProfile = "''${config.services.eklow.package}/share/eklow/gemma-4-26b-a4b-experts.json";
           };
         }
       '';
@@ -294,8 +288,8 @@ in
       type = lib.types.ints.between 70 1120;
       default = 280;
       description = ''
-        Rows an image becomes at most in EmbeddingGemma 2's input and in Gemma 4's chat (Google's default is 280, the
-        projectors' maximum 1120). Qwen3.6's encoder has its own budget (`--image-max-tokens`).
+        Rows an image becomes at most in EmbeddingGemma 2's input (Google's default is 280, the projector's maximum
+        1120). Qwen3.6's encoder has its own budget (`--image-max-tokens`).
       '';
     };
 

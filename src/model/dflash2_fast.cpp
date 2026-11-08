@@ -28,7 +28,7 @@ double now_ms() {
 OwnedTarget::OwnedTarget(sycl::queue& q, const gguf::File& target) : q_(q) {
   const gguf::Tensor* emb = target.tensor("token_embd.weight");
   const gguf::Tensor* out = target.tensor("output.weight");
-  if (!out) out = emb;  // a tied head (Gemma 4): the embedding table is the head
+  if (!out) out = emb;  // a tied head: the embedding table is the head
   if (!emb || !out) throw std::runtime_error(target.path() + ": needs token_embd.weight (and output.weight, unless the head is tied)");
   auto put = [&](const gguf::Tensor& t) {
     auto* d = sycl::malloc_device<uint8_t>(t.nbytes, q);

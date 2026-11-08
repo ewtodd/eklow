@@ -5,7 +5,7 @@
 //   eklow-dflash-test fast    ... same inputs: the serving forward against the reference forward
 //   eklow-dflash-test time    --draft GGUF --target GGUF: timings on the card
 //   eklow-dflash-test plain   --draft Q8_0.gguf --target GGUF --feats F.f32 --anchors a,b,.. --ctx N [--block B] [--window W] [--full-context N] [--no-int8]
-//       a plain DFlash draft (Gemma's) on fixed features: the serving forward against the reference (tools/dflash_test/ref_torch_plain.py makes the inputs)
+//       a plain DFlash draft (z-lab's kind; the one built for was Gemma 4 26B A4B's, since removed) on fixed features: the serving forward against the reference (tools/dflash_test/ref_torch_plain.py makes the inputs)
 //   eklow-dflash-test dump    --draft GGUF --target GGUF [--ctx N] [--block B] [--window W]: hashes of the serving forward's lattices on fixed random features
 // The inputs are what ref_torch.py read: ORACLE_DIR holds eklow-oracle's l_out-N.f32 for the draft's target layers.
 #include <algorithm>
@@ -305,7 +305,7 @@ int cmd_fast(const Args& a) {
   return 0;
 }
 
-// A plain DFlash draft (Gemma's) on fixed features and anchors (ref_torch_plain.py writes the feature file and compares
+// A plain DFlash draft (z-lab's kind; the one built for was Gemma 4 26B A4B's, since removed) on fixed features and anchors (ref_torch_plain.py writes the feature file and compares
 // the reference forward with model.py; eklow-dflash-host runs that reference without a card): blocks at positions
 // ctx, ctx + 3, ... after injecting the features of the rows before them, drafted by the serving forward (the draft's Q8_0
 // file) and by the exact fp32 reference (--emulate-free) and the reference with the serving activations' rounding. Prints

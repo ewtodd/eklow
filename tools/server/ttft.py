@@ -4,7 +4,7 @@
 import json, sys, time, urllib.request
 
 url, sysfile = sys.argv[1], sys.argv[2]
-model = sys.argv[3] if len(sys.argv) > 3 else "gemma-4-12b"
+model = sys.argv[3] if len(sys.argv) > 3 else "qwen3.6-35b-a3b"
 system = open(sysfile).read()
 users = [
     "In one sentence, what is eklow?",

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# How skewed is Gemma 4 26B A4B's expert routing, layer by layer?
+# How skewed is a model's expert routing, layer by layer?
 #
 # Reads routing.bin files written by `eklow-ref-run --routing` (raw int32 little-endian expert ids,
 # layer-major: layer, token, `used` ids per token, with a sidecar .json {"layers", "tokens",

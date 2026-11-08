@@ -1,4 +1,4 @@
-// eklow-vision: Gemma 4's vision encoder (model/vision_gemma4v.hpp) on one image, for checking
+// eklow-vision: the Gemma vision tower (model/vision_gemma4v.hpp; EmbeddingGemma 2's image input) on one image, for checking
 // against the oracle's image_0.f32 (the rows llama.cpp feeds the text model).
 //
 //   eklow-vision --mmproj GGUF --image FILE [--tokens N] [--out ROWS.f32] [--taps DIR [--tap-prefix P,...]]

@@ -20,7 +20,7 @@ constexpr int kATileBytes = 256;  // activation tile: 8 rows x 32 K bytes
 // Tiles of one 8-column group run contiguously along K, so a decode thread's consecutive blocks are adjacent.
 inline int64_t tile_at(int64_t b, int64_t g, int64_t kb) { return g * kb + b; }
 
-// The GLU of one gate and up value: gelu_tanh(gate) * up (Gemma), or silu(gate) * up (Qwen).
+// The GLU of one gate and up value: gelu_tanh(gate) * up (GeGLU), or silu(gate) * up (SwiGLU, Qwen).
 inline float glu_value(float g, float u, bool silu) {
   if (silu) return g / (1.0f + sycl::exp(-g)) * u;
   return 0.5f * g * (1.0f + sycl::tanh(0.7978845608028654f * (g + 0.044715f * g * g * g))) * u;

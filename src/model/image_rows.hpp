@@ -1,5 +1,5 @@
 // Input rows given as embeddings instead of token ids: an image's rows from the vision encoder, which stand in for
-// the text model's embedding of a token (llama.cpp feeds them unscaled, where Gemma's token embedding is multiplied by
+// the text model's embedding of a token (llama.cpp feeds them unscaled, where a Gemma-family token embedding is multiplied by
 // sqrt(n_embd); Qwen's is not scaled). A span of a chunk or an embedding input.
 #pragma once
 

@@ -5,7 +5,7 @@
 #
 # Environment: ORACLE (eklow-oracle), TEXT_MODEL (any GGUF with n_embd 2048: the oracle loads it only for mtmd),
 # MMPROJ_F32 (the oracle's projector: F32 weights, so that ggml's bf16 activation rounding is out of the comparison, as
-# for Gemma's, DECISIONS 2026-10-27), MMPROJ (eklow's: the BF16 file), TOKENS (token budgets, default "64 256 1024"),
+# for the Gemma tower's, DECISIONS 2026-10-27), MMPROJ (eklow's: the BF16 file), TOKENS (token budgets, default "64 256 1024"),
 # REF_MAX (largest budget the reference path runs, it is serial: default 256), PARTS ("ref fast", what to check).
 # Prints, per budget and image, the oracle's token grid against eklow's and the rows' agreement (cosine min / mean,
 # relative L2 worst row / total, from tools/ref/compare_rows.cpp, built next to this script's output).

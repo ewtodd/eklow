@@ -138,7 +138,7 @@ Dflash2Weights Dflash2Weights::upload(const gguf::File& f, const gguf::File& tar
   w.hidden_norm = vec("enc.output_norm.weight", E);
   w.out_norm = vec("output_norm.weight", E);
   w.tok_embd = matrix(target, "token_embd.weight", E, c.n_vocab);
-  // a target that ties its head to the embedding (Gemma) has no output.weight
+  // a target that ties its head to the embedding has no output.weight
   w.head = matrix(target, target.tensor("output.weight") ? "output.weight" : "token_embd.weight", E, c.n_vocab);
   for (int l = 0; l < c.n_layer; ++l) {
     const std::string b = "blk." + std::to_string(l) + ".";

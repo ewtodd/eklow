@@ -1,7 +1,7 @@
 // eklow-dflash-host: the DFlash draft's reference forward (Dflash2Ref) on SYCL's host device, no card needed, on fixed
 // random features and tokens: the lattice and the final hidden rows of a few blocks, written to a file and hashed. The
 // same inputs before and after a change to src/model/dflash2.* must give the same bytes for a DFlash 2 draft (Qwen's path
-// stays bit-identical); with a plain DFlash draft (Gemma's) it is the run whose output tools/dflash_test/ref_torch_plain.py
+// stays bit-identical); with a plain DFlash draft (z-lab's kind, as Gemma 4 26B A4B's was) it is the run whose output tools/dflash_test/ref_torch_plain.py
 // is compared against (host_compare.py).
 //
 //   eklow-dflash-host DRAFT.gguf TARGET.gguf OUT.bin [--ctx N] [--B B] [--window W] [--seed S] [--blocks K] [--feat-scale F] [--feats FILE] [--anchors a,b,...]

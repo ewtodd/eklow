@@ -25,7 +25,7 @@
 
 namespace eklow::xmx {
 
-// The weight formats. Q4_0 is the Gemma models' (every path takes it); Q8_0 and F16 (from F16, BF16 or F32 files)
+// The weight formats. Q4_0 (every path takes it); Q8_0 and F16 (from F16, BF16 or F32 files)
 // only the fp16 GEMM, for EmbeddingGemma 2 and the vision encoders. Tiles of 8 columns x 32 K in the same
 // [N/8][K/32] order: Q8_0 256 bytes of int8 laid out as the fp16 B operand (each 16-K half, element (k, n) at
 // (k/2)*16 + n*2 + k%2) with an fp16 scale per column; F16 512 bytes, the B operand itself, no scales.
@@ -122,8 +122,8 @@ void set_rows(Activations& a, int64_t m, int64_t k, bool fp16 = false);
 // queue must be in order); the caller waits.
 void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out);
 
-// The activation of the fused GLU kernels: Gemma's GeGLU (gelu_tanh(gate) * up) or Qwen's SwiGLU (silu(gate) * up).
-// The kernels named geglu serve both; the default is Gemma's, so existing callers are unchanged.
+// The activation of the fused GLU kernels: the GeGLU (gelu_tanh(gate) * up) or Qwen's SwiGLU (silu(gate) * up).
+// The kernels named geglu serve both; the default is GeGLU, so existing callers are unchanged.
 enum class Glu : uint8_t { Gelu, Silu };
 
 // GeGLU: gelu_tanh(gate) * up for w a gate|up matrix repacked with interleave, into `out` (n/2

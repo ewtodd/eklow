@@ -12,7 +12,7 @@
 namespace eklow::serve {
 
 struct SamplingParams {
-  // Gemma 4's model card.
+  // The fallback when neither the GGUF (general.sampling.*, which every Qwen file eklow serves sets) nor the request does.
   float temperature = 1.0f;
   int32_t top_k = 64;  // 0: no limit
   float top_p = 0.95f;

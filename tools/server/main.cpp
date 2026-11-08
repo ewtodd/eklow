@@ -1,10 +1,8 @@
 // eklow-server: Qwen3.6-35B-A3B (stock or a finetune such as Ornith) with DFlash 2 speculative decoding on the A770M,
-// behind an OpenAI-compatible HTTP API; or Gemma 4 26B A4B (no draft) behind the same one.
+// behind an OpenAI-compatible HTTP API.
 //
-// One binary, two servers: main() reads the GGUF's general.architecture (before anything else is parsed) and runs
-// qwen35moe's server (qwen_server_main, below: this file, unchanged in flags and log) or gemma4's (gemma4_server_main,
-// tools/server/gemma4_main.cpp, which has its own flags: the Qwen-only ones, --draft among them, it refuses by name).
-// Any other architecture is an error naming both. Everything below up to main() is the Qwen server.
+// main() reads the GGUF's general.architecture first (before anything else is parsed) and runs the server (qwen_server_main,
+// below) for qwen35moe; any other architecture is refused with a message naming Qwen3.6 and its finetunes.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] [--kv-pool N]
 //                [--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
@@ -95,8 +93,6 @@
 #include "text/chat_qwen36.hpp"
 #include "text/tokenizer.hpp"
 #include "text/tokenizer_qwen.hpp"
-
-#include "gemma4_main.hpp"
 
 using namespace eklow;
 
@@ -943,8 +939,7 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (arch == "qwen35moe") return qwen_server_main(argc, argv);
-  if (arch == "gemma4") return gemma4_server_main(argc, argv);
-  std::fprintf(stderr, "eklow-server: %s: architecture %s; eklow serves qwen35moe (Qwen3.6-35B-A3B and its finetunes) and gemma4 (Gemma 4 26B A4B)\n",
+  std::fprintf(stderr, "eklow-server: %s: architecture %s; eklow serves qwen35moe (Qwen3.6-35B-A3B and its finetunes) only\n",
                model_path.c_str(), arch.c_str());
   return 1;
 }

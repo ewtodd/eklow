@@ -2337,3 +2337,53 @@ on fiona; the owner had the card free):
 - `serve_test.py basic` at that shape: every check ok with stock Qwen3.6 EKK8. Sage fails six checks with the pool and without
   (the same six with verification on and off). They come from Sage's longer thinking under the test's greedy decoding and tight caps
   (700 tokens on "why is the sky blue, in one sentence"; repeated get_weather calls up to the 1,500-token cap), not from the server.
+
+## 2026-11-07 — Gemma 4 out of eklow again: Qwen3.6 and its finetunes only
+
+The owner: "we can remove gemma entirely from here. just qwen 3.6 and finetunes for now." Gemma 4 26B A4B had come back
+beside Qwen on 2026-11-03 (`d9ffaf0`, the restore) and gained its speculative path the same day (`9775e98`); fiona now
+serves only Sage-A1.5, a Qwen3.6 finetune, and /etc/nixos keeps one instance (`ornith`) with the instances pattern. No
+fault in the 26B was found. `d9ffaf0` and `9775e98` hold its last state; the entries of 2026-11-03 ("Gemma 4 26B A4B
+back beside Qwen3.6", "z-lab's draft on the card") and `docs/bench/**` stay as they were.
+
+What went (branch `cleanup/gemma-out`; the first removal, `f15d04b`, `80fd39b`, `d8006ec` of 2026-10-31/11-01, was the
+model): everything that existed only to run Gemma 4 as the chat model. The engine (`engine_gemma4.*`), its reference
+forward (`model/gemma4.*`), the fast kernels (`gemma_fast.*`), the request layer, scheduler and tool-call grammar
+(`*_gemma4`), the chat template and output parser (`chat_gemma4`, `output_parser_gemma4`), the Gemma server
+(`tools/server/gemma4_main.*`), the tools (`eklow-engine-run-gemma4`, `-engine-bench-gemma4`, `-grammar-test-gemma4`,
+`-chat-gemma4`, `-parse-gemma4`, `-prompt-gemma4`) and their reference comparers (`tools/ref/gemma4_{chat,parse}_compare.py`),
+the 26B's routing profile, the `dflash-gemma-*` bench scripts and the gemma mode of `make-draft.sh`. Two tools that read
+only a Gemma 4 chat GGUF went too: `eklow-kernel-test` (the Q4_0 matmul and grouped-GEMV checks on the 12B's and 26B's
+tensors; the same kernels run in the Qwen engine and are checked by `eklow-qfmt-test`, `eklow-attn-test`,
+`eklow-gdn-test` and `checkq`) and `eklow-cpu-gemv-test` (the Q4_0 CPU GEMV on the 26B's layer 0; `eklow-cpu-qgemv-test`
+covers the CPU GEMVs of Qwen's formats). `serve_test.py` lost its Gemma family detection; `image_test.py`, `ttft.py` and
+`embed_contend.py` their Gemma names. In the NixOS module the `gemma` instance example and every description naming
+Gemma 4 or the 26B are gone (the named instances, `autoStart` and the conflicts stay); `flake.nix`'s description says
+Qwen3.6. The README is Qwen-only again (with Sage, the shared K/V pool, the keep-alive and the verification switch);
+STATUS.md has a line where Gemma's section was.
+
+`eklow-server` still reads `general.architecture` before anything else: `qwen35moe` runs the Qwen server (flags and log
+unchanged); anything else is refused, before a device is opened, with a message that names Qwen3.6 and its finetunes.
+
+What stays, and why:
+- EmbeddingGemma 2: `model/embed_gemma2.*`, the Gemma tokenizer in `text/tokenizer.*`, the gemma4v vision tower and
+  `image/gemma4_image.*` that its mmproj uses, `--embed-model`, `--embed-mmproj`, `--image-tokens`. fiona's RAG
+  embeddings depend on it.
+- Generic code that a Gemma model motivated and that the Qwen engine, the draft or the embeddings still call: the Q4_0
+  and fp16-GEMM formats and the GeGLU kernels in `xmx`, `cpu/q4_gemv` (under `cpu/qgemv`), and the plain DFlash draft
+  path (`model/dflash2*`, `kernels/attention.cpp`, `kernels/ref.cpp`: per-layer sliding/full attention, a tied head, the
+  embedding scale, the softcap) with its tests in `tools/dflash_test`. z-lab also publishes plain DFlash drafts for
+  Qwen3.6, and the owner wants the sliding-window draft kept. Their comments no longer say "Gemma's"; their code is
+  unchanged. The plain-draft tests' `--draft` modes still name z-lab's Gemma draft, so they need such a file fetched.
+- `SamplingParams`' defaults (temperature 1, top-k 64, top-p 0.95, from Gemma 4's card) are only the fallback: every
+  Qwen file eklow serves sets `general.sampling.*` (top-k 20), which the server reads first.
+
+Checks (host only, e-workstation): the tree and `nix build path:.` build with the same 16 warnings as `main`; the package
+has no `-gemma4` tools and only the Qwen profiles; the module evaluates with named instances. `eklow-grammar-test-qwen`
+(2,000/2,000 walks, 828/828 bans on stock, Ornith and Ornith's jinja vocabularies), `eklow-spec-test`,
+`eklow-kvpool-test`, `eklow-keepalive-test` and `eklow-verification-test` (20/20 on each vocabulary) pass;
+`qwen_chat_compare` (stock, Ornith: 8,317 cases, 0 differences), `qwen_tok_compare` (0), `qwen_parse_compare`
+(310/310), `qwen_grammar_compare` (75/75, 20,000/20,000 mutated calls refused) and the Gemma tokenizer's `tok_compare`
+(0) as before; the draft's host build gives the same output hashes as `main`'s. A Gemma 4 GGUF is refused with rc 1; a
+Qwen vocabulary GGUF gets as far as on `main` (no card on this host). Nothing ran on the card: the Qwen server's code is
+unchanged.

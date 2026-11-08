@@ -1,4 +1,4 @@
-// Gemma 4's tokenizer, built from the GGUF and following Hugging Face's tokenizer.json for it:
+// The Gemma tokenizer (tokenizer.ggml.model gemma4: EmbeddingGemma 2's), built from the GGUF and following Hugging Face's tokenizer.json for it:
 //   1. the 24 added tokens (GGUF types control and user-defined: <bos>, <|turn>, <|"|>, ...) are
 //      split out first, longest match first, when special tokens are parsed;
 //   2. the rest is normalized by replacing every space with U+2581 ("▁"); the pre-tokenizer splits
@@ -25,7 +25,7 @@ namespace eklow::text {
 
 class Tokenizer {
  public:
-  // Throws std::runtime_error when the file has no Gemma 4 tokenizer.
+  // Throws std::runtime_error when the file has no Gemma tokenizer.
   static Tokenizer from_gguf(const gguf::File& f);
 
   std::vector<int32_t> encode(std::string_view text, bool parse_special = true) const;

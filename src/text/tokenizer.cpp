@@ -47,7 +47,7 @@ uint64_t pair_key(int32_t a, int32_t b) { return uint64_t(uint32_t(a)) << 32 | u
 
 Tokenizer Tokenizer::from_gguf(const gguf::File& f) {
   if (auto* m = f.find("tokenizer.ggml.model"); !m || m->as_string() != "gemma4")
-    throw std::runtime_error(f.path() + ": not a Gemma 4 tokenizer");
+    throw std::runtime_error(f.path() + ": not a Gemma tokenizer");
   Tokenizer t;
   const auto& toks = f.at("tokenizer.ggml.tokens").as_array();
   const auto& types = f.at("tokenizer.ggml.token_type").as_array();

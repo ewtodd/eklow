@@ -15,18 +15,12 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   layers, 256 routed experts of 512 + one shared, 8 used) with **DFlash 2** speculative decoding and **image input**
   (Qwen3-VL's encoder behind `--mmproj`). Two targets so far, same architecture: stock
   `Qwen/Qwen3.6-35B-A3B` and `ornith-ai/Ornith-1.5-35B-A3B`. `qwen/main` went into `main` on 2026-11-02.
-- **Gemma 4 26B A4B is back beside it** (DECISIONS 2026-11-03, "Gemma 4 26B A4B back beside Qwen3.6"): its engine,
-  scheduler and request layer restored from `76d8588` under `*_gemma4` names; one `eklow-server` runs whichever model
-  the GGUF's architecture names. The NixOS module serves named instances (`eklow-<name>.service`, conflicting); on
-  fiona `llm-mode ornith|gemma` switches them; fiona serves the 26B in `llm-mode gemma` since 2026-11-03 14:51 (eklow
-  95d2912). The 12B is not served.
-- **Speculative decoding for the 26B works and was dropped** (DECISIONS 2026-11-03, "z-lab's draft on the card"): the
-  engine's verify blocks and capture, the server's draft path (`--draft`) and plain DFlash drafts in the draft code are on
-  `main`, off without `--draft`. z-lab's draft accepts what llama.cpp's does (3.26 / 3.14 / 2.90 at blocks of 4) and is
-  lossless (p = 0.787), but its card memory takes the 26B from 42 to 27 experts a layer: decode a wash on prose, prefill
-  -40%. The owner: a sliding-window draft of our own (every layer sliding, small, blocks of 4) is the way, perhaps trained
-  on the 4090.
-- **One K/V pool for the slots** (branch `serve/kv-pool`, DECISIONS 2026-11-07; card-tested on fiona, not merged): `--kv-pool N`
+- **Gemma 4 was removed from eklow on 2026-11-07** (the owner: Qwen3.6 and its finetunes only, for now; DECISIONS 2026-11-07):
+  `eklow-server` refuses any GGUF whose architecture is not `qwen35moe`. EmbeddingGemma 2 (and its vision tower) stays. The
+  last state of the 26B's engine, server, draft path and tools is `d9ffaf0` (the restore beside Qwen) and `9775e98` (its
+  speculative path; z-lab's draft measured and dropped). The plain-DFlash draft code (per-layer sliding/full attention, tied
+  head, softcap) stays, with its tests in `tools/dflash_test`.
+- **One K/V pool for the slots** (`serve/kv-pool`, merged into `main`; DECISIONS 2026-11-07): `--kv-pool N`
   positions for all slots together (default 0 = slots x ctx, unchanged). At `--slots 2 --ctx 262144 --kv-pool 262144` the K/V
   and state take 3.03 GiB instead of 5.84 and the card keeps 91 experts a layer instead of 48: decode with the draft +22% at
   8k, +11% at 32k, GSM8K +19% (measured, Sage-A1.5 EKK8). An idle slot gives pages back and re-prefills later; a request
@@ -79,13 +73,13 @@ engine", plus the attention segments): prefill 1,180 / 1,032 / 539 tok/s at 8k /
 Server (`serve_perf.py`, stock EKK8 with Inco's draft at block 4, 52 experts a layer; measured before the attention
 segments were merged, so prefill at depth is now higher; DECISIONS 2026-11-01, "eklow-server on Qwen3.6"):
 
-| | Qwen3.6 | the 26B in production (2026-10-27) |
-|---|---|---|
-| prefill at 8k / 32k / 128k / 252k (time to first token) | 1,001 / 977 / 602 / 392 tok/s | 1,865 / 1,794 / 1,177 / 765 |
-| decode at 8k / 32k / 128k / 252k, with the draft | 44.1 / 40.5 / 33.1 / 24.3 tok/s | 36.6 / 34.0 / 30.5 / 26.5 |
-| decode without the draft | 33.9 / 31.5 / 28.1 / 23.6 tok/s | |
-| GSM8K one / two at a time (with the draft) | 53.5 / 62.8 tok/s aggregate | 33.4 / 40.2 |
-| next turn of a 10k-token conversation | 0.26-0.61 s | 0.2-0.7 s |
+| | Qwen3.6 |
+|---|---|
+| prefill at 8k / 32k / 128k / 252k (time to first token) | 1,001 / 977 / 602 / 392 tok/s |
+| decode at 8k / 32k / 128k / 252k, with the draft | 44.1 / 40.5 / 33.1 / 24.3 tok/s |
+| decode without the draft | 33.9 / 31.5 / 28.1 / 23.6 tok/s |
+| GSM8K one / two at a time (with the draft) | 53.5 / 62.8 tok/s aggregate |
+| next turn of a 10k-token conversation | 0.26-0.61 s |
 
 Fidelity: the engine within the fp32 reference's band on every path (`checkq`: stock EKK8 242-248 of 256 top-1 on the
 2,573-token prompt, chat 27/27); DFlash 2 lossless through the server (3,000 sampled completions with and without the
@@ -147,5 +141,5 @@ draft, chi-square p = 0.985); acceptance at block 8 5.75 / 5.43 / 5.02 on GSM8K 
 
 ## History
 
-Milestones 1-6 (foundation, the 12B's correct forward, serving, speed, the 26B A4B in production 2026-10-27) are in
+Milestones 1-6 (foundation, the 12B's correct forward, serving, speed, the 26B A4B in production 2026-10-27; Gemma 4 is out of the tree since 2026-11-07) are in
 DECISIONS.md from 2026-10-24 to 2026-10-27, with every measurement; the Qwen3.6 port from 2026-10-31.
