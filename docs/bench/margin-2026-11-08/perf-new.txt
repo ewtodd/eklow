@@ -1,0 +1,22 @@
+server pid 59254
+eklow-server: vision encoder warmed with a 1024-row image in 0.4 s
+eklow-server: vision encoder /nix/store/b23r16sm3j0pq7lr0lyyva2gw2swkkl6-mmproj-Ornith-1.5-35B-A3B-bf16.gguf, up to 1024 rows an image, 283 MiB on the card while encoding
+eklow-server: vision projector warmed with a 1120-row image in 0.5 s
+eklow-server: vision projector /nix/store/ns0n6xhg02xrc8q5dqv6ck25yavlvm4v-mmproj-embeddinggemma-2-Q8_0.gguf, 269 MiB on the card for 1120-row images
+eklow-server: experts on the card: N = 96 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 7.75 GiB, margin 0.25 GiB, free after 1.15 GiB)
+eklow-server: DFlash 2 draft /nix/store/pfrc3qzdjv0jlsfpcky5mrz55qlfffkg-Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf: blocks of 4 (trained for 8), window 2048, 780 MiB on the card (its token table stays on the host); free card memory now 0.31 GiB
+== ready 21:10:57
+== perfplain 21:11:12
+plain request | prompt 32707 (32692 cached), completion 256 | ttft 0.15 s, decode 38.6 tok/s
+plain request | prompt 32709 (32692 cached), completion 256 | ttft 0.16 s, decode 38.0 tok/s
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 5    tokens/verify
+8k         1840 (4.4 s)        55.1              2.72        plain 40.3
+32k         2011 (16.3 s)        50.0              2.73        plain 38.1
+== end 21:13:29
+== done 21:13:37
+stage                      start MiB  peak MiB   grew  since ready
+ready                          15953     15953      0            0
+perfplain                      15953     16053    100          100
+end                            16053     16053      0          100
+ready 15953 MiB, final peak 16053 MiB, residual growth 100 MiB

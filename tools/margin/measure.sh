@@ -13,11 +13,11 @@ for u in eklow-sage eklow-ornith; do systemctl is-active --quiet $u && { echo "$
 mkdir -p $B; : > $B/marks.txt; : > $B/vram.txt
 mark() { echo "$(date +%s) $*" >> $B/marks.txt; echo "== $* $(date +%T)"; }
 PRE=(); [ -n "${PRELOAD:-}" ] && PRE=(env EKLOW_ZETRACE=$B/ze.txt LD_PRELOAD=$PRELOAD)
-SERVER=${SERVER:-./build/eklow-server}; ALIAS=${ALIAS:-sage-a1.5}
+SERVER=${SERVER:-./build/eklow-server}; ALIAS=${ALIAS:-sage-a1.5}; VERIF=${VERIF---verification on}  # VERIF= (empty) for a model without the sage template
 setsid flock ~/eklow-perf/gpu.lock timeout 7200 nix develop path:. -c "${PRE[@]}" $SERVER \
   --model ${MODEL:-$S/hs1g9p0q2gpk8bwizkmv6mwrpr4asrjc-Sage-A1.5-Q4_K-Q8_0.gguf} --alias $ALIAS --host 127.0.0.1 --port 8095 --slots 2 --ctx 262144 --kv-int8 \
   --expert-profile data/qwen36-experts.json --snapshot-mib 4096 --draft $S/pfrc3qzdjv0jlsfpcky5mrz55qlfffkg-Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf --group 8 --group-busy 4096 \
-  --kv-pool 262144 --verification on --mmproj $S/b23r16sm3j0pq7lr0lyyva2gw2swkkl6-mmproj-Ornith-1.5-35B-A3B-bf16.gguf \
+  --kv-pool 262144 $VERIF --mmproj $S/b23r16sm3j0pq7lr0lyyva2gw2swkkl6-mmproj-Ornith-1.5-35B-A3B-bf16.gguf \
   --embed-model $S/rxga3ywxisxmvmblmaqd9i40cr472wfr-embeddinggemma-2-Q8_0.gguf --embed-port 8096 --embed-alias embeddinggemma-2 \
   --embed-mmproj $S/ns0n6xhg02xrc8q5dqv6ck25yavlvm4v-mmproj-embeddinggemma-2-Q8_0.gguf --image-tokens 280 "$@" > $B/server.log 2>&1 < /dev/null &
 SRV=$!

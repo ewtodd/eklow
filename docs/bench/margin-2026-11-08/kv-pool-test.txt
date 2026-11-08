@@ -1,0 +1,29 @@
+eklow-server: experts on the card: N = 136 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 10.39 GiB, margin 0.25 GiB, free after 1.15 GiB)
+filler line: 25.8 tokens
+trim: 6 s  A1: 5555+11 tok stop cached 0  B: 4511+24 tok length cached 0  A2: 5555+24 tok length cached 5535
+exhaust: 51 s  C: 2929+2600 tok length cached 0  D: 2929+2600 tok length cached 0
+wait: 16 s  F: 5689+24 tok length cached 0  E: 3442+1000 tok length cached 0
+kv_pool_test ref exit 0
+ref card MiB: first 15953, max 16053
+eklow-server: experts on the card: N = 138 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 10.48 GiB, margin 0.25 GiB, free after 1.11 GiB)
+filler line: 25.8 tokens
+trim: 7 s  A1: 5555+11 tok stop cached 0  B: 4511+24 tok length cached 0  A2: 5555+24 tok length cached 1490
+exhaust: 42 s  C: 2929+2600 tok length cached 0  D: 2929+1165 tok length cached 0
+wait: 16 s  E: 3442+1000 tok length cached 0  F: 5689+24 tok length cached 0
+ok   trim A1: the text is the default pool's  (differ after 31 characters)
+ok   trim B: the text is the default pool's  (differ after 85 characters)
+ok   trim A2: the text is the default pool's  (differ after 67 characters)
+ok   trim A2: the cut kept the system prompt (~1,500) and re-prefilled the rest  (cached 1490 of 5555)
+ok   exhaust: the pair outgrew the pool (the model wrote enough: the test is meaningful)  ({'C': 2600, 'D': 1165})
+ok   exhaust: at most one sequence ended early, at least one finished  (ended ['D'], finished ['C'])
+ok   exhaust C: the survivor's text is the default pool's  (differ after 2600 characters)
+ok   exhaust D: what it wrote before ending is a prefix of the default pool's  (differ after 1165 of 1165 characters)
+ok   wait: F's text is the default pool's  (differ after 85 characters)
+ok   wait: E (running when F arrived) is unchanged  (differ after 1000 characters)
+wait: F took 8.5 s here, 3.2 s at the default pool (longer here: it waited for E)
+ok   log: a line with 'kv pool: slot'
+ok   log: a line with 'waits for pages'
+ok   log: a line with 'ends at'
+all ok
+kv_pool_test pool exit 0
+pool card MiB: first 15998, max 16098

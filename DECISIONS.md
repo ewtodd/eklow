@@ -2387,3 +2387,113 @@ has no `-gemma4` tools and only the Qwen profiles; the module evaluates with nam
 (0) as before; the draft's host build gives the same output hashes as `main`'s. A Gemma 4 GGUF is refused with rc 1; a
 Qwen vocabulary GGUF gets as far as on `main` (no card on this host). Nothing ran on the card: the Qwen server's code is
 unchanged.
+
+## 2026-11-08 — allocate up front: the card margin from 1 GiB to 256 MiB
+
+**Why.** The routed experts that do not fit on the card run on the CPU from DDR4, the slow part of decode, so a MiB the card does
+not need is a MiB of experts. `load_experts()` places experts until the driver's free memory less `--card-margin-mib` (1,024) is
+used, and the margin existed because some memory was allocated after the placement (2026-10-27, "Fit.": 0.04 GiB lost the device
+once a request went deep, 0.5 and 1 GiB ran clean). The owner: allocate up front, as llama.cpp does, and stop paying a gigabyte.
+
+**What grew after startup, measured** (fiona, `main` cc4b4b5, production's exact flags on test ports, the server's card memory sampled
+each second from DRM fdinfo `drm-total-vram0`, `tools/margin/measure.sh` + `poll.py` + `stages.py`; the owner's run of the same day
+gave 455 MiB, mine 459; `docs/bench/margin-2026-11-08/baseline-stages-trace0.txt`):
+
+| stage | growth | what it was |
+|---|--:|---|
+| the first 252k request (prefill, then decode at depth) | +121 MiB | (a) attention scratch growing by `grow()`: split partials `part` 8.1 MiB, `part2` 3.0, query tiles 1.5 and 0.4, each regrown by doubling when a larger shape came (the two-long stage: `part` 16.3, `part2` 4.1, 0.8), 13 and 21 MiB allocated; (b) the rest, ~100 MiB, **is not ours**: kernel-driver buffer objects the user-mode driver creates on a kernel's first launch (below) |
+| two long prompts at once (88k + 167k) | +12 MiB | the partials again (`part` 16.3 MiB) |
+| the first chat image (Qwen vision) and its embedding (EmbeddingGemma 2's projector) | +156 MiB | attention scratch of the vision encoder grown beyond `reserve()` (29.9 MiB: its plan, heads in flight and keys a segment, depends on the padded row count, so a smaller image takes a larger scratch than the largest one), the per-image buffers (a 10.1 MiB copy of the position table, the pixels, the 7.7 MiB of rows, allocated and freed per image), and driver buffers on the first launches of the vision kernels |
+| the second image and its embedding (a tall one) | +177 MiB | the same, other sizes: the driver keeps what is freed |
+| everything else (EmbeddingGemma at 8k tokens, GSM8K two at a time, small images) | 0 |
+
+How I found the sources: `tools/margin/zetrace.c`, an `LD_PRELOAD` shim that logs every `zeMemAlloc*`/`zeMemFree` with the caller's frames in
+the executable (symbolized with `tools/margin/zesum.py`) and every kernel-driver buffer object (`DRM_IOCTL_XE_GEM_CREATE`, size and
+placement) the same way. The BO list attributes the driver's memory: at the first prefill and decode (d8k), 92 MiB in VRAM: `ref::embed`
+32 MiB twice (once from `step_group`, once from `step`), `fast::cold_scatter` 19 MiB, and 2 + 2 + 1.75 + 1.1 + 1.1 + 2 x 0.5 MiB for
+the attention, `add_norm_quant`, `gemm16`, the copy engine and the grouped GEMVs; at the images, 306 MiB: the Qwen encoder 40 + 40 + 3 x 20 +
+4.5, the projector 40 + 40 + 80 (`docs/bench/margin-2026-11-08/bo-trace-before-vision-warm.txt`). 32 MiB is 8 KiB x 4,096 hardware threads: these look like
+per-thread scratch space for kernels with private arrays (my reading, not checked in the driver). What matters: they appear on a kernel's
+first launch, in whatever queue launches it, and they stay.
+
+**What I changed** (no kernel changed; `checkq ekk8` is bit for bit the pool branch's record):
+- `src/kernels/attention.cpp`, `.hpp`: `split_count()` is the launch's own rule for the number of splits, used by the launch and by
+  `reserve()`, which now takes `max_keys` and sizes `part` and `part2` for the worst case over every tile count up to `max_tiles` at
+  `max_keys` (about 9 + 1 MiB at 262,144 keys: computed, not printed) and writes every buffer once (a zero fill). The engine passes
+  `max_ctx + 256`, the DFlash 2 draft its ring reach + block (`dflash2_fast.cpp`), EmbeddingGemma 2 its 8,192 tokens (`embed_gemma2.cpp`).
+- `src/kernels/vision_attn.cpp`: `reserve()` and `scratch_bytes()` take the largest scratch over every padded row count up to the
+  reserved one (`max_sizes`), so no image grows it; zero-filled.
+- `src/model/vision_qwen3vl_fast.cpp`, `vision_gemma4v_fast.cpp` (and the `Fast` structs): `ensure()` allocates, once, what an encode
+  used to allocate and free per image: the position table copy and RoPE angles, the pixels, and the rows (a buffer handed out as a
+  `shared_ptr` while no caller holds the previous encode's rows; if one does, or a picture is stranger than 4:1 for the projector's
+  position rows, that one allocation is made as before, and logged under `EKLOW_ALLOC_TRACE`).
+- `VisionQwen3VL::warm(tokens)`, `VisionGemma4V::warm(tokens)`: one synthetic image of the largest size through the whole encoder at
+  startup, before the experts are placed (0.4 and 0.5 s), so the driver's buffers for their kernels exist when `load_experts()` reads the
+  free memory. The server's log says what the driver took ("the driver took 0 MiB / 162 MiB": the Qwen encoder's was already there from
+  `reserve()`'s zero fills and repacks).
+- `src/rt/device.cpp`, `.hpp`, `tools/server/main.cpp`: `EKLOW_ALLOC_TRACE=1` makes the server log each card allocation made after startup
+  (`rt::startup_done()`, called before it listens): the `grow()`s and the per-image fallbacks. None was logged in any run below.
+- `tools/server/main.cpp`: `--card-margin-mib` defaults to 256 (the engine's own default stays 1 GiB for the benches).
+
+**Residual, measured after all that** (same flags, this branch, margin 1,024 for the first two runs so that nothing was held back,
+`docs/bench/margin-2026-11-08/residual-m2.txt`, `residual-m3.txt`; MiB of growth since the server was ready):
+
+| stage | grew |
+|---|--:|
+| first prefill + decode at 8k (the engine's first launches) | 99 |
+| images: a large and a tall JPEG, a PNG, each chat and then embedded | 5 |
+| 8,000-token embedding | 0 |
+| the 252k request, decode at depth | 4 |
+| two long prompts (88k + 167k); a 100k + a 131k prompt both generating | 0 |
+| verify blocks of 16 at depth ("speculative": 16 through `serve_perf.py --block 16`) | 4 |
+| GSM8K, two at a time | 0 |
+| total | 108 |
+
+Another run of the first stage gave 94-100, the one before the vision warm-up 109. Everything from the first prefill on is the driver
+creating its buffers for kernels launched the first time; the vision encoders' share (306 MiB before) is now inside the placement.
+The shared pool's reclaiming (`kv_pool_test.py`, below) added nothing beyond the same ~100.
+
+**The margin: 256 MiB.** 108 MiB measured, the largest single buffer of this kind 32 MiB, so 256 is 2.4 times the whole residual and
+8 times the largest buffer, and the draft's unconditional slack (it reserves 0.85 GiB and takes 0.76) comes on top: the server starts
+with 0.31 GiB free and the stress run below ended with ~0.2 GiB (estimate: 0.31 GiB less 103 MiB). 0.04 GiB lost the device when ~455 MiB
+came after it; here 108 MiB come after 256 + 60. Not a warm-up of the engine: it needs the experts present (the MoE kernels, the cold
+path), so it would run after the placement; running it before needs a second placement pass. The ~100 MiB it would save is 1.5
+ranks of experts; `--card-margin-mib` still overrides.
+
+**Experts and decode, before and after** (Sage-A1.5 EKK8, the draft, both projectors, EmbeddingGemma 2, 2 x 262,144 with the pool;
+`serve_perf.py depth --repeats 5 --plain 5`, measured the same evening; `perf-base.txt`, `perf-new.txt`):
+
+| | main cc4b4b5 | this branch | |
+|---|--:|--:|--:|
+| free before the experts / margin | 8.15 GiB / 1.00 | 7.75 GiB / 0.25 | the eager buffers and warm-ups took 0.40 |
+| experts on the card, of 256 a layer | 91 | **96** | +5 (+0.35 GiB net) |
+| decode at 8k / 32k, plain | 39.5 / 37.2 | 40.3 / 38.1 | +2.0% / +2.4% |
+| decode at 8k / 32k, with the draft (5 repeats) | 56.1 / 48.0 | 55.1 / 50.0 | -1.8% / +4.2% |
+| tokens a verify at 8k / 32k | 2.83 / 2.74 | 2.72 / 2.73 | |
+| prefill at 8k / 32k | 1,814 / 2,002 | 1,840 / 2,011 | |
+
+Five ranks of 256 are 3% of the cold work, so the gain is small, and the draft's rows are inside the acceptance noise (the tokens a
+verify differ between the two placements: the experts that move run on the card instead of the CPU, and the logits differ in the
+last bits; not investigated). The brief's premise is right (a MiB of margin is a MiB of experts) but most of the gigabyte was not
+the lazy allocations: 0.40 GiB of it is what the server now holds from the start, ~0.43 GiB is the two projectors with their driver
+buffers (EmbeddingGemma 2's projector alone: 264 MiB reserved for 1,120 rows because `reserve(280)` gave NaN rows for some images,
+plus the 162 MiB the driver took at its warm-up), and the margin itself is 0.25. If the projector's reserve could be cut to the
+280 rows the server actually sends (a fault to find first), that is ~6 more ranks.
+
+**Tests on the card** (`docs/bench/margin-2026-11-08/`):
+- `bash ~/eklow-perf/bench.sh checkq ekk8`: identical, line for line, to the pool branch's record (`kv-pool-2026-11-07/checkq.txt`);
+  long top-1 242-248/256, median KL 1.8e-3 to 3.6e-3, chat 27/27.
+- `serve_test.py basic` with stock Qwen3.6 EKK8 (`--chat-template stock`, production's other flags): all ok. Its stage: 96 MiB.
+- `kv_pool_test.py record` (default pool) and `check` (two slots over 8,192 positions), Sage-A1.5 EKK8, the draft, both projectors, at the
+  new margin (136 and 138 experts: the K/V is small): all ok, the same trim / exhaust / wait results as 2026-11-07; the card grew 100 MiB in each
+  run (the first launches).
+- The stress run (`stress-stages.txt`): deep (252k) + two long + images and their embeddings + an 8,000-token embedding + verify blocks of 16
+  at depth + two generating at 100k and 131k, then the same again (each 252k prompt re-prefilled: the two long ones evict it), then GSM8K two
+  at a time. 103 MiB of growth, all of it in the first stage; the second round 0; no late allocation logged; no OUT_OF_RESOURCES or
+  DEVICE_LOST in the server log. `journalctl -k`: three xe forcewake timeouts (20:36:31, 20:37:23, 20:37:35) while the card was idle between two
+  runs, in a runtime-PM resume (`xe_pm_runtime_resume`, via the audio component's power get); none during any run, and the next runs were fine.
+  It is the failure `/etc/nixos` 432377be kept the card out of runtime suspend for (the device's `power/control` reads `auto` now).
+
+**Not done.** An engine warm-up before the placement (above). The server's `--draft-block 16` flag itself was not run: blocks of 16 were
+asked per request at the default server block of 4 (the same engine path, `max_pending` 16 already). The projector's 264 MiB (above).
+Every allocation site is not instrumented under `EKLOW_ALLOC_TRACE`: the `grow()`s and the per-image fallbacks are; the shim covers the rest.
