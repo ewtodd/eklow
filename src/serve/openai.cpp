@@ -175,9 +175,10 @@ ChatRequest parse_chat(const json::Value& body, const text::QwenTokenizer& tok, 
   if (r.tools) r.tool_specs = std::make_shared<const text::ToolSpecs>(tools);
 
   // Thinking is on unless the request says otherwise: reasoning_effort "none", or think / enable_thinking false (the
-  // template variable wins). preserve_thinking (stock's and Sage's templates) keeps the reasoning of earlier turns.
+  // template variable wins). preserve_thinking (stock's and Sage's templates) keeps the reasoning of earlier turns: the request's
+  // own value, else the server's default (--preserve-thinking).
   r.thinking = true;
-  bool preserve = false;
+  bool preserve = d.preserve_thinking;
   // verification (Sage's template only; the others never look at it): the template variable as sent, else the server's default.
   std::optional<json::Value> verification;
   // The server's default (--verification on) applies only to a conversation that has system text to carry the trigger (read from

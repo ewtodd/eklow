@@ -1,5 +1,6 @@
-// Host test of --verification's default in parse_chat (Sage's template): eklow-verification-test VOCAB_GGUF, any Qwen3.6
-// GGUF for its tokenizer. Each request's prompt must be the ids of the template's own render with the options the rule gives.
+// Host test of the server defaults in parse_chat: --verification (Sage's template) and --preserve-thinking. eklow-verification-test
+// VOCAB_GGUF, any Qwen3.6 GGUF for its tokenizer. Each request's prompt must be the ids of the template's own render with the options
+// the rule gives; with preserve_thinking the next turn of an agentic conversation must share the prompt up to its generation prompt.
 #include <cstdio>
 #include <string>
 
@@ -108,6 +109,50 @@ int main(int argc, char** argv) {
   check(threw, "request \"false\" string: 400");
   // default off: nothing sent, nothing appended
   check(prompt(m_sys, "", off) == ids(m_sys, std::nullopt), "default off, nothing sent");
+
+  // --preserve-thinking: an agentic turn (a tool call with reasoning, its result), then the answer and a new user message. The
+  // second request's prompt must share the first's up to its generation prompt (where the scheduler snapshots), or the whole turn
+  // is prefilled again.
+  {
+    const std::string tools = ",\"tools\":[{\"type\":\"function\",\"function\":{\"name\":\"ls\",\"description\":\"List files\","
+                              "\"parameters\":{\"type\":\"object\",\"properties\":{}}}}]";
+    const std::string turn = "[{\"role\":\"system\",\"content\":\"Be brief.\"},{\"role\":\"user\",\"content\":\"What is here?\"},"
+                             "{\"role\":\"assistant\",\"content\":\"\",\"reasoning_content\":\"I should list the files.\","
+                             "\"tool_calls\":[{\"id\":\"c1\",\"type\":\"function\",\"function\":{\"name\":\"ls\",\"arguments\":\"{}\"}}]},"
+                             "{\"role\":\"tool\",\"tool_call_id\":\"c1\",\"content\":\"a.txt\"}";
+    const std::string first = turn + "]";
+    const std::string next = turn + ",{\"role\":\"assistant\",\"content\":\"There is a.txt.\",\"reasoning_content\":\"One file.\"},"
+                                    "{\"role\":\"user\",\"content\":\"Thanks.\"}]";
+    const auto req = [&](const std::string& m, const std::string& extra, const serve::ChatDefaults& d) {
+      return serve::parse_chat(json::parse("{\"messages\":" + m + tools + extra + "}"), tok, d).prompt;
+    };
+    const auto shared = [](const std::vector<int32_t>& a, const std::vector<int32_t>& b) {
+      size_t n = 0;
+      while (n < a.size() && n < b.size() && a[n] == b[n]) ++n;
+      return n;
+    };
+    const int32_t im_start = tok.id("<|im_start|>");
+    const auto gen_start = [&](const std::vector<int32_t>& p) {
+      size_t at = 0;
+      for (size_t i = 0; i < p.size(); ++i)
+        if (p[i] == im_start) at = i;
+      return at;
+    };
+    serve::ChatDefaults keep = off, drop = off;
+    keep.preserve_thinking = true;
+    const auto a_keep = req(first, "", keep), b_keep = req(next, "", keep);
+    const auto a_drop = req(first, "", drop), b_drop = req(next, "", drop);
+    check(a_keep == a_drop, "preserve: the turn's own prompt is the same either way (its reasoning is after the last user query)");
+    check(shared(a_keep, b_keep) >= gen_start(a_keep), "preserve on: the next turn shares the prompt up to its generation prompt");
+    check(shared(a_drop, b_drop) < gen_start(a_drop), "preserve off: the next turn parts from the prompt inside the turn");
+    // the request's own value wins either way, top level and in chat_template_kwargs
+    check(req(next, ",\"preserve_thinking\":false", keep) == b_drop, "preserve default on, request false");
+    check(req(next, ",\"chat_template_kwargs\":{\"preserve_thinking\":false}", keep) == b_drop, "preserve default on, kwargs false");
+    check(req(next, ",\"preserve_thinking\":true", drop) == b_keep, "preserve default off, request true");
+    check(req(next, ",\"chat_template_kwargs\":{\"preserve_thinking\":true}", drop) == b_keep, "preserve default off, kwargs true");
+    std::printf("preserve: the next turn shares %zu of %zu tokens with it, %zu without (generation prompt at %zu)\n", shared(a_keep, b_keep),
+                b_keep.size(), shared(a_drop, b_drop), gen_start(a_keep));
+  }
 
   std::printf("%d checks, %d failures\n", checks, failures);
   return failures ? 1 : 0;
