@@ -146,7 +146,8 @@ an exact CPU emulation of the quantized arithmetic (`eklow-attn-test`, `eklow-gd
     `/v1/embeddings`, `/v1/models` and `/health` on a port of its own;
   - request features: SSE streaming, `reasoning_content` (thinking on unless `reasoning_effort` is `none`), tool calls
     and `tool_choice`, stop strings, seeds, temperature / top-k / top-p / min-p and penalties, usage with
-    `cached_tokens`; also `preserve_thinking` for stock's template, sampling defaults from the model's
+    `cached_tokens`; also `preserve_thinking` for stock's and Sage's templates (`--preserve-thinking on` makes it the
+    default, so the turn after an agentic one reuses the cache instead of prefilling the turn again), sampling defaults from the model's
     `general.sampling.*`, and with a draft `speculation` in the usage (verify blocks, tokens drafted and accepted) and
     `"speculative": false` to decode one request plain;
   - a keep-alive on the streams (`--keepalive`, default 15 s): a stream silent that long gets an SSE comment, so a long
@@ -228,7 +229,7 @@ explains every flag.
 
 The flake's NixOS module serves named instances, as unholy's does: `services.eklow.instances.<name>` (`model`, `alias`,
 `port`, `expertProfile`, `mmproj`, `contextSize`, `slots`, `kvInt8`, `extraArgs`, `draft`, `draftBlock`, `prefillGroup`,
-`prefillGroupBusy`, `chatTemplate`, `snapshotMiB`, `kvPool`, `verification`) is the unit `eklow-<name>.service`, with
+`prefillGroupBusy`, `chatTemplate`, `snapshotMiB`, `kvPool`, `verification`, `preserveThinking`) is the unit `eklow-<name>.service`, with
 the embedding model and its projector shared (`embedModel`, `embedMmproj`, `embedPort`, `imageTokens`). The instances
 hold the one card, so each conflicts with the others: starting one stops the one running. `autoStart` names the one
 started at boot (by default the only one); the house switches them with `llm-mode` instead.

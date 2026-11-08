@@ -57,6 +57,10 @@ struct ChatDefaults {
   text::QwenTemplate chat_template = text::QwenTemplate::Stock;
   // Sage's template: the verification protocol is on for a request that does not send `verification` (--verification on), if its first message is a system message with text.
   bool verification = false;
+  // Stock's and Sage's templates: keep earlier turns' reasoning for a request that does not send preserve_thinking (--preserve-thinking on).
+  // Off, a new user message re-renders every assistant message since the previous one without its reasoning, so the prompt parts from
+  // the slot's sequence at the first of them and that whole turn is prefilled again. Ornith's template always keeps it.
+  bool preserve_thinking = false;
   // Image input: encodes an image_url part's picture (null: image parts are refused with a 400). It may block (it holds the
   // scheduler for the encode) and is called on the request's thread, once per image, in conversation order.
   const ImageEncoder* images = nullptr;

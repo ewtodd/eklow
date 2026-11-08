@@ -2507,3 +2507,39 @@ step, token, speculation, snapshot and embedding counters, and three accounting 
 the scheduler already counts (plus two timestamps a step) and a read of `Scheduler::stats()` per scrape; scheduling, batching,
 kernels, sampling, snapshots, the pool and every output byte are as before, and the log lines are untouched. The rendering is a
 pure function (`tools/server/metrics.hpp`, tested on the host by `eklow-metrics-test`).
+
+## 2026-11-08 — keep earlier turns' reasoning by default: `--preserve-thinking`
+
+**What happened.** After Sage-A1.5 replaced Ornith on fiona (2026-11-07), the owner's turns sat for minutes before their first
+token. fiona's journal from 2026-11-07 22:11 to 2026-11-08 07:55 shows several causes. One of them is the template.
+
+Sage's template is stock's. It renders an assistant message's reasoning only after the last user query. When the next user
+message arrives, every assistant message of the turn before it loses its `<think>` block, so the prompt parts from what the slot
+holds at the first assistant message of that turn. The whole turn is prefilled again. Ornith's template always keeps the reasoning.
+- 00:15:38: the turn after one of 16 tool calls and an answer reused 5,712 of its 8,201 tokens (the system prompt and the first
+  messages). The prompt was 1,315 tokens shorter than the slot's sequence.
+- 01:03: the turn after one of 500 tool calls (00:40-01:03) came with a prompt of 190,577 tokens, 4,440 shorter than the slot's
+  195,017 (the think blocks, about 9 tokens a call). Nothing was reused: 180 s to the first token.
+
+The night's other causes, not changed here:
+- A restart empties the cache: the reboot at 05:30 and the deploy at 07:38. At 07:51 the same 193k conversation took 184 s to its
+  first token.
+- Two conversations larger than the pool together (125k + 165k against 262,144, 23:30-00:08) cut each other back on every
+  turn: 60 to 300 s to the first token.
+- The model called a tool 500 times in one turn, 390 of the calls the same 70 tokens (00:42-01:03). That is how one conversation
+  reached 195k.
+
+**What.** `--preserve-thinking on|off` (module `preserveThinking`; default off, the template's own) is the template variable
+`preserve_thinking` for a request that sends none. A request's own value, top level or in `chat_template_kwargs`, wins. On,
+earlier assistant turns are rendered with their reasoning as the client sent it back (`reasoning_content`, or `<think>` in the
+content; an empty block when it sends none), as Ornith's template does always. The next turn then shares the prompt up to the
+previous generation prompt, where the scheduler keeps a snapshot. Ornith's template ignores the flag. The startup line says
+which applies.
+
+**Cost.** A conversation grows by the reasoning the client sends back. The model also sees past reasoning that Sage's own
+template drops. Qwen3.6's template has the switch for agents, and Ornith (the same base) ran this way in production from
+2026-11-02 to 2026-11-07. Sage's behaviour with it is not measured.
+
+**Checks.** `eklow-verification-test` (host, Qwen3.6 vocabulary) adds 7 checks. The turn's own prompt is identical either way.
+With preserve on, the next turn shares the prompt up to its generation prompt; with it off, it parts inside the turn. A
+request's `preserve_thinking`, false or true, top level or in kwargs, overrides the default. Nothing ran on the card.

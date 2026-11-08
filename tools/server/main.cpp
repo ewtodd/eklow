@@ -6,7 +6,7 @@
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] [--kv-pool N]
 //                [--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
-//                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith|sage] [--verification on|off] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF [--image-max-tokens N]]
+//                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith|sage] [--verification on|off] [--preserve-thinking on|off] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF [--image-max-tokens N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
 //                [--log-interval S] [--keepalive S]
 //
@@ -37,6 +37,10 @@
 // string other than true/1/yes/on. --verification on|off (default off; Sage only) is the value for a request that sends none, and
 // applies only to a conversation whose first message is a system message with non-blank text (any other is rendered as if
 // the request had sent nothing, so a default never turns a request away); a request's own "verification" keeps all of the above.
+// --preserve-thinking on|off (default off, the template's own; stock and sage, Ornith's template always keeps it) is the template
+// variable preserve_thinking for a request that sends none (top level or in chat_template_kwargs): on, earlier assistant turns keep
+// their reasoning. Off, a new user message re-renders every assistant message since the previous one without its reasoning, so the
+// prompt parts from what the slot holds at the first of them and an agentic turn of 100k tokens is prefilled again (DECISIONS 2026-11-08).
 // --snapshot-mib is the pinned host memory kept for snapshots of the DeltaNet state, which make a conversation's or a
 // document's prefix reusable (taken before each prompt's generation prompt, every --snapshot-every tokens of a long
 // prefill, and at the end of a generation); 0 keeps none, and then only a slot's live sequence is reused.
@@ -505,7 +509,7 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 
 static int qwen_server_main(int argc, char** argv) {
   std::string model_path, alias = "qwen3.6-35b-a3b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", embed_mmproj_path;
-  std::string draft_path, chat_template, verification, mmproj_path, image_rows_dir;
+  std::string draft_path, chat_template, verification, preserve_thinking, mmproj_path, image_rows_dir;
   int image_max_tokens = 1024;  // chat images: rows an image becomes at most (llama.cpp's image_max_tokens; 8 to 4096)
   int64_t vision_reserve_mib = 0;
   int image_tokens = 280;
@@ -543,6 +547,7 @@ static int qwen_server_main(int argc, char** argv) {
     else if (a == "--draft-block") draft_block = std::atoi(next().c_str());
     else if (a == "--chat-template") chat_template = next();
     else if (a == "--verification") verification = next();
+    else if (a == "--preserve-thinking") preserve_thinking = next();
     else if (a == "--snapshot-mib") snapshot_mib = std::atoll(next().c_str());
     else if (a == "--snapshot-every") snapshot_every = std::atoll(next().c_str());
     else if (a == "--embed-model") embed_path = next();
@@ -561,7 +566,7 @@ static int qwen_server_main(int argc, char** argv) {
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] [--kv-pool N] "
                            "[--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
-                           "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith|sage] [--verification on|off] [--snapshot-mib N [--snapshot-every N]] "
+                           "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith|sage] [--verification on|off] [--preserve-thinking on|off] [--snapshot-mib N [--snapshot-every N]] "
                            "[--mmproj GGUF [--image-max-tokens N]] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] [--log-interval S] [--keepalive S]\n");
       return 2;
     }
@@ -580,6 +585,10 @@ static int qwen_server_main(int argc, char** argv) {
   }
   if (!verification.empty() && verification != "on" && verification != "off") {
     std::fprintf(stderr, "eklow-server: --verification must be on or off\n");
+    return 2;
+  }
+  if (!preserve_thinking.empty() && preserve_thinking != "on" && preserve_thinking != "off") {
+    std::fprintf(stderr, "eklow-server: --preserve-thinking must be on or off\n");
     return 2;
   }
   if (draft_block < 0 || draft_block > 16 || draft_block == 1) {
@@ -790,9 +799,12 @@ static int qwen_server_main(int argc, char** argv) {
     sc.max_group = ec.max_group;
     sc.group_busy = std::min(group_busy, ec.max_group);
     serve::Scheduler sched(eng, tok, sc);
-    std::fprintf(stderr, "eklow-server: chat template %s%s, sampling defaults temperature %g, top-k %d, top-p %g, min-p %g; snapshots of %.0f MiB each, up to %lld MiB\n",
-                 text::qwen36_template_name(tmpl), tmpl == text::QwenTemplate::Sage ? (verification == "on" ? " (verification on by default)" : " (verification off by default)") : "", double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p),
-                 double(eng.snapshot_bytes()) / 1048576.0, (long long)snapshot_mib);
+    std::fprintf(stderr, "eklow-server: chat template %s%s%s, sampling defaults temperature %g, top-k %d, top-p %g, min-p %g; snapshots of %.0f MiB each, up to %lld MiB\n",
+                 text::qwen36_template_name(tmpl), tmpl == text::QwenTemplate::Sage ? (verification == "on" ? " (verification on by default)" : " (verification off by default)") : "",
+                 tmpl == text::QwenTemplate::Ornith ? " (earlier turns' reasoning kept)"
+                 : preserve_thinking == "on"        ? " (earlier turns' reasoning kept by default)"
+                                                    : " (earlier turns' reasoning dropped by default)",
+                 double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p), double(eng.snapshot_bytes()) / 1048576.0, (long long)snapshot_mib);
     if (embed_images) embed_images->bind(&sched);
     if (chat_images) chat_images->bind(&sched);
     std::thread engine_thread([&] { sched.run(g_stop); });
@@ -820,6 +832,7 @@ static int qwen_server_main(int argc, char** argv) {
         }
       });
     serve::ChatDefaults defaults{sampling, ec.max_ctx, tmpl, verification == "on"};
+    defaults.preserve_thinking = preserve_thinking == "on";
     const serve::ImageEncoder chat_encoder = [&](std::span<const uint8_t> bytes) { return (*chat_images)(bytes); };
     if (chat_images) defaults.images = &chat_encoder;
     defaults.max_image_rows = std::min(batch, chunk);

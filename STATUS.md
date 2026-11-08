@@ -20,7 +20,11 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   last state of the 26B's engine, server, draft path and tools is `d9ffaf0` (the restore beside Qwen) and `9775e98` (its
   speculative path; z-lab's draft measured and dropped). The plain-DFlash draft code (per-layer sliding/full attention, tied
   head, softcap) stays, with its tests in `tools/dflash_test`.
-- **The card margin is 256 MiB, not 1 GiB** (`serve/margin`, DECISIONS 2026-11-08; not merged, not deployed): everything the server
+- **`--preserve-thinking on`** (module `preserveThinking`; DECISIONS 2026-11-08 "keep earlier turns' reasoning"): with Sage's
+  (stock's) template a new user message re-rendered the whole agentic turn before it without reasoning, and the server prefilled
+  that turn again: 180 s to the first token on fiona for a 190k conversation. On, earlier turns keep their reasoning, as Ornith's
+  template always did. Host test only; /etc/nixos sets it for sage; the owner deploys.
+- **The card margin is 256 MiB, not 1 GiB** (`serve/margin`, DECISIONS 2026-11-08; deployed 2026-11-07 22:11): everything the server
   allocated lazily (attention partials at depth, the vision encoders' scratch and per-image buffers) is now sized, zero-filled and
   warmed before the experts are placed; what is left is the driver's own buffers on the engine's first launches, 108 MiB measured
   over every stage (252k decode, two long prompts, images and embeddings, an 8,000-token embedding, verify blocks of 16, the pool

@@ -180,6 +180,18 @@ let
           '';
         };
 
+        preserveThinking = lib.mkOption {
+          type = lib.types.nullOr lib.types.bool;
+          default = null;
+          description = ''
+            Stock's and Sage-A1.5's templates: keep earlier assistant turns' reasoning in the prompt by default
+            (`--preserve-thinking on`, the template variable preserve_thinking); a request may still send its own. Off, every
+            new user message re-renders the turn before it without its reasoning, and the server prefills that whole turn
+            again (an agentic turn of 190k tokens: three minutes on fiona). Ornith's template always keeps it. null: the
+            server's default, off.
+          '';
+        };
+
         extraArgs = lib.mkOption {
           type = lib.types.listOf lib.types.str;
           default = [ ];
@@ -403,6 +415,10 @@ in
             ++ lib.optionals (inst.verification != null) [
               "--verification"
               (if inst.verification then "on" else "off")
+            ]
+            ++ lib.optionals (inst.preserveThinking != null) [
+              "--preserve-thinking"
+              (if inst.preserveThinking then "on" else "off")
             ]
             ++ lib.optionals (inst.mmproj != null) [
               "--mmproj"
