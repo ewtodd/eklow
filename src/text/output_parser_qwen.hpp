@@ -33,8 +33,9 @@ namespace eklow::text {
 class QwenOutputParser {
  public:
   // `in_thinking`: the prompt ends "<think>\n", so the output starts inside the reasoning. `tools` (not owned, may be
-  // null, must outlive the parser) says what the parameters' types are.
-  explicit QwenOutputParser(const QwenTokenizer& tok, bool in_thinking = false, const ToolSpecs* tools = nullptr);
+  // null, must outlive the parser) says what the parameters' types are. `calls` false (tool_choice "none") takes no
+  // <tool_call> in the content either, so the sampler never starts one.
+  explicit QwenOutputParser(const QwenTokenizer& tok, bool in_thinking = false, const ToolSpecs* tools = nullptr, bool calls = true);
 
   OutputDelta push(int32_t id);
   // Whatever text is still held back (an incomplete UTF-8 tail, a call never closed).
@@ -46,7 +47,7 @@ class QwenOutputParser {
   // The special tokens the parser cannot take next: all but its state's own markers and the turn's ends. The sampler
   // never picks them, so a structural token where it does not parse cannot reach the output (DECISIONS 2026-10-27,
   // "structural tokens only where they parse"). In reasoning only </think> and the ends are taken; in content
-  // <tool_call> and the ends; in a call only </tool_call> (a turn that ends inside one is an error).
+  // <tool_call> (unless calls are off) and the ends; in a call only </tool_call> (a turn that ends inside one is an error).
   const std::vector<int32_t>& banned() const { return banned_[size_t(state_)]; }
 
  private:

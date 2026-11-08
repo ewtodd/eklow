@@ -145,7 +145,7 @@ an exact CPU emulation of the quantized arithmetic (`eklow-attn-test`, `eklow-gd
   - endpoints: `/v1/chat/completions` (streamed or whole), `/v1/models`, `/health`, `/metrics` (Prometheus text, for llmtop); with an embedding model,
     `/v1/embeddings`, `/v1/models` and `/health` on a port of its own;
   - request features: SSE streaming, `reasoning_content` (thinking on unless `reasoning_effort` is `none`), tool calls
-    and `tool_choice`, stop strings, seeds, temperature / top-k / top-p / min-p and penalties, usage with
+    and `tool_choice` (`"none"` keeps the tools in the prompt, so it stays cached, and never samples a call), stop strings, seeds, temperature / top-k / top-p / min-p and penalties, usage with
     `cached_tokens`; also `preserve_thinking` for stock's and Sage's templates (`--preserve-thinking on` makes it the
     default, so the turn after an agentic one reuses the cache instead of prefilling the turn again), sampling defaults from the model's
     `general.sampling.*`, and with a draft `speculation` in the usage (verify blocks, tokens drafted and accepted) and

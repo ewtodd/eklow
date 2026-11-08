@@ -89,7 +89,7 @@ ToolCall parse_qwen_tool_call(const std::string& body, const ToolSpecs* tools) {
   return call;
 }
 
-QwenOutputParser::QwenOutputParser(const QwenTokenizer& tok, bool in_thinking, const ToolSpecs* tools) : tok_(tok), tools_(tools) {
+QwenOutputParser::QwenOutputParser(const QwenTokenizer& tok, bool in_thinking, const ToolSpecs* tools, bool calls) : tok_(tok), tools_(tools) {
   think_close_ = need_id(tok, "</think>");
   call_open_ = need_id(tok, "<tool_call>");
   call_close_ = need_id(tok, "</tool_call>");
@@ -101,7 +101,10 @@ QwenOutputParser::QwenOutputParser(const QwenTokenizer& tok, bool in_thinking, c
       if (std::find(ok.begin(), ok.end(), id) == ok.end()) banned_[size_t(s)].push_back(id);
   };
   ban_all_but(State::Thinking, {think_close_, im_end_, endoftext_});
-  ban_all_but(State::Content, {call_open_, im_end_, endoftext_});
+  if (calls)
+    ban_all_but(State::Content, {call_open_, im_end_, endoftext_});
+  else
+    ban_all_but(State::Content, {im_end_, endoftext_});
   ban_all_but(State::ToolCall, {call_close_});
 }
 

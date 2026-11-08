@@ -25,7 +25,8 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   that turn again (~1,050 tok/s at 190k on fiona). On, earlier turns keep their reasoning, as Ornith's template always did. Host
   test only; /etc/nixos sets it for sage; the owner deploys. The night's two three-minute waits were something else:
   son-of-anton's last step of a 500-step turn sends `tool_choice: "none"`, and eklow then drops the tools from the system
-  message, so the whole prompt is prefilled again (DECISIONS 2026-11-08, not fixed).
+  message, so the whole prompt is prefilled again. Fixed on `serve/tool-choice-none`: the tools stay in the prompt and
+  `<tool_call>` is never sampled (DECISIONS 2026-11-08 "tool_choice none").
 - **The card margin is 256 MiB, not 1 GiB** (`serve/margin`, DECISIONS 2026-11-08; deployed 2026-11-07 22:11): everything the server
   allocated lazily (attention partials at depth, the vision encoders' scratch and per-image buffers) is now sized, zero-filled and
   warmed before the experts are placed; what is left is the driver's own buffers on the engine's first launches, 108 MiB measured

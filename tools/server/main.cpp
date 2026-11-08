@@ -875,6 +875,7 @@ static int qwen_server_main(int argc, char** argv) {
       r->stop = cr.stop;
       r->in_thinking = cr.in_thinking;
       r->tool_specs = cr.tool_specs;
+      r->calls_allowed = cr.calls_allowed;
       r->snapshot_points = cr.snapshot_points;
       r->draft_block = cr.draft_block;
       r->images = std::move(cr.images);

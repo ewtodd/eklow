@@ -197,7 +197,7 @@ bool Scheduler::admit() {
     q.held.clear();
     q.called = false;
     q.first_pushed = false;
-    q.parser = std::make_unique<text::QwenOutputParser>(tok_, r->in_thinking, r->tool_specs.get());
+    q.parser = std::make_unique<text::QwenOutputParser>(tok_, r->in_thinking, r->tool_specs.get(), r->calls_allowed);
     q.sampler = std::make_unique<Sampler>(r->sampling);
     q.grammar = r->tool_specs ? std::make_unique<QwenToolGrammar>(vocab_, r->tool_specs) : nullptr;
     q.draft_rng.seed(r->sampling.seed * 0x9e3779b97f4a7c15ull + 1);
