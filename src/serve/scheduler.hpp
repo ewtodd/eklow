@@ -163,6 +163,12 @@ class Scheduler {
     // Wall seconds of the engine thread in each part of a step, since the start: drafting, the engine step (the logits come
     // back to the host in it), acceptance and sampling, the draft's context injection, snapshots.
     double draft_s = 0, engine_s = 0, sample_s = 0, inject_s = 0, snapshot_s = 0;
+    // For /metrics. busy_s: wall seconds of the engine thread inside step() (one dt per step, the same dt the sequence-seconds use).
+    // prefill_seq_s, decode_seq_s: per step, its dt once for each sequence that contributed prefill tokens (a step that also samples
+    // counts as prefill), resp. only decode or verify tokens; queued requests count toward neither. first_token_s, first_tokens: the
+    // sum over requests of (the first event pushed to the reader - submit), and how many requests it sums.
+    double busy_s = 0, prefill_seq_s = 0, decode_seq_s = 0, first_token_s = 0;
+    int64_t first_tokens = 0;
   };
   Stats stats() const;
 
@@ -203,6 +209,7 @@ class Scheduler {
     std::mt19937_64 draft_rng;
     int64_t generated = 0, cached = 0, verifies = 0, drafted = 0, accepted = 0;
     std::chrono::steady_clock::time_point admitted, first;  // the slot taken, the first token sampled
+    bool first_pushed = false;    // the first event went to the reader (counted in stats_.first_tokens)
     std::string held;             // content held back while it could start a stop string
     bool called = false;          // a tool call came out
     std::vector<Snap> snaps;      // of the slot's content, by ascending position; outlives the request
@@ -237,6 +244,7 @@ class Scheduler {
   std::vector<Seq> seqs_;
   uint64_t tick_ = 0;
   bool grouped_last_ = false;  // the last step was a layer-major group (a generating slot then gets a step before the next group)
+  int step_prefill_seqs_ = 0, step_decode_seqs_ = 0;  // sequences the last step() fed prefill, resp. decode/verify (engine thread)
   uint64_t snap_bytes_ = 0;  // held by all slots' snapshots (engine thread; mirrored into stats_)
 
   mutable std::mutex mu_;

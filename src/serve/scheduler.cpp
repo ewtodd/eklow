@@ -196,6 +196,7 @@ bool Scheduler::admit() {
     q.generated = q.verifies = q.drafted = q.accepted = 0;
     q.held.clear();
     q.called = false;
+    q.first_pushed = false;
     q.parser = std::make_unique<text::QwenOutputParser>(tok_, r->in_thinking, r->tool_specs.get());
     q.sampler = std::make_unique<Sampler>(r->sampling);
     q.grammar = r->tool_specs ? std::make_unique<QwenToolGrammar>(vocab_, r->tool_specs) : nullptr;
@@ -239,11 +240,21 @@ void Scheduler::run(const std::atomic<bool>& stop) {
       seen = releases_;
     }
     if (stop.load()) break;
+    const auto t0 = std::chrono::steady_clock::now();
+    step_prefill_seqs_ = step_decode_seqs_ = 0;
     try {
       step();
     } catch (const std::exception& e) {
       fail_all(e.what());
     }
+    // The accounting rule for /metrics: this iteration's wall dt is busy time, and counts once for every sequence that contributed
+    // tokens to it, to the phase of those tokens: prefill if it was fed prompt tokens (even when the same step sampled its first
+    // token), else decode. step() sets the two counts from the chunks it ran; waiting requests are in neither.
+    const double dt = seconds(std::chrono::steady_clock::now() - t0);
+    std::lock_guard lk(mu_);
+    stats_.busy_s += dt;
+    stats_.prefill_seq_s += dt * step_prefill_seqs_;
+    stats_.decode_seq_s += dt * step_decode_seqs_;
   }
 }
 
@@ -460,6 +471,7 @@ void Scheduler::step() {
     return;
   }
 
+  for (const Item& it : items) ++(it.kind == Item::Prefill ? step_prefill_seqs_ : step_decode_seqs_);  // one chunk a sequence
   grouped_last_ = false;
   for (const engine::Chunk& c : chunks)
     if (int64_t(c.tokens.size()) > c_.max_chunk) grouped_last_ = true;
@@ -628,7 +640,15 @@ std::string Scheduler::on_token(int slot, int32_t token) {
   }
   const bool any = !e.delta.reasoning.empty() || !e.delta.content.empty() || !e.delta.tool_calls.empty() || !e.delta.errors.empty();
   const bool ended = e.delta.done || stopped;
-  if (any) q.req->push(std::move(e));
+  if (any) {
+    q.req->push(std::move(e));
+    if (!q.first_pushed) {
+      q.first_pushed = true;
+      const double t = seconds(std::chrono::steady_clock::now() - q.req->submitted);
+      std::lock_guard lk(mu_);
+      stats_.first_token_s += t, ++stats_.first_tokens;
+    }
+  }
   if (ended) return q.called ? "tool_calls" : "stop";
   const int64_t cap = q.req->max_tokens > 0 ? q.req->max_tokens : c_.max_ctx;
   if (q.generated >= cap || int64_t(q.tokens.size()) + 1 >= c_.max_ctx) return "length";

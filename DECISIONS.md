@@ -2497,3 +2497,13 @@ reserve could be cut to the 280 rows the server actually sends (a fault to find 
 **Not done.** An engine warm-up before the placement (above). The server's `--draft-block 16` flag itself was not run: blocks of 16 were
 asked per request at the default server block of 4 (the same engine path, `max_pending` 16 already). The projector's 264 MiB (above).
 Every allocation site is not instrumented under `EKLOW_ALLOC_TRACE`: the `grow()`s and the per-image fallbacks are; the shim covers the rest.
+
+## 2026-11-08 — GET /metrics, for llmtop
+
+The chat port serves `GET /metrics` (Prometheus text, unauthenticated like `/health`, prefix `eklow`) so llmtop, the terminal
+monitor that scrapes every second, shows eklow beside unholy: slots, running and waiting requests, the K/V share held by requests,
+step, token, speculation, snapshot and embedding counters, and three accounting counters llmtop's per-stream speeds need
+(`*_sequence_seconds_total`, `first_token_seconds_total`). Nothing served changes: the additions are counters updated where
+the scheduler already counts (plus two timestamps a step) and a read of `Scheduler::stats()` per scrape; scheduling, batching,
+kernels, sampling, snapshots, the pool and every output byte are as before, and the log lines are untouched. The rendering is a
+pure function (`tools/server/metrics.hpp`, tested on the host by `eklow-metrics-test`).
