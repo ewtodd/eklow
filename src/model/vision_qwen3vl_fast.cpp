@@ -316,6 +316,19 @@ void VisionQwen3VL::reserve(int tokens) {
   ensure(int64_t(tokens) * merge_ * merge_);
 }
 
+void VisionQwen3VL::warm(int tokens) {
+  if (reference_) return;
+  // A synthetic picture of `tokens` output rows through the whole encoder, rows thrown away: the driver allocates scratch space on a
+  // kernel's first launch (tens of MiB for these kernels, DECISIONS 2026-11-08), which should happen before the experts are placed.
+  const int side = std::max(1, int(std::sqrt(double(tokens)))) * 2 * patch_;
+  image::Rgb pic;
+  pic.width = pic.height = side;
+  pic.pixels.resize(size_t(side) * side * 3);
+  for (size_t i = 0; i < pic.pixels.size(); ++i) pic.pixels[i] = uint8_t((i * 7 + i / 3000) & 255);
+  encode(pic);
+  q_.wait();
+}
+
 QwenImageRows VisionQwen3VL::encode_fast(const image::Rgb& pic) {
   std::lock_guard lock(mu_);
   Fast& F = *fast_;

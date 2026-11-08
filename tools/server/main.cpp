@@ -681,6 +681,11 @@ static int qwen_server_main(int argc, char** argv) {
         vision_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
         vision = std::make_unique<model::VisionQwen3VL>(*vision_q, *mmproj_file);
         vision->reserve(image_max_tokens);
+        {
+          const auto t_warm = std::chrono::steady_clock::now();
+          vision->warm(image_max_tokens);  // the driver's scratch for its kernels exists before the experts are placed
+          std::fprintf(stderr, "eklow-server: vision encoder warmed with a %d-row image in %.1f s\n", image_max_tokens, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count());
+        }
         const image::QwenSpec spec = vision->spec(image_max_tokens);
         salt = uint64_t(image_max_tokens) * 0x9e3779b97f4a7c15ull;
         fn = [&q = *vision_q, v = vision.get(), spec](std::span<const uint8_t> bytes) {
@@ -728,6 +733,11 @@ static int qwen_server_main(int argc, char** argv) {
       // Not image_tokens: reserve(280) on this projector gave NaN embeddings for some images (reserve(400) and up, and no
       // reserve, did not; reported to perf/vision-fast), so it takes the full 1,120 rows (264 MiB instead of 183).
       embed_vision->reserve(1120);
+      {
+        const auto t_warm = std::chrono::steady_clock::now();
+        embed_vision->warm(1120);
+        std::fprintf(stderr, "eklow-server: vision projector warmed with a 1120-row image in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count());
+      }
       std::fprintf(stderr, "eklow-server: vision projector %s, %.0f MiB on the card for %d-row images\n", embed_mmproj_path.c_str(), double(embed_vision->bytes()) / 1048576.0, 1120);
       embed_images = std::make_unique<ImageService>(*embed_vision_q, *embed_vision, image_tokens);
     }

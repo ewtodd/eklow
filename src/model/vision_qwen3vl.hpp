@@ -66,6 +66,9 @@ class VisionQwen3VL {
   // rows (the rows themselves, which the caller owns, excluded); card_bytes(tokens) is what the class holds while
   // encoding such an image; bytes() what it holds now; release() frees the staging and the activations.
   void reserve(int tokens);
+  // Runs one synthetic image of `tokens` output rows through the encoder and drops the rows, so that the driver's scratch space for
+  // its kernels exists before anything reads the card's free memory (reserve() first; the rows are not kept).
+  void warm(int tokens);
   uint64_t card_bytes(int tokens = 1024) const;
   uint64_t bytes() const { return bytes_ + held_; }
   void release();

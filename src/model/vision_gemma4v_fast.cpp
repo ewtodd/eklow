@@ -294,6 +294,17 @@ void VisionGemma4V::reserve(int tokens) {
   ensure(int64_t(tokens) * merge_ * merge_);
 }
 
+void VisionGemma4V::warm(int tokens) {
+  if (reference_) return;
+  const int side = std::max(1, int(std::sqrt(double(tokens)))) * merge_ * patch_;
+  image::Rgb pic;
+  pic.width = pic.height = side;
+  pic.pixels.resize(size_t(side) * side * 3);
+  for (size_t i = 0; i < pic.pixels.size(); ++i) pic.pixels[i] = uint8_t((i * 7 + i / 3000) & 255);
+  encode(image::prepare(pic, spec(tokens)));
+  q_.wait();
+}
+
 DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
   std::lock_guard lock(mu_);
   Fast& F = *fast_;

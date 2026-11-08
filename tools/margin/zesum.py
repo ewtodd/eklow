@@ -11,6 +11,7 @@ for line in open(path):
     if not f: continue
     if f[0] == "mark": cur = int(f[1]); continue
     if f[0] in ("dev", "shared"): stages[cur].append((f[0], int(f[2]), tuple(f[4:])))
+    if f[0] == "bo": stages[cur].append(("bo@" + f[3], int(f[2]), tuple(f[4:])))  # the kernel driver's buffer objects; @placement mask
 addrs = sorted({a for ev in stages.values() for _, _, fr in ev for a in fr})
 sym = {}
 if addrs:
