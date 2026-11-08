@@ -24,7 +24,8 @@
 // --expert-profile: the experts of each layer that the routing profile says are busiest stay on the card and the rest are
 // computed on the CPU (the model's 256 experts a layer do not fit). How many (--experts-on-card) is, by default, as many as
 // fit in the card's free memory after the KV cache, the workspace, the embedding model and the draft, less
-// --card-margin-mib (1024) for what the first requests allocate and the driver keeps.
+// --card-margin-mib (256) for what the driver allocates for itself on the first launches of the engine's kernels (about 100 MiB measured; every buffer
+// of ours, the vision encoders' and the embedding model's scratch included, is allocated, written and warmed before the experts are placed).
 // --draft (a DFlash 2 draft GGUF) turns on speculative decoding: a verify block of --draft-block tokens (default the
 // draft's trained block or 4 if less, at most 16) per step, accepted losslessly (the sampler's every feature, the tool
 // grammar included). A request may choose its own block with "speculative": N (0 or false: plain decode).
@@ -513,7 +514,7 @@ static int qwen_server_main(int argc, char** argv) {
   bool kv_int8 = true;
   std::string expert_profile;
   int64_t experts_on_card = -2;  // as many as fit, once there is a profile
-  int64_t card_margin_mib = 1024;
+  int64_t card_margin_mib = 256;  // measured after startup: 108 MiB of driver scratch on first launches, nothing else (DECISIONS 2026-11-08)
   int64_t snapshot_mib = 4096, snapshot_every = 16384;
   int stream_slots = -1, stream_min_rows = -1;  // -1: the engine's
   double log_interval = 10;  // seconds between the engine's log lines while there is traffic; 0: none
