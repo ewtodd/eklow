@@ -684,8 +684,11 @@ static int qwen_server_main(int argc, char** argv) {
         vision->reserve(image_max_tokens);
         {
           const auto t_warm = std::chrono::steady_clock::now();
+          const double free0 = double(rt::free_memory(q.get_device()).value_or(0));
           vision->warm(image_max_tokens);  // the driver's scratch for its kernels exists before the experts are placed
-          std::fprintf(stderr, "eklow-server: vision encoder warmed with a %d-row image in %.1f s\n", image_max_tokens, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count());
+          std::fprintf(stderr, "eklow-server: vision encoder warmed with a %d-row image in %.1f s, the driver took %.0f MiB for it\n", image_max_tokens,
+                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count(),
+                       (free0 - double(rt::free_memory(q.get_device()).value_or(0))) / 1048576.0);
         }
         const image::QwenSpec spec = vision->spec(image_max_tokens);
         salt = uint64_t(image_max_tokens) * 0x9e3779b97f4a7c15ull;
@@ -736,8 +739,11 @@ static int qwen_server_main(int argc, char** argv) {
       embed_vision->reserve(1120);
       {
         const auto t_warm = std::chrono::steady_clock::now();
+        const double free0 = double(rt::free_memory(q.get_device()).value_or(0));
         embed_vision->warm(1120);
-        std::fprintf(stderr, "eklow-server: vision projector warmed with a 1120-row image in %.1f s\n", std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count());
+        std::fprintf(stderr, "eklow-server: vision projector warmed with a 1120-row image in %.1f s, the driver took %.0f MiB for it\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count(),
+                     (free0 - double(rt::free_memory(q.get_device()).value_or(0))) / 1048576.0);
       }
       std::fprintf(stderr, "eklow-server: vision projector %s, %.0f MiB on the card for %d-row images\n", embed_mmproj_path.c_str(), double(embed_vision->bytes()) / 1048576.0, 1120);
       embed_images = std::make_unique<ImageService>(*embed_vision_q, *embed_vision, image_tokens);
