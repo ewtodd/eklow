@@ -45,6 +45,8 @@ for st in $STAGES; do
   esac
 done
 mark end; sleep 5
-pkill -TERM -g $SRV; sleep 8; pkill -KILL -g $SRV 2>/dev/null
+kill -TERM $P; for i in $(seq 1 30); do kill -0 $P 2>/dev/null || break; sleep 1; done; kill -KILL $P 2>/dev/null
+pkill -KILL -g $SRV 2>/dev/null; sleep 2
+pgrep -f "^./build/eklow-server --model" && echo "WARNING: a server is still running"
 echo "== done $(date +%T)"
 nix develop path:. -c python3 -I tools/margin/stages.py $B

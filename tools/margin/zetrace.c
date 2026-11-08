@@ -76,3 +76,32 @@ int zeMemFree(void* ctx, void* ptr) {
   log_call("free", 0, ptr);
   return real(ctx, ptr);
 }
+
+// The kernel driver's buffer objects (xe: DRM_IOCTL_XE_GEM_CREATE, i386 nr 0x41), which include what the user-mode driver allocates for
+// itself (kernel code, scratch, command buffers): "bo <time> <size> <placement mask> <flags>", then the executable's frames. VRAM0 is placement bit 1.
+#include <stdarg.h>
+int ioctl(int fd, unsigned long req, ...) {
+  typedef int (*fn)(int, unsigned long, ...);
+  static fn real;
+  if (!real) real = (fn)dlsym(RTLD_NEXT, "ioctl");
+  va_list ap;
+  va_start(ap, req);
+  void* arg = va_arg(ap, void*);
+  va_end(ap);
+  unsigned long long size = 0;
+  unsigned placement = 0, flags = 0;
+  const int is_bo = ((req >> 8) & 0xff) == 'd' && (req & 0xff) == 0x41 && arg;
+  if (is_bo) {
+    const unsigned long long* w = (const unsigned long long*)arg;
+    size = w[1];
+    placement = ((const unsigned*)arg)[4];
+    flags = ((const unsigned*)arg)[5];
+  }
+  const int r = real(fd, req, arg);
+  if (is_bo && r == 0) {
+    char what[64];
+    snprintf(what, sizeof what, "bo");
+    log_call(what, size, (void*)(unsigned long)placement);
+  }
+  return r;
+}
