@@ -20,6 +20,14 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   last state of the 26B's engine, server, draft path and tools is `d9ffaf0` (the restore beside Qwen) and `9775e98` (its
   speculative path; z-lab's draft measured and dropped). The plain-DFlash draft code (per-layer sliding/full attention, tied
   head, softcap) stays, with its tests in `tools/dflash_test`.
+- **The card margin is 256 MiB, not 1 GiB** (`serve/margin`, DECISIONS 2026-11-08; not merged, not deployed): everything the server
+  allocated lazily (attention partials at depth, the vision encoders' scratch and per-image buffers) is now sized, zero-filled and
+  warmed before the experts are placed; what is left is the driver's own buffers on the engine's first launches, 108 MiB measured
+  over every stage (252k decode, two long prompts, images and embeddings, an 8,000-token embedding, verify blocks of 16, the pool
+  reclaiming). At production's shape: 96 experts a layer against 91 (net +0.35 GiB: 0.75 from the margin, 0.40 now held from the
+  start), plain decode +2% at 8k / 32k; with the draft -1.8% / +4.2% (acceptance noise). `EKLOW_ALLOC_TRACE=1` logs what the server
+  allocates after startup; `tools/margin/` has the trace shim, the stage measurement and `pool.sh`. The next lever is EmbeddingGemma 2's
+  projector, 264 MiB + 162 MiB of driver buffers for 1,120 rows when the server sends 280 (`reserve(280)` gave NaN rows once).
 - **One K/V pool for the slots** (`serve/kv-pool`, merged into `main`; DECISIONS 2026-11-07): `--kv-pool N`
   positions for all slots together (default 0 = slots x ctx, unchanged). At `--slots 2 --ctx 262144 --kv-pool 262144` the K/V
   and state take 3.03 GiB instead of 5.84 and the card keeps 91 experts a layer instead of 48: decode with the draft +22% at

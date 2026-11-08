@@ -3,6 +3,9 @@
 #include <level_zero/ze_api.h>
 
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <cstdlib>
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <vector>
 
@@ -31,6 +34,28 @@ sycl::device pick_device() {
     return std::pair{!integrated(d), d.get_info<sycl::info::device::global_mem_size>()};
   };
   return *std::max_element(gpus.begin(), gpus.end(), [&](const sycl::device& a, const sycl::device& b) { return rank(a) < rank(b); });
+}
+
+}  // namespace eklow::rt
+
+namespace eklow::rt {
+
+namespace {
+std::atomic<bool> g_started{false};
+bool trace_on() {
+  static const bool on = [] {
+    const char* e = std::getenv("EKLOW_ALLOC_TRACE");
+    return e && e[0] && e[0] != '0';
+  }();
+  return on;
+}
+}  // namespace
+
+void startup_done() { g_started = true; }
+
+void note_alloc(const char* what, uint64_t bytes) {
+  if (!g_started || !trace_on()) return;
+  std::fprintf(stderr, "eklow: late card allocation: %s, %.2f MiB\n", what, double(bytes) / 1048576.0);
 }
 
 }  // namespace eklow::rt

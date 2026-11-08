@@ -174,8 +174,8 @@ void EmbedGemma2::ensure(int64_t n_tok) {
   for (int64_t i = 0; i < pages_; ++i) identity[size_t(i)] = int32_t(i);
   q_.memcpy(table_, identity.data(), identity.size() * sizeof(int32_t)).wait();
   const int64_t chunk = std::min(T, kAttnChunk);
-  attn::reserve(q_, scratch_, max_tiles, chunk * (n_head_ / hkv_s), hkv_s, d_s);
-  attn::reserve(q_, scratch_, max_tiles, chunk * (n_head_ / hkv_g), hkv_g, d_g);
+  attn::reserve(q_, scratch_, max_tiles, chunk * (n_head_ / hkv_s), hkv_s, d_s, 0, T);
+  attn::reserve(q_, scratch_, max_tiles, chunk * (n_head_ / hkv_g), hkv_g, d_g, 0, T);
   max_tok_ = T;
 }
 

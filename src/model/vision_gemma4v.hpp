@@ -67,6 +67,8 @@ class VisionGemma4V {
   // anything else on the card. bytes() is what it holds now. release() frees the staging and the activations,
   // leaving the small resident part (the patch embedding and the projection); the next encode() allocates again.
   void reserve(int tokens);
+  // One synthetic image of `tokens` output rows through the encoder, rows dropped (see VisionQwen3VL::warm).
+  void warm(int tokens);
   uint64_t card_bytes(int tokens = 1120) const;
   uint64_t bytes() const { return bytes_ + held_; }
   void release();

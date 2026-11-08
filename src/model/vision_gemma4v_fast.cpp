@@ -13,6 +13,8 @@
 #include "kernels/vision_attn.hpp"
 #include "kernels/xmx.hpp"
 #include "model/vision_gemma4v_fast.hpp"
+
+#include "rt/device.hpp"
 #include "rt/copy_engine.hpp"
 
 namespace eklow::model {
@@ -212,10 +214,12 @@ void VisionGemma4V::free_activations() {
   Fast& F = *fast_;
   q_.wait();
   for (void* p : {static_cast<void*>(F.x), static_cast<void*>(F.wide), static_cast<void*>(F.act_main), static_cast<void*>(F.act_ffn),
-                  static_cast<void*>(F.qt), static_cast<void*>(F.kt), static_cast<void*>(F.vt)})
+                  static_cast<void*>(F.qt), static_cast<void*>(F.kt), static_cast<void*>(F.vt), static_cast<void*>(F.small)})
     if (p) sycl::free(p, q_);
   F.x = F.wide = nullptr;
   F.act_main = F.act_ffn = F.qt = F.kt = F.vt = nullptr;
+  F.small = nullptr;
+  F.out_buf.reset();
   vattn::release(q_, F.att);
   F.n_cap = 0;
   held_ = 0;
@@ -256,6 +260,24 @@ void VisionGemma4V::ensure(int64_t n) {
   dev(F.qt, H * R * F.Dp);
   dev(F.kt, H * R * F.Dp);
   dev(F.vt, H * R * F.Dp);
+  // What an encode needs besides the activations: the position rows and RoPE angles (for pictures up to 4:1... see small_floats) and the
+  // rows. An encode used to allocate and free these per image; the driver keeps what is freed, so every new size cost the margin.
+  {
+    const int64_t side = 4 * int64_t(std::ceil(std::sqrt(double(n))));  // cols + rows of any picture up to about 4:1
+    F.small_floats = size_t(side * E + 2 * side * ((d_head_ / 2) / 2));
+    dev(F.small, int64_t(F.small_floats));
+    const size_t out_floats = size_t(n / (merge_ * merge_) + 1) * size_t(n_out_);
+    rt::note_alloc("vision projector rows", out_floats * sizeof(float));
+    float* o = sycl::malloc_device<float>(out_floats, q_);
+    if (!o) {
+      free_activations();
+      throw std::runtime_error("vision encoder: out of device memory for the rows");
+    }
+    q_.memset(o, 0, out_floats * sizeof(float));
+    const sycl::context c = q_.get_context();
+    F.out_buf = std::shared_ptr<float>(o, [c](float* x) { sycl::free(x, c); });
+    F.out_floats = out_floats;
+  }
   // The padding dimensions of the attention operands are never written: zero once.
   q_.memset(F.qt, 0, size_t(H * R * F.Dp) * 2);
   q_.memset(F.kt, 0, size_t(H * R * F.Dp) * 2);
@@ -270,6 +292,17 @@ void VisionGemma4V::reserve(int tokens) {
   if (reference_) return;
   std::lock_guard lock(mu_);
   ensure(int64_t(tokens) * merge_ * merge_);
+}
+
+void VisionGemma4V::warm(int tokens) {
+  if (reference_) return;
+  const int side = std::max(1, int(std::sqrt(double(tokens)))) * merge_ * patch_;
+  image::Rgb pic;
+  pic.width = pic.height = side;
+  pic.pixels.resize(size_t(side) * side * 3);
+  for (size_t i = 0; i < pic.pixels.size(); ++i) pic.pixels[i] = uint8_t((i * 7 + i / 3000) & 255);
+  encode(image::prepare(pic, spec(tokens)));
+  q_.wait();
 }
 
 DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
@@ -317,18 +350,29 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
   // Small per-image device data: the position rows (columns' table rows, then rows'), the RoPE angles.
   const int64_t rot = D / 2, half = rot / 2, maxpos = std::max(cols, rows);
   const ref::RopeTables rt = ref::rope_tables(maxpos, rot, double(rope_theta_), nullptr);
-  float* small = sycl::malloc_device<float>(size_t((cols + rows) * E + 2 * maxpos * half), q_);
-  if (!small) throw std::runtime_error("vision encoder: out of device memory");
-  std::shared_ptr<float> small_guard(small, [ctx](float* x) { sycl::free(x, ctx); });
+  // (ensure() sized it for pictures up to about 4:1; a stranger one allocates its own.)
+  float* small = F.small;
+  std::shared_ptr<float> small_guard;
+  if (size_t((cols + rows) * E + 2 * maxpos * half) > F.small_floats) {
+    rt::note_alloc("vision projector position rows (odd aspect)", size_t((cols + rows) * E + 2 * maxpos * half) * sizeof(float));
+    small = sycl::malloc_device<float>(size_t((cols + rows) * E + 2 * maxpos * half), q_);
+    if (!small) throw std::runtime_error("vision encoder: out of device memory");
+    small_guard = std::shared_ptr<float>(small, [ctx](float* x) { sycl::free(x, ctx); });
+  }
   float *posx = small, *posy = small + cols * E, *cos_t = posy + rows * E, *sin_t = cos_t + maxpos * half;
   q_.memcpy(posx, F.pos, size_t(cols * E) * 4);
   q_.memcpy(posy, F.pos + n_pos_ * E, size_t(rows * E) * 4);
   q_.memcpy(cos_t, rt.cos.data(), size_t(maxpos * half) * 4);
   q_.memcpy(sin_t, rt.sin.data(), size_t(maxpos * half) * 4);
 
-  auto* out_raw = sycl::malloc_device<float>(size_t(n_out * n_out_), q_);
-  if (!out_raw) throw std::runtime_error("vision encoder: out of device memory for the rows");
-  std::shared_ptr<float> out(out_raw, [ctx](float* x) { sycl::free(x, ctx); });
+  // The rows go in the buffer ensure() allocated, unless a caller still holds the previous encode's rows.
+  std::shared_ptr<float> out = F.out_buf;
+  if (out.use_count() > 2 || size_t(n_out * n_out_) > F.out_floats) {
+    rt::note_alloc("vision projector rows (held by a caller)", size_t(n_out * n_out_) * sizeof(float));
+    auto* out_raw = sycl::malloc_device<float>(size_t(n_out * n_out_), q_);
+    if (!out_raw) throw std::runtime_error("vision encoder: out of device memory for the rows");
+    out = std::shared_ptr<float>(out_raw, [ctx](float* x) { sycl::free(x, ctx); });
+  }
 
   auto gemm = [&](sycl::half* a_ptr, int64_t m, int64_t k, const xmx::Weight& w, float* dst) {
     xmx::Activations a;

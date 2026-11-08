@@ -278,7 +278,7 @@ Dflash2::Dflash2(sycl::queue& q, const gguf::File& draft, const Dflash2Target& t
   s.iV = s.dev<float>(I * Hkv * D);
   s.ipos = s.dev<int32_t>(I);
   s.islot = s.dev<int32_t>(I);
-  attn::reserve(q, s.scratch, 256, 64, Hkv, D);
+  attn::reserve(q, s.scratch, 256, 64, Hkv, D, 0, reach_ + opt.max_block + attn::kPage);
   bytes_ = s.bytes;
 }
 

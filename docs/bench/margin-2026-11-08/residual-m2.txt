@@ -1,0 +1,48 @@
+server pid 53239
+eklow-server: vision encoder warmed with a 1024-row image in 0.4 s
+eklow-server: vision encoder /nix/store/b23r16sm3j0pq7lr0lyyva2gw2swkkl6-mmproj-Ornith-1.5-35B-A3B-bf16.gguf, up to 1024 rows an image, 283 MiB on the card while encoding
+eklow-server: vision projector warmed with a 1120-row image in 0.5 s
+eklow-server: vision projector /nix/store/ns0n6xhg02xrc8q5dqv6ck25yavlvm4v-mmproj-embeddinggemma-2-Q8_0.gguf, 269 MiB on the card for 1120-row images
+eklow-server: experts on the card: N = 85 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 7.75 GiB, margin 1.00 GiB, free after 1.88 GiB)
+eklow-server: DFlash 2 draft /nix/store/pfrc3qzdjv0jlsfpcky5mrz55qlfffkg-Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf: blocks of 4 (trained for 8), window 2048, 780 MiB on the card (its token table stays on the host); free card memory now 1.04 GiB
+== ready 20:38:54
+== d8k 20:39:09
+depth    prefill tok/s (TTFT)    decode tok/s, median of 3    tokens/verify
+8k         1773 (4.6 s)        52.0              2.70
+== images 20:39:29
+== image-big.jpg 20:39:29
+[refusal: garbage] HTTP 400: image_url: the image is not in a format this server reads (JPEG, PNG, GIF, BMP, ...)
+[embedding of big.jpg] 0.3 s, 768 dims, prompt_tokens 281
+== image-tall.jpg 20:39:42
+[refusal: garbage] HTTP 400: image_url: the image is not in a format this server reads (JPEG, PNG, GIF, BMP, ...)
+[embedding of tall.jpg] 0.1 s, 768 dims, prompt_tokens 83
+== image-test-1.jpeg 20:39:54
+[refusal: garbage] HTTP 400: image_url: the image is not in a format this server reads (JPEG, PNG, GIF, BMP, ...)
+[embedding of test-1.jpeg] 0.1 s, 768 dims, prompt_tokens 141
+== image-wide.png 20:40:04
+[refusal: garbage] HTTP 400: image_url: the image is not in a format this server reads (JPEG, PNG, GIF, BMP, ...)
+[embedding of wide.png] 0.2 s, 768 dims, prompt_tokens 264
+== embed8k 20:40:13
+32000 chars -> 8167 tokens, 768 dims, 0.41 s
+30718 chars -> 7827 tokens, 768 dims, 0.37 s
+== deep1 20:40:14
+
+depth    prefill tok/s (TTFT)    decode tok/s, median of 1    tokens/verify
+246k          877 (287.4 s)        29.8              2.57
+== twolong 20:45:10
+('88000', 257, {'prompt_tokens': 87957, 'completion_tokens': 300, 'total_tokens': 88257, 'prompt_tokens_details': {'cached_tokens': 0}, 'speculation': {'verifies': 109, 'drafted': 327, 'accepted': 190
+('167000', 259, {'prompt_tokens': 166957, 'completion_tokens': 300, 'total_tokens': 167257, 'prompt_tokens_details': {'cached_tokens': 0}, 'speculation': {'verifies': 96, 'drafted': 288, 'accepted': 2
+== end 20:49:29
+== done 20:49:37
+stage                      start MiB  peak MiB   grew  since ready
+ready                          15211     15211      0            0
+d8k                            15211     15310     99           99
+image-big.jpg                  15310     15314      4          103
+image-tall.jpg                 15314     15315      1          104
+image-test-1.jpeg              15315     15315      0          104
+image-wide.png                 15315     15315      0          104
+embed8k                        15315     15315      0          104
+deep1                          15315     15319      4          108
+twolong                        15319     15319      0          108
+end                            15319     15319      0          108
+ready 15211 MiB, final peak 15319 MiB, residual growth 108 MiB

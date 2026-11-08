@@ -1,0 +1,21 @@
+== mark 1: 36 allocations, 622.8 MiB
+      8 x    66.000 MiB =    528.00  bo@0x1  unsigned char* sycl::_V1::malloc_host<unsigned char>(unsigne < eklow::engine::Engine::snapshot(int) < eklow::serve::Scheduler::take_snapshot(int)
+      1 x    32.000 MiB =     32.00  bo@0x2  eklow::ref::rmsnorm(sycl::_V1::queue&, float const*, float c < eklow::engine::Engine::step_group(eklow::engine::Chunk const < eklow::engine::Engine::step(std::vector<eklow::engine::Chunk
+      1 x    32.000 MiB =     32.00  bo@0x2  eklow::ref::matmul(sycl::_V1::queue&, eklow::ref::Weight con < eklow::engine::Engine::step(std::vector<eklow::engine::Chunk < eklow::serve::Scheduler::step()
+      1 x    19.000 MiB =     19.00  bo@0x2  eklow::fast::moe_group(sycl::_V1::queue&, int const*, long,  < eklow::engine::Engine::cold_decode(eklow::engine::Engine::La < eklow::engine::Engine::step(std::vector<eklow::engine::Chunk
+      1 x     2.000 MiB =      2.00  bo@0x2  eklow::attn::attend(sycl::_V1::queue&, float const*, eklow:: < eklow::model::Dflash2::lattices(std::vector<eklow::model::Df < eklow::serve::Scheduler::step()
+      1 x     2.000 MiB =      2.00  bo@0x2  eklow::qwenk::moe_accumulate(sycl::_V1::queue&, float*, floa < eklow::engine::Engine::step(std::vector<eklow::engine::Chunk < eklow::serve::Scheduler::step()
+      1 x     1.750 MiB =      1.75  bo@0x2  eklow::xmx::(anonymous namespace)::gemm16(sycl::_V1::queue&, < eklow::engine::Engine::step_group(eklow::engine::Chunk const < eklow::engine::Engine::step(std::vector<eklow::engine::Chunk
+      1 x     1.125 MiB =      1.12  bo@0x2  eklow::attn::attend(sycl::_V1::queue&, float const*, eklow:: < eklow::engine::Engine::step_group(eklow::engine::Chunk const < eklow::engine::Engine::step(std::vector<eklow::engine::Chunk
+      1 x     1.062 MiB =      1.06  bo@0x2  eklow::cpu::gemv_q4(unsigned char const*, long, long, eklow: < eklow::engine::Engine::cold_group(eklow::engine::Engine::Lay < eklow::engine::Engine::cold_group(eklow::engine::Engine::Lay
+      2 x     0.500 MiB =      1.00  bo@0x2  sycl::_V1::detail::HostKernelRef<eklow::xmx::fmt::detail::ge < void eklow::xmx::fmt::detail::gemv_grouped_t<(eklow::xmx::We < void eklow::xmx::fmt::detail::gemv_grouped_t<(eklow::xmx::We
+      1 x     0.438 MiB =      0.44  bo@0x2  sycl::_V1::detail::HostKernelRef<eklow::xmx::fmt::detail::ge < void eklow::xmx::fmt::detail::gemv_t<(eklow::xmx::WeightForm < eklow::engine::Engine::step(std::vector<eklow::engine::Chunk
+== mark 2: 46 allocations, 1825.7 MiB
+     23 x    66.000 MiB =   1518.00  bo@0x1  unsigned char* sycl::_V1::malloc_host<unsigned char>(unsigne < eklow::engine::Engine::snapshot(int) < eklow::serve::Scheduler::take_snapshot(int)
+      2 x    40.000 MiB =     80.00  bo@0x2  eklow::model::VisionQwen3VL::encode_fast(eklow::image::Rgb c < eklow::model::VisionQwen3VL::encode_ref(eklow::image::Rgb co < eklow::model::VisionQwen3VL::encode_ref(eklow::image::Rgb co
+      2 x    40.000 MiB =     80.00  bo@0x2  eklow::model::VisionGemma4V::encode_fast(eklow::image::Patch < eklow::model::VisionGemma4V::encode(eklow::image::Patches co < (anonymous namespace)::serve_embeddings(httplib::Server&, ek
+      1 x    80.000 MiB =     80.00  bo@0x2  eklow::model::VisionGemma4V::encode_fast(eklow::image::Patch < eklow::model::VisionGemma4V::encode(eklow::image::Patches co < (anonymous namespace)::serve_embeddings(httplib::Server&, ek
+      3 x    20.000 MiB =     60.00  bo@0x2  eklow::model::VisionQwen3VL::encode_fast(eklow::image::Rgb c < eklow::model::VisionQwen3VL::encode_ref(eklow::image::Rgb co < eklow::model::VisionQwen3VL::encode_ref(eklow::image::Rgb co
+      1 x     4.500 MiB =      4.50  bo@0x2  eklow::model::VisionQwen3VL::encode_fast(eklow::image::Rgb c < eklow::model::VisionQwen3VL::encode_ref(eklow::image::Rgb co < eklow::model::VisionQwen3VL::encode_ref(eklow::image::Rgb co
+      1 x     1.062 MiB =      1.06  bo@0x2  eklow::cpu::gemv_q4(unsigned char const*, long, long, eklow: < sycl::_V1::detail::HostKernelRef<eklow::model::(anonymous na < eklow::model::VisionQwen3VL::encode_fast(eklow::image::Rgb c
+      1 x     1.062 MiB =      1.06  bo@0x2  eklow::cpu::gemv_q4(unsigned char const*, long, long, eklow: < sycl::_V1::detail::HostKernelRef<sycl::_V1::detail::RoundedR < eklow::model::VisionGemma4V::encode_fast(eklow::image::Patch

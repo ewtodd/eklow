@@ -18,6 +18,12 @@ bool integrated(const sycl::device& d);
 // the card holds and the first kernels then fail, so this, not malloc, says what fits.
 std::optional<uint64_t> free_memory(const sycl::device& d);
 
+// EKLOW_ALLOC_TRACE=1 makes the server log every card allocation that happens after startup (a scratch buffer growing, a per-image buffer),
+// with its size and what it is: the margin exists for exactly these (DECISIONS 2026-11-08). The server calls startup_done() once the engine,
+// the draft and the projectors are placed; allocations before that are not logged.
+void startup_done();
+void note_alloc(const char* what, uint64_t bytes);
+
 // Throws std::runtime_error when there is no Level Zero GPU.
 sycl::device pick_device();
 

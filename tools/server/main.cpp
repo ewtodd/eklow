@@ -24,7 +24,8 @@
 // --expert-profile: the experts of each layer that the routing profile says are busiest stay on the card and the rest are
 // computed on the CPU (the model's 256 experts a layer do not fit). How many (--experts-on-card) is, by default, as many as
 // fit in the card's free memory after the KV cache, the workspace, the embedding model and the draft, less
-// --card-margin-mib (1024) for what the first requests allocate and the driver keeps.
+// --card-margin-mib (256) for what the driver allocates for itself on the first launches of the engine's kernels (about 100 MiB measured; every buffer
+// of ours, the vision encoders' and the embedding model's scratch included, is allocated, written and warmed before the experts are placed).
 // --draft (a DFlash 2 draft GGUF) turns on speculative decoding: a verify block of --draft-block tokens (default the
 // draft's trained block or 4 if less, at most 16) per step, accepted losslessly (the sampler's every feature, the tool
 // grammar included). A request may choose its own block with "speculative": N (0 or false: plain decode).
@@ -513,7 +514,7 @@ static int qwen_server_main(int argc, char** argv) {
   bool kv_int8 = true;
   std::string expert_profile;
   int64_t experts_on_card = -2;  // as many as fit, once there is a profile
-  int64_t card_margin_mib = 1024;
+  int64_t card_margin_mib = 256;  // measured after startup: 108 MiB of driver scratch on first launches, nothing else (DECISIONS 2026-11-08)
   int64_t snapshot_mib = 4096, snapshot_every = 16384;
   int stream_slots = -1, stream_min_rows = -1;  // -1: the engine's
   double log_interval = 10;  // seconds between the engine's log lines while there is traffic; 0: none
@@ -681,6 +682,14 @@ static int qwen_server_main(int argc, char** argv) {
         vision_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
         vision = std::make_unique<model::VisionQwen3VL>(*vision_q, *mmproj_file);
         vision->reserve(image_max_tokens);
+        {
+          const auto t_warm = std::chrono::steady_clock::now();
+          const double free0 = double(rt::free_memory(q.get_device()).value_or(0));
+          vision->warm(image_max_tokens);  // the driver's scratch for its kernels exists before the experts are placed
+          std::fprintf(stderr, "eklow-server: vision encoder warmed with a %d-row image in %.1f s, the driver took %.0f MiB for it\n", image_max_tokens,
+                       std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count(),
+                       (free0 - double(rt::free_memory(q.get_device()).value_or(0))) / 1048576.0);
+        }
         const image::QwenSpec spec = vision->spec(image_max_tokens);
         salt = uint64_t(image_max_tokens) * 0x9e3779b97f4a7c15ull;
         fn = [&q = *vision_q, v = vision.get(), spec](std::span<const uint8_t> bytes) {
@@ -728,6 +737,14 @@ static int qwen_server_main(int argc, char** argv) {
       // Not image_tokens: reserve(280) on this projector gave NaN embeddings for some images (reserve(400) and up, and no
       // reserve, did not; reported to perf/vision-fast), so it takes the full 1,120 rows (264 MiB instead of 183).
       embed_vision->reserve(1120);
+      {
+        const auto t_warm = std::chrono::steady_clock::now();
+        const double free0 = double(rt::free_memory(q.get_device()).value_or(0));
+        embed_vision->warm(1120);
+        std::fprintf(stderr, "eklow-server: vision projector warmed with a 1120-row image in %.1f s, the driver took %.0f MiB for it\n",
+                     std::chrono::duration<double>(std::chrono::steady_clock::now() - t_warm).count(),
+                     (free0 - double(rt::free_memory(q.get_device()).value_or(0))) / 1048576.0);
+      }
       std::fprintf(stderr, "eklow-server: vision projector %s, %.0f MiB on the card for %d-row images\n", embed_mmproj_path.c_str(), double(embed_vision->bytes()) / 1048576.0, 1120);
       embed_images = std::make_unique<ImageService>(*embed_vision_q, *embed_vision, image_tokens);
     }
@@ -885,6 +902,7 @@ static int qwen_server_main(int argc, char** argv) {
           [r](bool) { r->cancel(); });
     });
 
+    rt::startup_done();  // EKLOW_ALLOC_TRACE logs the card allocations from here on
     httplib::Server embed_http;
     std::thread embed_thread;
     if (embed_model) {

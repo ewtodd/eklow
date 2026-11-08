@@ -1,0 +1,5 @@
+eklow-server: vision encoder warmed with a 1024-row image in 0.4 s, the driver took 0 MiB for it
+eklow-server: vision projector warmed with a 1120-row image in 0.5 s, the driver took 162 MiB for it
+eklow-server: K/V pool of 262144 positions (1024 pages of 256) for 2 slots of up to 262144 each (shared: an idle slot gives pages back when another needs them)
+eklow-server: experts on the card: N = 96 of 256 per layer, the rest on the CPU (one expert of every layer is 68 MiB; free card memory before them 7.75 GiB, margin 0.25 GiB, free after 1.16 GiB)
+eklow-server: DFlash 2 draft /nix/store/pfrc3qzdjv0jlsfpcky5mrz55qlfffkg-Qwen3.6-35B-A3B-DFlash2-Q8_0.gguf: blocks of 4 (trained for 8), window 2048, 780 MiB on the card (its token table stays on the host); free card memory now 0.31 GiB
