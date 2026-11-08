@@ -2444,7 +2444,7 @@ first launch, in whatever queue launches it, and they stay.
 | images: a large and a tall JPEG, a PNG, each chat and then embedded | 5 |
 | 8,000-token embedding | 0 |
 | the 252k request, decode at depth | 4 |
-| two long prompts (88k + 167k); a 100k + a 131k prompt both generating | 0 |
+| two long prompts (88k + 167k); a 100k + a 131k prompt both generating (when not the first stage: it took the 100 when it was) | 0 |
 | verify blocks of 16 at depth ("speculative": 16 through `serve_perf.py --block 16`) | 4 |
 | GSM8K, two at a time | 0 |
 | total | 108 |
@@ -2475,10 +2475,10 @@ ranks of experts; `--card-margin-mib` still overrides.
 Five ranks of 256 are 3% of the cold work, so the gain is small, and the draft's rows are inside the acceptance noise (the tokens a
 verify differ between the two placements: the experts that move run on the card instead of the CPU, and the logits differ in the
 last bits; not investigated). The brief's premise is right (a MiB of margin is a MiB of experts) but most of the gigabyte was not
-the lazy allocations: 0.40 GiB of it is what the server now holds from the start, ~0.43 GiB is the two projectors with their driver
-buffers (EmbeddingGemma 2's projector alone: 264 MiB reserved for 1,120 rows because `reserve(280)` gave NaN rows for some images,
-plus the 162 MiB the driver took at its warm-up), and the margin itself is 0.25. If the projector's reserve could be cut to the
-280 rows the server actually sends (a fault to find first), that is ~6 more ranks.
+the lazy allocations: 0.40 GiB of it is what the server now holds from the start (the eager buffers and the driver's
+buffers for the vision kernels), and the margin itself is 0.25. The biggest single item is EmbeddingGemma 2's projector: 264 MiB reserved for
+1,120 rows (because `reserve(280)` gave NaN rows for some images) plus the 162 MiB the driver took at its warm-up, 0.42 GiB together. If the
+reserve could be cut to the 280 rows the server actually sends (a fault to find first), that is ~6 more ranks (estimate: 0.42 GiB x 0.7 / 68 MiB).
 
 **Tests on the card** (`docs/bench/margin-2026-11-08/`):
 - `bash ~/eklow-perf/bench.sh checkq ekk8`: identical, line for line, to the pool branch's record (`kv-pool-2026-11-07/checkq.txt`);
