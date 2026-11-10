@@ -23,7 +23,7 @@ Rgb decode(std::span<const uint8_t> bytes, int64_t max_pixels) {
 // The arithmetic is mtmd's, float where it is float.
 Size fit(int width, int height, int patch, int min_patches, int max_patches) {
   const int area = patch * patch, min_pixels = min_patches * area, max_pixels = max_patches * area;
-  auto round_by = [patch](float x) { return int(std::round(x / float(patch))) * patch; };
+  auto round_by = [patch](float x) { return int(std::nearbyint(x / float(patch))) * patch; };
   auto ceil_by = [patch](float x) { return int(std::ceil(x / float(patch))) * patch; };
   auto floor_by = [patch](float x) { return int(std::floor(x / float(patch))) * patch; };
   int w = std::max(patch, round_by(float(width))), h = std::max(patch, round_by(float(height)));
@@ -35,6 +35,22 @@ Size fit(int width, int height, int patch, int min_patches, int max_patches) {
     const float beta = std::sqrt(float(min_pixels) / (float(height) * float(width)));
     h = ceil_by(float(height) * beta);
     w = ceil_by(float(width) * beta);
+  }
+  return {w, h};
+}
+
+// In double, as the Python is.
+Size fill(int width, int height, int patch, int max_patches) {
+  if (width <= 0 || height <= 0) throw std::invalid_argument("fill: empty picture");
+  const double factor = std::sqrt(double(max_patches) * patch * patch / (double(width) * height));
+  int h = int(std::floor(factor * height / patch)) * patch, w = int(std::floor(factor * width / patch)) * patch;
+  if (h == 0 && w == 0) throw std::invalid_argument("the image cannot be resized to a whole number of patches");
+  if (h == 0) {
+    h = patch;
+    w = std::min(int(std::floor(double(width) / height)) * patch, max_patches * patch);
+  } else if (w == 0) {
+    w = patch;
+    h = std::min(int(std::floor(double(height) / width)) * patch, max_patches * patch);
   }
   return {w, h};
 }
@@ -128,18 +144,6 @@ Rgb resize_bicubic(const Rgb& src, int width, int height) {
   return src;
 }
 
-Rgb resize_padded(const Rgb& src, int width, int height) {
-  if (src.width == width && src.height == height) return src;
-  const float scale = std::min(float(width) / float(src.width), float(height) / float(src.height));
-  const int nw = std::min(int(std::ceil(float(src.width) * scale)), width), nh = std::min(int(std::ceil(float(src.height) * scale)), height);
-  const Rgb r = resize_bicubic(src, nw, nh);
-  Rgb dst{width, height, std::vector<uint8_t>(size_t(width) * height * 3, 0)};
-  const int ox = (width - nw) / 2, oy = (height - nh) / 2;
-  for (int y = 0; y < nh; ++y)
-    std::copy_n(&r.pixels[size_t(y) * nw * 3], size_t(nw) * 3, &dst.pixels[(size_t(y + oy) * width + ox) * 3]);
-  return dst;
-}
-
 Patches patchify(const Rgb& p, int patch) {
   if (p.width % patch || p.height % patch) throw std::invalid_argument("patchify: sides must be whole patches");
   Patches out;
@@ -158,9 +162,11 @@ Patches patchify(const Rgb& p, int patch) {
   return out;
 }
 
-Patches prepare(const Rgb& picture, const Spec& s) {
-  const Size t = fit(picture.width, picture.height, s.patch, s.min_patches, s.max_patches);
-  return patchify(resize_padded(picture, t.width, t.height), s.cut ? s.cut : s.patch);
+Rgb fitted(const Rgb& picture, const Spec& s) {
+  const Size t = fill(picture.width, picture.height, s.patch, s.max_tokens);
+  return resize_bicubic(picture, t.width, t.height);
 }
+
+Patches prepare(const Rgb& picture, const Spec& s) { return patchify(fitted(picture, s), s.cut ? s.cut : s.patch); }
 
 }  // namespace eklow::image

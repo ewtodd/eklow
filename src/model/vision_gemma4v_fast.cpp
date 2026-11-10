@@ -535,7 +535,8 @@ DeviceRows VisionGemma4V::encode_fast(const image::Patches& p) {
         q_.parallel_for(sycl::range<2>(size_t(m), size_t(Kp)), [=](sycl::id<2> id) {
           const int64_t r = int64_t(id[0]), c = int64_t(id[1]);
           const float g = gu[r * 2 * Fp + c], u = gu[r * 2 * Fp + Fp + c];
-          af[xmx::act16_index(r, c, Kp / 16)] = sycl::half(g * (1.0f / (1.0f + sycl::exp(-1.702f * g))) * u);
+          const float k0 = 0.7978845608028654f, k1 = 0.044715f;  // ref::gelu_mul's tanh approximation
+          af[xmx::act16_index(r, c, Kp / 16)] = sycl::half(0.5f * g * (1.0f + sycl::tanh(k0 * (g + k1 * g * g * g))) * u);
         });
       }
       mark("gelu");

@@ -59,6 +59,9 @@ add_library(eklow_image STATIC
 target_include_directories(eklow_image PUBLIC src third_party)
 set_source_files_properties(src/image/stb_image.cpp PROPERTIES COMPILE_OPTIONS "-w")
 
+add_executable(eklow-image-prep tools/vision/prep_main.cpp)
+target_link_libraries(eklow-image-prep PRIVATE eklow_image)
+
 add_executable(eklow-tok tools/tok/main.cpp)
 target_link_libraries(eklow-tok PRIVATE eklow_text)
 
@@ -203,7 +206,7 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
 # The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
 

@@ -177,7 +177,7 @@ an exact CPU emulation of the quantized arithmetic (`eklow-attn-test`, `eklow-gd
 - **Mixture of experts on 16 GB**: routing, grouping and the experts' GEMVs and GEMMs on the card; a placement by routing
   profile, with cold experts on the CPU (AVX-VNNI, Q4_K and Q4_0) at decode and streamed over PCIe for prefill.
 - **Image input to chat** (`--mmproj`, llama.cpp's projector GGUF), OpenAI `image_url` parts (base64 `data:` URLs; JPEG,
-  PNG, GIF, BMP), preprocessed as llama.cpp does and encoded on the matrix units, the encoder's weights streamed from
+  PNG, GIF, BMP), preprocessed as Hugging Face's processor does and encoded on the matrix units, the encoder's weights streamed from
   host memory, with prefix reuse that tells images apart: Qwen3.6's vision tower (which Ornith-1.5 shares unchanged):
   0.1-0.4 s an image at the default budget of 1,024 tokens (`--image-max-tokens`); the image's rows enter the prompt
   with Qwen's 3D rotary positions. Against llama.cpp the logits after an image stay within its own CPU-CUDA band
