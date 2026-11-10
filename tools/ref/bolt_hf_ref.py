@@ -1,12 +1,14 @@
 """Transformers' Gemma 4 text model in fp32 over one prompt: the logits of its last positions in eklow-oracle's dump
 format (index.json + logits.f32), so tools/ref/kl_positions.py sets it beside eklow-ref-run's.
 
-Usage: bolt_hf_ref.py --hf DIR --tokens tokens.json --out DIR [--gguf FILE] [--last N] [--chunk N] [--check-gguf]
+Usage: bolt_hf_ref.py --hf DIR --tokens tokens.json --out DIR [--gguf FILE] [--last N] [--chunk N] [--dtype bf16] [--check-gguf]
 
 --hf: the BF16 checkpoint (config.json, model-*.safetensors). With --gguf the text weights are replaced by that GGUF's,
 dequantized as ggml stores them (the gguf package), so both sides run the same numbers and what is left between them is
 arithmetic; without it the checkpoint's own weights. --check-gguf: only compare every GGUF tensor with the checkpoint's
-(relative L2), which shows the name mapping and that the converter folded nothing into the values.
+(relative L2), which shows the name mapping and that the converter folded nothing into the values. --dtype bf16 runs
+the model as transformers usually serves it (weights and activations in bf16, the embedding scales rounded to bf16 as
+Gemma4TextScaledWordEmbedding does): a yardstick for what reduced-precision activations alone cost.
 
 The prompt runs in chunks through transformers' DynamicCache, as generate() does. The two embedding tables (11 GiB of
 the per-layer one in fp32) and the head stay on the CPU, the layers go to the GPU; TF32 is off.
@@ -84,7 +86,7 @@ def checkpoint(hf):
     return where
 
 
-def build(hf, gguf_path, device):
+def build(hf, gguf_path, device, dtype):
     from transformers import AutoConfig
     from transformers.models.gemma4.modeling_gemma4 import Gemma4TextModel, Gemma4TextRotaryEmbedding
 
@@ -99,7 +101,7 @@ def build(hf, gguf_path, device):
     def place(name, t):
         mod_name, _, attr = name.rpartition(".")
         mod = tm.get_submodule(mod_name) if mod_name else tm
-        t = t.to(torch.float32).to("cpu" if name in on_cpu else device)
+        t = t.to(torch.float32).to(dtype).to("cpu" if name in on_cpu else device)
         if isinstance(getattr(mod, attr), torch.nn.Parameter):
             setattr(mod, attr, torch.nn.Parameter(t, requires_grad=False))
         else:
@@ -128,8 +130,8 @@ def build(hf, gguf_path, device):
             raise SystemExit(f"the GGUF lacks {sorted(left)[:8]}")
     # Buffers that are not in a checkpoint: the RoPE frequencies and the embeddings' scales.
     tm.rotary_emb = Gemma4TextRotaryEmbedding(cfg, device=device)
-    tm.embed_tokens.embed_scale = torch.tensor(cfg.hidden_size**0.5)
-    tm.embed_tokens_per_layer.embed_scale = torch.tensor(cfg.hidden_size_per_layer_input**0.5)
+    tm.embed_tokens.embed_scale = torch.tensor(cfg.hidden_size**0.5).to(dtype)
+    tm.embed_tokens_per_layer.embed_scale = torch.tensor(cfg.hidden_size_per_layer_input**0.5).to(dtype)
     tm.eval()
     return cfg, tm
 
@@ -160,6 +162,7 @@ def main():
     ap.add_argument("--last", type=int, default=0)
     ap.add_argument("--chunk", type=int, default=2048)
     ap.add_argument("--check-gguf", action="store_true")
+    ap.add_argument("--dtype", choices=["fp32", "bf16"], default="fp32")
     a = ap.parse_args()
     if a.check_gguf:
         check_gguf(a.hf, a.gguf)
@@ -167,7 +170,7 @@ def main():
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     device = "cuda"
-    cfg, tm = build(a.hf, a.gguf, device)
+    cfg, tm = build(a.hf, a.gguf, device, torch.bfloat16 if a.dtype == "bf16" else torch.float32)
     from transformers import DynamicCache
 
     ids = json.load(open(a.tokens))["ids"]
@@ -187,8 +190,8 @@ def main():
             lo = max(0, (T - last) - s)
             if lo < n:
                 rows.append(h[lo:].cpu())
-    hid = torch.cat(rows)
-    logits = hid @ tm.embed_tokens.weight.T
+    hid = torch.cat(rows).float()
+    logits = hid @ tm.embed_tokens.weight.float().T
     cap = cfg.final_logit_softcapping
     if cap:
         logits = torch.tanh(logits / cap) * cap
@@ -201,7 +204,7 @@ def main():
 
     pieces = AutoTokenizer.from_pretrained(a.hf).convert_ids_to_tokens(ids)
     json.dump({"ids": ids, "pieces": pieces}, open(outd / "tokens.json", "w"))
-    print(f"{T} tokens, {logits.shape[0]} logits rows, {'GGUF ' + a.gguf if a.gguf else 'checkpoint'} weights")
+    print(f"{T} tokens, {logits.shape[0]} logits rows, {'GGUF ' + a.gguf if a.gguf else 'checkpoint'} weights, {a.dtype}")
 
 
 if __name__ == "__main__":

@@ -464,6 +464,9 @@ int gemma4_server_main(int argc, char** argv) {
     const gguf::Value* tmpl = file.find("tokenizer.chat_template");
     const std::optional<text::Gemma4Template> which = tmpl ? text::gemma4_template_of(tmpl->as_string()) : std::nullopt;
     if (!which) throw std::runtime_error(model_path + ": its chat template is neither Bolt's nor Google's Gemma 4 template, which eklow ports");
+    // Bolt was trained to 65,536 positions; beyond them its RoPE is untested, so a larger --ctx is refused, not served.
+    if (const gguf::Value* n = file.find("gemma4.context_length"); n && ctx > n->as_int())
+      throw std::runtime_error("--ctx " + std::to_string(ctx) + " is beyond the model's context of " + std::to_string(n->as_int()));
     const text::Tokenizer tok = text::Tokenizer::from_gguf(file);
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     engine::gemma4::Config ec;

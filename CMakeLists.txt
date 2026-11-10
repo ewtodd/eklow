@@ -199,6 +199,10 @@ eklow_sycl(eklow_serve_gemma4)
 
 # One server binary: tools/server/main.cpp is the Qwen server and the dispatch on the GGUF's architecture,
 # tools/server/gemma4_main.cpp the Gemma 4 server.
+add_executable(eklow-prompt-gemma4 tools/prompt_gemma4/main.cpp)
+target_link_libraries(eklow-prompt-gemma4 PRIVATE eklow_serve_gemma4)
+eklow_sycl(eklow-prompt-gemma4)
+
 add_executable(eklow-server tools/server/main.cpp tools/server/gemma4_main.cpp)
 target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
 target_link_libraries(eklow-server PRIVATE eklow_serve eklow_serve_gemma4 Threads::Threads)
@@ -243,7 +247,7 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-server eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-prompt-gemma4 eklow-server eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
 # The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
 install(TARGETS eklow-grammar-test-gemma4 eklow-chat-gemma4 eklow-parse-gemma4 RUNTIME DESTINATION bin)
 install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)

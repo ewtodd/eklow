@@ -6,8 +6,8 @@
 }:
 
 # Each instance is a chat model served by the one eklow-server, as its own unit eklow-<name>.service: the server reads
-# the model's architecture (Qwen3.6-35B-A3B and its finetunes, llama.cpp's qwen35moe; anything else is refused) and
-# runs its engine. The instances share the card and the embedding port, so at most one runs: each conflicts with
+# the model's architecture (Qwen3.6-35B-A3B and its finetunes, llama.cpp's qwen35moe; Gemma 4 E4B, gemma4, as NVIDIA's
+# Nemotron-3.5-Bolt-E4B; anything else is refused) and runs its engine. The instances share the card and the embedding port, so at most one runs: each conflicts with
 # the others, and starting one stops the one running (systemctl start, or a mode switch such as the house's llm-mode).
 let
   cfg = config.services.eklow;
@@ -25,7 +25,7 @@ let
           description = ''
             The chat model's GGUF, in the formats the engines run: Qwen3.6-35B-A3B or a finetune of it (Q4_K or Q4_0
             experts, Q8_0 dense matrices, a Q6_K head; stock Qwen3.6, Ornith-1.5 and Sage-A1.5 are served and
-            measured).
+            measured), or Gemma 4 E4B as NVIDIA publishes Nemotron-3.5-Bolt-E4B (Q4_K_M, the whole model on the card).
           '';
         };
 
@@ -64,17 +64,18 @@ let
         };
 
         contextSize = lib.mkOption {
-          type = lib.types.ints.positive;
-          default = 262144;
-          description = "Context of each slot, in tokens; Qwen3.6's full window by default.";
+          type = lib.types.nullOr lib.types.ints.positive;
+          default = null;
+          description = "Context of each slot, in tokens; null: the model's full window (Qwen3.6 262144, Bolt 65536).";
         };
 
         kvInt8 = lib.mkOption {
-          type = lib.types.bool;
-          default = true;
+          type = lib.types.nullOr lib.types.bool;
+          default = null;
           description = ''
-            Keep the attention layers' K/V in int8. Needed for 2 x 262144 (fp16 would not fit beside the
-            weights); fp16 decodes a few percent faster at depth.
+            Keep the attention layers' K/V in int8, which 2 x 262144 of Qwen3.6 needs (fp16 would not fit beside the weights);
+            fp16 decodes a few percent faster at depth. null: the server's default for the model (int8 for Qwen3.6, fp16 for
+            Bolt, whose 2 x 65536 take 2 GiB in fp16).
           '';
         };
 
@@ -89,7 +90,7 @@ let
             }
           '';
           description = ''
-            The chat model's vision projector (llama.cpp's mmproj GGUF: Qwen3.6's tower),
+            The chat model's vision projector (llama.cpp's mmproj GGUF: Qwen3.6's tower, or a Gemma 4 one for Bolt),
             for image_url parts in /v1/chat/completions; null refuses them. The encoder's weights and scratch come out of
             the experts' share of the card.
           '';
@@ -100,16 +101,16 @@ let
           default = null;
           example = lib.literalExpression "/models/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf";
           description = ''
-            Qwen3.6 only: a DFlash 2 draft GGUF (arch "dflash"; Inco AI's serves stock Qwen3.6 and Ornith-1.5 alike,
-            DECISIONS 2026-11-01) for speculative decoding, accepted losslessly; null decodes plain. Its weights and cache
-            take ~0.8 GiB of the card.
+            A DFlash draft GGUF (arch "dflash") for speculative decoding, accepted losslessly; null decodes plain. Qwen3.6:
+            a DFlash 2 draft (Inco AI's serves stock Qwen3.6 and Ornith-1.5 alike, DECISIONS 2026-11-01), ~0.8 GiB of the
+            card. Bolt: NVIDIA's Nemotron-3.5-Bolt-E4B-DFlash.
           '';
         };
 
         draftBlock = lib.mkOption {
           type = lib.types.nullOr (lib.types.ints.between 2 16);
           default = null;
-          description = "Qwen3.6 only: tokens of a verify block (the last sampled one and the drafted ones); null: 4, or the draft's trained block if smaller (a block costs ~8.5 ms a row beyond the first on this card; 4 measured best).";
+          description = "Tokens of a verify block (the last sampled one and the drafted ones); null: 4, or the draft's trained block if smaller (on Qwen3.6 a block costs ~8.5 ms a row beyond the first on this card; 4 measured best).";
         };
 
         prefillGroup = lib.mkOption {
@@ -184,8 +185,9 @@ let
           type = lib.types.nullOr lib.types.bool;
           default = null;
           description = ''
-            Stock's and Sage-A1.5's templates: keep earlier assistant turns' reasoning in the prompt by default
-            (`--preserve-thinking on`, the template variable preserve_thinking); a request may still send its own. Off, every
+            Stock's and Sage-A1.5's templates, and Bolt's: keep earlier assistant turns' reasoning in the prompt by default
+            (`--preserve-thinking on`, the template variable preserve_thinking; Bolt's keeps it for turns that called tools);
+            a request may still send its own. Off, every
             new user message re-renders the turn before it without its reasoning, and the server prefills that whole turn
             again (an agentic turn of 190k tokens would take three minutes on fiona). Ornith's template always keeps it. null: the
             server's default, off.
@@ -234,7 +236,7 @@ in
       ];
 
   options.services.eklow = {
-    enable = lib.mkEnableOption "eklow, Qwen3.6-35B-A3B finetunes (with DFlash 2 speculative decoding), and EmbeddingGemma 2, on an Intel Arc A770M behind an OpenAI-compatible API";
+    enable = lib.mkEnableOption "eklow, Qwen3.6-35B-A3B finetunes (with DFlash 2 speculative decoding) or Nemotron-3.5-Bolt-E4B, and EmbeddingGemma 2, on an Intel Arc A770M behind an OpenAI-compatible API";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -252,6 +254,11 @@ in
             model = /models/Ornith-1.5-35B-A3B-Q4_K-Q8_0.gguf;
             alias = "ornith-1.5-35b-a3b";
             expertProfile = "''${config.services.eklow.package}/share/eklow/ornith-1.5-experts.json";
+          };
+          bolt = {
+            model = /models/Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf;
+            alias = "nemotron-3.5-bolt-e4b";
+            port = 8083;
           };
         }
       '';
@@ -378,10 +385,12 @@ in
               (toString inst.port)
               "--slots"
               (toString inst.slots)
+            ]
+            ++ lib.optionals (inst.contextSize != null) [
               "--ctx"
               (toString inst.contextSize)
-              (if inst.kvInt8 then "--kv-int8" else "--kv-fp16")
             ]
+            ++ lib.optional (inst.kvInt8 != null) (if inst.kvInt8 then "--kv-int8" else "--kv-fp16")
             ++ lib.optionals (inst.expertProfile != null) [
               "--expert-profile"
               inst.expertProfile
