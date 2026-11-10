@@ -40,9 +40,11 @@ endfunction()
 
 # Serving text layer: the tokenizer (and, later, the chat template and output parser). No device code.
 add_library(eklow_text STATIC
+  src/text/chat_gemma4.cpp
   src/text/chat_qwen36.cpp
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
+  src/text/output_parser_gemma4.cpp
   src/text/output_parser_qwen.cpp
   src/text/tokenizer_qwen.cpp
   src/text/tool_schema.cpp
@@ -156,6 +158,18 @@ target_link_libraries(eklow_grammar PUBLIC eklow_text)
 add_executable(eklow-grammar-test-qwen tools/grammar_test/main.cpp)
 target_link_libraries(eklow-grammar-test-qwen PRIVATE eklow_grammar)
 
+add_library(eklow_grammar_gemma4 STATIC src/serve/tool_grammar_gemma4.cpp)
+target_link_libraries(eklow_grammar_gemma4 PUBLIC eklow_text)
+
+add_executable(eklow-grammar-test-gemma4 tools/grammar_test_gemma4/main.cpp)
+target_link_libraries(eklow-grammar-test-gemma4 PRIVATE eklow_grammar_gemma4)
+
+add_executable(eklow-chat-gemma4 tools/chat_gemma4/main.cpp)
+target_link_libraries(eklow-chat-gemma4 PRIVATE eklow_text)
+
+add_executable(eklow-parse-gemma4 tools/parse_gemma4/main.cpp)
+target_link_libraries(eklow-parse-gemma4 PRIVATE eklow_text)
+
 # Serving: the request layer (OpenAI surface, Qwen3.6's chat template and tokenizer), the scheduler (continuous batching,
 # speculative decoding with a DFlash 2 draft, snapshots of the recurrent state) and the server. The sampler and the
 # acceptance are eklow_spec's.
@@ -209,6 +223,7 @@ eklow_sycl(eklow-xmx-bench)
 
 install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
 # The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
+install(TARGETS eklow-grammar-test-gemma4 eklow-chat-gemma4 eklow-parse-gemma4 RUNTIME DESTINATION bin)
 install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
 
 # The CPU GEMVs of the Qwen formats for the cold experts, checked and timed (TASK qwen/mm).
