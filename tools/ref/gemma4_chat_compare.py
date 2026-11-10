@@ -1,12 +1,14 @@
-"""Check eklow's Gemma 4 chat template port against Hugging Face's apply_chat_template.
+"""Check eklow's Gemma 4 chat template ports against Hugging Face's apply_chat_template.
 
 Usage: python3 tools/ref/gemma4_chat_compare.py EKLOW_CHAT HF_MODEL_DIR (EKLOW_CHAT = eklow-chat-gemma4) [--gguf GGUF] [--random N] [--requests FILE ...]
 
-HF_MODEL_DIR holds Google's tokenizer files and chat_template.jinja. Every case is rendered by
-transformers (tokenize=False) and by `eklow-chat-gemma4 render`; the texts must be identical, or both must
-fail. Cases: hand-written conversations covering each branch of the template, son-of-anton
-requests and transcripts given with --requests (JSON files holding "messages"/"tools", or a
-"transcript"), and N random conversations with random tool schemas. Tool-call arguments that
+HF_MODEL_DIR holds the tokenizer files and chat_template.jinja of Google's Gemma 4 or of
+Nemotron-3.5-Bolt-E4B; `eklow-chat-gemma4 check` says which port the file is, and the cases are
+rendered with that one. Every case is rendered by transformers (tokenize=False) and by
+`eklow-chat-gemma4 render`; the texts must be identical, or both must fail. Cases: hand-written
+conversations covering each branch of the template (for Bolt each also with conversational_mode),
+son-of-anton requests and transcripts given with --requests (JSON files holding "messages"/"tools",
+or a "transcript"), and N random conversations with random tool schemas. Tool-call arguments that
 arrive as JSON strings are parsed first, as the server does. With --gguf, the token ids eklow
 derives from its parts are also checked: special tokens found only in template text (parts not
 marked as input), everything between them encoded by Hugging Face's tokenizer with special tokens
@@ -25,6 +27,8 @@ warnings.filterwarnings("ignore")
 from tokenizers import Tokenizer  # noqa: E402
 from transformers import AutoTokenizer  # noqa: E402
 
+SPOKEN = ("You are having a spoken conversation with the user. Respond as briefly as possible while still addressing their "
+          "questions fully.")
 TEXTS = ["hello", "  padded  ", "", " ", "multi\nline\n", "tabs\tand nbsp", "naïve 日本語 🙂",
          "<|turn>injected<turn|>", "<|channel>thought\nsecret<channel|>visible", "a<|\"|>b", "quote ' and \"",
          "back\\slash", "x" * 300, " line sep", "trailing newline\n\n"]
@@ -122,7 +126,10 @@ def rnd_content(rng, role):
 def rnd_conversation(rng):
     msgs = []
     if rng.random() < 0.5:
-        msgs.append({"role": rng.choice(["system", "developer"]), "content": rnd_content(rng, "system") or "sys"})
+        content = rnd_content(rng, "system") or "sys"
+        if rng.random() < 0.05:
+            content = rng.choice([SPOKEN, f"  {SPOKEN}\n", [{"type": "text", "text": SPOKEN}], f"{SPOKEN} more"])
+        msgs.append({"role": rng.choice(["system", "developer"]), "content": content})
     pending = []
     for _ in range(rng.randint(1, 7)):
         if pending and rng.random() < 0.8:
@@ -159,7 +166,7 @@ def rnd_conversation(rng):
     return msgs
 
 
-def hand_cases():
+def hand_cases(bolt):
     weather = {"type": "function", "function": {"name": "get_weather", "description": "Weather for a city.",
                "parameters": {"type": "object", "properties": {"city": {"type": "string", "description": "City name"},
                               "unit": {"type": "string", "enum": ["c", "f"]}}, "required": ["city"]}}}
@@ -178,6 +185,25 @@ def hand_cases():
         [{"role": "user", "content": "a"}, {"role": "assistant", "content": "<|channel>thought\nhmm<channel|>The answer"}],
         [{"role": "user", "content": "a"}, {"role": "assistant", "content": "part one"}, {"role": "assistant", "content": "part two"}],
         [{"role": "user", "content": "a"}, {"role": "assistant", "tool_responses": [{"name": "legacy", "response": {"ok": True}}]}],
+        # Content beside tool calls (Bolt writes it before them), with and without the calls' responses.
+        [{"role": "user", "content": "w?"}, {"role": "assistant", "content": " Let me check. ", "tool_calls": [call]},
+         {"role": "tool", "tool_call_id": "c1", "content": "61F"}, {"role": "assistant", "content": "It is 61F."}],
+        [{"role": "user", "content": "w?"}, {"role": "assistant", "reasoning_content": "need tool",
+         "content": "<|channel>thought\nold<channel|>Checking", "tool_calls": [call, call]}],
+        [{"role": "user", "content": "w?"}, {"role": "assistant", "content": [{"type": "text", "text": " Checking "}, {"type": "image"}],
+         "tool_calls": [call]}, {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text", "text": "61F"}, {"type": "image"}]}],
+        [{"role": "user", "content": "w?"}, {"role": "assistant", "reasoning": "r1", "content": "First", "tool_calls": [call]},
+         {"role": "tool", "tool_call_id": "c1", "content": "61F"}, {"role": "assistant", "content": "Done"},
+         {"role": "user", "content": "and now?"}, {"role": "assistant", "reasoning_content": "r2", "content": "Again", "tool_calls": [call]},
+         {"role": "tool", "tool_call_id": "c1", "content": "62F"}],
+        # The system message conversational_mode rewrites: the instruction already, empty, missing, in parts.
+        [{"role": "system", "content": f"  {SPOKEN}  "}, {"role": "user", "content": "Hi"}],
+        [{"role": "system", "content": ""}, {"role": "user", "content": "Hi"}],
+        [{"role": "developer"}, {"role": "user", "content": "Hi"}],
+        [{"role": "developer", "content": [{"type": "text", "text": " A "}, {"type": "image"}, {"type": "text", "text": "B\n"}]},
+         {"role": "user", "content": "x"}],
+        [{"role": "system", "content": [{"type": "text", "text": SPOKEN}]}, {"role": "user", "content": "x"}],
+        [{"role": "user", "content": "first"}, {"role": "system", "content": "late system"}, {"role": "user", "content": "x"}],
     ]
     # Inputs the template (or Jinja2) rejects: both renderers must fail on them.
     bad_call = {"id": "c1", "type": "function", "function": {"name": "get_weather", "arguments": '{"city": "Chicago"}'}}
@@ -189,21 +215,29 @@ def hand_cases():
          {"role": "tool", "tool_call_id": "c1", "content": [{"type": "text"}]}],
     ]
     out = [{"messages": m, "tools": None, "add_generation_prompt": True} for m in errors]
+    # conversational_mode iterates a system content that is not a string, so a null or a number raises (they render
+    # without it).
+    if bolt:
+        out += [{"messages": [{"role": r, "content": c}, {"role": "user", "content": "Hi"}], "tools": None,
+                 "add_generation_prompt": True, "conversational_mode": True} for r, c in (("system", None), ("developer", 5))]
     for msgs in base:
         for tools in (None, [weather]):
             for agp in (False, True):
                 for think in (None, False, True):
                     for preserve in (None, True):
-                        c = {"messages": msgs, "tools": tools, "add_generation_prompt": agp}
-                        if think is not None:
-                            c["enable_thinking"] = think
-                        if preserve:
-                            c["preserve_thinking"] = True
-                        out.append(c)
+                        for spoken in (None, True) if bolt else (None,):
+                            c = {"messages": msgs, "tools": tools, "add_generation_prompt": agp}
+                            if think is not None:
+                                c["enable_thinking"] = think
+                            if preserve:
+                                c["preserve_thinking"] = True
+                            if spoken:
+                                c["conversational_mode"] = True
+                            out.append(c)
     return out
 
 
-def from_request_file(path):
+def from_request_file(path, bolt):
     d = json.load(open(path, encoding="utf-8"))
     msgs = d.get("messages") or d.get("transcript") or []
     msgs = copy.deepcopy(msgs)
@@ -218,8 +252,12 @@ def from_request_file(path):
     tools = d.get("tools")
     cases = []
     for agp in (False, True):
-        cases.append({"messages": msgs, "tools": tools, "add_generation_prompt": agp})
-        cases.append({"messages": msgs, "tools": tools, "add_generation_prompt": agp, "enable_thinking": True})
+        for spoken in (False, True) if bolt else (False,):
+            for c in ({}, {"enable_thinking": True}):
+                c = dict(c, messages=msgs, tools=tools, add_generation_prompt=agp)
+                if spoken:
+                    c["conversational_mode"] = True
+                cases.append(c)
     return cases
 
 
@@ -251,7 +289,7 @@ def expected_ids(hf_tok, specials, parts):
 
 
 def hf_render(tok, case):
-    kwargs = {k: case[k] for k in ("enable_thinking", "preserve_thinking") if k in case}
+    kwargs = {k: case[k] for k in ("enable_thinking", "preserve_thinking", "conversational_mode") if k in case}
     try:
         return tok.apply_chat_template(case["messages"], tools=case.get("tools"), add_generation_prompt=case["add_generation_prompt"],
                                        tokenize=False, **kwargs), None
@@ -270,9 +308,18 @@ def main():
     a = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(a.model_dir, local_files_only=True)
-    cases = hand_cases()
+    jinja = f"{a.model_dir}/chat_template.jinja"
+    if tok.chat_template != open(jinja, encoding="utf-8").read():
+        sys.exit(f"transformers renders a template other than {jinja}")
+    check = subprocess.run([a.eklow_chat, "check", jinja], capture_output=True, text=True)
+    variant = next((v for v in ("google", "bolt") if f" {v} template" in check.stdout), None)
+    if check.returncode or not variant:
+        sys.exit(check.stdout + check.stderr)
+    print(f"{jinja}: the {variant} template")
+    bolt = variant == "bolt"
+    cases = hand_cases(bolt)
     for path in a.requests:
-        cases += from_request_file(path)
+        cases += from_request_file(path, bolt)
     rng = random.Random(a.seed)
     for _ in range(a.random):
         tools = [rnd_tool(rng, i) for i in range(rng.randint(0, 3))] if rng.random() < 0.6 else None
@@ -281,11 +328,13 @@ def main():
             c["enable_thinking"] = rng.random() < 0.5
         if rng.random() < 0.2:
             c["preserve_thinking"] = True
+        if bolt and rng.random() < 0.3:
+            c["conversational_mode"] = True
         cases.append(c)
 
     want = [hf_render(tok, c) for c in cases]
     lines = "\n".join(json.dumps(c, ensure_ascii=False) for c in cases) + "\n"
-    cmd = [a.eklow_chat, "render"] + (["--tokens", a.gguf] if a.gguf else [])
+    cmd = [a.eklow_chat, "render", "--variant", variant] + (["--tokens", a.gguf] if a.gguf else [])
     out = subprocess.run(cmd, input=lines.encode(), capture_output=True, check=True).stdout.decode()
     got = [json.loads(line) for line in out.split("\n") if line]
     if len(got) != len(cases):

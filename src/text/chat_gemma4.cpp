@@ -348,17 +348,63 @@ void media(Out& o, V type) {
 
 enum class Prev { None, Think, Tool, ToolCall, ToolResponse };
 
-}  // namespace
+constexpr std::string_view kSpokenInstruction =
+    "You are having a spoken conversation with the user. Respond as briefly as possible while still addressing their "
+    "questions fully.";
 
-bool is_gemma4_template(std::string_view tmpl) {
-  // FNV-1a over Google's chat_template.jinja (18,683 bytes, published 2026-07-09).
-  uint64_t h = 0xcbf29ce484222325ull;
-  for (unsigned char c : tmpl) h = (h ^ c) * 0x100000001b3ull;
-  return tmpl.size() == 18683 && h == 0x645a5f8cd6ec0ad0ull;
+// Bolt's conversational_mode: the content of the system message the template puts in place of the first message (a
+// system or developer one, `system_first`) or before all of them. Its text is trimmed already, so the system block's
+// own trim leaves it as it is.
+Out spoken_system(V first_message, bool system_first) {
+  Out o;
+  if (system_first) {
+    V content = sub(first_message, "content");
+    std::string text;
+    if (is_string(content)) {
+      text = py::strip(content->as_string());
+    } else {
+      // Anything else is iterated, so a null or a number raises here where the system block would skip it.
+      for (const auto& part : iter(content)) text += py::strip(print(sub(&part, "text"))) + " ";
+      text = py::strip(text);
+    }
+    o.in(text);
+    if (text == kSpokenInstruction) return o;
+    if (!text.empty()) o.lit("\n\n");
+  }
+  o.lit(kSpokenInstruction);
+  return o;
 }
 
-std::vector<ChatPart> render_gemma4(const Value& messages, const Value& tools_value, const ChatOptions& opt) {
+uint64_t fnv(std::string_view s) {
+  uint64_t h = 0xcbf29ce484222325ull;
+  for (unsigned char c : s) h = (h ^ c) * 0x100000001b3ull;
+  return h;
+}
+
+}  // namespace
+
+std::optional<Gemma4Template> gemma4_template_of(std::string_view tmpl) {
+  // FNV-1a over the two chat_template.jinja files: Google's (18,683 bytes, published 2026-07-09) and
+  // nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16's at 49843eed (20,161 bytes; its tokenizer_config.json and the Q4_K_M
+  // GGUF carry the same text).
+  const uint64_t h = fnv(tmpl);
+  if (tmpl.size() == 18683 && h == 0x645a5f8cd6ec0ad0ull) return Gemma4Template::Google;
+  if (tmpl.size() == 20161 && h == 0x4383c8eef667d589ull) return Gemma4Template::Bolt;
+  return std::nullopt;
+}
+
+const char* gemma4_template_name(Gemma4Template which) {
+  switch (which) {
+    case Gemma4Template::Google: return "google";
+    case Gemma4Template::Bolt: return "bolt";
+  }
+  return "?";
+}
+
+std::vector<ChatPart> render_gemma4(Gemma4Template which, const Value& messages, const Value& tools_value,
+                                    const ChatOptions& opt) {
   if (!messages.is_array()) throw ChatError("chat_template: messages must be a list");
+  const bool bolt = which == Gemma4Template::Bolt;
   V tools = tools_value.is_null() ? nullptr : &tools_value;
   const auto& msgs = messages.items();
   Out o;
@@ -369,13 +415,17 @@ std::vector<ChatPart> render_gemma4(const Value& messages, const Value& tools_va
   o.lit(opt.bos_token);
   V first_role = msgs.empty() ? nullptr : sub(&msgs[0], "role");
   bool system_first = !msgs.empty() && (eq(first_role, "system") || eq(first_role, "developer"));
-  if (opt.enable_thinking || truthy(tools) || system_first) {
+  const bool spoken = bolt && opt.conversational_mode;
+  if (opt.enable_thinking || truthy(tools) || system_first || spoken) {
     o.lit("<|turn>system\n");
     if (opt.enable_thinking) {
       o.lit("<|think|>\n");
       prev = Prev::Think;
     }
-    if (system_first) {
+    if (spoken) {
+      o.append(spoken_system(msgs.empty() ? nullptr : &msgs[0], system_first));
+      first = system_first ? 1 : 0;
+    } else if (system_first) {
       V content = sub(&msgs[0], "content");
       if (is_string(content)) {
         o.in(py::strip(content->as_string()));
@@ -430,6 +480,26 @@ std::vector<ChatPart> render_gemma4(const Value& messages, const Value& tools_va
       o.in(need_string(thinking, "reasoning"));
       o.lit("\n<channel|>");
     }
+
+    Out captured;
+    V content = get(message, "content");
+    if (is_string(content)) {
+      captured.in(role == "model" ? strip_thinking(content) : py::strip(content->as_string()));
+    } else if (is_sequence(content)) {
+      for (const auto& item : iter(content)) {
+        V type = get(&item, "type");
+        if (eq(type, "text")) {
+          V text = sub(&item, "text");
+          captured.in(role == "model" ? strip_thinking(text) : py::strip(print(text)));
+        } else {
+          media(captured, type);
+        }
+      }
+    }
+    // Bolt writes a model message's content before its tool calls, as the model wrote it; Google's after the calls'
+    // responses.
+    const bool content_first = bolt && role == "model" && truthy(tool_calls);
+    if (content_first) o.append(captured);
 
     if (truthy(tool_calls)) {
       for (const auto& tc : iter(tool_calls)) {
@@ -501,22 +571,7 @@ std::vector<ChatPart> render_gemma4(const Value& messages, const Value& tools_va
       }
     }
 
-    Out captured;
-    V content = get(message, "content");
-    if (is_string(content)) {
-      captured.in(role == "model" ? strip_thinking(content) : py::strip(content->as_string()));
-    } else if (is_sequence(content)) {
-      for (const auto& item : iter(content)) {
-        V type = get(&item, "type");
-        if (eq(type, "text")) {
-          V text = sub(&item, "text");
-          captured.in(role == "model" ? strip_thinking(text) : py::strip(print(text)));
-        } else {
-          media(captured, type);
-        }
-      }
-    }
-    o.append(captured);
+    if (!content_first) o.append(captured);
     const bool has_content = !py::strip(join(captured.parts)).empty();
 
     V next_role = nullptr;
@@ -541,7 +596,7 @@ std::vector<ChatPart> render_gemma4(const Value& messages, const Value& tools_va
   if (opt.add_generation_prompt) {
     if (prev != Prev::ToolResponse && prev != Prev::ToolCall) {
       o.lit("<|turn>model\n");
-      if (!opt.enable_thinking) o.lit("<|channel>thought\n<channel|>");
+      if (!opt.enable_thinking && !bolt) o.lit("<|channel>thought\n<channel|>");
     } else if (prev == Prev::ToolResponse && opt.enable_thinking) {
       o.lit("<|channel>thought\n");
     }
