@@ -143,9 +143,7 @@ image::Spec VisionGemma4V::spec(int tokens) const {
   image::Spec s;
   s.patch = patch_ * merge_;
   s.cut = patch_;
-  s.min_patches = 70;
-  s.max_patches = tokens > 0 ? tokens : 1120;
-  if (s.max_patches < s.min_patches) s.min_patches = s.max_patches;
+  s.max_tokens = tokens > 0 ? tokens : 1120;
   return s;
 }
 
@@ -257,7 +255,7 @@ DeviceRows VisionGemma4V::encode(const image::Patches& p) {
     ref::rmsnorm(q_, x.get(), L.ln2, n, E, eps_, h.get());
     mm(L.up, h.get(), n, up.get(), scratch.get());
     mm(L.gate, h.get(), n, gate.get(), scratch.get());
-    ref::gelu_quick_mul(q_, gate.get(), up.get(), n * F, up.get());
+    ref::gelu_mul(q_, gate.get(), up.get(), n * F, up.get());
     mm(L.down, up.get(), n, h.get(), scratch.get());
     tap("ffn_out", li, h.get(), n, E);
     if (L.ffn_post) ref::rmsnorm(q_, h.get(), L.ffn_post, n, E, eps_, h.get());

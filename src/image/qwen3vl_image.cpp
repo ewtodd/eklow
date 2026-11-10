@@ -11,7 +11,7 @@ Size qwen3vl_size(int width, int height, const QwenSpec& s) {
 
 Rgb prepare_qwen3vl(const Rgb& picture, const QwenSpec& s) {
   const Size t = qwen3vl_size(picture.width, picture.height, s);
-  return resize_padded(picture, t.width, t.height);
+  return resize_bicubic(picture, t.width, t.height);
 }
 
 Patches patchify_merged(const Rgb& p, const QwenSpec& s) {

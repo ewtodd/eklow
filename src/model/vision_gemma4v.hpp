@@ -7,7 +7,8 @@
 //     x += post_norm(attn(rms(x))), x += post_norm(ffn(rms(x)))
 //     attention: q, k per-head rmsnorm with weight, 2D RoPE (NeoX; the first half of a head turns by the
 //     column, the second by the row, base 100), v per-head rmsnorm without weight, scale 1, no mask
-//     ffn: down(gelu_quick(gate) * up)   (gelu_quick is what the file's missing use_gelu key selects)
+//     ffn: down(gelu_tanh(gate) * up)   (the model's gelu_pytorch_tanh; llama.cpp at the oracle's revision fell back to
+//     gelu_quick on the file's missing use_gelu key until 5ba3b9fd3)
 //   3x3 average pooling over the patch grid, * sqrt(n_embd), (x - std_bias) * std_scale if present,
 //   e = input_projection . rmsnorm(x)                                          (no weight)
 // The rows stand in for the text model's token embeddings, unscaled, between <|image> and <image|>.

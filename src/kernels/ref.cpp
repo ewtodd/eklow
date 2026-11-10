@@ -412,13 +412,6 @@ void add_rows(sycl::queue& q, float* x, const float* v, int64_t rows, int64_t co
    });
 }
 
-void gelu_quick_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out) {
-  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
-     const float g = gate[id[0]];
-     out[id[0]] = g * (1.0f / (1.0f + sycl::exp(-1.702f * g))) * up[id[0]];
-   });
-}
-
 void round_bf16(sycl::queue& q, const float* x, int64_t n, float* out) {
   q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> id) {
      uint32_t b = sycl::bit_cast<uint32_t>(x[id[0]]);

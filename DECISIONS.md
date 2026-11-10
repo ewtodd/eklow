@@ -2569,3 +2569,64 @@ The model can only write text or end the turn. No tool specs are attached, so no
 **Checks.** `eklow-verification-test` (host): the `"none"` prompt is identical to `"auto"`'s and to no `tool_choice`. The
 parser with calls off bans `<tool_call>` and not `<|im_end|>`, and its ban list stays ascending (the sampler needs that).
 Nothing ran on the card.
+
+## 2026-11-10 — images prepared as Hugging Face does, and the Gemma tower's FFN in tanh gelu
+
+**Why.** Against the model's own reference (`google/embeddinggemma-2` through sentence-transformers 6.2, fp32 on a CPU),
+production's (4b4bc40) text embeddings agree to cosine 0.99987-0.99995 at every length to 6,989 tokens, but its image
+embeddings to only 0.953-0.986. Fed pictures already at the size Hugging Face picks, so that neither side resizes, the
+tower gives 0.9989-0.9998: the encoder was right, the preparation was not. The image path followed mtmd at the oracle's
+revision (ea0c4c2c, 2026-10-17), and llama.cpp has since changed three things there or the reference differs:
+
+- Letterboxing. `resize_padded` scaled a picture to fit inside the target and centred it on black; Hugging Face's
+  processors (Gemma4ImageProcessor, Qwen-VL's smart_resize) resize straight to the target size. llama.cpp dropped the
+  padding for Qwen-VL in f711c8f30 (#30736, 10-19) and for Gemma 4 in 7bd180830 (#30922, 10-31). A 2939 x 2499 photo at
+  280 tokens became 847 x 720 between two black strips in an 864 x 720 picture; this is most of the difference.
+- The tower's FFN. The projector GGUF carries no `use_gelu`, so mtmd at the oracle's revision fell back to gelu_quick;
+  the model's activation is gelu_pytorch_tanh, which llama.cpp has written into converted files and set for GEMMA4V
+  since 5ba3b9fd3 (#30882, 10-20).
+- The size. mtmd keeps a picture whose sides already fit the budget at roughly its own size (rounded to 48 pixels,
+  scaled up only below 70 tokens); Gemma4ImageProcessor always scales to the largest whole number of 48-pixel tokens
+  under the budget, up as well as down. A 240 x 488 picture at 280 tokens was 72 tokens here and in llama.cpp (still,
+  at 7d7f028) and is 253 in the reference. This one llama.cpp has not changed.
+
+Smart_resize also rounds a side's halves to even (Python's round()); mtmd has done the same for Qwen-VL since f711c8f30.
+
+**What.** `image::fill` is Hugging Face's get_aspect_ratio_preserving_size, in double as the Python is; `image::fitted`
+resizes straight to its size, and `prepare` cuts that. `Spec` loses `min_patches` (the reference has no minimum).
+Qwen-VL's `fit` rounds with nearbyint, and `prepare_qwen3vl` resizes without padding. `resize_padded` is gone. The
+Gemma tower's FFN uses the tanh approximation on both paths (`ref::gelu_mul`, and the same arithmetic in the fast
+path's elementwise kernel); `ref::gelu_quick_mul` had no other user and is gone. The resampler stays Pillow's bicubic
+in fixed point: Hugging Face's default (torchvision) processors resize with antialiased bicubic, which follows Pillow.
+
+One difference is kept: `fit` still makes each side at least one 32-pixel tile before it checks the minimum, as mtmd and
+Qwen's own `qwen_vl_utils` do, where transformers' copy of smart_resize does not. Only a picture with a side under 16
+pixels tells them apart (1000 x 10: 992 x 32 here, 928 x 32 in transformers).
+
+`eklow-image-prep` (host only) writes the picture each preparation hands on, and `tools/vision/prep_compare.py` holds
+it against the processors themselves (Gemma4ImageProcessor's resize, Qwen2VLImageProcessor's), built from the
+projectors' settings, so no model files are needed.
+
+**Checks.** `prep_compare.py` on the four test pictures (a 2939 x 2499 photo, two newspaper JPEGs
+of 240 x 488 and 640 x 488, a 1280 x 640 PNG) and eight synthetic PNGs (1 x 1 to 5000 x 3000, 4000 x 20, 20 x 4000,
+1000 x 10): every Gemma size equal to Gemma4ImageProcessor's at 70, 280 and 1,120 tokens, every Qwen size equal to
+Qwen2VLImageProcessor's at 8:1024 and 8:256 but the 1000 x 10 above; PNG bytes within 2 of torchvision's (mean 0.000-0.010), JPEG
+bytes within 4 (mean 0.009-0.086), which is stb_image against Pillow's decoder (the decoded pictures alone: within 3,
+mean 0.008-0.066).
+
+The server at production's flags (eklow-sage.service's, Sage-A1.5, the draft, both projectors, `--image-tokens 280`),
+EmbeddingGemma 2 against the reference, cosine:
+
+| | this | 4b4bc40 | llama.cpp CPU, 7d7f028 |
+|---|---|---|---|
+| texts, 20-6,989 tokens | 0.99987-0.99995 | the same, to the bit | 0.99986-0.99991 |
+| the four pictures as sent | 0.99977, 0.99987, 0.99979, 0.99994 | 0.97865, 0.96324, 0.95268, 0.97847 | 0.99953, 0.95210, 0.95455, 0.99992 |
+| text + picture | 0.99958 | 0.98580 | 0.99944 |
+| the pictures pre-sized (no resize anywhere) | 0.99974-0.99993 | 0.99891-0.99977 | 0.99955-0.99989 |
+
+The pre-sized row is the tanh gelu alone. Token counts equal the reference's on every input (the two small JPEGs 257 and
+270, from 76 and 134). `image_test.py` (Sage): the newspaper read as the New York Times of July 21, 1969, its 240 x 488
+strip as the same page cut off, the PNG as the "LLM+" logo, the second turn's prefix reused (473 of 496 cached),
+same-size pictures told apart, the refusals unchanged. The text path is untouched (no `checkq`); `check-qwen.sh`
+against the oracle no longer applies to pictures the oracle letterboxes.
+

@@ -1,9 +1,9 @@
 // Images as Qwen3.5/3.6's vision encoder takes them (llama.cpp's PROJECTOR_TYPE_QWEN3VL, "qwen3vl_merger"), prepared as
-// mtmd does at the oracle's revision (mtmd_image_preprocessor_dyn_size, tools/mtmd/mtmd-image.cpp and clip.cpp): decoded
-// to RGB by stb_image (src/image/gemma4_image.hpp's decode), fitted to a multiple of 32 pixels (patch 16 x merge 2) by
-// smart_resize's rule between a minimum and a maximum number of output tokens (each token is 32 x 32 pixels), resized
-// with Pillow's bicubic and centred on black when rounding leaves a strip (the same resize as the Gemma encoder's), then
-// scaled by (x / 255 - mean) / std (Ornith: 0.5 / 0.5). Host code only.
+// Hugging Face's Qwen-VL processor does and mtmd has since llama.cpp f711c8f30 (mtmd_image_preprocessor_dyn_size with
+// PAD_NONE and image_round_half_even): decoded to RGB by stb_image (src/image/gemma4_image.hpp's decode), fitted to a
+// multiple of 32 pixels (patch 16 x merge 2) by smart_resize's rule between a minimum and a maximum number of output
+// tokens (each token is 32 x 32 pixels), resized straight to that size with Pillow's bicubic (the same resize as the
+// Gemma encoder's), then scaled by (x / 255 - mean) / std (Ornith: 0.5 / 0.5). Host code only.
 #pragma once
 
 #include <cstdint>

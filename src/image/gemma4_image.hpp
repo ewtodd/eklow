@@ -1,10 +1,9 @@
-// Images as Gemma 4's vision encoders take them, prepared exactly as llama.cpp's mtmd does at the
-// oracle's revision (tools/mtmd/clip.cpp and mtmd-image.cpp, mtmd_image_preprocessor_dyn_size): decoded
-// to RGB by stb_image (the same v2.30 llama.cpp vendors), resized to a whole number of pooled patches
-// (48 pixels for the encoder with 16-pixel patches and 3x3 pooling, the 12B's encoder-free embedder
-// cuts 48 directly), aspect ratio kept, between a minimum and a maximum number of tokens (Pillow's
-// bicubic resampling in fixed point; the resized picture is centred on black when rounding leaves a
-// strip), scaled to [0, 1] and cut into patches. Host code only.
+// Images as Gemma 4's vision encoders take them, prepared as Hugging Face's Gemma4ImageProcessor does (the
+// model's reference; llama.cpp's mtmd at the oracle's revision differs, see DECISIONS 2026-11-10): decoded to
+// RGB by stb_image (the same v2.30 llama.cpp vendors), resized straight to the largest whole number of pooled
+// patches (48 pixels for the encoder with 16-pixel patches and 3x3 pooling) that keeps the aspect ratio and
+// fits the token budget, smaller pictures scaled up to it (Pillow's bicubic resampling in fixed point, which
+// torchvision's antialiased bicubic follows), scaled to [0, 1] and cut into patches. Host code only.
 #pragma once
 
 #include <cstdint>
@@ -28,16 +27,19 @@ struct Size {
   int width, height;
 };
 
-// mtmd's calc_size_preserved_ratio with align = patch and the pixel bounds of min_patches and
-// max_patches patches.
+// Qwen-VL's smart_resize (mtmd's calc_size_preserved_ratio with align = patch): each side rounded to
+// a multiple of patch, halves to even as Python's round() does, then scaled down or up into the pixel
+// bounds of min_patches and max_patches patches.
 Size fit(int width, int height, int patch, int min_patches, int max_patches);
+
+// Hugging Face's get_aspect_ratio_preserving_size for Gemma 4: the largest sides, multiples of patch
+// with the aspect ratio kept, of at most max_patches patches; a picture below that is scaled up.
+// A side that rounds to nothing becomes one patch and the other takes the aspect ratio, at most
+// max_patches long. Throws std::invalid_argument when both do.
+Size fill(int width, int height, int patch, int max_patches);
 
 // Pillow's bicubic resampling (a = -0.5), as llama.cpp's resize_pillow.
 Rgb resize_bicubic(const Rgb& src, int width, int height);
-
-// mtmd's resize with PAD_CEIL: scaled to fit inside width x height, rounding each side up, and
-// placed in the middle of a black picture of that size.
-Rgb resize_padded(const Rgb& src, int width, int height);
 
 struct Patches {
   int cols = 0, rows = 0;  // the patch grid
@@ -50,11 +52,15 @@ Patches patchify(const Rgb& picture, int patch);
 
 struct Spec {
   // patch: the unit tokens are counted in (the pooled patch: 16 px times the pooling kernel for GEMMA4V);
+  // max_tokens: the budget in those units (Hugging Face's max_soft_tokens);
   // cut: the side of the patches the encoder takes, 0 for patch.
-  int patch = 48, min_patches = 70, max_patches = 1120, cut = 0;
+  int patch = 48, max_tokens = 280, cut = 0;
 };
 
-// decode's output, fitted, resized and cut.
+// decode's output resized to fill's size for the budget, before it is cut.
+Rgb fitted(const Rgb& picture, const Spec& spec = {});
+
+// fitted's picture cut into patches.
 Patches prepare(const Rgb& picture, const Spec& spec = {});
 
 }  // namespace eklow::image
