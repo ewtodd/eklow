@@ -187,7 +187,7 @@ ToolCall parse_tool_call(const std::vector<std::pair<std::string, bool>>& pieces
   return call;
 }
 
-OutputParser::OutputParser(const Tokenizer& tok, bool in_thinking) : tok_(tok) {
+OutputParser::OutputParser(const Tokenizer& tok, bool in_thinking, bool calls) : tok_(tok), calls_(calls) {
   channel_open_ = need_id(tok, "<|channel>");
   channel_close_ = need_id(tok, "<channel|>");
   call_open_ = need_id(tok, "<|tool_call>");
@@ -204,7 +204,10 @@ OutputParser::OutputParser(const Tokenizer& tok, bool in_thinking) : tok_(tok) {
     for (int32_t id : tok.special_ids())
       if (std::find(ok.begin(), ok.end(), id) == ok.end()) banned_[size_t(s)].push_back(id);
   };
-  ban_all_but(State::Content, {channel_open_, call_open_, eos_, turn_end_, tool_response_, turn_open_});
+  if (calls)
+    ban_all_but(State::Content, {channel_open_, call_open_, eos_, turn_end_, tool_response_, turn_open_});
+  else
+    ban_all_but(State::Content, {channel_open_, eos_, turn_end_, tool_response_, turn_open_});
   ban_all_but(State::ChannelName, {eos_, turn_end_, tool_response_, turn_open_});
   ban_all_but(State::Thinking, {channel_close_, eos_, turn_end_, tool_response_, turn_open_});
   ban_all_but(State::ToolCall, {call_close_, quote_});
@@ -254,7 +257,7 @@ OutputDelta OutputParser::push(int32_t id) {
         emit_text(pending_, d.content, true);
         channel_name_.clear();
         state_ = State::ChannelName;
-      } else if (id == call_open_) {
+      } else if (id == call_open_ && calls_) {
         emit_text(pending_, d.content, true);
         call_.clear();
         state_ = State::ToolCall;

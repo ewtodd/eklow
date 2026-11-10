@@ -1,13 +1,15 @@
-// eklow-grammar-test: the tool-call grammar (serve/tool_grammar.hpp) against the output parser,
-// on Gemma 4's vocabulary.
+// eklow-grammar-test-gemma4: the tool-call grammar (serve/tool_grammar_gemma4.hpp) against the output parser,
+// on a Gemma 4 vocabulary (Google's or Bolt's).
 //
-//   eklow-grammar-test --model GGUF [--calls N] [--walks N] [--seed S]
+//   eklow-grammar-test-gemma4 --model GGUF [--calls N] [--walks N] [--seed S]
 //
 // Calls: random well-formed calls (nested arguments of every kind, strings full of the
 // punctuation the syntax uses), written as the template writes them and tokenized as the model
 // would see them; every token must be allowed. Walks: random token sequences drawn from the
 // allowed sets until the call closes; every one must parse into a call of a declared tool. Bans:
-// in each state of the output parser, the special tokens it bans are exactly those it refuses.
+// in each state of the output parser (content also with calls off, for tool_choice "none"), the special tokens it
+// bans are exactly those it refuses, in ascending order. Ends: the tokens that end a turn are generation_config's
+// eos_token_id, [1, 106, 50].
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -93,7 +95,7 @@ int main(int argc, char** argv) {
     else if (a == "--walks") walks = std::atoi(next().c_str());
     else if (a == "--seed") seed = std::strtoull(next().c_str(), nullptr, 10);
     else {
-      std::fprintf(stderr, "usage: eklow-grammar-test --model GGUF [--calls N] [--walks N] [--seed S]\n");
+      std::fprintf(stderr, "usage: eklow-grammar-test-gemma4 --model GGUF [--calls N] [--walks N] [--seed S]\n");
       return 2;
     }
   }
@@ -208,12 +210,19 @@ int main(int argc, char** argv) {
       for (int32_t id : tok.encode("thought\n", false)) thought.push_back(id);
       // A call with its body written, so that closing it is well formed.
       for (int32_t id : tok.encode("call:todo{}", false)) call.push_back(id);
-      const std::vector<std::pair<const char*, std::vector<int32_t>>> states = {
-          {"content", {}}, {"channel name", {channel}}, {"reasoning", thought}, {"tool call", call}};
-      for (const auto& [name, prefix] : states) {
-        text::OutputParser p(tok);
+      struct Probe {
+        const char* name;
+        bool calls;
+        std::vector<int32_t> prefix;
+      };
+      const std::vector<Probe> states = {{"content", true, {}},          {"content, calls off", false, {}},
+                                         {"channel name", true, {channel}}, {"reasoning", true, thought},
+                                         {"tool call", true, call}};
+      for (const auto& [name, calls_on, prefix] : states) {
+        text::OutputParser p(tok, false, calls_on);
         for (int32_t id : prefix) p.push(id);
         const std::vector<int32_t>& banned = p.banned();
+        if (!std::is_sorted(banned.begin(), banned.end()) && ++bad_bans <= 5) std::fprintf(stderr, "%s: bans not ascending\n", name);
         for (int32_t s : tok.special_ids()) {
           text::OutputParser q = p;
           const bool refused = !q.push(s).errors.empty(), is_banned = std::binary_search(banned.begin(), banned.end(), s);
@@ -224,10 +233,20 @@ int main(int argc, char** argv) {
         }
       }
     }
+    std::vector<int32_t> ends;
+    {
+      text::OutputParser p(tok);
+      for (int32_t id = 0; id < int32_t(tok.size()); ++id)
+        if (p.is_end(id)) ends.push_back(id);
+    }
+    const bool ends_ok = ends == std::vector<int32_t>{1, 50, 106};
     std::printf("calls: %d of %d accepted token by token\n", calls - bad_calls, calls);
     std::printf("walks: %d closed (%d hit the length cap), %d failed to parse or got stuck\n", closed, capped, bad_walks);
     std::printf("bans: %d of %d (state, special token) pairs banned exactly when refused\n", checked - bad_bans, checked);
-    return bad_calls || bad_walks || bad_bans ? 1 : 0;
+    std::string shown;
+    for (int32_t id : ends) shown += (shown.empty() ? "" : ", ") + std::to_string(id) + " " + tok.piece(id);
+    std::printf("ends: %s (%s)\n", shown.c_str(), ends_ok ? "generation_config's eos_token_id" : "NOT generation_config's [1, 106, 50]");
+    return bad_calls || bad_walks || bad_bans || !ends_ok ? 1 : 0;
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-grammar-test: %s\n", e.what());
     return 1;

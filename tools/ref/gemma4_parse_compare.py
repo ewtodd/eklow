@@ -3,11 +3,14 @@
 Usage: python3 tools/ref/gemma4_parse_compare.py EKLOW_CHAT EKLOW_PARSE GGUF (eklow-chat-gemma4, eklow-parse-gemma4) [--random N]
 
 Random assistant turns (reasoning, tool calls with arguments of every JSON kind, content) are
-rendered after a user turn by the template port (identical to Hugging Face's, see gemma4_chat_compare.py)
-and tokenized; the tokens after the last "<|turn>model\\n" are what the model would have generated
-for that turn. eklow-parse reads them back one token at a time and must recover the reasoning, the
-tool calls (name and arguments, compared as values) and the content (as the template trims it).
-Exits 1 on any difference.
+rendered after a user turn by the port of the template the GGUF carries (Google's, or Bolt's, which writes
+the content before the calls; identical to Hugging Face's, see gemma4_chat_compare.py) and tokenized;
+the tokens after the last "<|turn>model\\n" are what the model would have generated for that turn.
+eklow-parse reads them back one token at a time and must recover the reasoning, the tool calls (name
+and arguments, compared as values) and the content (as the template trims it). About half the turns
+with reasoning are read from inside the thought channel instead, as after a tool response with
+thinking on: the prompt ends with "<|channel>thought\\n", and eklow-parse --thinking gets the rest
+(when the channel's newline is a token of its own). Exits 1 on any difference.
 """
 
 import argparse
@@ -74,14 +77,22 @@ def main():
     if len(rendered) != len(cases):
         sys.exit("eklow-chat returned the wrong number of results")
     marker = [105, 4368, 107]  # <|turn> model \n
+    channel = [100, 45518, 107]  # <|channel> thought \n
     gen = []
     for r in rendered:
         ids = r["ids"]
         k = max(i for i in range(len(ids) - 2) if ids[i:i + 3] == marker)
         gen.append(ids[k + 3:])
-    out = subprocess.run([a.eklow_parse, a.gguf], input=("\n".join(" ".join(map(str, g)) for g in gen) + "\n").encode(),
-                         capture_output=True, check=True).stdout.decode()
-    got = [json.loads(x) for x in out.split("\n") if x]
+    inside = [bool(t.get("reasoning_content")) and g[:3] == channel and rng.random() < 0.5 for t, g in zip(turns, gen)]
+
+    def parse(flags, seqs):
+        out = subprocess.run([a.eklow_parse, a.gguf] + flags, input=("\n".join(" ".join(map(str, g)) for g in seqs) + "\n").encode(),
+                             capture_output=True, check=True).stdout.decode()
+        return iter([json.loads(x) for x in out.split("\n") if x])
+
+    plain = parse([], [g for g, i in zip(gen, inside) if not i])
+    thinking = parse(["--thinking"], [g[3:] for g, i in zip(gen, inside) if i])
+    got = [next(thinking) if i else next(plain) for i in inside]
     bad = 0
     for t, g, r in zip(turns, got, rendered):
         want_calls = [{"name": c["function"]["name"], "arguments": c["function"]["arguments"]} for c in t.get("tool_calls", [])]
@@ -93,7 +104,7 @@ def main():
                 print("TURN ", json.dumps(t, ensure_ascii=False)[:400])
                 print("  want", json.dumps(want, ensure_ascii=False)[:400])
                 print("  got ", json.dumps(have, ensure_ascii=False)[:400], g["errors"])
-    print(f"{len(turns)} turns: {len(turns) - bad} recovered exactly, {bad} differences")
+    print(f"{len(turns)} turns ({sum(inside)} read from inside the thought channel): {len(turns) - bad} recovered exactly, {bad} differences")
     sys.exit(1 if bad else 0)
 
 

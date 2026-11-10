@@ -1,9 +1,9 @@
-// eklow-parse: Gemma 4's output parser from the command line.
+// eklow-parse-gemma4: Gemma 4's output parser from the command line.
 //
-//   eklow-parse GGUF [--thinking] < IDS > RESULTS   IDS: one generated turn per line, token ids
-//                                                   separated by spaces, fed one at a time;
-//                                                   RESULTS: one JSON object per line: reasoning,
-//                                                   content, tool_calls, errors, end (token id)
+//   eklow-parse-gemma4 GGUF [--thinking] < IDS > RESULTS  IDS: one generated turn per line, token ids
+//                                                           separated by spaces, fed one at a time;
+//                                                           RESULTS: one JSON object per line: reasoning,
+//                                                           content, tool_calls, errors, end (token id)
 #include <cstdio>
 #include <cstring>
 #include <iostream>
@@ -20,7 +20,7 @@ using namespace eklow;
 
 int main(int argc, char** argv) {
   if (argc < 2) {
-    std::fprintf(stderr, "usage: eklow-parse GGUF [--thinking] < IDS > RESULTS\n");
+    std::fprintf(stderr, "usage: eklow-parse-gemma4 GGUF [--thinking] < IDS > RESULTS\n");
     return 2;
   }
   const bool thinking = argc > 2 && !std::strcmp(argv[2], "--thinking");
@@ -53,7 +53,7 @@ int main(int argc, char** argv) {
       std::cout << w.str() << '\n';
     }
   } catch (const std::exception& e) {
-    std::fprintf(stderr, "eklow-parse: %s\n", e.what());
+    std::fprintf(stderr, "eklow-parse-gemma4: %s\n", e.what());
     return 1;
   }
   return 0;
