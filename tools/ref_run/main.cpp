@@ -1,5 +1,5 @@
-// eklow-ref-run: eklow's reference forward pass (qwen35moe, fp32) over one prompt, written in eklow-oracle's dump
-// format so tools/ref/compare_dumps.py can set the two side by side.
+// eklow-ref-run: eklow's reference forward pass (qwen35moe or gemma4, fp32) over one prompt, written in eklow-oracle's
+// dump format so tools/ref/compare_dumps.py can set the two side by side.
 //
 //   eklow-ref-run --model GGUF --out DIR (--tokens-json FILE | --tokens 2,105,...)
 //                 [--tensors PREFIX,...] [--logits-last N] [--routing FILE]
@@ -21,6 +21,7 @@
 
 #include "core/json.hpp"
 #include "core/json_value.hpp"
+#include "model/gemma4.hpp"
 #include "model/qwen35.hpp"
 #include "model/gguf.hpp"
 #include "rt/device.hpp"
@@ -80,11 +81,24 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     auto f = gguf::File::open(model);
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
-    // Layers are streamed to the card one at a time; the embedding, head and output norm stay on it.
-    const model::Qwen35Config qcfg = model::Qwen35Config::from_gguf(f);
-    const model::Qwen35Weights qw = model::Qwen35Weights::upload(f, qcfg, q);
-    const int n_vocab = qcfg.n_vocab, n_layer = qcfg.n_layer, n_used = qcfg.n_expert_used;
-    std::printf("loaded %.2f GiB onto %s in %.1f s\n", qw.bytes / 1073741824.0, q.get_device().get_info<sycl::info::device::name>().c_str(), since(t0));
+    const bool gemma = f.at("general.architecture").as_string() == "gemma4";
+    if (gemma && !routing_file.empty()) throw std::runtime_error("--routing: Gemma 4 E4B has no experts");
+    std::optional<model::Qwen35Config> qcfg;
+    std::optional<model::Qwen35Weights> qw;
+    std::optional<model::Gemma4Config> gcfg;
+    std::optional<model::Gemma4Weights> gw;
+    if (gemma) {
+      gcfg = model::Gemma4Config::from_gguf(f);
+      gw.emplace(model::Gemma4Weights::upload(f, *gcfg, q));
+    } else {
+      // Layers are streamed to the card one at a time; the embedding, head and output norm stay on it.
+      qcfg = model::Qwen35Config::from_gguf(f);
+      qw.emplace(model::Qwen35Weights::upload(f, *qcfg, q));
+    }
+    const int n_vocab = gemma ? gcfg->n_vocab : qcfg->n_vocab, n_layer = gemma ? gcfg->n_layer : qcfg->n_layer,
+              n_used = gemma ? 0 : qcfg->n_expert_used;
+    std::printf("loaded %.2f GiB onto %s in %.1f s\n", (gemma ? gw->bytes : qw->bytes) / 1073741824.0,
+                q.get_device().get_info<sycl::info::device::name>().c_str(), since(t0));
 
     json::Writer index;
     index.begin_object().kv("n_tokens", int64_t(tokens.size())).kv("n_vocab", int64_t(n_vocab));
@@ -110,7 +124,8 @@ int main(int argc, char** argv) {
 
     t0 = std::chrono::steady_clock::now();
     std::vector<int32_t> routing;
-    auto logits = model::reference_forward(q, qcfg, qw, tokens, logits_last, &sink, routing_file.empty() ? nullptr : &routing);
+    auto logits = gemma ? model::reference_forward(q, *gcfg, *gw, tokens, logits_last, &sink)
+                        : model::reference_forward(q, *qcfg, *qw, tokens, logits_last, &sink, routing_file.empty() ? nullptr : &routing);
     std::printf("reference forward over %zu tokens: %.1f s\n", tokens.size(), since(t0));
     if (!routing_file.empty()) {
       std::ofstream(routing_file, std::ios::binary)

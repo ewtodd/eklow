@@ -98,6 +98,7 @@ add_library(eklow_model STATIC
   src/model/vision_qwen3vl_fast.cpp
   src/kernels/vision_attn.cpp
   src/model/qwen35.cpp
+  src/model/gemma4.cpp
 )
 target_link_libraries(eklow_model PUBLIC eklow_host eklow_image eklow_rt)
 eklow_sycl(eklow_model)
