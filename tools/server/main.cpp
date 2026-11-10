@@ -1,8 +1,9 @@
 // eklow-server: Qwen3.6-35B-A3B (stock or a finetune such as Ornith) with DFlash 2 speculative decoding on the A770M,
 // behind an OpenAI-compatible HTTP API.
 //
-// main() reads the GGUF's general.architecture first (before anything else is parsed) and runs the server (qwen_server_main,
-// below) for qwen35moe; any other architecture is refused with a message naming Qwen3.6 and its finetunes.
+// One binary, two servers: main() reads the GGUF's general.architecture first (before anything else is parsed) and runs
+// qwen35moe's server (qwen_server_main, below) or gemma4's (gemma4_server_main, tools/server/gemma4_main.cpp: Gemma 4 E4B,
+// NVIDIA's Nemotron-3.5-Bolt-E4B). Any other architecture is refused with a message naming both.
 //
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] [--kv-pool N]
 //                [--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]]
@@ -64,6 +65,7 @@
 // the prefix hit rate, the draft's acceptance and the snapshots held.
 #include <httplib.h>
 
+#include "gemma4_main.hpp"
 #include "keepalive.hpp"
 #include "metrics.hpp"
 
@@ -983,7 +985,9 @@ int main(int argc, char** argv) {
     return 1;
   }
   if (arch == "qwen35moe") return qwen_server_main(argc, argv);
-  std::fprintf(stderr, "eklow-server: %s: architecture %s; eklow serves qwen35moe (Qwen3.6-35B-A3B and its finetunes) only\n",
+  if (arch == "gemma4") return gemma4_server_main(argc, argv);
+  std::fprintf(stderr, "eklow-server: %s: architecture %s; eklow serves qwen35moe (Qwen3.6-35B-A3B and its finetunes) and gemma4 "
+                       "(Gemma 4 E4B: Nemotron-3.5-Bolt-E4B)\n",
                model_path.c_str(), arch.c_str());
   return 1;
 }

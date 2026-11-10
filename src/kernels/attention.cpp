@@ -1023,9 +1023,14 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
     // The 26B's global layers: 2 K/V heads, 8 query heads each.
     if (c.int8()) run<512, 8, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
     else run<512, 8, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
-  } else if (c.head_dim == 512 && group == 4 && !c.int8()) {
-    // EmbeddingGemma 2's global layers: 1 K/V head, 4 query heads, an fp16 cache of the pass.
-    run<512, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+  } else if (c.head_dim == 512 && group == 4) {
+    // EmbeddingGemma 2's global layers (1 K/V head, 4 query heads, an fp16 cache of the pass) and Bolt's (2 K/V heads, 8
+    // query heads), whose cache may be int8.
+    if (c.int8()) run<512, 4, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+    else run<512, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+  } else if (c.head_dim == 256 && group == 4 && !c.int8()) {
+    // Bolt's sliding layers: 8 query heads over 2 K/V heads of 256, a ring in fp16.
+    run<256, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   }
   else throw std::runtime_error("attention: no kernel for head_dim " + std::to_string(c.head_dim) + ", group " + std::to_string(group));
 }

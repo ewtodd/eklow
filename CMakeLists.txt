@@ -84,6 +84,7 @@ add_library(eklow_model STATIC
   src/kernels/attention.cpp
   src/kernels/fast.cpp
   src/kernels/gdn.cpp
+  src/kernels/gemma_fast.cpp
   src/kernels/qwen_fast.cpp
   src/kernels/ref.cpp
   src/kernels/xmx.cpp
@@ -147,6 +148,20 @@ add_executable(eklow-engine-run tools/engine_run/main.cpp)
 target_link_libraries(eklow-engine-run PRIVATE eklow_engine)
 eklow_sycl(eklow-engine-run)
 
+# Gemma 4 E4B (Nemotron-3.5-Bolt-E4B) beside Qwen3.6: its engine and tools under *_gemma4 names and the gemma4 inner
+# namespace; eklow-server dispatches on the GGUF's architecture.
+add_library(eklow_engine_gemma4 STATIC src/engine/engine_gemma4.cpp)
+target_link_libraries(eklow_engine_gemma4 PUBLIC eklow_model)
+eklow_sycl(eklow_engine_gemma4)
+
+add_executable(eklow-engine-run-gemma4 tools/engine_run_gemma4/main.cpp)
+target_link_libraries(eklow-engine-run-gemma4 PRIVATE eklow_engine_gemma4)
+eklow_sycl(eklow-engine-run-gemma4)
+
+add_executable(eklow-engine-bench-gemma4 tools/engine_bench_gemma4/main.cpp)
+target_link_libraries(eklow-engine-bench-gemma4 PRIVATE eklow_engine_gemma4)
+eklow_sycl(eklow-engine-bench-gemma4)
+
 add_executable(eklow-engine-bench tools/engine_bench/main.cpp)
 target_link_libraries(eklow-engine-bench PRIVATE eklow_engine)
 eklow_sycl(eklow-engine-bench)
@@ -177,9 +192,16 @@ add_library(eklow_serve STATIC src/serve/openai.cpp src/serve/scheduler.cpp)
 target_link_libraries(eklow_serve PUBLIC eklow_spec eklow_grammar eklow_text eklow_engine)
 eklow_sycl(eklow_serve)
 
-add_executable(eklow-server tools/server/main.cpp)
+# Gemma 4's request layer and scheduler (the sampler is eklow_spec's, shared).
+add_library(eklow_serve_gemma4 STATIC src/serve/openai_gemma4.cpp src/serve/scheduler_gemma4.cpp)
+target_link_libraries(eklow_serve_gemma4 PUBLIC eklow_spec eklow_grammar_gemma4 eklow_text eklow_engine_gemma4)
+eklow_sycl(eklow_serve_gemma4)
+
+# One server binary: tools/server/main.cpp is the Qwen server and the dispatch on the GGUF's architecture,
+# tools/server/gemma4_main.cpp the Gemma 4 server.
+add_executable(eklow-server tools/server/main.cpp tools/server/gemma4_main.cpp)
 target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
-target_link_libraries(eklow-server PRIVATE eklow_serve Threads::Threads)
+target_link_libraries(eklow-server PRIVATE eklow_serve eklow_serve_gemma4 Threads::Threads)
 eklow_sycl(eklow-server)
 # The streams' keep-alive (tools/server/keepalive.hpp), host only.
 add_executable(eklow-keepalive-test tools/server/keepalive_test.cpp)
@@ -221,7 +243,7 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-server eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-server eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
 # The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
 install(TARGETS eklow-grammar-test-gemma4 eklow-chat-gemma4 eklow-parse-gemma4 RUNTIME DESTINATION bin)
 install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
