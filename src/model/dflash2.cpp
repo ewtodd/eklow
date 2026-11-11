@@ -72,7 +72,10 @@ Dflash2Config Dflash2Config::from_gguf(const gguf::File& f) {
   } else {
     if (const auto* v = f.find(p + "embedding_scale")) c.embed_scale = float(v->as_float());
     if (const auto* v = f.find(p + "final_logit_softcapping")) c.softcap = float(v->as_float());
-    c.block_causal = true;
+    // z-lab's drafts carry no attention.causal and their model.py runs the sliding layers causally inside the block;
+    // NVIDIA's Bolt draft says causal false and runs the whole block non-causally (its card: "a single non-causal forward
+    // pass").
+    c.block_causal = f.find(p + "attention.causal") == nullptr;
   }
   if (get_int(f, p + "attention.value_length") != c.head_dim) unsupported(f, "value heads differ from key heads");
   if (c.plain) {

@@ -248,7 +248,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   max_tiles_sliding_ = hkv_sliding_ * ((B * group_sliding_ + 7) / 8 + c_.n_slots);
   max_tiles_global_ = hkv_global_ * ((B * group_global_ + 7) / 8 + c_.n_slots);
   // Tile lists packed with their groups: 4 ints a tile, at most 2 a tile for its group.
-  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}, {&lo_, B}, {&hi_, B}, {&tiles_sliding_, 6 * max_tiles_sliding_},
+  for (auto [p, n] : {std::pair{&tok_, B}, {&slot_, B}, {&pos_, B}, {&tiles_sliding_, 6 * max_tiles_sliding_},
                       {&tiles_global_, 6 * max_tiles_global_}}) {
     *p = sycl::malloc_device<int32_t>(size_t(n), q_);
     if (!*p) throw std::runtime_error("engine: out of device memory");
@@ -317,11 +317,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   std::vector<int32_t> tok, slot, pos, logit_rows, cap_rows;
   capture_.ids.clear();
   const int ncap = int(c_.capture_layers.size());
-  // Image spans make the sliding layers' key ranges per token (lo, hi); without any, tokens are causal.
-  std::vector<int32_t> lo, hi;
   std::vector<std::pair<int64_t, const model::ImageRows*>> spans;  // batch row of the span's first token
-  bool ranged = false;
-  for (const auto& c : chunks) ranged |= !c.images.empty();
   attn::TileList tiles_s(cfg_.head_dim_sliding), tiles_g(cfg_.head_dim_global);
   for (const auto& c : chunks) {
     if (c.slot < 0 || c.slot >= c_.n_slots) throw std::runtime_error("engine: bad slot");
@@ -346,27 +342,15 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       slot.push_back(c.slot);
       pos.push_back(int32_t(c.start_pos + i));
     }
-    if (ranged) {
-      int64_t at = 0;
-      for (const auto& im : c.images) {
-        if (im.n <= 0 || im.offset < at || im.offset + im.n > n || !im.rows) throw std::runtime_error("engine: bad image span");
-        at = im.offset + im.n;
-        spans.push_back({base + im.offset, &im});
-      }
-      // Image tokens see up to the span's last position; every other token is causal. lo and hi do not decrease.
-      size_t next = 0;
-      for (int64_t i = 0; i < n; ++i) {
-        const int64_t p = c.start_pos + i;
-        int64_t h = p;
-        while (next < c.images.size() && i >= c.images[next].offset + c.images[next].n) ++next;
-        if (next < c.images.size() && i >= c.images[next].offset) h = c.start_pos + c.images[next].offset + c.images[next].n - 1;
-        lo.push_back(int32_t(std::max<int64_t>(0, p - cfg_.window + 1)));
-        hi.push_back(int32_t(h));
-      }
-      tiles_s.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_sliding_, hkv_sliding_, 0, lo[size_t(base)], hi.back());
-    } else {
-      tiles_s.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_sliding_, hkv_sliding_, cfg_.window);
+    int64_t at = 0;
+    for (const auto& im : c.images) {
+      if (im.n <= 0 || im.offset < at || im.offset + im.n > n || !im.rows) throw std::runtime_error("engine: bad image span");
+      at = im.offset + im.n;
+      spans.push_back({base + im.offset, &im});
     }
+    // Images are causal on every layer: Gemma 4 E2B and E4B leave use_bidirectional_attention unset, so transformers masks
+    // them as text (only the larger Gemma 4, "vision", let an image see all of itself on the sliding layers).
+    tiles_s.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_sliding_, hkv_sliding_, cfg_.window);
     tiles_g.add_chunk(int32_t(base), n, c.start_pos + n - 1, group_global_, hkv_global_, 0);
     for (int64_t r = std::max<int64_t>(0, n - (c.verify ? n : c.logits_rows)); r < n; ++r) logit_rows.push_back(int32_t(base + r));
     ensure_pages(c.slot, c.start_pos + n);
@@ -383,15 +367,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   q_.memcpy(tok_, tok.data(), size_t(T) * 4);
   q_.memcpy(slot_, slot.data(), size_t(T) * 4);
   q_.memcpy(pos_, pos.data(), size_t(T) * 4);
-  if (ranged) {
-    q_.memcpy(lo_, lo.data(), size_t(T) * 4);
-    q_.memcpy(hi_, hi.data(), size_t(T) * 4);
-  }
   const std::vector<int32_t> packed_s = tiles_s.packed(), packed_g = tiles_g.packed();
   q_.memcpy(tiles_sliding_, packed_s.data(), packed_s.size() * 4);
   q_.memcpy(tiles_global_, packed_g.data(), packed_g.size() * 4);
   q_.memcpy(page_table_, page_table_host_.data(), page_table_host_.size() * 4);
-  const attn::Tokens toks{slot_, pos_, T}, toks_s{slot_, pos_, T, ranged ? lo_ : nullptr, ranged ? hi_ : nullptr};
+  const attn::Tokens toks{slot_, pos_, T};
   // On a profiling queue each mark is an empty kernel whose end timestamp closes the section, so the card's own time is
   // measured; otherwise the host waits at each mark.
   const bool gpu_marks = profile_ && q_.has_property<sycl::property::queue::enable_profiling>();
@@ -485,7 +465,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       const attn::Cache cache{ring_k_ + L.ring_index * ring_layer_stride_, ring_v_ + L.ring_index * ring_layer_stride_, nullptr,
                               ring_pages_, cfg_.window, Hkv, D};
       if (L.writes_kv) attn::write(q_, kb_, vb_, toks, cache);
-      attn::attend(q_, qb_, toks_s, tiles_s, tiles_sliding_, cache, H, 1.0f, att_, attn_scratch_);
+      attn::attend(q_, qb_, toks, tiles_s, tiles_sliding_, cache, H, 1.0f, att_, attn_scratch_);
       mark("attn_sliding");
     } else {
       const GlobalCache& g = global_[size_t(L.page_index)];

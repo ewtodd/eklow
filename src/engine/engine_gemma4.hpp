@@ -48,9 +48,8 @@ struct Chunk {
   int64_t start_pos;  // position of tokens[0]
   std::vector<int32_t> tokens;
   int64_t logits_rows = 1;
-  // Spans of tokens whose input rows are given (an image's, unscaled) instead of looked up in the embedding table; the
-  // tokens there still pick the per-layer inputs. On the sliding layers each span's tokens see the whole span (Gemma 4
-  // runs an image bidirectionally on those layers only; the global layers stay causal). A span lies within one chunk, in
+  // Spans of tokens whose input rows are given (an image's, unscaled) instead of looked up in the embedding table; their
+  // per-layer inputs take the pad token's table rows. Attention stays causal over them. A span lies within one chunk, in
   // order.
   std::vector<model::ImageRows> images = {};
   // A verify chunk (a speculative decoder's block of 2 to kMaxVerify tokens: the anchor and the drafted ones): logits for
@@ -173,7 +172,7 @@ class Engine {
 
   // workspace, sized for max_batch tokens
   float *xa_, *xb_, *h_, *qkv_, *qkv2_, *qb_, *kb_, *vb_, *att_, *o_, *gu_, *pl_, *pg_, *rows_, *logits_;
-  int32_t *tok_, *slot_, *pos_, *lo_, *hi_, *tiles_sliding_, *tiles_global_;
+  int32_t *tok_, *slot_, *pos_, *tiles_sliding_, *tiles_global_;
   int64_t max_tiles_sliding_ = 0, max_tiles_global_ = 0;
   xmx::Activations act_, act_ffn_, act_pl_;  // matmul inputs: of width E or H x D, of the FFN's width, of the per-layer width
   attn::Scratch attn_scratch_;

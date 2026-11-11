@@ -63,7 +63,7 @@ struct Dflash2Config {
   bool plain = false;
   float embed_scale = 1.0f;   // the target's embedding rows are multiplied by it (dflash.embedding_scale; Gemma: sqrt(hidden))
   float softcap = 0.0f;       // dflash.final_logit_softcapping: logits become softcap * tanh(logit / softcap); 0: none
-  bool block_causal = false;  // sliding layers attend causally inside the block (model.py: a layer is causal when it slides)
+  bool block_causal = false;  // sliding layers attend causally inside the block (z-lab's model.py: a layer is causal when it slides)
   std::vector<uint8_t> full;  // per layer: 1 where attention is over the whole context (empty: every layer slides)
   bool full_layer(int l) const { return !full.empty() && full[size_t(l)] != 0; }
   bool has_full() const {
