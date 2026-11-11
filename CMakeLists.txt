@@ -149,6 +149,16 @@ add_library(eklow_vega STATIC
 target_link_libraries(eklow_vega PUBLIC eklow_model eklow_text)
 eklow_sycl(eklow_vega)
 
+# Qwen3-Reranker: llama.cpp's rerank endpoint over eklow's kernels.
+add_library(eklow_rerank STATIC src/model/rerank_qwen3.cpp)
+target_link_libraries(eklow_rerank PUBLIC eklow_model eklow_text)
+eklow_sycl(eklow_rerank)
+
+add_executable(eklow-rerank tools/rerank/main.cpp)
+target_include_directories(eklow-rerank PRIVATE ${HTTPLIB_INCLUDE_DIR})
+target_link_libraries(eklow-rerank PRIVATE eklow_rerank Threads::Threads)
+eklow_sycl(eklow-rerank)
+
 add_executable(eklow-vega tools/vega/main.cpp)
 target_include_directories(eklow-vega PRIVATE ${HTTPLIB_INCLUDE_DIR})
 target_link_libraries(eklow-vega PRIVATE eklow_vega Threads::Threads)
@@ -183,7 +193,7 @@ eklow_sycl(eklow_serve)
 
 add_executable(eklow-server tools/server/main.cpp)
 target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
-target_link_libraries(eklow-server PRIVATE eklow_serve eklow_vega Threads::Threads)
+target_link_libraries(eklow-server PRIVATE eklow_serve eklow_vega eklow_rerank Threads::Threads)
 eklow_sycl(eklow-server)
 # The streams' keep-alive (tools/server/keepalive.hpp), host only.
 add_executable(eklow-keepalive-test tools/server/keepalive_test.cpp)
@@ -225,7 +235,7 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-server eklow-vega eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-server eklow-vega eklow-rerank eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
 # The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
 install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
 

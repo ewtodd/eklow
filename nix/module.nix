@@ -406,10 +406,53 @@ in
       };
     };
 
+    reranker = {
+      model = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = lib.literalExpression ''
+          pkgs.fetchurl {
+            name = "qwen3-reranker-0.6b-q8_0.gguf";
+            url = "https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/a02f48bb4f057028298c21fa033da2b30d7742d5/qwen3-reranker-0.6b-q8_0.gguf";
+            sha256 = "22c9979ce4fbcdc5acdc310c6641c32797eff1aa980b8f7a2db8a8ea23429a48";
+          }
+        '';
+        description = ''
+          A Qwen3-Reranker GGUF with its yes/no head and rerank template (ggml-org's conversion; a plain causal-LM conversion
+          has neither), served by whichever instance runs as llama.cpp's POST /v1/rerank on `reranker.port`: 796 MiB of the
+          card at maxTokens 4096 (measured on fiona), out of the chat model's share. null serves none.
+        '';
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 8085;
+        description = ''
+          Port of the reranker's API (POST /v1/rerank, /rerank, GET /health). Not llama.cpp's 8083 by default: a port another
+          service holds stops the whole server (chat included) at startup, so take 8083 only once llama.cpp's reranker is gone.
+        '';
+      };
+
+      alias = lib.mkOption {
+        type = lib.types.str;
+        default = "qwen3-reranker-0.6b";
+        description = "Model name the reranker's answers carry when a request names none.";
+      };
+
+      maxTokens = lib.mkOption {
+        type = lib.types.ints.between 256 32768;
+        default = 4096;
+        description = ''
+          The longest query-document pair, in tokens, and the rows of one pass of the reranker (its activations grow with
+          it); a longer pair is refused with 400, as llama.cpp refuses a pair past its ubatch (4,096 on fiona).
+        '';
+      };
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Open the instances' ports, the embedding port and the checker's port in the firewall.";
+      description = "Open the instances' ports, the embedding port, the checker's and the reranker's ports in the firewall.";
     };
   };
 
@@ -436,6 +479,7 @@ in
         lib.mapAttrsToList (_: inst: inst.port) cfg.instances
         ++ lib.optional (cfg.embedModel != null) cfg.embedPort
         ++ lib.optional (cfg.checker.reader != null) cfg.checker.port
+        ++ lib.optional (cfg.reranker.model != null) cfg.reranker.port
       )
     );
 
@@ -541,6 +585,16 @@ in
                 cfg.checker.policy
               ]
             )
+            ++ lib.optionals (cfg.reranker.model != null) [
+              "--rerank-model"
+              cfg.reranker.model
+              "--rerank-port"
+              (toString cfg.reranker.port)
+              "--rerank-alias"
+              cfg.reranker.alias
+              "--rerank-max-tokens"
+              (toString cfg.reranker.maxTokens)
+            ]
             ++ inst.extraArgs
           );
           Restart = "on-failure";

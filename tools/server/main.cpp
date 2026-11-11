@@ -9,6 +9,7 @@
 //                [--draft GGUF [--draft-block B]] [--chat-template stock|ornith|sage] [--verification on|off] [--preserve-thinking on|off] [--snapshot-mib N [--snapshot-every N]] [--mmproj GGUF [--image-max-tokens N]]
 //                [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
 //                [--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]]
+//                [--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]]
 //                [--log-interval S] [--keepalive S]
 //
 // --ctx is the context of each slot (positions), 262,144 by default. --kv-pool N is the K/V pool of all the slots together, in positions
@@ -60,7 +61,9 @@
 // runs chat and embeddings as separate upstreams). With a checker (--checker-reader, vega's Qwen3.5-0.8B GGUF; --checker-vega, a vega-U
 // model directory; --checker-policy, laya's trained policy folder), POST /v1/systemone on --checker-port (tools/server/systemone.hpp:
 // son-of-anton's end-of-turn checks, run with the scheduler held as embeddings are); --checker-max-tokens (16,384) is the longest prompt
-// its reader holds, a longer state being refused with 413.
+// its reader holds, a longer state being refused with 413. With a reranker (--rerank-model, ggml-org's Qwen3-Reranker GGUF), POST /v1/rerank
+// (and /rerank, /v1/reranking, /reranking) on --rerank-port in llama.cpp's shape (tools/server/rerank.hpp), its scores llama.cpp's
+// P(yes); --rerank-max-tokens (4,096) is the longest query-document pair, and the rows of one of its passes.
 // The log (stdout, unholy's form, each line prefixed with the local time): a line per chat request as it ends
 // (finish reason; prompt, cached and completion tokens; queue, time to first token, prefill and decode tok/s; with a
 // draft, the tokens a verify gave), a line per embedding request, a line per rejected request, and every --log-interval
@@ -70,6 +73,7 @@
 
 #include "keepalive.hpp"
 #include "metrics.hpp"
+#include "rerank.hpp"
 #include "systemone.hpp"
 
 #include <algorithm>
@@ -532,6 +536,9 @@ static int qwen_server_main(int argc, char** argv) {
   std::string checker_reader, checker_vega, checker_policy, checker_alias = "vega-u";
   int checker_port = 0;
   int64_t checker_max_tokens = 16384;
+  std::string rerank_path, rerank_alias = "qwen3-reranker-0.6b";
+  int rerank_port = 0;
+  int64_t rerank_max_tokens = 4096;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -577,12 +584,17 @@ static int qwen_server_main(int argc, char** argv) {
     else if (a == "--checker-port") checker_port = std::atoi(next().c_str());
     else if (a == "--checker-alias") checker_alias = next();
     else if (a == "--checker-max-tokens") checker_max_tokens = std::atoll(next().c_str());
+    else if (a == "--rerank-model") rerank_path = next();
+    else if (a == "--rerank-port") rerank_port = std::atoi(next().c_str());
+    else if (a == "--rerank-alias") rerank_alias = next();
+    else if (a == "--rerank-max-tokens") rerank_max_tokens = std::atoll(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] [--kv-pool N] "
                            "[--batch N] [--chunk N] [--group N [--group-busy TOKENS]] [--kv-int8 | --kv-fp16] [--expert-profile JSON [--experts-on-card N] [--card-margin-mib N] [--stream-slots N] [--stream-min-rows N]] "
                            "[--draft GGUF [--draft-block B]] [--chat-template stock|ornith|sage] [--verification on|off] [--preserve-thinking on|off] [--snapshot-mib N [--snapshot-every N]] "
                            "[--mmproj GGUF [--image-max-tokens N]] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N] "
-                           "[--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]] [--log-interval S] [--keepalive S]\n");
+                           "[--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]] "
+                           "[--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S]\n");
       return 2;
     }
   }
@@ -616,6 +628,10 @@ static int qwen_server_main(int argc, char** argv) {
   }
   if (!checker_reader.empty() && (checker_vega.empty() || checker_port <= 0 || checker_max_tokens < 1024)) {
     std::fprintf(stderr, "eklow-server: --checker-reader needs --checker-vega, --checker-port and a --checker-max-tokens of 1024 or more\n");
+    return 2;
+  }
+  if (!rerank_path.empty() && (rerank_port <= 0 || rerank_max_tokens < 256)) {
+    std::fprintf(stderr, "eklow-server: --rerank-model needs --rerank-port and a --rerank-max-tokens of 256 or more\n");
     return 2;
   }
   if (snapshot_every < 1024) {
@@ -792,6 +808,22 @@ static int qwen_server_main(int argc, char** argv) {
                    checker_alias.c_str(), checker_reader.c_str(), checker->policy() ? checker->policy()->verified().c_str() : "none",
                    (free0 - double(rt::free_memory(q.get_device()).value_or(0))) / 1048576.0, (long long)checker_max_tokens,
                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ck).count());
+    }
+    // The reranker likewise: weights, activations for a pass of rerank_max_tokens rows, warmed with one pair.
+    std::unique_ptr<gguf::File> rerank_file;
+    std::unique_ptr<sycl::queue> rerank_q;
+    std::unique_ptr<model::RerankQwen3> reranker;
+    std::mutex rerank_mu;
+    if (!rerank_path.empty()) {
+      const auto t_rr = std::chrono::steady_clock::now();
+      const double free0 = double(rt::free_memory(q.get_device()).value_or(0));
+      rerank_file = std::make_unique<gguf::File>(gguf::File::open(rerank_path));
+      rerank_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
+      reranker = std::make_unique<model::RerankQwen3>(*rerank_q, *rerank_file, rerank_max_tokens);
+      reranker->score({reranker->prompt("A warm-up.", "A warm-up.")});
+      std::fprintf(stderr, "eklow-server: reranker %s (%s): %.0f MiB on the card with the driver's, pairs of up to %lld tokens, %.1f s\n",
+                   rerank_alias.c_str(), rerank_path.c_str(), (free0 - double(rt::free_memory(q.get_device()).value_or(0))) / 1048576.0,
+                   (long long)rerank_max_tokens, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rr).count());
     }
     engine::Engine eng(q, file, ec);
     const double GiB = 1073741824.0;
@@ -998,6 +1030,25 @@ static int qwen_server_main(int argc, char** argv) {
       });
     }
 
+    httplib::Server rerank_http;
+    std::thread rerank_thread;
+    if (reranker) {
+      rerank_http.new_task_queue = [] { return new httplib::ThreadPool(4); };
+      rerank_http.Get("/health", [](const httplib::Request&, httplib::Response& res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
+      serve::RerankConfig rc;
+      rc.alias = rerank_alias;
+      rc.log = log_line;
+      rc.hold = [&sched] { return std::static_pointer_cast<void>(std::make_shared<serve::Scheduler::Hold>(sched)); };
+      serve::serve_rerank(rerank_http, *reranker, rerank_mu, rc);
+      std::fprintf(stderr, "eklow-server: reranker %s listening on %s:%d (POST /v1/rerank)\n", rerank_alias.c_str(), host.c_str(), rerank_port);
+      rerank_thread = std::thread([&] {
+        if (!rerank_http.listen(host, rerank_port)) {
+          std::fprintf(stderr, "eklow-server: cannot listen on %s:%d\n", host.c_str(), rerank_port);
+          g_stop = true;
+        }
+      });
+    }
+
     std::signal(SIGINT, [](int) { g_stop = true; });
     std::signal(SIGTERM, [](int) { g_stop = true; });
     std::thread stopper([&] {
@@ -1005,6 +1056,7 @@ static int qwen_server_main(int argc, char** argv) {
       http.stop();
       embed_http.stop();
       checker_http.stop();
+      rerank_http.stop();
     });
     std::fprintf(stderr, "eklow-server: listening on %s:%d\n", host.c_str(), port);
     if (!http.listen(host, port)) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
@@ -1013,6 +1065,7 @@ static int qwen_server_main(int argc, char** argv) {
     engine_thread.join();
     if (embed_thread.joinable()) embed_thread.join();
     if (checker_thread.joinable()) checker_thread.join();
+    if (rerank_thread.joinable()) rerank_thread.join();
     if (stats_thread.joinable()) stats_thread.join();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-server: %s\n", e.what());
