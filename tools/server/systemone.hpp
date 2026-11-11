@@ -22,6 +22,7 @@
 
 #include "core/json.hpp"
 #include "core/json_value.hpp"
+#include "models.hpp"
 #include "vega/checker.hpp"
 
 namespace eklow::serve {
@@ -33,6 +34,7 @@ struct SystemOneConfig {
 };
 
 inline void serve_systemone(httplib::Server& http, vega::Checker& ck, std::mutex& mu, const SystemOneConfig& cfg) {
+  serve_models(http, cfg.alias, ck.reader().max_tokens(), 1);
   http.Post("/v1/systemone", [&ck, &mu, cfg](const httplib::Request& req, httplib::Response& res) {
     auto fail = [&](int status, const std::string& detail) {
       if (cfg.log) cfg.log("systemone: error " + std::to_string(status) + ": " + detail);

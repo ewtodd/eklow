@@ -1,8 +1,8 @@
 // eklow-rerank: Qwen3-Reranker on the card, alone.
 //
 //   eklow-rerank serve --model GGUF [--host ADDR] --port N [--alias NAME] [--max-tokens N]
-//       POST /v1/rerank (tools/server/rerank.hpp) and GET /health; eklow-server serves the same beside a chat model
-//       (--rerank-*).
+//       POST /v1/rerank (tools/server/rerank.hpp), GET /v1/models and GET /health; eklow-server serves the same beside a
+//       chat model (--rerank-*).
 //   eklow-rerank score --model GGUF --pairs PAIRS.json --out OUT.json [--repeat N] [--max-tokens N]
 //       Each request of PAIRS.json (tools/rerank/synthetic_pairs.py's) scored without HTTP: {name: {"scores": [...],
 //       "ms": [...]}} as rerank_compare.py fetch writes it, the first run a warm-up.

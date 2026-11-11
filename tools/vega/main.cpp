@@ -19,8 +19,8 @@
 //       POST /v1/systemone's answer to son-of-anton's three questions for every state ({key: {qid: {noul, readout}}}), and
 //       the latency of each (the median of N runs after one warm-up).
 //   eklow-vega serve --reader GGUF --vega DIR [--policy DIR] [--host ADDR] --port N [--alias NAME] [--max-tokens N]
-//       POST /v1/systemone (tools/server/systemone.hpp) and GET /health, the checker alone; eklow-server serves the same
-//       beside a chat model (--checker-*).
+//       POST /v1/systemone (tools/server/systemone.hpp), GET /v1/models and GET /health, the checker alone; eklow-server
+//       serves the same beside a chat model (--checker-*).
 //
 // STATES.json is a list of {"key", "state"}.
 #include <httplib.h>

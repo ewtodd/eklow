@@ -23,6 +23,7 @@
 #include "core/json.hpp"
 #include "core/json_value.hpp"
 #include "model/rerank_qwen3.hpp"
+#include "models.hpp"
 
 namespace eklow::serve {
 
@@ -122,6 +123,7 @@ inline void serve_rerank(httplib::Server& http, model::RerankQwen3& m, std::mute
     }
   };
   for (const char* path : {"/v1/rerank", "/rerank", "/v1/reranking", "/reranking"}) http.Post(path, handler);
+  serve_models(http, cfg.alias, m.max_tokens(), 1);
 }
 
 }  // namespace eklow::serve

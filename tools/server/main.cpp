@@ -29,7 +29,8 @@
 // auth; tools/server/metrics.hpp, K/V use is the global layers' pages); with an embedding model, POST /v1/embeddings, GET /v1/models
 // and GET /health on its own port (the house runs chat and embeddings as separate upstreams). The checker (--checker-*: POST
 // /v1/systemone, tools/server/systemone.hpp) and the reranker (--rerank-*: POST /v1/rerank, tools/server/rerank.hpp) are each on
-// a port and queue of their own, a request at a time with the scheduler held, as the embeddings are.
+// a port and queue of their own, with GET /v1/models and GET /health, a request at a time with the scheduler held, as the
+// embeddings are.
 // The log (stdout, unholy's form, each line prefixed with the local time): a line per chat request as it ends
 // (finish reason; prompt, cached and completion tokens; queue, time to first token, prefill and decode tok/s), a
 // line per embedding request, a line per rejected request, and every --log-interval seconds (10; 0 for none) while
@@ -38,6 +39,7 @@
 
 #include "keepalive.hpp"
 #include "metrics.hpp"
+#include "models.hpp"
 #include "rerank.hpp"
 #include "systemone.hpp"
 
@@ -162,16 +164,6 @@ void reply_error(httplib::Response& res, const serve::gemma4::ApiError& e) {
   res.set_content(serve::gemma4::error_json(e), "application/json");
 }
 
-std::string models_json(const std::string& id, int64_t ctx, int64_t slots) {
-  // context_length first: clients take the first context key they find.
-  json::Writer w(false);
-  w.begin_object().kv("object", "list").key("data").begin_array().begin_object().kv("id", id).kv("context_length", ctx);
-  w.kv("object", "model").kv("created", now_s()).kv("owned_by", "eklow");
-  w.key("meta").begin_object().kv("n_ctx", ctx).kv("n_slots", slots).end_object();
-  w.end_object().end_array().end_object();
-  return w.str();
-}
-
 // Images to rows for the text model: decoded and cut on the host, encoded on the card with the scheduler held (the
 // encoder runs for seconds, and every wait on the card costs a turn behind a long prefill: DECISIONS 2026-10-26) and
 // one at a time, the rows copied to host memory. A few encoded images are kept by the hash of their bytes: a
@@ -246,9 +238,7 @@ class ImageService {
 void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::Tokenizer& tok, std::mutex& mu,
                       serve::gemma4::Scheduler& sched, const std::string& alias, int64_t max_tokens, EmbedStats& stats, ImageService* images) {
   http.Get("/health", [](const httplib::Request&, httplib::Response& res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
-  http.Get("/v1/models", [alias, max_tokens](const httplib::Request&, httplib::Response& res) {
-    res.set_content(models_json(alias, max_tokens, 1), "application/json");
-  });
+  serve::serve_models(http, alias, max_tokens, 1);
   http.Post("/v1/embeddings", [&m, &tok, &mu, &sched, &stats, alias, max_tokens, images](const httplib::Request& req, httplib::Response& res) {
     try {
       json::Value body;
@@ -681,7 +671,7 @@ int main(int argc, char** argv) {
                       "text/plain; version=0.0.4; charset=utf-8");
     });
     http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-      res.set_content(models_json(alias, ec.max_ctx, slots), "application/json");
+      res.set_content(serve::models_json(alias, ec.max_ctx, slots), "application/json");
     });
     http.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
       ++http_requests;
