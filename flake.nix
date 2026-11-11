@@ -43,6 +43,16 @@
       oracle = llama-cpp.inputs.nixpkgs.legacyPackages.${system}.callPackage ./nix/oracle.nix {
         llama-cpp = llamaCpuAvx2;
       };
+      models =
+        removeAttrs
+          (pkgs.callPackage ./nix/models.nix {
+            llama-cpp-src = llama-cpp;
+            llama-cpp = llama-cpp.packages.${system}.default;
+          })
+          [
+            "override"
+            "overrideDerivation"
+          ];
       # Level Zero and OpenCL drivers from this nixpkgs, so the shell works whatever the host's
       # /run/opengl-driver carries (installed binaries use the system's, see nix/package.nix).
       driverLibs = with pkgs; [
@@ -58,10 +68,12 @@
       # services.eklow; the package is built with the host's nixpkgs.
       nixosModules.default = ./nix/module.nix;
 
+      # The model files of fiona's deployment (nix/models.nix) beside the engine.
       packages.${system} = {
         default = eklow;
         inherit eklow oracle llamaCpuAvx2;
-      };
+      }
+      // models;
 
       devShells.${system}.default = (pkgs.mkShell.override { stdenv = pkgs.intel-llvm.stdenv; }) {
         inputsFrom = [ eklow ];

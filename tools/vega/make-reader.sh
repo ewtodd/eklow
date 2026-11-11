@@ -2,7 +2,8 @@
 # make-reader.sh OUT.gguf: vega's reader as eklow loads it, Qwen/Qwen3.5-0.8B at 2fc06364 converted by the converter of the
 # llama.cpp flake.nix pins, in BF16 (the weights as published; eklow makes fp16 tiles of them, exactly) and without the MTP
 # block. Needs a Python with torch, transformers, safetensors and numpy (tools/weights/shell.nix has one); the checkpoint
-# comes from the Hugging Face cache or the Hub. The result's sha256 was 4f4a6b43e0d3cc85... on 2026-11-10.
+# comes from the Hugging Face cache or the Hub. The result's sha256 was 4f4a6b43e0d3cc85... on 2026-11-10. The flake's
+# vega-reader package (nix/models.nix) builds the same conversion reproducibly.
 set -euo pipefail
 OUT=$1
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
