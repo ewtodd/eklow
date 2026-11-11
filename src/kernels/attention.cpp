@@ -1012,6 +1012,9 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
     // layers) or, for the full layer of a plain DFlash draft, in int8.
     if (c.int8()) run<128, 4, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
     else run<128, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+  } else if (c.head_dim == 256 && group == 4 && !c.int8()) {
+    // Qwen3.5-0.8B's (vega's reader, src/vega/reader.hpp): 8 query heads over 2 K/V heads of 256, an fp16 cache of one prompt.
+    run<256, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   } else if (c.head_dim == 256 && group == 8) {
     // Qwen3.6's attention layers: 16 query heads over 2 K/V heads of 256.
     if (c.int8()) run<256, 8, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);

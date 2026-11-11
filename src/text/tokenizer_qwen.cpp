@@ -216,7 +216,9 @@ QwenTokenizer QwenTokenizer::from_gguf(const gguf::File& f) {
     t.merge_keys_[h] = key;
     t.merge_vals_[h] = uint64_t(r) << 32 | uint32_t(c);
   }
-  t.bos_ = int32_t(f.at("tokenizer.ggml.bos_token_id").as_int());
+  // Qwen3.5's GGUFs (vega's reader) carry no BOS; Qwen3.6's do, and none is ever added.
+  const auto* bos = f.find("tokenizer.ggml.bos_token_id");
+  t.bos_ = bos ? int32_t(bos->as_int()) : -1;
   t.eos_ = int32_t(f.at("tokenizer.ggml.eos_token_id").as_int());
   return t;
 }
