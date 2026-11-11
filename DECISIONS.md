@@ -2944,3 +2944,77 @@ mirostat 2 pass a chi-square against llama.cpp's (|z| < 1.8). `eklow-spec-test`:
 distribution for 17 chains (the 10 before and llama.cpp's defaults, typical, top-n-sigma, XTC, dynamic temperature, a repeat
 penalty over the last 2 tokens so that the window runs into the block, a reordered chain), all |z| < 2.5, the broken variants
 caught; greedy with a draft equals plain greedy.
+
+## 2026-11-11 — Bolt under llama.cpp's sampler: the replay, the draft, and `preserve_thinking`
+
+**The replay**, as on 2026-11-10 (same harness, shape and points, six samples a point, no draft, no sampling fields sent, so
+the server's defaults: the GGUF's temperature 1, top-k 64 and top-p 0.95 over llama.cpp's min-p 0.05), graded by the same
+standard, my readings kept with the private replay set:
+
+| point | llama.cpp | eklow before (2 runs) | eklow now, run 1 | run 2 |
+|---|---|---|---|---|
+| P1 (house) | 0 | 0, 1 | 1 | 1 |
+| P2 (house) | 4 | 3, 1 | 2 | 2 |
+| P3 (house) | 5 | 3, 3 | 3 | 4 |
+| P4 (house) | 5 | 3, 4 | 6 | 5 |
+| P5 (play) | 0 | 0, 0 | 0 | 0 |
+| P6 (play) | 0 | 0, 0 | 0 | 1 |
+| P7-P9 (ricky) | 18 | 18, 18 | 18 | 18 |
+| **of 54** | **32** | **27, 27** | **30** | **31** |
+
+61 of 108 (56%) against llama.cpp's 32 of 54 (59%): 0.3 standard errors, where the old sampler's 54 of 108 was 1.1. The gap
+was mostly the sampler; what is left is within noise.
+
+**The draft.** The chi-square of 2026-11-10 again, 3,000 completions with NVIDIA's draft against 3,000 without, two at a time,
+now under the default chain (min-p 0.05 from the server, since the check sends none): p = 0.000. Every answer agrees within noise
+except two: "Elephant" 0 plain against 15 drafted, "Badger" 0 against 14. This is not the acceptance. The first token decides the
+answer, and min-p's hard cut-off sits on two of its candidates:
+- Transformers (fp32, the GGUF's weights) puts the first token's `Elephant` at 0.066 of the top token's probability (`P`, of
+  Panda) and `Gir` at 0.048: min-p 0.05 keeps one and drops the other, by 0.28 and 0.03 nats.
+- eklow's engine puts `Elephant` at 0.048 and `Bad` at 0.033 when the prompt is one 17-token step, and at 0.056 and 0.050 when the
+  prompt's last token is a step of its own, as the server feeds a repeated prompt (it reuses the prefix and feeds the last token
+  again). KL from transformers at this position is 0.010 and 0.020; between the two shapes it is 0.009. The small-batch matmuls'
+  int8 activations depend on the step's shape (2026-11-10 "Bolt's serving forward"), and this position is a high-entropy one.
+- One request at a time, where the first token always comes from a one-token step, plain and drafted serving give the same
+  3,000 answers seed for seed, `Elephant` 83 and `Badger` 72 in both. Two at a time, the plain server's first token shares a step
+  with the other request's decode, and neither appears. The drafted server's first token sometimes shares a step with the other's
+  verify block, and they appear 29 times.
+- Without a cut-off (`serve_test.py sample` now sends `min_p` 0 unless `--min-p` says otherwise; temperature 1, top-k 0, top-p 1),
+  two at a time: chi-square 13.5 on 25 degrees of freedom, p = 0.969. On fixed logits, `eklow-spec-test`'s 17 chains (min-p
+  among them) stay exact (entry above).
+
+So a token at a cut-off's edge is kept in one batch shape and dropped in another: plain serving does it too, one request against
+two. That is the engine's int8 noise meeting a discontinuous filter, and the draft only changes which shapes occur. Not changed.
+
+**`preserve_thinking` for Bolt.** The owner leans to on and asked for it tested first.
+
+*Quality: not measured.* The replay's chats carry no reasoning: the private replay set's extraction does not copy
+son-of-anton's `messages.reasoning`, and the databases it reads are root's. Its harness has two opt-in flags for the run once
+the data has it: one sends each stored assistant row's reasoning back as `reasoning_content`, as son-of-anton's agent.go does,
+the other sends `chat_template_kwargs.preserve_thinking`. Without them the requests are as before.
+
+*Latency* (`eklow-server` at production's shape, no draft, the replay's chats with Bolt's own reasoning from the replay runs on
+every assistant row as a stand-in). Request A is a turn's last tool step. Request B is the next user message, `max_tokens` 1,
+and its time is about the time to the first token:
+
+| turn | B's prompt, off / on | prefilled again, off / on | B's time, off / on |
+|---|---|---|---|
+| T1 | 19,125 / 20,383 | 13,742 / 426 | 4.29 / 0.23 s |
+| T2 | 18,343 / 21,210 | 865 / 590 | 0.37 / 0.29 s |
+| T3 | 29,915 / 35,962 | 3,488 / 134 | 1.35 / 0.20 s |
+| T4 | 39,928 / 48,109 | 3,648 / 761 | 1.55 / 0.41 s |
+| T5 | 53,870 / 65,317 | 2,134 / 393 | 1.14 / 0.37 s |
+| T6 | 59,503 / 62,138 | 35,713 / 2,535 | 15.01 / 1.33 s |
+
+Off, the next user message re-renders the last turn's tool loop without its reasoning, so the prompt parts from the slot at that
+turn's first assistant message. What gets prefilled again is the whole loop with its tool results: 1-4k tokens in four of the
+six, 14k and 36k (4.3 and 15.0 s) in the two whose loops returned long results. On, the prompt parts only after the slot's last
+generation, so B prefills its new message and the stored answer.
+
+*The window.* Kept reasoning is about 300 tokens an assistant message (the stand-in's mean over 123 answers). Over each chat's
+whole history less the fixed system prompt and tools (5.4-5.8k), it grows the conversation 1.2-1.7x, the most where tool
+calls are densest. So the 64K window fills 1.2-1.7x faster. In this run two turns at 61k and 63k without it got the 400 for
+exceeding the context with it on.
+
+Not changed: `--preserve-thinking` stays the owner's to set per instance. On buys the turn-after-a-loop latency. Off keeps the
+window. The quality side waits for the data.

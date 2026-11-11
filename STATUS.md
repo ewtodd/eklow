@@ -11,9 +11,17 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   shared K/V). The fp32 reference matches transformers to KL 5e-8 at 16k; the engine sits inside transformers' own bf16 distance.
   On fiona at production's shape (2 x 65,536 fp16, EmbeddingGemma 2 beside, 5.71 + 2.20 GiB): prefill 3,549 / 2,920 / 2,273 tok/s
   at 8k / 32k / 60k, decode 44.8 / 39.3 / 35.6 tok/s plain and 90.8 / 87.9 / 64.6 with NVIDIA's DFlash draft (blocks of 8,
-  lossless by chi-square). Chat images through Google's E4B projector (the same tower) in 0.10 s. fiona's replay: 27 and 27 of 54
-  in two runs against llama.cpp CUDA's 32 of 54 (within noise, all of it in three house points). The module runs it as an instance
-  (`model`, `alias`, `port`; `draft`, `mmproj` as for Qwen). The owner deploys.
+  lossless by chi-square). Chat images through Google's E4B projector (the same tower) in 0.10 s. fiona's replay with llama.cpp's
+  sampler: 30 and 31 of 54 in two runs against llama.cpp CUDA's 32 of 54 (27 and 27 under eklow's old sampler; DECISIONS
+  2026-11-11 "Bolt under llama.cpp's sampler"). `preserve_thinking` on: the user turn after a tool loop prefills 0.1-2.5k tokens
+  instead of the whole loop (up to 36k, 15 s, off), and the 64K window fills 1.2-1.7x faster; its effect on answers is not
+  measured (the replay's chats lack the stored reasoning). The module runs it as an instance (`model`, `alias`, `port`; `draft`,
+  `mmproj` as for Qwen). The owner deploys.
+- **Sampling is llama.cpp's** (2026-11-11, branch `gemma/bolt-e4b`; DECISIONS "llama.cpp's sampler, exactly"), for Qwen and
+  Gemma alike: llama-server's chain, defaults, GGUF keys and request fields, bit for bit against the pinned build's libllama on
+  fixed logits; DRY, adaptive_p and infill are refused. Bolt and Sage both gain min-p 0.05. A token at min-p's edge can be kept in
+  one batch shape and dropped in another (the int8 activations), so a two-at-a-time chi-square under the default chain is not a
+  test of the draft; `serve_test.py sample` sends min_p 0.
 - **Sage-A1.5 is ready to serve, not deployed** (2026-11-07, DECISIONS "Sage-A1.5 on eklow" and "Sage-A1.5's chat template"):
   `--chat-template sage` (recognised from the GGUF), `--verification on|off` (on only for conversations with system text);
   0 differences against Hugging Face on 28,017 cases. Its EKK8 is on Hugging Face (below), with KL 0.0127 at 4k against its Q8_0.
