@@ -324,10 +324,92 @@ in
       description = "Model id the embedding API lists.";
     };
 
+    checker = {
+      reader = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = "/var/lib/eklow/Qwen3.5-0.8B-BF16.gguf";
+        description = ''
+          vega's reader for the end-of-turn checker, laya's System One (POST /v1/systemone on `checker.port`, served by
+          whichever instance runs, beside the chat model and the embeddings): Qwen/Qwen3.5-0.8B at 2fc06364 converted by
+          the pinned llama.cpp's converter, BF16 (tools/vega/make-reader.sh; sha256 4f4a6b43...). It takes 1,197 MiB of the
+          card with checker.maxTokens 16384 (measured on fiona, the driver's buffers included), which comes out of what the
+          chat model's experts or K/V would get. null serves no checker.
+        '';
+      };
+
+      vega = lib.mkOption {
+        type = lib.types.path;
+        default = pkgs.linkFarm "vega-U-4d205028" (
+          map
+            (f: {
+              inherit (f) name;
+              path = pkgs.fetchurl {
+                url = "https://huggingface.co/nandakishorm/vega-U/resolve/4d2050287982ca7a7bb0c22fd19a389f5f94474e/${f.name}";
+                inherit (f) sha256;
+              };
+            })
+            [
+              {
+                name = "vega_config.json";
+                sha256 = "000461315c798b6eca62323476360c14cf31b4e1adcba21ab8266fca41d3fcf8";
+              }
+              {
+                name = "engine.safetensors";
+                sha256 = "78f96be7c6a06abb873e573fcf9e43ef467010a30c72cd6cac32538cd7078db8";
+              }
+              {
+                name = "port.safetensors";
+                sha256 = "398ae79d5e3956a3ed809d500fbdf57982d303c719e464bb81ba12a5ee7d23bd";
+              }
+              {
+                name = "stats.npz";
+                sha256 = "f891292bb7cb2a7616bb925a3c2fe182c72b2899f36c16494445229bed1d3a12";
+              }
+            ]
+        );
+        defaultText = "nandakishorm/vega-U at 4d205028 (its Qwen3.5-0.8B port)";
+        description = "The vega-U model directory for the reader: vega_config.json, engine.safetensors, port.safetensors, stats.npz.";
+      };
+
+      policy = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = ''
+          A laya policy folder (laya-policy/1, as laya's save_calibration writes it: heads.npz, calibration.json,
+          manifest.json), fitted on this engine: a question whose id has a head is answered by it, and the calibration's
+          temperatures apply. Its manifest's hashes and engine are checked at startup; a signed policy is refused. null:
+          every question is the engine's, zero-shot.
+        '';
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 8084;
+        description = "Port of the checker's API (POST /v1/systemone, GET /health).";
+      };
+
+      alias = lib.mkOption {
+        type = lib.types.str;
+        default = "vega-u";
+        description = "Model name the checker's answers carry.";
+      };
+
+      maxTokens = lib.mkOption {
+        type = lib.types.ints.between 1024 73728;
+        default = 16384;
+        description = ''
+          The longest prompt the reader holds (its attention cache, 10 KiB a token); a longer state is answered 413, and
+          son-of-anton then keeps the draft. vegaml reads up to 73,728, but a state that long takes the reader seconds,
+          past son-of-anton's 3 s timeout.
+        '';
+      };
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Open the instances' ports and the embedding port in the firewall.";
+      description = "Open the instances' ports, the embedding port and the checker's port in the firewall.";
     };
   };
 
@@ -353,6 +435,7 @@ in
       lib.unique (
         lib.mapAttrsToList (_: inst: inst.port) cfg.instances
         ++ lib.optional (cfg.embedModel != null) cfg.embedPort
+        ++ lib.optional (cfg.checker.reader != null) cfg.checker.port
       )
     );
 
@@ -440,6 +523,24 @@ in
               "--image-tokens"
               (toString cfg.imageTokens)
             ]
+            ++ lib.optionals (cfg.checker.reader != null) (
+              [
+                "--checker-reader"
+                cfg.checker.reader
+                "--checker-vega"
+                cfg.checker.vega
+                "--checker-port"
+                (toString cfg.checker.port)
+                "--checker-alias"
+                cfg.checker.alias
+                "--checker-max-tokens"
+                (toString cfg.checker.maxTokens)
+              ]
+              ++ lib.optionals (cfg.checker.policy != null) [
+                "--checker-policy"
+                cfg.checker.policy
+              ]
+            )
             ++ inst.extraArgs
           );
           Restart = "on-failure";

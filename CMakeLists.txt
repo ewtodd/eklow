@@ -183,7 +183,7 @@ eklow_sycl(eklow_serve)
 
 add_executable(eklow-server tools/server/main.cpp)
 target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
-target_link_libraries(eklow-server PRIVATE eklow_serve Threads::Threads)
+target_link_libraries(eklow-server PRIVATE eklow_serve eklow_vega Threads::Threads)
 eklow_sycl(eklow-server)
 # The streams' keep-alive (tools/server/keepalive.hpp), host only.
 add_executable(eklow-keepalive-test tools/server/keepalive_test.cpp)
