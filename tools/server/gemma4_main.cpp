@@ -8,7 +8,9 @@
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
 //                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--preserve-thinking on|off]
 //                [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
-//                [--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--log-interval S] [--keepalive S]
+//                [--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]]
+//                [--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]]
+//                [--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S]
 //
 // --ctx is the context of each slot (positions), Bolt's full 65,536 by default; --batch the tokens of one engine step
 // and --chunk the prefill tokens of one sequence in a step (2,048). The whole model fits on the card (5.7 GiB with the
@@ -26,7 +28,9 @@
 // request's thread with the scheduler held, one at a time per encoder, and counts in the prompt tokens.
 // Endpoints: POST /v1/chat/completions (streamed or whole), GET /v1/models, GET /health; with an
 // embedding model, POST /v1/embeddings, GET /v1/models and GET /health on its own port (the house
-// runs chat and embeddings as separate upstreams).
+// runs chat and embeddings as separate upstreams). The checker (--checker-*: POST /v1/systemone) and the reranker
+// (--rerank-*: POST /v1/rerank) are the Qwen server's (tools/server/main.cpp has their flags), each on its own port and
+// queue, a request at a time with the scheduler held, as the embeddings are.
 // The log (stdout, unholy's form, each line prefixed with the local time): a line per chat request as it ends
 // (finish reason; prompt, cached and completion tokens; queue, time to first token, prefill and decode tok/s), a
 // line per embedding request, a line per rejected request, and every --log-interval seconds (10; 0 for none) while
@@ -34,6 +38,8 @@
 #include <httplib.h>
 
 #include "keepalive.hpp"
+#include "rerank.hpp"
+#include "systemone.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -391,6 +397,12 @@ int gemma4_server_main(int argc, char** argv) {
   bool kv_int8 = false, preserve_thinking = false;
   double log_interval = 10;  // seconds between the engine's log lines while there is traffic; 0: none
   double keepalive_s = 15;  // a stream silent this long gets an SSE comment (keepalive.hpp); 0: never
+  std::string checker_reader, checker_vega, checker_policy, checker_alias = "vega-u";
+  int checker_port = 0;
+  int64_t checker_max_tokens = 16384;
+  std::string rerank_path, rerank_alias = "qwen3-reranker-0.6b";
+  int rerank_port = 0;
+  int64_t rerank_max_tokens = 4096;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -424,6 +436,16 @@ int gemma4_server_main(int argc, char** argv) {
     else if (a == "--draft-block") draft_block = std::atoi(next().c_str());
     else if (a == "--draft-full-context") draft_full_context = std::atoll(next().c_str());
     else if (a == "--draft-sliding-causal") draft_sliding_causal = std::atoi(next().c_str());
+    else if (a == "--checker-reader") checker_reader = next();
+    else if (a == "--checker-vega") checker_vega = next();
+    else if (a == "--checker-policy") checker_policy = next();
+    else if (a == "--checker-port") checker_port = std::atoi(next().c_str());
+    else if (a == "--checker-alias") checker_alias = next();
+    else if (a == "--checker-max-tokens") checker_max_tokens = std::atoll(next().c_str());
+    else if (a == "--rerank-model") rerank_path = next();
+    else if (a == "--rerank-port") rerank_port = std::atoi(next().c_str());
+    else if (a == "--rerank-alias") rerank_alias = next();
+    else if (a == "--rerank-max-tokens") rerank_max_tokens = std::atoll(next().c_str());
     else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" || a == "--kv-pool" ||
                a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib" || a == "--expert-profile" ||
                a == "--experts-on-card" || a == "--card-margin-mib" || a == "--verification" || a == "--draft-reserve-mib") {
@@ -432,7 +454,9 @@ int gemma4_server_main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
                            "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--preserve-thinking on|off] [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] "
-                           "[--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] [--log-interval S] [--keepalive S]\n");
+                           "[--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] "
+                           "[--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]] "
+                           "[--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S]\n");
       return 2;
     }
   }
@@ -446,6 +470,14 @@ int gemma4_server_main(int argc, char** argv) {
   }
   if (draft_path.empty() && draft_block) {
     std::fprintf(stderr, "eklow-server: --draft-block needs --draft\n");
+    return 2;
+  }
+  if (!checker_reader.empty() && (checker_vega.empty() || checker_port <= 0 || checker_max_tokens < 1024)) {
+    std::fprintf(stderr, "eklow-server: --checker-reader needs --checker-vega, --checker-port and a --checker-max-tokens of 1024 or more\n");
+    return 2;
+  }
+  if (!rerank_path.empty() && (rerank_port <= 0 || rerank_max_tokens < 256)) {
+    std::fprintf(stderr, "eklow-server: --rerank-model needs --rerank-port and a --rerank-max-tokens of 256 or more\n");
     return 2;
   }
   if (image_tokens < 70 || image_tokens > 1120) {
@@ -538,6 +570,37 @@ int gemma4_server_main(int argc, char** argv) {
       embed_vision->reserve(1120);
       std::fprintf(stderr, "eklow-server: vision projector %s, %.0f MiB on the card for %d-row images\n", embed_mmproj_path.c_str(), double(embed_vision->bytes()) / 1048576.0, 1120);
       embed_images = std::make_unique<ImageService>(*embed_vision_q, *embed_vision, image_tokens);
+    }
+    // vega's checker and the reranker, each on a queue of its own and warmed before the engine, so that their weights,
+    // activations and the driver's buffers for their kernels are counted in what is left of the card.
+    std::unique_ptr<sycl::queue> checker_q;
+    std::unique_ptr<vega::Checker> checker;
+    std::mutex checker_mu;
+    if (!checker_reader.empty()) {
+      const auto t_ck = std::chrono::steady_clock::now();
+      const double free0 = double(rt::free_memory(q.get_device()).value_or(0));
+      checker_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
+      checker = std::make_unique<vega::Checker>(*checker_q, checker_reader, checker_vega, checker_policy, checker_max_tokens);
+      checker->warm();
+      std::fprintf(stderr, "eklow-server: checker %s (%s, policy %s): %.0f MiB on the card with the driver's, prompts of up to %lld tokens, %.1f s\n",
+                   checker_alias.c_str(), checker_reader.c_str(), checker->policy() ? checker->policy()->verified().c_str() : "none",
+                   (free0 - double(rt::free_memory(q.get_device()).value_or(0))) / 1048576.0, (long long)checker_max_tokens,
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t_ck).count());
+    }
+    std::unique_ptr<gguf::File> rerank_file;
+    std::unique_ptr<sycl::queue> rerank_q;
+    std::unique_ptr<model::RerankQwen3> reranker;
+    std::mutex rerank_mu;
+    if (!rerank_path.empty()) {
+      const auto t_rr = std::chrono::steady_clock::now();
+      const double free0 = double(rt::free_memory(q.get_device()).value_or(0));
+      rerank_file = std::make_unique<gguf::File>(gguf::File::open(rerank_path));
+      rerank_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
+      reranker = std::make_unique<model::RerankQwen3>(*rerank_q, *rerank_file, rerank_max_tokens);
+      reranker->score({reranker->prompt("A warm-up.", "A warm-up.")});
+      std::fprintf(stderr, "eklow-server: reranker %s (%s): %.0f MiB on the card with the driver's, pairs of up to %lld tokens, %.1f s\n",
+                   rerank_alias.c_str(), rerank_path.c_str(), (free0 - double(rt::free_memory(q.get_device()).value_or(0))) / 1048576.0,
+                   (long long)rerank_max_tokens, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rr).count());
     }
     engine::gemma4::Engine eng(q, file, ec);
     if (vision && vision->n_embd() != eng.model().n_embd)
@@ -698,12 +761,52 @@ int gemma4_server_main(int argc, char** argv) {
       });
     }
 
+    auto hold = [&sched] { return std::static_pointer_cast<void>(std::make_shared<serve::gemma4::Scheduler::Hold>(sched)); };
+    httplib::Server checker_http;
+    std::thread checker_thread;
+    if (checker) {
+      checker_http.new_task_queue = [] { return new httplib::ThreadPool(4); };
+      checker_http.Get("/health", [](const httplib::Request&, httplib::Response& res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
+      serve::SystemOneConfig c1;
+      c1.alias = checker_alias;
+      c1.log = log_line;
+      c1.hold = hold;
+      serve::serve_systemone(checker_http, *checker, checker_mu, c1);
+      std::fprintf(stderr, "eklow-server: checker %s listening on %s:%d (POST /v1/systemone)\n", checker_alias.c_str(), host.c_str(), checker_port);
+      checker_thread = std::thread([&] {
+        if (!checker_http.listen(host, checker_port)) {
+          std::fprintf(stderr, "eklow-server: cannot listen on %s:%d\n", host.c_str(), checker_port);
+          g_stop = true;
+        }
+      });
+    }
+    httplib::Server rerank_http;
+    std::thread rerank_thread;
+    if (reranker) {
+      rerank_http.new_task_queue = [] { return new httplib::ThreadPool(4); };
+      rerank_http.Get("/health", [](const httplib::Request&, httplib::Response& res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
+      serve::RerankConfig rc;
+      rc.alias = rerank_alias;
+      rc.log = log_line;
+      rc.hold = hold;
+      serve::serve_rerank(rerank_http, *reranker, rerank_mu, rc);
+      std::fprintf(stderr, "eklow-server: reranker %s listening on %s:%d (POST /v1/rerank)\n", rerank_alias.c_str(), host.c_str(), rerank_port);
+      rerank_thread = std::thread([&] {
+        if (!rerank_http.listen(host, rerank_port)) {
+          std::fprintf(stderr, "eklow-server: cannot listen on %s:%d\n", host.c_str(), rerank_port);
+          g_stop = true;
+        }
+      });
+    }
+
     std::signal(SIGINT, [](int) { g_stop = true; });
     std::signal(SIGTERM, [](int) { g_stop = true; });
     std::thread stopper([&] {
       while (!g_stop.load()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
       http.stop();
       embed_http.stop();
+      checker_http.stop();
+      rerank_http.stop();
     });
     std::fprintf(stderr, "eklow-server: listening on %s:%d\n", host.c_str(), port);
     if (!http.listen(host, port)) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
@@ -711,6 +814,8 @@ int gemma4_server_main(int argc, char** argv) {
     stopper.join();
     engine_thread.join();
     if (embed_thread.joinable()) embed_thread.join();
+    if (checker_thread.joinable()) checker_thread.join();
+    if (rerank_thread.joinable()) rerank_thread.join();
     if (stats_thread.joinable()) stats_thread.join();
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-server: %s\n", e.what());
