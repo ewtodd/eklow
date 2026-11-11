@@ -33,8 +33,8 @@ VisionGemma4V::VisionGemma4V(sycl::queue& q, const gguf::File& f, bool reference
   if (f.tensor("v.pre_ln.weight") || f.tensor("v.post_ln.weight") || f.tensor("v.blk.0.attn_qkv.weight"))
     throw std::runtime_error(f.path() + ": pre/post layer norm and fused qkv are not in the gemma4v graph");
 
-  // The fast path takes the files it can (no biases, clamps or layer scales; 64- or 72-wide heads); others run the
-  // reference kernels.
+  // The fast path takes the files it can (no biases or layer scales; 64- or 72-wide heads; clamps only where the stacked
+  // matrices share their input's bounds); others run the reference kernels.
   if (!reference_ && load_fast(f)) return;
   reference_ = true;
   auto find = [&](const std::string& name) { return f.tensor(name); };
@@ -79,7 +79,7 @@ VisionGemma4V::VisionGemma4V(sycl::queue& q, const gguf::File& f, bool reference
       return l;
     }
     l.w = matrix(need(weight));
-    const std::string base = weight.substr(0, weight.size() - 6);  // ".weight"
+    const std::string base = weight.substr(0, weight.size() - 7);  // less ".weight"
     bool found = false;
     l.in_max = scalar(base + ".input_max", FLT_MAX, found);
     l.in_min = scalar(base + ".input_min", -FLT_MAX, found);

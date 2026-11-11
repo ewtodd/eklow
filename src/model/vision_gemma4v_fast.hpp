@@ -2,6 +2,8 @@
 // destroy it.
 #pragma once
 
+#include <cfloat>
+
 #include <memory>
 
 #include "kernels/vision_attn.hpp"
@@ -12,9 +14,15 @@
 namespace eklow::model {
 
 struct VisionGemma4V::Fast {
+  // Gemma4ClippableLinear's bounds (Gemma 4 E2B and E4B's towers): each linear's input and output clamped; a stacked
+  // matrix's parts share their input's. No bounds in the file: +-FLT_MAX, which clamps nothing.
+  struct Clip {
+    float lo = -FLT_MAX, hi = FLT_MAX;
+  };
   struct Layer {
     uint8_t* blob = nullptr;  // pinned host memory
     const float *ln1, *ln2, *q_norm, *k_norm, *attn_post, *ffn_post;  // on the card
+    Clip qkv_in, q_out, k_out, v_out, o_in, o_out, gu_in, gate_out, up_out, down_in, down_out;
   };
   xmx::WeightFormat fmt = xmx::WeightFormat::F16;
   int64_t Dp = 0, Fp = 0, Kp = 0;  // head size padded to 32, ffn width padded to 128 (gate|up), to 32 (down's K)
