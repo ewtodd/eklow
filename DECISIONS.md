@@ -2895,3 +2895,52 @@ top-p unless told otherwise; eklow (and the model card) has none. P2-P4 again wi
 forwarder in front of eklow (my readings likewise): P2 2, P3 5, P4 4, 11 of 18 against 9 and 8 without it and llama.cpp's 14.
 Suggestive, not shown at 6 samples a point. A request may send `min_p` itself; whether eklow should default to 0.05 for Bolt is
 the owner's call (not changed).
+
+## 2026-11-11 — llama.cpp's sampler, exactly, for every model
+
+**Why.** Neither the replay nor son-of-anton sends sampling fields (son-of-anton sends a temperature only when one is configured),
+so the server's defaults are production's behaviour, and eklow's were not llama.cpp's: it fell back to temperature 1, top-k 64,
+top-p 0.95 and min-p 0, applied the temperature before min-p and top-p, and counted presence and frequency penalties over the
+whole completion. Bolt's replay on llama.cpp scored 32 of 54 and on eklow 27 and 27 (entry above), Sage's 37 against 31 (2026-11-08).
+The owner: "min_p and every other sampling parameter llama would use".
+
+**The reference.** The llama.cpp that scored Bolt's 32: `/nix/store/lmx91mgr7w5crghv2ji6p76a04admga4-llama-cpp-cuda-0.0.0` (llama.cpp
+0.7.0-dev, ggml 0.27.0, built from `/nix/store/qa9sw7gaykrg203s0q6n3d0zk4a74zdp-source`, no commit recorded in it). Its
+`common/sampling.cpp`, `common/common.h` and `tools/server/server-common.cpp` are upstream's of 2026-10-19/20 byte for byte (blobs
+564fa9c4, 0c2d5e46, 5577c339; e.g. upstream 0ce8cd114), though no single upstream commit matches every file (a patched or merged
+tree). What it does, read from that source:
+- Defaults (`common_params_sampling`): temp 0.8, top_k 40, top_p 0.95, min_p 0.05, typ_p 1, top_n_sigma -1, xtc 0 / 0.1,
+  dynatemp 0 / 1, penalty_last_n 64, repeat 1, freq 0, present 0, dry 0 (base 1.75, allowed 2, last_n 64), mirostat 0 (tau 5,
+  eta 0.1), min_keep 0.
+- The GGUF over them (`common_init_sampler_from_model`, unless set on the command line): `general.sampling.sequence`, `top_k`,
+  `top_p`, `min_p`, `xtc_probability`, `xtc_threshold`, `temp`, `penalty_last_n`, `penalty_repeat`, `mirostat`, `mirostat_tau`,
+  `mirostat_eta`. A request's fields over both (`server-schema.cpp`).
+- The chain (`common_sampler_init`): the logit biases (the request's, and the vocabulary's suppressed tokens: Bolt's file has none,
+  eklow reads none), then penalties, dry,
+  top_n_sigma, top_k, typ_p, top_p, min_p, xtc, temperature on the untempered logits, then a draw from the softmax, or greedy when
+  the chain ends in a temperature of 0 or a top_k of 1; mirostat replaces the chain by a temperature and its own pick. The
+  server feeds every prompt token into the sampler first (`init_sampler`), so the penalties' window starts in the prompt.
+
+**What changed.** `serve::Sampler` follows that stage for stage (each stage's arithmetic as `src/llama-sampler.cpp` does it,
+float where it uses float); `apply_gguf_sampling` and `apply_request_sampling` take the GGUF's keys and llama-server's request
+fields (`top_k`, `min_p`, `typical_p`, `repeat_penalty`, `repeat_last_n`, `presence_penalty`, `frequency_penalty`, `top_n_sigma`,
+`xtc_*`, `dynatemp_*`, `mirostat*`, `min_keep`, `samplers` as names or letters, `logit_bias` as pairs or an object, ids or
+text, `seed`) for the Qwen and the Gemma servers alike; the schedulers feed the prompt in. Not implemented, refused with a 400
+when asked for: DRY with a multiplier, adaptive_p, infill (all off by default). Speculative decoding stays lossless: verify takes
+each row's distribution with the drafted tokens before it in the penalties' window, XTC's random removal as the mixture it is; a
+mirostat request decodes plain (its state moves with each pick). eklow's own constraints (the tool grammar's mask, the parser's
+banned tokens) still come first.
+
+What it changes in production: Bolt's file sets temp 1, top_k 64, top_p 0.95, so Bolt gains min-p 0.05; Sage's (`make-sage.sh`)
+sets temp 1, top_k 20, top_p 0.95, so Sage gains the same min-p 0.05 and nothing else (at temperature 1 the filters see the same
+values before and after it). Neither sets a penalty.
+
+**Checks.** `tools/sampler_test`: `llama-sampler-ref` (`llama_ref.cpp`, built by `build-llama-ref.sh` against that build's
+libllama) and `eklow-sampler-test` on the same synthetic rows (`common.hpp`), `compare.py`: on 13 deterministic chains (the
+defaults, Bolt's and Sage's settings, penalties over 64 and over 8, typical 0.7, top-n-sigma 1.5, top-k 0 with top-p 0.9, min-p
+0.2 with min_keep 5, dynamic temperature, logit biases, greedy, a reordered chain) the candidates after the chain are the same ids
+with the same probabilities, bit for bit, over 262,144 and 4,096 tokens; 20,000 draws of each of those and of XTC, mirostat 1 and
+mirostat 2 pass a chi-square against llama.cpp's (|z| < 1.8). `eklow-spec-test`: draft + verify against plain sampling's exact
+distribution for 17 chains (the 10 before and llama.cpp's defaults, typical, top-n-sigma, XTC, dynamic temperature, a repeat
+penalty over the last 2 tokens so that the window runs into the block, a reordered chain), all |z| < 2.5, the broken variants
+caught; greedy with a draft equals plain greedy.

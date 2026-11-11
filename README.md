@@ -165,11 +165,15 @@ an exact CPU emulation of the quantized arithmetic (`eklow-attn-test`, `eklow-gd
   - endpoints: `/v1/chat/completions` (streamed or whole), `/v1/models`, `/health`, `/metrics` (Prometheus text, for llmtop); with an embedding model,
     `/v1/embeddings`, `/v1/models` and `/health` on a port of its own;
   - request features: SSE streaming, `reasoning_content` (thinking on unless `reasoning_effort` is `none`), tool calls
-    and `tool_choice` (`"none"` keeps the tools in the prompt, so it stays cached, and never samples a call), stop strings, seeds, temperature / top-k / top-p / min-p and penalties, usage with
+    and `tool_choice` (`"none"` keeps the tools in the prompt, so it stays cached, and never samples a call), stop strings, usage with
     `cached_tokens`; also `preserve_thinking` for stock's and Sage's templates (`--preserve-thinking on` makes it the
-    default, so the turn after an agentic one reuses the cache instead of prefilling the turn again), sampling defaults from the model's
-    `general.sampling.*`, and with a draft `speculation` in the usage (verify blocks, tokens drafted and accepted) and
+    default, so the turn after an agentic one reuses the cache instead of prefilling the turn again), and with a draft `speculation` in the usage (verify blocks, tokens drafted and accepted) and
     `"speculative": false` to decode one request plain;
+  - sampling as llama-server does it (DECISIONS 2026-11-11): its chain (penalties, top-n-sigma, top-k, typical, top-p, min-p,
+    XTC, temperature, then the draw; mirostat 1 and 2), its defaults (temperature 0.8, top-k 40, top-p 0.95, min-p 0.05, a
+    64-token penalty window over prompt and completion), the GGUF's `general.sampling.*` over them and its request fields over
+    both, `seed` and `logit_bias` included; checked candidate for candidate against llama.cpp's own samplers
+    (`tools/sampler_test`);
   - a keep-alive on the streams (`--keepalive`, default 15 s): a stream silent that long gets an SSE comment, so a long
     tool call does not look like a dead connection (DECISIONS 2026-11-07).
 - **The text layer, matching the references exactly**, its tokenizer identical to Hugging Face's:
