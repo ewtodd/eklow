@@ -15,29 +15,29 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   sampler: 30 and 31 of 54 in two runs against llama.cpp CUDA's 32 of 54 (27 and 27 under eklow's old sampler; DECISIONS
   2026-11-11 "Bolt under llama.cpp's sampler"). `preserve_thinking` on: the user turn after a tool loop prefills 0.1-2.5k tokens
   instead of the whole loop (up to 36k, 15 s, off), and the 64K window fills 1.2-1.7x faster; its effect on answers is not
-  measured (the replay's chats lack the stored reasoning). The module runs it as an instance (`model`, `alias`, `port`; `draft`,
-  `mmproj` as for Qwen). The owner deploys.
+  measured (the replay's chats lack the stored reasoning); the owner has it on for Bolt and runs that test. The module runs it
+  as an instance (`model`, `alias`, `port`; `draft`, `mmproj` as for Qwen). The owner deploys.
 - **Sampling is llama.cpp's** (2026-11-11, branch `gemma/bolt-e4b`; DECISIONS "llama.cpp's sampler, exactly"), for Qwen and
   Gemma alike: llama-server's chain, defaults, GGUF keys and request fields, bit for bit against the pinned build's libllama on
   fixed logits; DRY, adaptive_p and infill are refused. Bolt and Sage both gain min-p 0.05. A token at min-p's edge can be kept in
   one batch shape and dropped in another (the int8 activations), so a two-at-a-time chi-square under the default chain is not a
   test of the draft; `serve_test.py sample` sends min_p 0.
-- **vega's checker and the reranker are ready to serve, not merged or deployed** (`vega/checker`, 2026-11-10, DECISIONS "vega's
-  checker" and "Qwen3-Reranker on eklow"), beside whichever chat model runs (`eklow-server --checker-*`, `--rerank-*`; module
-  `services.eklow.checker`, `services.eklow.reranker`; `eklow-vega serve` and `eklow-rerank serve` alone):
-  - the checker is laya's System One (`POST /v1/systemone`) for son-of-anton's end-of-turn checks: Qwen3.5-0.8B (vega's reader)
-    on the card, vega-U's engine and laya's policy on the CPU. On the 29 replay turns it is within 0.0014 of laya with an fp32
-    reader (no flag differs) and within 0.012 / 0.036 / 0.0023 (claim, unchecked, offtopic) of laya as fitted in bf16, as far as
-    laya's own fp32, eager-attention and CPU runs land, flipping the one flag (0.00027 from its cut-off) they all flip. p50 271
-    ms, p90 502 ms a turn; 1,197 MiB of the card.
-  - the reranker is llama.cpp's `POST /v1/rerank` over ggml-org's Qwen3-Reranker-0.6B Q8_0: within 0.0021 of llama.cpp (f16
-    K/V) and 0.00036 of an fp32 run of the same weights; 101 ms for 8 documents of ~1,200 characters, 264 ms for 24; 796 MiB.
-  - All four on the card with fp16 caches (the owner's call): Bolt 5.71 GiB and EmbeddingGemma 2 2.20 GiB at 2 x 65,536 (the
-    Bolt branch's measurement), the checker 1.17 GiB, the reranker 0.78 GiB: 9.86 GiB of 16.
-  - To deploy: the reader GGUF (`tools/vega/make-reader.sh`) and the policy folder where the unit can read them, the reranker's
-    GGUF (fetchurl, the module's example), the ports in son-of-anton's `[checker] base_url` and the rerank route. The Bolt-E4B
-    server (`gemma/bolt-e4b`) takes the same flags once it calls `serve_systemone` and `serve_rerank` (tools/server/systemone.hpp,
-    rerank.hpp) as qwen_server_main does.
+- **fiona's milestone is ready to deploy, not deployed** (`fiona/milestone`, 2026-11-11; DECISIONS "fiona's milestone"):
+  - What it is: Bolt (2 x 65,536 fp16, NVIDIA's draft in blocks of 8, Gemma 4's projector, `preserve_thinking` on),
+    EmbeddingGemma 2 with its projector, vega's checker (`POST /v1/systemone`, the vega-cv32 policy) and Qwen3-Reranker
+    (`POST /v1/rerank`). All four are in one `eklow-server` on the A770M, every cache fp16. The process holds 12.7 GiB of the
+    card; 3.2 GiB stay free.
+  - Side requests while Bolt streams: the checker 280-430 ms a turn, a rerank of 8 documents 100 ms, an embedding 70-160 ms.
+    Bolt pauses for about as long, since a side request holds the scheduler.
+  - The checker end to end on the 29 replay turns: within 0.0011 of laya-fp32 with the same policy, and no flag differs.
+  - The merge leaves Sage's path as it was: `checkq` is line for line the 2026-11-08 record; the tokenizer has 0 differences
+    on 1.47M tokens; `serve_test.py basic` is all ok at Sage's flags with the side models beside it.
+  - Every model file is a flake package (`nix/models.nix`; the built draft is byte-identical to the measured one).
+  - The module takes the private policy from agenix's root-only files (`checker.policyFiles`). systemd's credentials cap one
+    at 1 MiB, and the heads are 6.4 MB.
+  - vega's checker and the reranker on their own: DECISIONS 2026-11-10 "vega's checker" and "Qwen3-Reranker on eklow". The
+    checker: p50 271 ms; within 0.0014 of laya with an fp32 reader. The reranker: within 0.0021 of llama.cpp (f16 K/V); 101
+    ms for 8 documents.
 - **Sage-A1.5 is ready to serve, not deployed** (2026-11-07, DECISIONS "Sage-A1.5 on eklow" and "Sage-A1.5's chat template"):
   `--chat-template sage` (recognised from the GGUF), `--verification on|off` (on only for conversations with system text);
   0 differences against Hugging Face on 28,017 cases. Its EKK8 is on Hugging Face (below), with KL 0.0127 at 4k against its Q8_0.

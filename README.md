@@ -299,7 +299,7 @@ step's time goes:
 Prefill in a request's line is over the uncached part of its prompt, from the slot to the first token; cached
 positions are those kept in idle slots for prefix reuse.
 
-With `--checker-reader` (Qwen3.5-0.8B as `tools/vega/make-reader.sh` converts it), `--checker-vega` (a vega-U model directory)
+With `--checker-reader` (Qwen3.5-0.8B as the flake's `vega-reader` converts it), `--checker-vega` (a vega-U model directory)
 and `--checker-policy` (a laya policy folder), the server also answers laya's System One on `--checker-port`:
 
 ```sh
@@ -310,8 +310,9 @@ curl http://localhost:8084/v1/systemone -H 'Content-Type: application/json' -d '
 # {"model":"vega-u","answers":{"claim":{"type":"noul","noul":0.31,"probabilities":{...},"readout":"engine",...}},"usage":{...}}
 ```
 
-The module's `services.eklow.checker` (`reader`, `vega`, by default the published vega-U, `policy`, `port`, `maxTokens`)
-adds it to whichever instance runs. `eklow-vega serve` serves the checker alone, for development; `eklow-vega check`
+The module's `services.eklow.checker` (`reader`, `vega`, by default the published vega-U, `policy` or `policyFiles`, `port`,
+`maxTokens`) adds it to whichever instance runs; `policyFiles` takes a private policy as three root-only files (agenix's), which
+the unit copies to its runtime directory for its dynamic user. The Gemma 4 server takes the same flags, so Bolt runs with both. `eklow-vega serve` serves the checker alone, for development; `eklow-vega check`
 holds the reader and engine to `tools/vega/golden.json`, and `features`, `engine` and `predict` to
 `tools/vega/ref_vega.py` (vegaml and laya themselves). Likewise `--rerank-model` (ggml-org's Qwen3-Reranker GGUF) and
 `--rerank-port` serve llama.cpp's `POST /v1/rerank` (module `services.eklow.reranker`; `eklow-rerank serve` alone,
@@ -347,7 +348,7 @@ This is not a general-purpose engine:
 | `src/rt` | device selection and free memory, the copy engine |
 | `tools/` | `eklow-server`, the engine and kernel benchmarks and tests, the reference runs (`tools/ref`), the weights' tooling (`tools/weights`), the server tests and benchmark (`tools/server`, `tools/bench`) |
 | `data/` | the routing profiles |
-| `nix/` | the package, the NixOS module, and llama.cpp's CPU backend as the oracle |
+| `nix/` | the package, the NixOS module, llama.cpp's CPU backend as the oracle, and fiona's model files as derivations (`models.nix`: the flake's `bolt-e4b`, `bolt-e4b-mmproj`, `bolt-e4b-dflash`, `vega-reader`, `qwen3-reranker`) |
 | `DESIGN.md` | the target and the shape of the system |
 | `DECISIONS.md` | dated decisions with their measurements: why each piece is the way it is |
 | `STATUS.md` | what's done and what's open |

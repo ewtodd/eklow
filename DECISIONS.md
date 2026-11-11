@@ -3187,3 +3187,117 @@ exceeding the context with it on.
 
 Not changed: `--preserve-thinking` stays the owner's to set per instance. On buys the turn-after-a-loop latency. Off keeps the
 window. The quality side waits for the data.
+
+## 2026-11-11 — fiona's milestone: Bolt, EmbeddingGemma 2, the checker and the reranker on one card
+
+**What.** `fiona/milestone` is `gemma/bolt-e4b` with `vega/checker` merged into it. On top of the merge:
+- the Gemma 4 server takes the Qwen server's `--checker-*` and `--rerank-*` flags;
+- the model files are derivations (`nix/models.nix`);
+- the module takes a private checker policy from root-only files.
+
+The owner's settings for it:
+- every cache fp16;
+- Bolt at 2 x 65,536 with NVIDIA's draft in blocks of 8;
+- `preserve_thinking` on for Bolt (its effect on answers is the owner's own test, once the replay set has the stored
+  reasoning);
+- the min-p edge of the int8 activations accepted as it is (entry above; fp16 activations only if it turns out to matter).
+
+**Sage's path after the merge.** vega's branch edited the shared attention dispatch and the Qwen tokenizer.
+- `bench.sh checkq ekk8`: line for line the 2026-11-08 record.
+- `bench.sh attn`: every correctness line is the tree's before the merge, and the timings are within noise (Qwen3.6's
+  decode 63.2 / 82.5 / 162.8 us at 1k / 4k / 16k against 63.2 / 83.4 / 160.2).
+- `tools/ref/qwen_tok_compare.py`, run with the merged `eklow-tok` on stock Qwen3.6's GGUF against Qwen3.6's tokenizer.json
+  (the same file as Qwen3.5's): 20,802 strings, 1.47M tokens, 0 encode differences, 0 of 81,604 decodes.
+- The host tests pass: `eklow-verification-test` 34 checks; `eklow-grammar-test-qwen` 2,000 walks and 828 bans; the K/V pool,
+  keep-alive and metrics tests.
+- `serve_test.py basic` against stock Qwen3.6 EKK8 at Sage's production flags (pool, draft, both projectors), with the
+  checker and the reranker beside it: all ok. The side models' 1.95 GiB come first, and the card keeps 67 experts a
+  layer.
+- Both branches had added the same attention case (head 256, group 4, fp16): one serves both now.
+
+**On the card** (fiona's A770M, `eklow-server` from this tree). The parts, as the server reports each:
+
+| | card memory |
+|---|---|
+| Bolt's weights | 5.71 GiB |
+| Bolt's K/V, 2 x 65,536 fp16 | 2.20 GiB |
+| the draft | 547 MiB |
+| Gemma 4's projector, 280-row images | 203 MiB |
+| EmbeddingGemma 2 | 0.27 GiB |
+| its projector, 1,120-row images | 269 MiB |
+| the checker, 16,384-token prompts | 1,193 MiB |
+| the reranker, 4,096-token pairs | 796 MiB |
+
+That leaves 3.23 GiB free. The process's total from the xe driver (`drm-total-vram0` in its fdinfo) is 12.67 GiB after
+startup and 12.73 GiB after the run below.
+
+Side requests, idle (median of five) and while Bolt streams (three each, 1.5 s apart). Bolt's stream ran alone at 66
+tokens/s (the draft, a ~6k-token prompt), its steps at most 32 ms apart at the 99th percentile. The last column is its
+longest pause while the side request ran:
+
+| side request | idle | while Bolt streams | Bolt's longest pause |
+|---|---|---|---|
+| checker, a median turn (4,366 tokens) | 270 ms | 279-292 ms | 267-269 ms |
+| checker, the longest turn (14,648 tokens) | 405 ms | 413-433 ms | 346-405 ms |
+| rerank, 8 documents (2,214 tokens) | 97 ms | 98-104 ms | 94-95 ms |
+| rerank, 24 documents (6,640 tokens) | 263 ms | 255-275 ms | 141-249 ms |
+| embedding, one sentence | 62 ms | 72-90 ms | 60-61 ms |
+| embedding, 1,648 tokens | 122 ms | 130-156 ms | 118-123 ms |
+
+A side request holds the scheduler, so Bolt stops for about the side request's own card time and then goes on. Over the
+run with side requests its rate was 45 tokens/s against 66 alone.
+
+**The checker end to end.** The 29 replay turns went through `POST /v1/systemone` on that server. The reader was the
+flake's `vega-reader`. The policy was vega-cv32, laid out as the module lays out `policyFiles`: three 0400 files in a 0500
+folder. The server checked it at startup: integrity, engine and calibration checksum.
+
+Against the probabilities laya-fp32 gives with that policy:
+- largest |delta|: claim 0.00063, unchecked 0.0011, offtopic 0.00017;
+- no flag differs at the policy's cut-offs (0.7342, 0.4858, 0.4399);
+- p50 270 ms a turn, max 519 ms.
+
+**`serve_test.py basic` on the deployment** (`--preserve-thinking on`): every check passes but three.
+- The three: the streamed answer equals the whole one at temperature 0, its usage, and the same seed giving the same
+  output. They fail identically, character for character, on `gemma/bolt-e4b`'s tree with the same flags, so the merge
+  and the side models do not cause them.
+- The second request of each pair reuses the first's prefix. Its steps, and the draft's context, then have other shapes,
+  the int8 rounding moves, and a near-tie goes the other way. Plain decoding passes all three (2026-11-11, above).
+- With a draft eklow is lossless in distribution, not token for token, which the owner accepted.
+- "Two at once" fails now and then, at the near-tie between thinking and not thinking (2026-11-11).
+
+**Model files** (`nix/models.nix`, flake packages):
+
+| package | what | license |
+|---|---|---|
+| `bolt-e4b` | `nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB` @ 1db54d5b, `Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf` | NVIDIA OpenMDW-1.1 |
+| `bolt-e4b-mmproj` | `ggml-org/gemma-4-E4B-it-GGUF` @ 27cd6836, `mmproj-gemma-4-E4B-it-BF16.gguf` | Apache-2.0 |
+| `bolt-e4b-dflash` | `nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-DFlash` @ 0949a2eb's BF16 GGUF, quantized to Q8_0 by the flake's llama-quantize | NVIDIA OpenMDW-1.1 |
+| `vega-reader` | `Qwen/Qwen3.5-0.8B` @ 2fc06364, converted to BF16 by the flake's `convert_hf_to_gguf.py` (`--no-mtp`) | Apache-2.0 |
+| `qwen3-reranker` | `ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF` @ a02f48bb | Apache-2.0 |
+
+EmbeddingGemma 2 and its projector (Apache-2.0) and vega-U (Apache-2.0) stay the module's fetches.
+
+The two built files, against the copies the measurements ran:
+- The draft is byte-identical: sha256 46968a8f, made before by a CUDA build of llama.cpp 0.7.0-dev. Q8_0 is ggml's
+  reference quantization in every build.
+- The reader is not. It is sha256 2781f548 against `make-reader.sh`'s 4f4a6b43. The two differ in 22 values of 12 `ssm_a`
+  tensors, by one float32 ulp each (relative 1e-7).
+  - The converter computes -exp(A_log) with torch.
+  - The earlier conversion ran under a pip torch 2.15, and nixpkgs' torch 2.13 rounds exp differently: each torch,
+    applied to the checkpoint's A_log, reproduces its own file.
+  - The checker run above used the built reader.
+
+**The private policy in the module.** In production the policy comes from agenix: three root-only files. eklow's units
+run as a DynamicUser. systemd's credentials would be the natural carrier, but systemd 262 refuses one of 1 MiB or more
+(1,048,575 bytes load; 1,048,576 stop the unit with 243/CREDENTIALS), and `heads.npz` is 6.4 MB.
+
+So `checker.policyFiles = { heads; calibration; manifest; }`, absolute paths as strings that never enter the store, works
+like this:
+- a `+` ExecStartPre (root, outside the sandbox) copies them into the unit's runtime directory as
+  `/run/eklow-<name>/checker-policy/{heads.npz,calibration.json,manifest.json}`, owned by the dynamic user, 0400 in a 0500
+  folder;
+- `--checker-policy` points there;
+- systemd removes the folder when the unit stops.
+
+The unit evaluates and passes `systemd-analyze verify`. The copy step, run against a scratch directory, gives the
+layout the server accepted above.
