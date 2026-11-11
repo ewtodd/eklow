@@ -3343,3 +3343,80 @@ model.
   second server beside it, and the service's one running request fell to 0.9 tok/s for six minutes, until that server was
   killed. A check with a server from this tree waits for a pause of the service: a few requests, then their usage
   against the counters' deltas.
+
+## 2026-11-11 — the Qwen3.6 chat path leaves eklow
+
+**Why.** Bolt has served fiona in production since 2026-11-10 22:48, and the owner finds it better at the job than Sage-A1.5
+was. eklow's reason to exist is now utility: a reliable small assistant (Bolt) and the tools beside it on the same card
+(embeddings, the end-of-turn checker, reranking), with text-to-speech and speech-to-text planned. The Qwen3.6-35B-A3B path (the
+MoE engine and its expert offload, its server, template, parser and grammar, DFlash 2, snapshots of the DeltaNet state)
+was most of the code and none of what fiona runs. The owner decided to remove it.
+
+**Where it is.** `main` at **32152a6** (2026-11-11, "server: GET /metrics on the Gemma 4 server") is the last commit with
+the Qwen3.6 path complete and working; DECISIONS from 2026-10-31 to 2026-11-08 document it. To serve Sage or Ornith again,
+start from there.
+
+**What went** (about 19,000 lines; `git diff --stat 32152a6`):
+- the model and its forward passes: `src/model/qwen35.*`, `src/engine/engine.*` (the MoE engine: expert placement by routing
+  profile, cold experts on the CPU, prefill streaming, layer-major groups, the K/V pool, DeltaNet snapshots), `src/cpu/*`
+  (the AVX-VNNI expert GEMVs), `src/kernels/gdn.*` (Qwen3.6's Gated DeltaNet with slots and rollback), the routing
+  profiles in `data/`;
+- the kernels only the MoE used, cut out of shared files: the router, grouping, gather, combine and cold-expert kernels of
+  `kernels/fast`, the MoE tail and its quantizing epilogues of `kernels/qwen_fast`, the expert tables with the grouped
+  GEMVs and GEMMs of `kernels/xmx` and `xmx_fmt` (the fp16 GEMM kernel loses its `Grouped` form), the Qwen3.5/3.6
+  reference kernels of `kernels/ref` (DeltaNet, conv, gated norm, MoE scatter), and Qwen3.6's head-256 group-8 attention
+  case;
+- the server and text layer: `src/serve/openai.*`, `scheduler.*`, `kv_pool.hpp`, `tool_grammar_qwen.*`,
+  `src/text/chat_qwen36.*` (stock's, Ornith's and Sage's templates, the verification protocol), `output_parser_qwen.*`,
+  `tool_schema.*`; `tools/server/main.cpp`'s Qwen server (the Gemma 4 server is now `main.cpp`, and refuses any other
+  architecture by name);
+- DFlash 2: the convolutions and the candidate selector in `src/model/dflash2*` and `kernels/dflash`, `ref_dflash`
+  (Qwen3.6's drafts were DFlash 2; Bolt's is a plain DFlash draft), and `eklow-dflash-test`'s torch and fast commands with
+  `tools/dflash_test/ref_torch.py`;
+- Qwen3-VL's vision encoder and image preparation (`src/model/vision_qwen3vl*`, `src/image/qwen3vl_image.*`);
+- tools: `eklow-engine-run` and `-bench`, `eklow-chat`, `-parse`, `-prompt`, `eklow-verification-test`,
+  `eklow-grammar-test-qwen`, `eklow-gdn-test`, `eklow-cpu-qgemv-test`, `eklow-copy-bench`, `eklow-kvpool-test`,
+  `eklow-vision-qwen`; `tools/weights/` (the Qwen GGUFs: make-gguf.sh, make-sage.sh, make-draft.sh and the KL tooling);
+  the Qwen reference comparisons (`tools/ref/qwen_chat_compare.py`, `qwen_grammar_compare.py`, `qwen_parse_compare.py`,
+  routing and profile scripts); the check-source, DFlash 2 acceptance and release benchmarks; the card-margin scripts for
+  Sage's shape; the server image and K/V pool tests;
+- the module's Qwen-only instance options `expertProfile`, `prefillGroup`, `prefillGroupBusy`, `chatTemplate`,
+  `snapshotMiB`, `kvPool` and `verification`, and the server flags they set (`--expert-profile`, `--group`,
+  `--group-busy`, `--chat-template`, `--snapshot-mib`, `--snapshot-every`, `--kv-pool`, `--verification`,
+  `--experts-on-card`, `--card-margin-mib`, `--image-max-tokens`, `--image-rows-dir`, `--vision-reserve-mib`,
+  `--draft-reserve-mib`), which the server now refuses with a message saying they left.
+
+**What stayed and why.**
+- The Qwen tokenizer (`src/text/tokenizer_qwen.*`): vega's reader and the reranker use it.
+- `kernels/gdn_seq` and `kernels/dense`: vega's reader runs its DeltaNet layers and norms on them; the reranker its norms.
+- From `kernels/qwen_fast`: `attn_heads` (vega's reader has Qwen3.5's gated attention) and `gather_rows` (Bolt's engine
+  gathers the hidden states its draft reads); the file keeps its name.
+- `kernels/fast::matmul_f32`: vega's reader's DeltaNet alpha and beta.
+- All weight formats (Q4_0, Q8_0, Q4_K, Q5_K, Q6_K, IQ4_XS) and their GEMVs and GEMMs: they are GGUF format support, and
+  Bolt's file and its draft use several.
+- The DFlash draft classes (`Dflash2`, `Dflash2Ref`; their names keep DFlash 2's "2") and `serve/spec.*`: Bolt's draft.
+- The attention cases of the Gemma 4 26B and 12B, removed on 2026-11-07 (head 512 groups 8 and 16, head 256 group 2), are
+  still in `attend`, tested by `eklow-attn-test`. They are not Qwen's and are left for a later cleanup.
+- `DESIGN.md` is the original design document, kept as history; README and STATUS describe what runs now.
+
+**Checks** (without the card: fiona's A770M serves production, and nothing may start beside it).
+- Builds: every remaining target (`ninja`, all 25 binaries) and the package (`nix build .#eklow`).
+- Host tests: `eklow-metrics-test`, `eklow-spec-test` (17 sampler chains), `eklow-keepalive-test`,
+  `eklow-grammar-test-gemma4` on Bolt's GGUF (1,997 walks closed, 0 failed; 120 bans).
+- The draft's reference forward on the CPU (`eklow-dflash-host`, SYCL native CPU; its build script gains the JSON sources
+  the sampler now needs) on NVIDIA's BF16 draft and Bolt's GGUF, 2 blocks of 8 at position 100: byte-identical before and
+  after the cut (sha256 899d79f5...).
+- The module evaluates for fiona's deployment (Bolt with the draft, the checker with `policyFiles`, the reranker), and an
+  instance that still sets a removed option fails evaluation as an unknown option.
+- The reranker's reference for the card run: llama.cpp's server (the oracle build, ea0c4c2c, on the CPU, f16 cache) on the
+  synthetic pairs. Gating the last eklow record against it gives a largest difference of 0.0027 under 0.1 and 0.0001
+  above, and one swap of two documents 1e-6 apart in the 24-document request, as on 2026-11-10.
+- On the card, in a pause of the service, a script outside the repository (it reads the private replay set; about 15
+  minutes) runs:
+  - the attention and weight-format kernel tests;
+  - the draft's lattice hashes and EmbeddingGemma 2's vectors from this build and from 32152a6's;
+  - the checker's golden states and its 29 turns against laya-fp32 with vega-cv32;
+  - the reranker against that llama.cpp reference;
+  - `serve_test.py basic` and decode at 8k through the full deployment.
+
+  Not run yet.
