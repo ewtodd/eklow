@@ -335,11 +335,11 @@ in
       reader = lib.mkOption {
         type = lib.types.nullOr lib.types.path;
         default = null;
-        example = "/var/lib/eklow/Qwen3.5-0.8B-BF16.gguf";
+        example = lib.literalExpression "inputs.eklow.packages.x86_64-linux.vega-reader";
         description = ''
           vega's reader for the end-of-turn checker, laya's System One (POST /v1/systemone on `checker.port`, served by
           whichever instance runs, beside the chat model and the embeddings): Qwen/Qwen3.5-0.8B at 2fc06364 converted by
-          the pinned llama.cpp's converter, BF16 (tools/vega/make-reader.sh; sha256 4f4a6b43...). It takes 1,197 MiB of the
+          the pinned llama.cpp's converter, BF16 (the flake's `vega-reader`, nix/models.nix). It takes 1,197 MiB of the
           card with checker.maxTokens 16384 (measured on fiona, the driver's buffers included), which comes out of what the
           chat model's experts or K/V would get. null serves no checker.
         '';
@@ -386,7 +386,36 @@ in
           A laya policy folder (laya-policy/1, as laya's save_calibration writes it: heads.npz, calibration.json,
           manifest.json), fitted on this engine: a question whose id has a head is answered by it, and the calibration's
           temperatures apply. Its manifest's hashes and engine are checked at startup; a signed policy is refused. null:
-          every question is the engine's, zero-shot.
+          every question is the engine's, zero-shot. A folder in the store is world-readable: a private policy goes in
+          `policyFiles` instead.
+        '';
+      };
+
+      policyFiles = lib.mkOption {
+        type = lib.types.nullOr (
+          lib.types.submodule {
+            options = lib.genAttrs [ "heads" "calibration" "manifest" ] (
+              f:
+              lib.mkOption {
+                type = lib.types.strMatching "/.*";
+                description = "Absolute path of the policy's ${f} file, read by systemd as root (a string, so that it never enters the store).";
+              }
+            );
+          }
+        );
+        default = null;
+        example = {
+          heads = "/run/agenix/eklow-checker-heads";
+          calibration = "/run/agenix/eklow-checker-calibration";
+          manifest = "/run/agenix/eklow-checker-manifest";
+        };
+        description = ''
+          A private laya policy, given as three root-only files (agenix's, say). Before the server starts, a privileged step
+          copies them, owned by the unit's dynamic user and mode 0400, into a folder of its runtime directory
+          (/run/eklow-<name>/checker-policy: heads.npz, calibration.json, manifest.json), which systemd removes when the unit
+          stops; the server reads it as `policy`, with the same checks. Not systemd's credentials (LoadCredential), which hold
+          at most 1 MiB less a byte each (systemd 262 refuses the unit's start, status 243/CREDENTIALS): a policy's heads.npz
+          is 6.4 MB.
         '';
       };
 
@@ -472,6 +501,10 @@ in
       {
         assertion = cfg.autoStart == null || cfg.instances ? ${cfg.autoStart};
         message = "services.eklow.autoStart '${toString cfg.autoStart}' is not an instance (${lib.concatStringsSep ", " (lib.attrNames cfg.instances)}).";
+      }
+      {
+        assertion = cfg.checker.policy == null || cfg.checker.policyFiles == null;
+        message = "services.eklow.checker: set policy or policyFiles, not both.";
       }
       {
         assertion = lib.all (n: builtins.match "[a-z0-9][a-z0-9-]*" n != null) (
@@ -593,6 +626,10 @@ in
                 "--checker-policy"
                 cfg.checker.policy
               ]
+              ++ lib.optionals (cfg.checker.policyFiles != null) [
+                "--checker-policy"
+                "/run/${unitName name}/checker-policy"
+              ]
             )
             ++ lib.optionals (cfg.reranker.model != null) [
               "--rerank-model"
@@ -631,6 +668,27 @@ in
           RestrictNamespaces = true;
           LockPersonality = true;
           SystemCallArchitectures = "native";
+        }
+        // lib.optionalAttrs (cfg.checker.reader != null && cfg.checker.policyFiles != null) {
+          RuntimeDirectory = unitName name;
+          # "+": as root and outside the sandbox, so that it can read the root-only files; the runtime directory is the
+          # dynamic user's, whose uid it takes.
+          ExecStartPre =
+            "+"
+            + pkgs.writeShellScript "eklow-${name}-checker-policy" (
+              with cfg.checker.policyFiles;
+              ''
+                set -eu
+                d=/run/${unitName name}/checker-policy
+                uid=$(${pkgs.coreutils}/bin/stat -c %u /run/${unitName name})
+                ${pkgs.coreutils}/bin/rm -rf "$d"
+                ${pkgs.coreutils}/bin/install -d -m 0700 -o "$uid" "$d"
+                ${pkgs.coreutils}/bin/install -m 0400 -o "$uid" ${lib.escapeShellArg heads} "$d/heads.npz"
+                ${pkgs.coreutils}/bin/install -m 0400 -o "$uid" ${lib.escapeShellArg calibration} "$d/calibration.json"
+                ${pkgs.coreutils}/bin/install -m 0400 -o "$uid" ${lib.escapeShellArg manifest} "$d/manifest.json"
+                ${pkgs.coreutils}/bin/chmod 0500 "$d"
+              ''
+            );
         };
       }
     ) cfg.instances;
