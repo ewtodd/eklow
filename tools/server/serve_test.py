@@ -255,13 +255,15 @@ def compare(a):
 
 def sample(a):
     """N completions of a short, high-entropy prompt at temperature 1 (thinking off): the first A.tokens tokens by
-    logprob-free means, i.e. the text itself; the distribution of (first words) is compared between servers."""
+    logprob-free means, i.e. the text itself; the distribution of (first words) is compared between servers. No
+    truncation unless asked (min_p 0 over the server's default): a hard cut-off meets the engine's step-shape noise (the int8
+    activations), so a token near it is kept in one batch shape and dropped in another, and a draft changes the shapes."""
     msgs = [{"role": "user", "content": a.prompt}]
     out = []
     lock = threading.Lock()
 
     def one(i):
-        j = chat(a.url, msgs, max_tokens=a.tokens, temperature=1.0, top_p=1.0, top_k=0, reasoning_effort="none", seed=1000 + i)
+        j = chat(a.url, msgs, max_tokens=a.tokens, temperature=1.0, top_p=1.0, top_k=0, min_p=a.min_p, reasoning_effort="none", seed=1000 + i)
         t = j["choices"][0]["message"]["content"]
         with lock:
             out.append(t)
@@ -315,6 +317,7 @@ p.add_argument("--n", type=int, default=1500)
 p.add_argument("--conc", type=int, default=2)
 p.add_argument("--tokens", type=int, default=4)
 p.add_argument("--prompt", default="Name a random animal, one word.")
+p.add_argument("--min-p", type=float, default=0.0)
 p.add_argument("--out", required=True)
 p = sub.add_parser("chi2")
 p.add_argument("a")
