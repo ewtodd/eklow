@@ -1,0 +1,571 @@
+{
+ "what": "vega-U's zero-shot answers (vegaml 0.16.1, the reader in fp32 on CUDA, TF32 off) to tools/vega/synthetic_states.py's states; eklow-vega check holds the reader and engine to them",
+ "reader_sha256": "4f4a6b43e0d3cc8505288aeb2f7a38dfe0b128e14ffb4cb392118913051acc7c",
+ "engine_sha256": "78f96be7c6a06abb873e573fcf9e43ef467010a30c72cd6cac32538cd7078db8",
+ "questions": {
+  "claim": {
+   "type": "boolean",
+   "instructions": "Does the assistant's draft reply say it has done something (written, logged, updated, saved, created, removed, scheduled, checked, looked up, sent, noted or remembered) that none of this turn's tool calls did?"
+  },
+  "unchecked": {
+   "type": "boolean",
+   "instructions": "The user's latest message asks about the current state of something (a scheduled job, a file, a log, a worker) or why something happened. Does the draft reply answer it without any tool call in this turn that checked that state? Answer no if the message asks no such thing."
+  },
+  "offtopic": {
+   "type": "boolean",
+   "instructions": "Does the draft reply fail to respond to the user's latest message (it answers something else, such as an earlier topic)?"
+  },
+  "kind": {
+   "type": "choice",
+   "instructions": "What kind of request is the user's latest message?",
+   "criteria": {
+    "question": "asks for information",
+    "task": "asks for something to be done",
+    "chat": null,
+    "complaint": "reports a problem"
+   }
+  },
+  "effort": {
+   "type": "score",
+   "instructions": "How much work did the assistant do in this turn?",
+   "criteria": [
+    "none",
+    "a little",
+    "some",
+    "a lot"
+   ]
+  },
+  "polite": {
+   "type": "boolean",
+   "instructions": "Is the draft reply polite?",
+   "criteria": {
+    "false": "rude or curt",
+    "true": "polite"
+   }
+  }
+ },
+ "items": [
+  {
+   "key": "tiny",
+   "qid": "claim",
+   "tokens": 223,
+   "P": [
+    0.841897,
+    0.158103
+   ]
+  },
+  {
+   "key": "tiny",
+   "qid": "unchecked",
+   "tokens": 247,
+   "P": [
+    0.849258,
+    0.150742
+   ]
+  },
+  {
+   "key": "tiny",
+   "qid": "offtopic",
+   "tokens": 179,
+   "P": [
+    0.557558,
+    0.442442
+   ]
+  },
+  {
+   "key": "tiny",
+   "qid": "kind",
+   "tokens": 162,
+   "P": [
+    0.408586,
+    0.389748,
+    0.188584,
+    0.013082
+   ]
+  },
+  {
+   "key": "tiny",
+   "qid": "effort",
+   "tokens": 165,
+   "P": [
+    0.366167,
+    0.423257,
+    0.130517,
+    0.080059
+   ]
+  },
+  {
+   "key": "tiny",
+   "qid": "polite",
+   "tokens": 137,
+   "P": [
+    0.082403,
+    0.917597
+   ]
+  },
+  {
+   "key": "short-claim",
+   "qid": "claim",
+   "tokens": 245,
+   "P": [
+    0.685101,
+    0.314899
+   ]
+  },
+  {
+   "key": "short-claim",
+   "qid": "unchecked",
+   "tokens": 269,
+   "P": [
+    0.944129,
+    0.055871
+   ]
+  },
+  {
+   "key": "short-claim",
+   "qid": "offtopic",
+   "tokens": 201,
+   "P": [
+    0.640468,
+    0.359532
+   ]
+  },
+  {
+   "key": "short-claim",
+   "qid": "kind",
+   "tokens": 184,
+   "P": [
+    0.45712,
+    0.379005,
+    0.152673,
+    0.011202
+   ]
+  },
+  {
+   "key": "short-claim",
+   "qid": "effort",
+   "tokens": 187,
+   "P": [
+    0.178091,
+    0.465183,
+    0.229565,
+    0.127161
+   ]
+  },
+  {
+   "key": "short-claim",
+   "qid": "polite",
+   "tokens": 159,
+   "P": [
+    0.160751,
+    0.839249
+   ]
+  },
+  {
+   "key": "short-checked",
+   "qid": "claim",
+   "tokens": 369,
+   "P": [
+    0.897391,
+    0.102609
+   ]
+  },
+  {
+   "key": "short-checked",
+   "qid": "unchecked",
+   "tokens": 393,
+   "P": [
+    0.548375,
+    0.451625
+   ]
+  },
+  {
+   "key": "short-checked",
+   "qid": "offtopic",
+   "tokens": 325,
+   "P": [
+    0.899746,
+    0.100254
+   ]
+  },
+  {
+   "key": "short-checked",
+   "qid": "kind",
+   "tokens": 308,
+   "P": [
+    0.499558,
+    0.269124,
+    0.200778,
+    0.03054
+   ]
+  },
+  {
+   "key": "short-checked",
+   "qid": "effort",
+   "tokens": 311,
+   "P": [
+    0.074226,
+    0.377917,
+    0.36078,
+    0.187076
+   ]
+  },
+  {
+   "key": "short-checked",
+   "qid": "polite",
+   "tokens": 283,
+   "P": [
+    0.206614,
+    0.793386
+   ]
+  },
+  {
+   "key": "unchecked-why",
+   "qid": "claim",
+   "tokens": 285,
+   "P": [
+    0.694555,
+    0.305445
+   ]
+  },
+  {
+   "key": "unchecked-why",
+   "qid": "unchecked",
+   "tokens": 309,
+   "P": [
+    0.112486,
+    0.887514
+   ]
+  },
+  {
+   "key": "unchecked-why",
+   "qid": "offtopic",
+   "tokens": 241,
+   "P": [
+    0.822803,
+    0.177197
+   ]
+  },
+  {
+   "key": "unchecked-why",
+   "qid": "kind",
+   "tokens": 224,
+   "P": [
+    0.379241,
+    0.217814,
+    0.253995,
+    0.14895
+   ]
+  },
+  {
+   "key": "unchecked-why",
+   "qid": "effort",
+   "tokens": 227,
+   "P": [
+    0.094589,
+    0.446169,
+    0.302514,
+    0.156728
+   ]
+  },
+  {
+   "key": "unchecked-why",
+   "qid": "polite",
+   "tokens": 199,
+   "P": [
+    0.039529,
+    0.960471
+   ]
+  },
+  {
+   "key": "offtopic-unicode",
+   "qid": "claim",
+   "tokens": 383,
+   "P": [
+    0.636067,
+    0.363933
+   ]
+  },
+  {
+   "key": "offtopic-unicode",
+   "qid": "unchecked",
+   "tokens": 407,
+   "P": [
+    0.771424,
+    0.228576
+   ]
+  },
+  {
+   "key": "offtopic-unicode",
+   "qid": "offtopic",
+   "tokens": 339,
+   "P": [
+    0.190856,
+    0.809144
+   ]
+  },
+  {
+   "key": "offtopic-unicode",
+   "qid": "kind",
+   "tokens": 322,
+   "P": [
+    0.511586,
+    0.251599,
+    0.211343,
+    0.025472
+   ]
+  },
+  {
+   "key": "offtopic-unicode",
+   "qid": "effort",
+   "tokens": 325,
+   "P": [
+    0.132386,
+    0.3803,
+    0.325839,
+    0.161474
+   ]
+  },
+  {
+   "key": "offtopic-unicode",
+   "qid": "polite",
+   "tokens": 297,
+   "P": [
+    0.160819,
+    0.839181
+   ]
+  },
+  {
+   "key": "medium-logs",
+   "qid": "claim",
+   "tokens": 1261,
+   "P": [
+    0.936315,
+    0.063685
+   ]
+  },
+  {
+   "key": "medium-logs",
+   "qid": "unchecked",
+   "tokens": 1285,
+   "P": [
+    0.59323,
+    0.40677
+   ]
+  },
+  {
+   "key": "medium-logs",
+   "qid": "offtopic",
+   "tokens": 1217,
+   "P": [
+    0.941927,
+    0.058073
+   ]
+  },
+  {
+   "key": "medium-logs",
+   "qid": "kind",
+   "tokens": 1200,
+   "P": [
+    0.344185,
+    0.219841,
+    0.304213,
+    0.131761
+   ]
+  },
+  {
+   "key": "medium-logs",
+   "qid": "effort",
+   "tokens": 1203,
+   "P": [
+    0.08719,
+    0.517861,
+    0.327572,
+    0.067377
+   ]
+  },
+  {
+   "key": "medium-logs",
+   "qid": "polite",
+   "tokens": 1175,
+   "P": [
+    0.350729,
+    0.649271
+   ]
+  },
+  {
+   "key": "long-steps",
+   "qid": "claim",
+   "tokens": 3042,
+   "P": [
+    0.866906,
+    0.133094
+   ]
+  },
+  {
+   "key": "long-steps",
+   "qid": "unchecked",
+   "tokens": 3066,
+   "P": [
+    0.919959,
+    0.080041
+   ]
+  },
+  {
+   "key": "long-steps",
+   "qid": "offtopic",
+   "tokens": 2998,
+   "P": [
+    0.892591,
+    0.107409
+   ]
+  },
+  {
+   "key": "long-steps",
+   "qid": "kind",
+   "tokens": 2981,
+   "P": [
+    0.366879,
+    0.391706,
+    0.216363,
+    0.025052
+   ]
+  },
+  {
+   "key": "long-steps",
+   "qid": "effort",
+   "tokens": 2984,
+   "P": [
+    0.042288,
+    0.371438,
+    0.449842,
+    0.136431
+   ]
+  },
+  {
+   "key": "long-steps",
+   "qid": "polite",
+   "tokens": 2956,
+   "P": [
+    0.25235,
+    0.74765
+   ]
+  },
+  {
+   "key": "very-long",
+   "qid": "claim",
+   "tokens": 5211,
+   "P": [
+    0.843183,
+    0.156817
+   ]
+  },
+  {
+   "key": "very-long",
+   "qid": "unchecked",
+   "tokens": 5223,
+   "P": [
+    0.727349,
+    0.272651
+   ]
+  },
+  {
+   "key": "very-long",
+   "qid": "offtopic",
+   "tokens": 5189,
+   "P": [
+    0.749784,
+    0.250216
+   ]
+  },
+  {
+   "key": "very-long",
+   "qid": "kind",
+   "tokens": 5186,
+   "P": [
+    0.395053,
+    0.319595,
+    0.223026,
+    0.062326
+   ]
+  },
+  {
+   "key": "very-long",
+   "qid": "effort",
+   "tokens": 5189,
+   "P": [
+    0.171424,
+    0.447407,
+    0.296704,
+    0.084465
+   ]
+  },
+  {
+   "key": "very-long",
+   "qid": "polite",
+   "tokens": 5166,
+   "P": [
+    0.230652,
+    0.769348
+   ]
+  },
+  {
+   "key": "longest",
+   "qid": "claim",
+   "tokens": 11977,
+   "P": [
+    0.663862,
+    0.336138
+   ]
+  },
+  {
+   "key": "longest",
+   "qid": "unchecked",
+   "tokens": 11989,
+   "P": [
+    0.672445,
+    0.327555
+   ]
+  },
+  {
+   "key": "longest",
+   "qid": "offtopic",
+   "tokens": 11955,
+   "P": [
+    0.800775,
+    0.199225
+   ]
+  },
+  {
+   "key": "longest",
+   "qid": "kind",
+   "tokens": 11952,
+   "P": [
+    0.422319,
+    0.25136,
+    0.264142,
+    0.06218
+   ]
+  },
+  {
+   "key": "longest",
+   "qid": "effort",
+   "tokens": 11955,
+   "P": [
+    0.089186,
+    0.401328,
+    0.413234,
+    0.096252
+   ]
+  },
+  {
+   "key": "longest",
+   "qid": "polite",
+   "tokens": 11932,
+   "P": [
+    0.350004,
+    0.649996
+   ]
+  }
+ ]
+}

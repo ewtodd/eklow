@@ -13,7 +13,9 @@ namespace eklow::text {
 namespace {
 
 // tokenizer.json's added_tokens: id, content, "special". The GGUF holds 33 control and user-defined tokens; these are
-// the 26 Hugging Face knows (the other seven, <|audio_start|> .. <|audio_pad|>, are in tokenizer_config.json only).
+// the 26 Hugging Face knows (the other seven, <|audio_start|> .. <|audio_pad|>, are in tokenizer_config.json only). The ids
+// are Qwen3.5's and 3.6's; Qwen3's vocabulary (Qwen3-Reranker's) has the same 26 from 151643 on, so from_gguf finds each by
+// its text.
 struct Added {
   int32_t id;
   const char* text;
@@ -45,7 +47,9 @@ std::array<uint32_t, 256> byte_to_char() {
 uint64_t pair_key(int32_t a, int32_t b) { return uint64_t(uint32_t(a)) << 32 | uint32_t(b); }
 constexpr uint64_t kEmpty = ~0ull;
 
-bool is_lm(uint8_t k) { return k & (unicode::kLetter | unicode::kMark); }
+// The classes a word's letters may have: Qwen3.5's and 3.6's pre-tokenizer counts marks with letters ([\p{L}\p{M}]+),
+// Qwen2's and Qwen3's do not (\p{L}+, and a mark is punctuation to it).
+constexpr uint8_t kLettersMarks = unicode::kLetter | unicode::kMark;
 
 // (?i:'s|'t|'re|'ve|'m|'ll|'d) after the apostrophe at s[i-1]: the end of the match, or 0. Case-insensitive the way
 // Oniguruma folds: ASCII letters, and U+017F (long s) is an s.
@@ -75,11 +79,13 @@ size_t contraction(const char* s, size_t n, size_t i) {
   return 0;
 }
 
-// The pre-token starting at s[i] (valid UTF-8, i < n): its end.
-size_t next_piece(const char* s, size_t n, size_t i) {
+// The pre-token starting at s[i] (valid UTF-8, i < n): its end. lm: the classes of a word's letters (kLettersMarks, or
+// kLetter for the Qwen2 regex, whose alternatives below read \p{L}+ and  ?[^\s\p{L}\p{N}]+[\r\n]*).
+size_t next_piece(const char* s, size_t n, size_t i, uint8_t lm = kLettersMarks) {
   uint32_t c0;
   const size_t l0 = unicode::decode(s + i, n - i, c0);
   const uint8_t k0 = unicode::classes(c0);
+  auto is_lm = [lm](uint8_t k) { return (k & lm) != 0; };
   // (?i:'s|'t|'re|'ve|'m|'ll|'d)
   if (c0 == '\'')
     if (size_t e = contraction(s, n, i + 1)) return e;
@@ -109,7 +115,7 @@ size_t next_piece(const char* s, size_t n, size_t i) {
     while (q < n) {
       uint32_t c;
       const size_t l = unicode::decode(s + q, n - q, c);
-      if (unicode::classes(c)) break;
+      if (unicode::classes(c) & (lm | unicode::kNumber | unicode::kSpace)) break;
       q += l;
     }
     if (q > p) {
@@ -140,11 +146,14 @@ size_t next_piece(const char* s, size_t n, size_t i) {
 QwenTokenizer QwenTokenizer::from_gguf(const gguf::File& f) {
   const auto* m = f.find("tokenizer.ggml.model");
   const auto* pre = f.find("tokenizer.ggml.pre");
-  if (!m || m->as_string() != "gpt2" || !pre || pre->as_string() != "qwen35")
-    throw std::runtime_error(f.path() + ": not a Qwen3.6 tokenizer (gpt2 model with the qwen35 pre-tokenizer)");
-  const auto* nfc = f.find("tokenizer.ggml.normalizer.nfc");
-  if (!nfc || !std::get<bool>(nfc->v)) throw std::runtime_error(f.path() + ": the tokenizer does not say it normalizes to NFC");
+  if (!m || m->as_string() != "gpt2" || !pre || (pre->as_string() != "qwen35" && pre->as_string() != "qwen2"))
+    throw std::runtime_error(f.path() + ": not a Qwen tokenizer (gpt2 model with the qwen35 or qwen2 pre-tokenizer)");
   QwenTokenizer t;
+  t.lm_ = pre->as_string() == "qwen35" ? kLettersMarks : unicode::kLetter;
+  // Qwen3's tokenizer.json normalizes to NFC as Qwen3.6's does; converters before the key existed did not write it.
+  const auto* nfc = f.find("tokenizer.ggml.normalizer.nfc");
+  if (t.lm_ == kLettersMarks && (!nfc || !std::get<bool>(nfc->v)))
+    throw std::runtime_error(f.path() + ": the tokenizer does not say it normalizes to NFC");
   const auto& toks = f.at("tokenizer.ggml.tokens").as_array();
   const auto& types = f.at("tokenizer.ggml.token_type").as_array();
   if (types.size() != toks.size()) throw std::runtime_error(f.path() + ": token and token type counts differ");
@@ -159,7 +168,11 @@ QwenTokenizer QwenTokenizer::from_gguf(const gguf::File& f) {
   t.hf_special_.assign(n, 0);
   t.known_.assign(n, 0);
   t.byte_ids_.fill(-1);
-  const int32_t base = kAdded[0].id;
+  // The added tokens follow the base vocabulary: the first, <|endoftext|>, is where it ends.
+  int32_t base = -1;
+  for (size_t i = 0; i < n && base < 0; ++i)
+    if (toks[i].as_string() == kAdded[0].text) base = int32_t(i);
+  if (base < 0) throw std::runtime_error(f.path() + ": no <|endoftext|>");
   for (size_t i = 0; i < n; ++i) {
     const std::string& p = toks[i].as_string();
     t.pieces_.push_back(p);
@@ -186,12 +199,13 @@ QwenTokenizer QwenTokenizer::from_gguf(const gguf::File& f) {
   for (int32_t b : t.byte_ids_)
     if (b < 0) throw std::runtime_error(f.path() + ": the 256 single-byte tokens are not all present");
   for (const Added& a : kAdded) {
-    if (size_t(a.id) >= n || t.pieces_[size_t(a.id)] != a.text || !t.special_[size_t(a.id)])
-      throw std::runtime_error(f.path() + ": token " + std::to_string(a.id) + " is not " + a.text);
-    t.bytes_[size_t(a.id)] = a.text;
-    t.known_[size_t(a.id)] = 1;
-    t.hf_special_[size_t(a.id)] = a.special;
-    t.added_.emplace_back(a.text, a.id);
+    const int32_t id = base + (a.id - kAdded[0].id);
+    if (size_t(id) >= n || t.pieces_[size_t(id)] != a.text || !t.special_[size_t(id)])
+      throw std::runtime_error(f.path() + ": token " + std::to_string(id) + " is not " + a.text);
+    t.bytes_[size_t(id)] = a.text;
+    t.known_[size_t(id)] = 1;
+    t.hf_special_[size_t(id)] = a.special;
+    t.added_.emplace_back(a.text, id);
   }
   std::stable_sort(t.added_.begin(), t.added_.end(), [](auto& a, auto& b) { return a.first.size() > b.first.size(); });
 
@@ -216,7 +230,9 @@ QwenTokenizer QwenTokenizer::from_gguf(const gguf::File& f) {
     t.merge_keys_[h] = key;
     t.merge_vals_[h] = uint64_t(r) << 32 | uint32_t(c);
   }
-  t.bos_ = int32_t(f.at("tokenizer.ggml.bos_token_id").as_int());
+  // Qwen3.5's GGUFs (vega's reader) carry no BOS; Qwen3.6's do, and none is ever added.
+  const auto* bos = f.find("tokenizer.ggml.bos_token_id");
+  t.bos_ = bos ? int32_t(bos->as_int()) : -1;
   t.eos_ = int32_t(f.at("tokenizer.ggml.eos_token_id").as_int());
   return t;
 }
@@ -329,7 +345,7 @@ void QwenTokenizer::encode_plain(std::string_view s, std::vector<int32_t>& out) 
   const char* p = normalized.data();
   const size_t n = normalized.size();
   for (size_t i = 0; i < n;) {
-    const size_t e = next_piece(p, n, i);
+    const size_t e = next_piece(p, n, i, lm_);
     bpe(reinterpret_cast<const unsigned char*>(p) + i, e - i, out);
     i = e;
   }

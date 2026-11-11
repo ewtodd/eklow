@@ -331,10 +331,135 @@ in
       description = "Model id the embedding API lists.";
     };
 
+    checker = {
+      reader = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = "/var/lib/eklow/Qwen3.5-0.8B-BF16.gguf";
+        description = ''
+          vega's reader for the end-of-turn checker, laya's System One (POST /v1/systemone on `checker.port`, served by
+          whichever instance runs, beside the chat model and the embeddings): Qwen/Qwen3.5-0.8B at 2fc06364 converted by
+          the pinned llama.cpp's converter, BF16 (tools/vega/make-reader.sh; sha256 4f4a6b43...). It takes 1,197 MiB of the
+          card with checker.maxTokens 16384 (measured on fiona, the driver's buffers included), which comes out of what the
+          chat model's experts or K/V would get. null serves no checker.
+        '';
+      };
+
+      vega = lib.mkOption {
+        type = lib.types.path;
+        default = pkgs.linkFarm "vega-U-4d205028" (
+          map
+            (f: {
+              inherit (f) name;
+              path = pkgs.fetchurl {
+                url = "https://huggingface.co/nandakishorm/vega-U/resolve/4d2050287982ca7a7bb0c22fd19a389f5f94474e/${f.name}";
+                inherit (f) sha256;
+              };
+            })
+            [
+              {
+                name = "vega_config.json";
+                sha256 = "000461315c798b6eca62323476360c14cf31b4e1adcba21ab8266fca41d3fcf8";
+              }
+              {
+                name = "engine.safetensors";
+                sha256 = "78f96be7c6a06abb873e573fcf9e43ef467010a30c72cd6cac32538cd7078db8";
+              }
+              {
+                name = "port.safetensors";
+                sha256 = "398ae79d5e3956a3ed809d500fbdf57982d303c719e464bb81ba12a5ee7d23bd";
+              }
+              {
+                name = "stats.npz";
+                sha256 = "f891292bb7cb2a7616bb925a3c2fe182c72b2899f36c16494445229bed1d3a12";
+              }
+            ]
+        );
+        defaultText = "nandakishorm/vega-U at 4d205028 (its Qwen3.5-0.8B port)";
+        description = "The vega-U model directory for the reader: vega_config.json, engine.safetensors, port.safetensors, stats.npz.";
+      };
+
+      policy = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        description = ''
+          A laya policy folder (laya-policy/1, as laya's save_calibration writes it: heads.npz, calibration.json,
+          manifest.json), fitted on this engine: a question whose id has a head is answered by it, and the calibration's
+          temperatures apply. Its manifest's hashes and engine are checked at startup; a signed policy is refused. null:
+          every question is the engine's, zero-shot.
+        '';
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 8084;
+        description = "Port of the checker's API (POST /v1/systemone, GET /health).";
+      };
+
+      alias = lib.mkOption {
+        type = lib.types.str;
+        default = "vega-u";
+        description = "Model name the checker's answers carry.";
+      };
+
+      maxTokens = lib.mkOption {
+        type = lib.types.ints.between 1024 73728;
+        default = 16384;
+        description = ''
+          The longest prompt the reader holds (its attention cache, 10 KiB a token); a longer state is answered 413, and
+          son-of-anton then keeps the draft. vegaml reads up to 73,728, but a state that long takes the reader seconds,
+          past son-of-anton's 3 s timeout.
+        '';
+      };
+    };
+
+    reranker = {
+      model = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = lib.literalExpression ''
+          pkgs.fetchurl {
+            name = "qwen3-reranker-0.6b-q8_0.gguf";
+            url = "https://huggingface.co/ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF/resolve/a02f48bb4f057028298c21fa033da2b30d7742d5/qwen3-reranker-0.6b-q8_0.gguf";
+            sha256 = "22c9979ce4fbcdc5acdc310c6641c32797eff1aa980b8f7a2db8a8ea23429a48";
+          }
+        '';
+        description = ''
+          A Qwen3-Reranker GGUF with its yes/no head and rerank template (ggml-org's conversion; a plain causal-LM conversion
+          has neither), served by whichever instance runs as llama.cpp's POST /v1/rerank on `reranker.port`: 796 MiB of the
+          card at maxTokens 4096 (measured on fiona), out of the chat model's share. null serves none.
+        '';
+      };
+
+      port = lib.mkOption {
+        type = lib.types.port;
+        default = 8085;
+        description = ''
+          Port of the reranker's API (POST /v1/rerank, /rerank, GET /health). Not llama.cpp's 8083 by default: a port another
+          service holds stops the whole server (chat included) at startup, so take 8083 only once llama.cpp's reranker is gone.
+        '';
+      };
+
+      alias = lib.mkOption {
+        type = lib.types.str;
+        default = "qwen3-reranker-0.6b";
+        description = "Model name the reranker's answers carry when a request names none.";
+      };
+
+      maxTokens = lib.mkOption {
+        type = lib.types.ints.between 256 32768;
+        default = 4096;
+        description = ''
+          The longest query-document pair, in tokens, and the rows of one pass of the reranker (its activations grow with
+          it); a longer pair is refused with 400, as llama.cpp refuses a pair past its ubatch (4,096 on fiona).
+        '';
+      };
+    };
+
     openFirewall = lib.mkOption {
       type = lib.types.bool;
       default = false;
-      description = "Open the instances' ports and the embedding port in the firewall.";
+      description = "Open the instances' ports, the embedding port, the checker's and the reranker's ports in the firewall.";
     };
   };
 
@@ -360,6 +485,8 @@ in
       lib.unique (
         lib.mapAttrsToList (_: inst: inst.port) cfg.instances
         ++ lib.optional (cfg.embedModel != null) cfg.embedPort
+        ++ lib.optional (cfg.checker.reader != null) cfg.checker.port
+        ++ lib.optional (cfg.reranker.model != null) cfg.reranker.port
       )
     );
 
@@ -448,6 +575,34 @@ in
             ++ lib.optionals (cfg.embedMmproj != null || inst.mmproj != null) [
               "--image-tokens"
               (toString cfg.imageTokens)
+            ]
+            ++ lib.optionals (cfg.checker.reader != null) (
+              [
+                "--checker-reader"
+                cfg.checker.reader
+                "--checker-vega"
+                cfg.checker.vega
+                "--checker-port"
+                (toString cfg.checker.port)
+                "--checker-alias"
+                cfg.checker.alias
+                "--checker-max-tokens"
+                (toString cfg.checker.maxTokens)
+              ]
+              ++ lib.optionals (cfg.checker.policy != null) [
+                "--checker-policy"
+                cfg.checker.policy
+              ]
+            )
+            ++ lib.optionals (cfg.reranker.model != null) [
+              "--rerank-model"
+              cfg.reranker.model
+              "--rerank-port"
+              (toString cfg.reranker.port)
+              "--rerank-alias"
+              cfg.reranker.alias
+              "--rerank-max-tokens"
+              (toString cfg.reranker.maxTokens)
             ]
             ++ inst.extraArgs
           );

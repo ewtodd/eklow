@@ -22,6 +22,22 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   fixed logits; DRY, adaptive_p and infill are refused. Bolt and Sage both gain min-p 0.05. A token at min-p's edge can be kept in
   one batch shape and dropped in another (the int8 activations), so a two-at-a-time chi-square under the default chain is not a
   test of the draft; `serve_test.py sample` sends min_p 0.
+- **vega's checker and the reranker are ready to serve, not merged or deployed** (`vega/checker`, 2026-11-10, DECISIONS "vega's
+  checker" and "Qwen3-Reranker on eklow"), beside whichever chat model runs (`eklow-server --checker-*`, `--rerank-*`; module
+  `services.eklow.checker`, `services.eklow.reranker`; `eklow-vega serve` and `eklow-rerank serve` alone):
+  - the checker is laya's System One (`POST /v1/systemone`) for son-of-anton's end-of-turn checks: Qwen3.5-0.8B (vega's reader)
+    on the card, vega-U's engine and laya's policy on the CPU. On the 29 replay turns it is within 0.0014 of laya with an fp32
+    reader (no flag differs) and within 0.012 / 0.036 / 0.0023 (claim, unchecked, offtopic) of laya as fitted in bf16, as far as
+    laya's own fp32, eager-attention and CPU runs land, flipping the one flag (0.00027 from its cut-off) they all flip. p50 271
+    ms, p90 502 ms a turn; 1,197 MiB of the card.
+  - the reranker is llama.cpp's `POST /v1/rerank` over ggml-org's Qwen3-Reranker-0.6B Q8_0: within 0.0021 of llama.cpp (f16
+    K/V) and 0.00036 of an fp32 run of the same weights; 101 ms for 8 documents of ~1,200 characters, 264 ms for 24; 796 MiB.
+  - All four on the card with fp16 caches (the owner's call): Bolt 5.71 GiB and EmbeddingGemma 2 2.20 GiB at 2 x 65,536 (the
+    Bolt branch's measurement), the checker 1.17 GiB, the reranker 0.78 GiB: 9.86 GiB of 16.
+  - To deploy: the reader GGUF (`tools/vega/make-reader.sh`) and the policy folder where the unit can read them, the reranker's
+    GGUF (fetchurl, the module's example), the ports in son-of-anton's `[checker] base_url` and the rerank route. The Bolt-E4B
+    server (`gemma/bolt-e4b`) takes the same flags once it calls `serve_systemone` and `serve_rerank` (tools/server/systemone.hpp,
+    rerank.hpp) as qwen_server_main does.
 - **Sage-A1.5 is ready to serve, not deployed** (2026-11-07, DECISIONS "Sage-A1.5 on eklow" and "Sage-A1.5's chat template"):
   `--chat-template sage` (recognised from the GGUF), `--verification on|off` (on only for conversations with system text);
   0 differences against Hugging Face on 28,017 cases. Its EKK8 is on Hugging Face (below), with KL 0.0127 at 4k against its Q8_0.
@@ -156,6 +172,10 @@ draft, chi-square p = 0.985); acceptance at block 8 5.75 / 5.43 / 5.02 on GSM8K 
 
 ## Open, in order
 
+0. **The checker's policy on the features eklow serves.** Its heads and son-of-anton's cut-offs were fitted on bf16 features whose
+   own noise moves unchecked by up to 0.036 (DECISIONS "vega's checker"); refitting them on eklow's (or fp32) features would put
+   the cut-offs where the served probabilities are. The offtopic cut-off sits inside the mass of offtopic's answers (0.39-0.46
+   after its temperature of 17.7), so any implementation flips some of its flags.
 1. **What production shows** with Ornith-1.5 and the prefill groups.
 2. **Prefill**, the owner's order (2026-11-02): layer-major groups (done), then a microbenchmark of the DMA tax (does a
    kernel reading pinned host memory slow the card less than copy-engine pushes?), int8 Q.K prefill attention at depth

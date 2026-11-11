@@ -1,5 +1,7 @@
-// Qwen3.6's tokenizer (the Qwen3.6-35B-A3B family: stock and finetunes, one tokenizer.json), built from the GGUF and
-// following Hugging Face's tokenizers on that tokenizer.json:
+// Qwen3.6's tokenizer (the Qwen3.6-35B-A3B family: stock and finetunes, one tokenizer.json; Qwen3.5's is the same), built
+// from the GGUF and following Hugging Face's tokenizers on that tokenizer.json. Qwen3's (pre-tokenizer qwen2: Qwen3-Reranker)
+// differs only in its ids and in the regex below counting no marks with letters ([^\r\n\p{L}\p{N}]?\p{L}+ and
+// ?[^\s\p{L}\p{N}]+[\r\n]*):
 //   1. the 26 added tokens (<|im_start|>, <think>, <tool_call>, ...) are split out of the text first, longest match
 //      first, where special tokens are parsed;
 //   2. each stretch between them is normalized to NFC;
@@ -88,6 +90,7 @@ class QwenTokenizer {
   // The 26 added tokens, longest first.
   std::vector<std::pair<std::string, int32_t>> added_;
   int32_t bos_ = -1, eos_ = -1;
+  uint8_t lm_ = 3;  // the classes of a word's letters: unicode::kLetter | kMark (qwen35), kLetter (qwen2)
 };
 
 }  // namespace eklow::text

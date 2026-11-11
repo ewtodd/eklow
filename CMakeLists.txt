@@ -84,6 +84,8 @@ add_library(eklow_model STATIC
   src/kernels/attention.cpp
   src/kernels/fast.cpp
   src/kernels/gdn.cpp
+  src/kernels/dense.cpp
+  src/kernels/gdn_seq.cpp
   src/kernels/gemma_fast.cpp
   src/kernels/qwen_fast.cpp
   src/kernels/ref.cpp
@@ -138,6 +140,33 @@ eklow_sycl(eklow-dequant-test)
 add_executable(eklow-ref-run tools/ref_run/main.cpp)
 target_link_libraries(eklow-ref-run PRIVATE eklow_model)
 eklow_sycl(eklow-ref-run)
+
+# vega's checker (laya's System One): its reader, Qwen3.5-0.8B, on the card; its engine and laya's policies on the CPU.
+add_library(eklow_vega STATIC
+  src/vega/checker.cpp
+  src/vega/engine.cpp
+  src/vega/files.cpp
+  src/vega/policy.cpp
+  src/vega/prompt.cpp
+  src/vega/reader.cpp
+)
+target_link_libraries(eklow_vega PUBLIC eklow_model eklow_text)
+eklow_sycl(eklow_vega)
+
+# Qwen3-Reranker: llama.cpp's rerank endpoint over eklow's kernels.
+add_library(eklow_rerank STATIC src/model/rerank_qwen3.cpp)
+target_link_libraries(eklow_rerank PUBLIC eklow_model eklow_text)
+eklow_sycl(eklow_rerank)
+
+add_executable(eklow-rerank tools/rerank/main.cpp)
+target_include_directories(eklow-rerank PRIVATE ${HTTPLIB_INCLUDE_DIR})
+target_link_libraries(eklow-rerank PRIVATE eklow_rerank Threads::Threads)
+eklow_sycl(eklow-rerank)
+
+add_executable(eklow-vega tools/vega/main.cpp)
+target_include_directories(eklow-vega PRIVATE ${HTTPLIB_INCLUDE_DIR})
+target_link_libraries(eklow-vega PRIVATE eklow_vega Threads::Threads)
+eklow_sycl(eklow-vega)
 
 # The serving forward pass: KV cache, batched steps over several sequences.
 add_library(eklow_engine STATIC src/engine/engine.cpp)
@@ -205,7 +234,7 @@ eklow_sycl(eklow-prompt-gemma4)
 
 add_executable(eklow-server tools/server/main.cpp tools/server/gemma4_main.cpp)
 target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
-target_link_libraries(eklow-server PRIVATE eklow_serve eklow_serve_gemma4 Threads::Threads)
+target_link_libraries(eklow-server PRIVATE eklow_serve eklow_serve_gemma4 eklow_vega eklow_rerank Threads::Threads)
 eklow_sycl(eklow-server)
 # The streams' keep-alive (tools/server/keepalive.hpp), host only.
 add_executable(eklow-keepalive-test tools/server/keepalive_test.cpp)
@@ -247,7 +276,7 @@ add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-prompt-gemma4 eklow-server eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-prompt-gemma4 eklow-server eklow-vega eklow-rerank eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
 # The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
 install(TARGETS eklow-grammar-test-gemma4 eklow-chat-gemma4 eklow-parse-gemma4 RUNTIME DESTINATION bin)
 install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
