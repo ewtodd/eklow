@@ -1,5 +1,6 @@
-// GET /metrics: the Prometheus text exposition (version 0.0.4) llmtop scrapes, prefix eklow. A pure function of the scheduler's Stats, the
-// embedding counters and the config, so it is testable without a card (metrics_test.cpp). Names follow llmtop's contract for engines.
+// GET /metrics: the Prometheus text exposition (version 0.0.4) llmtop scrapes, prefix eklow. A pure function of a scheduler's Stats (the Qwen
+// scheduler's or Gemma 4's, serve/scheduler.hpp and serve/scheduler_gemma4.hpp, which name these counters alike), the embedding counters and
+// the config, so it is testable without a card (metrics_test.cpp). Names follow llmtop's contract for engines.
 #pragma once
 
 #include <algorithm>
@@ -7,8 +8,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <string>
-
-#include "serve/scheduler.hpp"
 
 namespace eklow::serve {
 
@@ -41,13 +40,16 @@ inline std::string metrics_escape(const std::string& v) {
 // prefix in a slot with no request included) and Stats::idle_positions the positions of slots with no request, so held minus idle is what
 // running requests hold; over kv_pool_positions. A zero-capacity pool gives 0, and rounding (held counts whole pages, idle exact positions)
 // cannot push the value outside 0..1.
-inline double metrics_kv_ratio(const Scheduler::Stats& s) {
+template <class Stats>
+double metrics_kv_ratio(const Stats& s) {
   if (s.kv_pool_positions <= 0) return 0.0;
   const double r = double(s.kv_held_positions - s.idle_positions) / double(s.kv_pool_positions);
   return std::min(1.0, std::max(0.0, r));
 }
 
-inline std::string render_metrics(const Scheduler::Stats& s, const MetricsEmbed& e, const MetricsHttp& h, const MetricsConfig& c) {
+// The snapshot gauges only for a scheduler that keeps snapshots (the Qwen one's DeltaNet states; Gemma 4 has none).
+template <class Stats>
+std::string render_metrics(const Stats& s, const MetricsEmbed& e, const MetricsHttp& h, const MetricsConfig& c) {
   std::string out;
   char buf[96];
   auto put = [&](const char* name, const char* type, const std::string& value) {
@@ -83,8 +85,10 @@ inline std::string render_metrics(const Scheduler::Stats& s, const MetricsEmbed&
   put("embedding_requests_total", "counter", num(e.requests));
   put("embedding_inputs_total", "counter", num(e.inputs));
   put("embedding_tokens_total", "counter", num(e.tokens));
-  put("snapshots", "gauge", num(s.snapshots));
-  put("snapshot_bytes", "gauge", num(s.snapshot_bytes));
+  if constexpr (requires { s.snapshots; s.snapshot_bytes; }) {
+    put("snapshots", "gauge", num(s.snapshots));
+    put("snapshot_bytes", "gauge", num(s.snapshot_bytes));
+  }
   return out;
 }
 

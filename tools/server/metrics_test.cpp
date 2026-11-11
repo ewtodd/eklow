@@ -1,9 +1,12 @@
-// eklow-metrics-test: render_metrics (metrics.hpp) on the host, no card: every name once, numeric values, label escaping, the K/V ratio.
+// eklow-metrics-test: render_metrics (metrics.hpp) on the host, no card: every name once, numeric values, label escaping, the K/V ratio,
+// for the Qwen scheduler's Stats and Gemma 4's.
 #include <cstdio>
 #include <map>
 #include <sstream>
 
 #include "metrics.hpp"
+#include "serve/scheduler.hpp"
+#include "serve/scheduler_gemma4.hpp"
 
 using namespace eklow::serve;
 
@@ -87,6 +90,30 @@ int main() {
   z.kv_held_positions = 100, z.idle_positions = 100;
   check(metrics_kv_ratio(z) == 0.0, "all cached, none held by a request: 0");
   check(parse(render_metrics(z, {}, {}, {"m", 0, 0})).numeric, "an all-zero render is numeric");
+
+  std::printf("gemma 4\n");
+  gemma4::Scheduler::Stats g;
+  g.active = 1, g.waiting = 0, g.steps = 7, g.prompt_tokens = 300, g.cached_tokens = 280, g.prefill_tokens = 20, g.generated_tokens = 90;
+  g.kv_pool_positions = 131072, g.kv_held_positions = 4096, g.idle_positions = 1024;
+  g.verifies = 30, g.drafted = 210, g.accepted = 60;
+  g.busy_s = 2.5, g.prefill_seq_s = 0.5, g.decode_seq_s = 2.0, g.first_token_s = 0.25, g.first_tokens = 1;
+  const std::string gt = render_metrics(g, e, h, {"nemotron-3.5-bolt-e4b", 2, 65536});
+  const Parsed gp = parse(gt);
+  bool gonce = true;
+  for (const char* n : names) {
+    const bool snap = std::string(n).rfind("snapshot", 0) == 0;
+    auto it = gp.n.find(std::string("eklow_") + n);
+    if (snap ? it != gp.n.end() : (it == gp.n.end() || it->second != 1)) {
+      std::printf("    bad: %s\n", n);
+      gonce = false;
+    }
+  }
+  check(gonce, "every contract name exactly once, no snapshot gauges (Gemma 4 keeps none)");
+  check(gp.numeric && gp.n.size() == 24, "numeric, info plus 23 samples");
+  check(gp.v.at("eklow_kv_usage_ratio") == "0.0234375", "kv ratio from the global layers' pool: (4096 - 1024) / 131072");
+  check(gp.v.at("eklow_spec_drafted_total") == "210" && gp.v.at("eklow_spec_accepted_total") == "60", "the draft's counters");
+  check(gp.v.at("eklow_decode_sequence_seconds_total") == "2" && gp.v.at("eklow_first_token_seconds_total") == "0.25", "second counters");
+  check(gt.find("eklow_info{model=\"nemotron-3.5-bolt-e4b\"} 1\n") != std::string::npos, "the served name");
 
   std::printf(g_fail ? "FAILED\n" : "all ok\n");
   return g_fail ? 1 : 0;

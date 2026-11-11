@@ -81,6 +81,7 @@ Scheduler::Scheduler(engine::gemma4::Engine& eng, const text::Tokenizer& tok, co
     if (eng.config().capture_layers.empty())
       throw std::invalid_argument("a draft needs an engine that captures the draft's layers");
   }
+  stats_.kv_pool_positions = stats_.kv_free_positions = eng.pool_pages() * attn::kPage;
 }
 
 void Scheduler::submit(std::shared_ptr<Request> r) {
@@ -157,6 +158,7 @@ bool Scheduler::admit() {
     q.draft_rng.seed(r->sampling.seed * 0x9e3779b97f4a7c15ull + 1);
     q.held.clear();
     q.called = false;
+    q.first_pushed = false;
     q.parser = std::make_unique<text::OutputParser>(tok_, r->in_thinking, r->calls_allowed);
     q.sampler = std::make_unique<Sampler>(r->sampling);
     // llama-server's sampler has seen the prompt: its penalties' window starts in it.
@@ -201,11 +203,20 @@ void Scheduler::run(const std::atomic<bool>& stop) {
       seen = releases_;
     }
     if (stop.load()) break;
+    const auto t0 = std::chrono::steady_clock::now();
+    step_prefill_seqs_ = step_decode_seqs_ = 0;
     try {
       step();
     } catch (const std::exception& e) {
       fail_all(e.what());
     }
+    // /metrics' accounting rule, the Qwen scheduler's: this iteration's wall dt is busy time, and counts once for every sequence
+    // that contributed tokens to it, to the phase of those tokens (prefill if it was fed prompt tokens, else decode).
+    const double dt = seconds(std::chrono::steady_clock::now() - t0);
+    std::lock_guard lk(mu_);
+    stats_.busy_s += dt;
+    stats_.prefill_seq_s += dt * step_prefill_seqs_;
+    stats_.decode_seq_s += dt * step_decode_seqs_;
   }
 }
 
@@ -320,6 +331,7 @@ void Scheduler::step() {
     cap_left -= cap;
   }
   if (chunks.empty()) return;
+  for (const Item& it : items) ++(it.kind == Item::Prefill ? step_prefill_seqs_ : step_decode_seqs_);  // one chunk a sequence
 
   const std::vector<float> logits = [&] {
     Timer timer(mu_, stats_.engine_s);
@@ -474,7 +486,15 @@ std::string Scheduler::on_token(int slot, int32_t token) {
   }
   const bool any = !e.delta.reasoning.empty() || !e.delta.content.empty() || !e.delta.tool_calls.empty() || !e.delta.errors.empty();
   const bool ended = e.delta.done || stopped;
-  if (any) q.req->push(std::move(e));
+  if (any) {
+    q.req->push(std::move(e));
+    if (!q.first_pushed) {
+      q.first_pushed = true;
+      const double t = seconds(std::chrono::steady_clock::now() - q.req->submitted);
+      std::lock_guard lk(mu_);
+      stats_.first_token_s += t, ++stats_.first_tokens;
+    }
+  }
   if (ended) return q.called ? "tool_calls" : "stop";
   const int64_t cap = q.req->max_tokens > 0 ? q.req->max_tokens : c_.max_ctx;
   if (q.generated >= cap || int64_t(q.tokens.size()) + 1 >= c_.max_ctx) return "length";
@@ -526,6 +546,9 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
 
 // The positions the slots hold, all and those of slots with no request; with mu_ held, on the engine thread.
 void Scheduler::note_positions() {
+  stats_.kv_pool_positions = eng_.pool_pages() * attn::kPage;
+  stats_.kv_free_positions = eng_.free_pages() * attn::kPage;
+  stats_.kv_held_positions = stats_.kv_pool_positions - stats_.kv_free_positions;
   stats_.positions = stats_.idle_positions = 0;
   for (size_t s = 0; s < seqs_.size(); ++s) {
     stats_.positions += eng_.length(int(s));

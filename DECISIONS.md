@@ -3301,3 +3301,45 @@ like this:
 
 The unit evaluates and passes `systemd-analyze verify`. The copy step, run against a scratch directory, gives the
 layout the server accepted above.
+
+## 2026-11-11 — GET /metrics on the Gemma 4 server
+
+**Why.** llmtop scrapes every engine's `/metrics`. Bolt's server answered 404, so llmtop showed nothing for fiona's chat
+model.
+
+**What.** The Gemma 4 server now serves `GET /metrics` on the chat port, unauthenticated like `/health`.
+- The text comes from the same `render_metrics` (`tools/server/metrics.hpp`), with the same names, prefix and types.
+  `render_metrics` is now a template over the scheduler's Stats, since the Qwen scheduler's Stats and Gemma 4's name these
+  counters alike.
+- `gemma4::Scheduler` accounts as the Qwen scheduler does (2026-11-08, "GET /metrics, for llmtop"):
+  - busy seconds are each run-loop iteration's dt;
+  - prefill and decode sequence-seconds take that dt once for each sequence, by the phase of its chunk (verify blocks are
+    decode);
+  - first-token time runs from submit to the first event pushed to the reader;
+  - the chat handler counts requests and the ones it answers with an error.
+- Nothing served changes.
+
+**Where Gemma 4 differs.**
+- `kv_usage_ratio` is over the global layers' page pool: slots x context positions, with pages taken as a sequence grows.
+  That pool is the K/V that bounds a context. The ratio is held minus the idle slots' positions over the pool, as for
+  Qwen. The sliding layers' rings (window + chunk a slot, allocated at startup) are not in it: they are a fixed cost.
+  `Engine::pool_pages()` and `free_pages()` are the Qwen engine's accessors.
+- No snapshot gauges. Gemma 4 keeps no snapshots, so `eklow_snapshots` and `eklow_snapshot_bytes` are left out rather than
+  reported as 0. llmtop reads neither.
+- The draft's counters mean what Qwen's do: verify blocks, tokens drafted (the block less one a verify), and of them
+  accepted.
+- The model is dense and whole on the card, so there is no expert offload to report, and the contract has no metric for it.
+
+**Checks.**
+- `eklow-metrics-test` now renders Gemma 4's Stats too. Every contract name appears once, there are no snapshot gauges,
+  every value is numeric, the ratio comes from the global pool, and the draft and second counters come through.
+- llmtop 0.2.0, at /etc/nixos's pin 06a2451, run with `--dump` against two renders of Gemma 4's Stats one second apart,
+  reads:
+  - kind eklow and the model's name;
+  - 2 slots and 65,536 context;
+  - per-stream decode 90 tok/s from the sequence-seconds, the rate the second render implies;
+  - busy 99.7%, TTFT 0.13 s, cache 91.7%, speculation 28.6%.
+- Not run on the card. fiona's `eklow-bolt.service` has been live since 2026-11-10 22:48. A first attempt started a
+  second server beside it, and the service's one running request fell to 0.9 tok/s for six minutes, until that server was
+  killed. A check with a server from this tree waits for a pause of the service: a few requests, then their usage
+  against the counters' deltas.

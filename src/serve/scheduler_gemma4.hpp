@@ -115,10 +115,18 @@ class Scheduler {
     int64_t prompt_tokens = 0, cached_tokens = 0;      // of admitted prompts, and of those already in their slot
     int64_t prefill_tokens = 0, generated_tokens = 0;  // fed as prefill, sampled
     int64_t positions = 0, idle_positions = 0;         // held by the slots, and by those with no request (cached)
+    // The global layers' page pool (Engine::pool_pages), in positions: its size, held by the slots, free.
+    int64_t kv_pool_positions = 0, kv_held_positions = 0, kv_free_positions = 0;
     int64_t verifies = 0, drafted = 0, accepted = 0;   // verify blocks, tokens drafted, of them accepted
     // Wall seconds of the engine thread in each part of a step, since the start: drafting, the engine step (the logits come
     // back to the host in it), acceptance and sampling, the draft's context injection.
     double draft_s = 0, engine_s = 0, sample_s = 0, inject_s = 0;
+    // For /metrics, as the Qwen scheduler's (serve/scheduler.hpp): busy_s, wall seconds of the engine thread inside step();
+    // prefill_seq_s and decode_seq_s, per step its dt once for each sequence that contributed prefill tokens (a step that also
+    // samples counts as prefill), resp. only decode or verify tokens; first_token_s and first_tokens, the sum over requests of
+    // (the first event pushed to the reader - submit) and how many it sums.
+    double busy_s = 0, prefill_seq_s = 0, decode_seq_s = 0, first_token_s = 0;
+    int64_t first_tokens = 0;
   };
   Stats stats() const;
 
@@ -149,6 +157,7 @@ class Scheduler {
     std::mt19937_64 draft_rng;
     int64_t generated = 0, cached = 0, verifies = 0, drafted = 0, accepted = 0;
     std::chrono::steady_clock::time_point admitted, first;  // the slot taken, the first token sampled
+    bool first_pushed = false;    // an event has gone to the reader (/metrics' first-token time)
     std::string held;             // content held back while it could start a stop string
     bool called = false;          // a tool call came out
   };
@@ -176,6 +185,7 @@ class Scheduler {
   std::condition_variable hold_cv_;
   int holds_ = 0;
   uint64_t releases_ = 0;  // Holds ended so far
+  int step_prefill_seqs_ = 0, step_decode_seqs_ = 0;  // sequences the last step() fed prefill, resp. decode/verify (engine thread)
 };
 
 }  // namespace eklow::serve::gemma4

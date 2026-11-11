@@ -98,6 +98,10 @@ class Engine {
   int64_t ring_slack() const { return ring_pages_ * attn::kPage - cfg_.window; }
   // Positions the slot holds (where its next chunk starts).
   int64_t length(int slot) const { return slots_[size_t(slot)].length; }
+  // The global layers' page pool: pages in all (max_ctx's worth per slot) and free now (a page is attn::kPage positions). The
+  // sliding layers' rings are each slot's for good and are not in it.
+  int64_t pool_pages() const { return n_pages_; }
+  int64_t free_pages() const { return int64_t(free_pages_.size()); }
 
   // With a profile set, step waits after each section of the forward pass and adds its wall time under the section's
   // name: slower, for finding where the time goes.
