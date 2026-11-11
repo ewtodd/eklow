@@ -2630,3 +2630,171 @@ strip as the same page cut off, the PNG as the "LLM+" logo, the second turn's pr
 same-size pictures told apart, the refusals unchanged. The text path is untouched (no `checkq`); `check-qwen.sh`
 against the oracle no longer applies to pictures the oracle letterboxes.
 
+## 2026-11-10 — vega's checker: laya's System One on the card
+
+**Why.** son-of-anton's end-of-turn checker (son-of-anton `daemon/end-of-turn-checker`, 69047723) sends a draft reply,
+with the turn's tool calls and the user's message, to laya's System One (`POST <base>/systemone`) as three yes/no
+questions (claim, unchecked, offtopic), and sends the draft back when one comes back at or over its cut-off (0.7325,
+0.5916, 0.4387). The answers it was fitted on are laya's (3a38cbe) with vega underneath (`laya.Agent(vegaml=True)`,
+vegaml 0.16.1, `nandakishorm/vega-U` at 4d205028 over `Qwen/Qwen3.5-0.8B` at 2fc06364) and a policy fitted on fiona's
+replay (`save_calibration`'s laya-policy/1: TTT heads for unchecked and offtopic, a temperature of 17.694 for offtopic,
+claim left to vega's zero-shot engine). The owner wants everything on fiona to run on eklow; laya beside eklow would be a
+second program on the card, which starves the server (README, "Hardware assumptions").
+
+**What.** `src/vega` and `eklow-vega`:
+- the reader (`reader.*`): Qwen3.5-0.8B through layer 19, the last layer vega reads, from its GGUF; pooled as
+  Perception.pooled pools (the state, question and last token at layers 13 and 19, the options at 19, the state cut into
+  16 memory chunks at 19). Its DeltaNet layers run `kernels/gdn_seq.*`, a prefill-only form for any head count with the
+  state carried per sequence (kernels/gdn.* is Qwen3.6's 16 key and 32 value heads, slots and rollback); its attention runs
+  kernels/attention.hpp's flash kernels, which gain the head-256 group-4 instantiation it needs; its matrices are xmx's
+  fp16 GEMMs over F16 tiles of the BF16 weights (the gate and up halves interleaved for the SwiGLU epilogue). Prompts
+  whose state reaches 4,096 tokens share their prefix as vegaml's `_pooled_prefix` does; the others of a request go
+  through side by side, their tokens packed into each pass's rows, each with its own DeltaNet state and its own pages of
+  the cache;
+- the prompt (`prompt.*`): vegaml's `build_prompt` and `option_texts`, template 0, the question first under 4,096
+  state tokens, the cuts at 32 tokens an option and 256 for the instructions;
+- the engine (`engine.*`): UniversalEngine's standardization and port, VegaEngine's forward with halting and the memory
+  reader, and the thermal calibration, on the CPU in double (14M parameters, about a millisecond a question);
+- the policy (`policy.*`): laya-policy/1 verified as laya verifies it (every file's SHA-256 against the manifest, heads
+  and calibration named by it, the engine's SHA-256 against the one the policy names, the calibration's own checksum,
+  which means writing its JSON as Python's json.dumps does); TTT heads; Calibration.apply's rescale; heads chosen per
+  question as vegaml's "auto" chooses them (`_head_worth_using`);
+- System One (`checker.*`, `tools/server/systemone.hpp`): laya's request and answer, noul only.
+
+**Decisions.**
+- **The reader from a GGUF** (llama.cpp's converter at the oracle's pin, `--outtype bf16 --no-mtp`,
+  `tools/vega/make-reader.sh`; 1.5 GB, sha256 4f4a6b43...). eklow's GGUF loader and Qwen tokenizer take it as it is (the
+  tokenizer now accepts a file with no BOS id; Qwen3.5's 26 added tokens sit at Qwen3.6's ids, and its prompts tokenize
+  as Hugging Face's do, below), the weights stay exact (BF16 to fp16 tiles loses nothing), and the converter's transforms
+  (norms with the +1, ssm_a = -exp(A_log), the conv taps) are the ones eklow's Qwen3.6 code already reads. vega's own files stay as published (safetensors, npz,
+  JSON): a policy names its engine by the SHA-256 of engine.safetensors.
+- **Held to an fp32 reference, not to bf16's rounding.** vegaml runs the reader in bf16 on a CUDA card, so the policy's
+  heads and son-of-anton's cut-offs were fitted on bf16 features. That arithmetic is not reproducible by another
+  implementation: laya itself, on the same 29 replay turns, moves this far from the probabilities it was fitted to
+  (the private replay set's, which laya's bf16 run reproduces to the digit) when only the reader's kernels change:
+
+  | laya, the reader as | claim | unchecked | offtopic | flags that differ |
+  |---|---|---|---|---|
+  | bf16, eager attention instead of SDPA (CUDA) | 0.0375 | 0.0347 | 0.0032 | 1 |
+  | bf16 on the CPU | 0.0165 | 0.0196 | 0.0027 | 1 |
+  | fp32 (CUDA, TF32 off) | 0.0117 | 0.0356 | 0.0023 | 1 |
+
+  (the largest |delta| of each question; the flag is one turn's offtopic, 0.438971 against the cut-off
+  0.4387, which every other implementation puts below). The TTT heads whiten 6,144 features into 128 directions, and the
+  last token's vector in bf16 is only 0.99972 (cosine) from fp32's. So eklow computes what fp32 computes (fp32 residual
+  stream, norms, recurrence and pooling; fp16 GEMM operands), and is held to the fp32 reference to the policy's own
+  rounding; the bf16 one is reported beside it.
+- **In the server, not an instance of its own**: one process owns the card (DESIGN). `eklow-server --checker-*` loads
+  the checker before the experts are placed, warmed by two requests so its kernels' driver buffers exist, and serves it
+  on a port of its own with the scheduler held while a request reads, as embeddings are. `eklow-vega serve` is the
+  checker alone, for development.
+- **Prompts of up to 16,384 tokens by default** (`--checker-max-tokens`, the cache is 10 KiB a token): vegaml reads up
+  to 73,728, but past ~16k the reader takes longer than son-of-anton's 3 s timeout, which lets the draft stand anyway; a
+  longer state is answered 413 at once, with the same effect and no card time.
+- **noul only** (422 for choice and score, which the engine also runs: `eklow-vega` exercises them against the reference);
+  a signed policy is refused (eklow has no Ed25519), an unsigned one with a manifest is checked, one without loads
+  unverified, as in laya.
+
+**Checks** (`tools/vega/ref_vega.py` on e-workstation's 4090: vegaml and laya themselves; `eklow-vega` on fiona;
+`compare.py`). States: nine synthetic ones (`synthetic_states.py`, 86 to 11,898 tokens: under 128 tokens, the question
+first, past 4,096, CRLF, CJK, emoji, a combining mark) with the checker's three questions and a choice, a score and a
+labelled yes/no; and the 29 replay turns of 2026-11-10 (485-4,807 tokens; kept on fiona and e-workstation, not in the
+repository).
+- Prompts: 141 of 141 equal to vegaml's, ids and spans.
+- The reader against vegaml's Perception.pooled, every vector (state, question and last token at both layers, every
+  option, every memory chunk; 1,032 vectors synthetic, 1,542 replay), cosine:
+
+  | | state | question | last token | options | chunks |
+  |---|---|---|---|---|---|
+  | against fp32, the lowest | 1 - 2e-8 | 1 - 8e-8 | 1 - 4.8e-7 | 1 - 1.3e-7 | 1 - 1.6e-8 |
+  | against bf16 (what the policy was fitted on), the lowest | 0.999989 | 0.999964 | 0.99972 | 0.999954 | 0.999993 |
+  | vegaml's fp32 against its bf16, the lowest | 0.999989 | 0.999964 | 0.99972 | 0.999955 | 0.999993 |
+
+  The engine on eklow's vectors against vegaml's on its own fp32 ones: largest |dp| 1.6e-3 (141 questions of all types).
+  `eklow-vega check` holds the reader and engine to the fp32 answers for the synthetic states (`tools/vega/golden.json`,
+  2e-3; 6.2e-4 measured), with no Python.
+- The engine on identical vectors (the reference's own): largest |dp| 1.3e-6 over 141 questions of all three types.
+- The policy on identical vectors (the reference's bf16 ones): every noul equal to laya's to its last (sixth) digit.
+- End to end, the 29 turns, noul against laya's (the largest |delta| of each question, and the flags at son-of-anton's
+  cut-offs):
+
+  | eklow against | claim | unchecked | offtopic | flags that differ |
+  |---|---|---|---|---|
+  | laya with an fp32 reader | 0.00062 | 0.0014 | 0.00016 | 0 |
+  | laya as fitted (bf16 on CUDA; the private replay set's) | 0.0117 | 0.0357 | 0.0023 | 1 (the same turn's offtopic, 0.437065 against 0.438971; cut-off 0.4387, 0.00027 away) |
+
+  The second row is the table above's: eklow lands where laya's own fp32, eager-attention and CPU runs land, and flips the
+  same flag they all flip. The same through son-of-anton's own client (`check.Review` and `ask` in a throwaway test against
+  eklow-server, not committed): every turn's `State(in)` equal to the state the probabilities were fitted on, every flag
+  `Review` raised the one the probabilities say.
+
+**Speed** (the A770M, the three questions of a turn, after one warm-up; median of three; `eklow-vega predict`): over the
+29 turns (1,846-14,648 prompt tokens a turn) p50 271 ms, p90 502 ms, max 521 ms. Through eklow-server and son-of-anton's
+client (an SSH tunnel between): p50 293 ms, p90 544 ms, max 564 ms; son-of-anton allows 3 s. Where it went
+(`EKLOW_VEGA_PROFILE=1`, which waits after every stage, on three prompts of ~3,000 tokens): first the norms, which ran
+one row a work-item in `ref::rmsnorm` (317 ms of 908; now `dense::norm_quant`, a work-group a row with the residual add and
+the fp16 activations fused: 23 ms), then the DeltaNet scan (its operands now loaded a token ahead: 219 to 171 ms); what is
+left is GEMMs (~265 ms), the scan and attention (96 ms). Batching a request's prompts side by side took the p50 from 483 to
+447 ms before those two.
+
+**Card memory** (free memory before and after eklow-server loads and warms it, on fiona): 1,197 MiB with
+`--checker-max-tokens 16384` (fp16 weights of 20 layers 0.83 GiB, the cache 160 MiB, activations for 1,024-row passes, four
+DeltaNet states, the driver's buffers). Prompts of 8,192 would save 80 MiB; Q8_0 weights ~0.4 GiB, at a precision nobody
+has measured yet.
+
+## 2026-11-10 — Qwen3-Reranker on eklow: llama.cpp's /v1/rerank on the card
+
+**Why.** fiona reranks for maitred (`rerank/qwen3-reranker-0.6b`) and son-of-anton's recall (`<base_url>/rerank`, a 2 s
+budget; session_search 10 s) with llama.cpp on the Iris Xe (port 8083, `--reranking`, ctx 8192 over 2 slots, batch =
+ubatch 4096, a q8_0 K/V cache, ggml-org's Qwen3-Reranker-0.6B Q8_0 GGUF at a02f48bb, sha256 22c9979c...). The owner wants
+embeddings, Bolt, the checker and reranking served by eklow together on the A770M. son-of-anton keeps candidates scoring
+at least 0.01, so the low end of the score matters, not only the order.
+
+**What.** `src/model/rerank_qwen3.*`: llama.cpp's `qwen3` with rank pooling as its server scores a pair (7d7f028, the
+fleet's): the GGUF's rerank template with `{query}` and `{document}` replaced in one scan, tokenized with special tokens
+and no BOS; 28 layers, attention with q and k RMS-normed per head and NeoX RoPE over all 128 dims at 1e6
+(`kernels/dense.*`, shared with the reader now), SwiGLU; the score `softmax(cls.output . output_norm(h_last))[0]`, P(yes).
+Weights are xmx's Q8_0 tiles under fp16 activations; the head runs on the host in double. Pairs go through whole, packed
+into passes of up to `--rerank-max-tokens` rows (4,096: llama.cpp's ubatch on fiona, which also bounds a pair), each
+attending to its own tokens through the attention kernels' per-token key ranges, so a pass needs one layer's K/V at a
+time. The tokenizer takes Qwen3's vocabulary (pre-tokenizer `qwen2`: marks are not letters, the 26 added tokens at
+151643 on, found by their text). `tools/server/rerank.hpp`: `POST /v1/rerank` (also `/rerank`, `/v1/reranking`,
+`/reranking`) in llama.cpp's request and answer, TEI's `texts` shape too; `eklow-server --rerank-*`, `eklow-rerank
+serve|score|tokens`, module `services.eklow.reranker`.
+
+**The reference.** llama.cpp is not one number either: its CPU backend multiplies Q8_0 weights by int8-quantized
+activations, and fiona's deployment keeps a q8_0 K/V cache. `tools/rerank/ref_rerank.py` runs the same Q8_0 weights in
+fp32 through transformers' Qwen3 (nothing else quantized) as the yardstick. On the synthetic requests
+(`tools/rerank/synthetic_pairs.py`: relevant, near-miss, indirect and unrelated documents, German, Japanese, emoji, and
+8 and 24 documents of ~1,200 characters):
+
+| | largest \|d\|, scores under 0.1 | above 0.1 | order per query |
+|---|---|---|---|
+| eklow against fp32 | 0.00036 | 0.00007 | the same but two of latency-24's 24, 1.3e-7 apart |
+| eklow against llama.cpp, f16 K/V (CPU, 7d7f028) | 0.0021 | 0.00015 | the same but two of latency-24's, 8.5e-7 apart |
+| eklow against llama.cpp, q8_0 K/V (fiona's flags, CPU) | 0.0075 | 0.0054 | 3 of 6 requests differ, among documents at most 4.2e-4 apart |
+| llama.cpp q8_0 K/V against its f16 K/V | 0.0096 | 0.0019 | 3 of 6 differ, at most 1.0e-3 apart |
+| llama.cpp f16 K/V against fp32 | 0.0020 | 0.00015 | latency-24 differs, 2.1e-6 apart |
+
+The gate (0.005 under 0.1, 0.02 above, the same order) holds against llama.cpp with an f16 cache but for one swap of two
+documents whose scores differ by less than a millionth; against the q8_0 cache fiona runs, no implementation holds it,
+llama.cpp's own f16 one included (the dentist's near miss: fp32 0.0381, eklow 0.0381, llama.cpp f16 0.0360, q8_0 0.0456).
+Tokens: the 60 prompts equal llama.cpp's /tokenize, Japanese, German and emoji included; `tools/ref/qwen_tok_compare.py`
+finds 0 differences against Hugging Face's Qwen3 tokenizer.json on its 20,802 strings (1.38M tokens, the combining marks
+the two pre-tokenizers split differently among them), and still 0 for Qwen3.5's (1.47M tokens).
+
+**Speed** (the A770M, through eklow-server, median of five): a query with 8 documents of ~1,200 characters (2,214 tokens)
+101 ms, with 24 (6,640 tokens) 264 ms, ~25k tokens/s; the short requests (642-801 tokens) 42-50 ms. son-of-anton's recall
+allows 2 s, session_search 10 s.
+
+**Card memory**: 796 MiB with `--rerank-max-tokens 4096` (Q8_0 weights 0.47 GiB, activations for 4,096 rows, one layer's
+K/V, the driver's buffers), measured as the checker's was.
+
+**All four on the A770M, every cache fp16** (the owner's decision, 2026-11-10: fp16 K/V for everything in fiona's
+deployment). The checker's and the reranker's caches are fp16 and have no int8 form. Measured in one eklow-server on fiona
+(stock Qwen3.6 in Bolt's place, one slot of 32k): the checker 1,197 MiB, the reranker 796 MiB, each as the free memory
+before and after it loads and warms. The Bolt branch measured Bolt at 2 x 65,536 with an fp16 cache (about 2 GiB of it
+K/V) at 5.71 GiB and EmbeddingGemma 2 at that shape at 2.20 GiB. Together: 5.71 + 2.20 + 1.17 + 0.78 = 9.86 GiB of the
+card's 16, leaving ~5.5 GiB before the server's margin for Bolt's draft, its vision tower and whatever it sizes to the
+free memory. It fits; nothing needs int8. The side models load first and come out of what the chat model then finds free,
+so the server's own placement keeps the sum honest.

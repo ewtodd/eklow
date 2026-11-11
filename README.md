@@ -174,6 +174,12 @@ an exact CPU emulation of the quantized arithmetic (`eklow-attn-test`, `eklow-gd
   (`--group`).
 - **Embeddings beside chat**: EmbeddingGemma 2 on its own queue on the card, so an embedding does not wait behind a
   long prefill; image inputs to `/v1/embeddings` with its projector (`--embed-mmproj`, `--image-tokens`).
+- **A yes/no checker beside chat** (`--checker-*`): laya's System One (`POST /v1/systemone`, laya's request and answer)
+  over vega (nandakishorm/vega-U): its reader, Qwen3.5-0.8B, on the card with prompts built token for token as vegaml
+  builds them and pooled as it pools them; its engine and laya's trained policies (heads, temperatures, their hashes
+  checked) on the CPU. For son-of-anton's end-of-turn checks (DECISIONS 2026-11-10, "vega's checker").
+- **A reranker beside chat** (`--rerank-*`): llama.cpp's `POST /v1/rerank` over ggml-org's Qwen3-Reranker GGUF, its score
+  llama.cpp's P(yes), the pairs of a request packed into passes (DECISIONS 2026-11-10, "Qwen3-Reranker on eklow").
 - **Mixture of experts on 16 GB**: routing, grouping and the experts' GEMVs and GEMMs on the card; a placement by routing
   profile, with cold experts on the CPU (AVX-VNNI, Q4_K and Q4_0) at decode and streamed over PCIe for prefill.
 - **Image input to chat** (`--mmproj`, llama.cpp's projector GGUF), OpenAI `image_url` parts (base64 `data:` URLs; JPEG,
@@ -256,6 +262,24 @@ step's time goes:
 Prefill in a request's line is over the uncached part of its prompt, from the slot to the first token; cached
 positions are those kept in idle slots for prefix reuse.
 
+With `--checker-reader` (Qwen3.5-0.8B as `tools/vega/make-reader.sh` converts it), `--checker-vega` (a vega-U model directory)
+and `--checker-policy` (a laya policy folder), the server also answers laya's System One on `--checker-port`:
+
+```sh
+curl http://localhost:8084/v1/systemone -H 'Content-Type: application/json' -d '{
+  "state": "...",
+  "questions": {"claim": {"type": "noul", "instructions": "Does the draft say it did something no tool call did?"}}
+}'
+# {"model":"vega-u","answers":{"claim":{"type":"noul","noul":0.31,"probabilities":{...},"readout":"engine",...}},"usage":{...}}
+```
+
+The module's `services.eklow.checker` (`reader`, `vega`, by default the published vega-U, `policy`, `port`, `maxTokens`)
+adds it to whichever instance runs. `eklow-vega serve` serves the checker alone, for development; `eklow-vega check`
+holds the reader and engine to `tools/vega/golden.json`, and `features`, `engine` and `predict` to
+`tools/vega/ref_vega.py` (vegaml and laya themselves). Likewise `--rerank-model` (ggml-org's Qwen3-Reranker GGUF) and
+`--rerank-port` serve llama.cpp's `POST /v1/rerank` (module `services.eklow.reranker`; `eklow-rerank serve` alone,
+`tools/rerank/` its reference and gate).
+
 `eklow-probe` measures what the card actually does (allocatable memory, copy rates, launch and host-signal latency),
 and `eklow-copy-bench` what PCIe copies cost the kernels beside them: the first things to run on new hardware.
 
@@ -280,6 +304,8 @@ This is not a general-purpose engine:
 | `src/kernels` | XMX matmuls for the files' formats (int8 GEMVs for decode, fp16 GEMMs for prefill, grouped expert forms), the Gated DeltaNet, flash attention over the paged cache and long prefill attention in key segments, the DFlash 2 draft's kernels, fused small kernels and routing (`fast`, `qwen_fast`); `ref` holds the reference kernels |
 | `src/cpu` | the AVX-VNNI GEMVs for the cold experts |
 | `src/model` | GGUF loading, Qwen3.6's configuration and reference forward pass, the DFlash 2 draft, the vision encoders, EmbeddingGemma 2 |
+| `src/vega` | vega's checker: the Qwen3.5-0.8B reader, vegaml's prompt and engine, laya's policies and System One; `tools/vega` holds its tool (`eklow-vega`) and its Python reference |
+| `src/model/rerank_qwen3.*` | Qwen3-Reranker; `tools/rerank` holds its tool (`eklow-rerank`) and its reference |
 | `src/serve`, `src/text` | the scheduler, OpenAI layer and tool-call grammar, the sampler and lossless acceptance; tokenizers, chat templates and output parsers |
 | `src/rt` | device selection and free memory, the copy engine |
 | `tools/` | `eklow-server`, the engine and kernel benchmarks and tests, the reference runs (`tools/ref`), the weights' tooling (`tools/weights`), the server tests and benchmark (`tools/server`, `tools/bench`) |
