@@ -17,7 +17,7 @@
 // --preserve-thinking on renders earlier assistant turns that made tool calls with their reasoning (the template's
 // preserve_thinking, for a request that sends none), so the next turn shares the prompt the slot holds.
 // --draft (a DFlash draft GGUF) turns on speculative decoding: a verify block of --draft-block tokens (default the
-// draft's trained block or 4 if less, 2 to 16) per step, accepted losslessly (the sampler's every feature, the tool grammar
+// draft's trained block, 2 to 16) per step, accepted losslessly (the sampler's every feature, the tool grammar
 // included); a request may choose its own with "speculative": N (0 or false: plain decode). The draft shares the engine's
 // head on the matrix units and reads the token table from the GGUF's mapping.
 // --mmproj (a Gemma 4 projector GGUF) lets chat requests carry images (OpenAI image_url parts with base64 data: URLs),
@@ -485,8 +485,9 @@ int gemma4_server_main(int argc, char** argv) {
       if (draft_cfg.n_embd != mcfg.n_embd || draft_cfg.n_vocab != mcfg.n_vocab)
         throw std::runtime_error(draft_path + ": the draft is for a target of hidden " + std::to_string(draft_cfg.n_embd) + " and vocabulary " +
                                  std::to_string(draft_cfg.n_vocab) + ", not this model's " + std::to_string(mcfg.n_embd) + " and " + std::to_string(mcfg.n_vocab));
-      // The draft's trained block is 16; the default is the lesser of that and 4 until Bolt's own measurements say otherwise.
-      if (draft_block == 0) draft_block = std::min(draft_cfg.block_size, 4);
+      // The draft's trained block (8 for Bolt's): the model is dense, so a verify row past the first costs little, unlike the
+      // Qwen MoE's ~8.5 ms of cold experts a row. Bolt at 8k / 32k on prose: 96.7 / 80.9 tok/s at 8 against 77.4 / 64.3 at 4.
+      if (draft_block == 0) draft_block = std::min(draft_cfg.block_size, int(engine::gemma4::kMaxVerify));
       // The draft reads the target's hidden states at its layers; a step captures the rows of its verify blocks and of the
       // last `window` rows of a prompt. The head is the engine's, shared with the draft.
       ec.capture_layers = draft_cfg.target_layers;

@@ -110,7 +110,7 @@ let
         draftBlock = lib.mkOption {
           type = lib.types.nullOr (lib.types.ints.between 2 16);
           default = null;
-          description = "Tokens of a verify block (the last sampled one and the drafted ones); null: 4, or the draft's trained block if smaller (on Qwen3.6 a block costs ~8.5 ms a row beyond the first on this card; 4 measured best).";
+          description = "Tokens of a verify block (the last sampled one and the drafted ones); null: Qwen3.6 4, or the draft's trained block if smaller (a block costs ~8.5 ms a row beyond the first on this card; 4 measured best); Bolt the draft's trained block, 8 (dense, its rows are cheap).";
         };
 
         prefillGroup = lib.mkOption {
