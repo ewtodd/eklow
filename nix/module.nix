@@ -5,10 +5,11 @@
   ...
 }:
 
-# Each instance is a chat model served by the one eklow-server, as its own unit eklow-<name>.service: the server reads
-# the model's architecture (Qwen3.6-35B-A3B and its finetunes, llama.cpp's qwen35moe; Gemma 4 E4B, gemma4, as NVIDIA's
-# Nemotron-3.5-Bolt-E4B; anything else is refused) and runs its engine. The instances share the card and the embedding port, so at most one runs: each conflicts with
-# the others, and starting one stops the one running (systemctl start, or a mode switch such as the house's llm-mode).
+# Each instance is a chat model served by eklow-server, as its own unit eklow-<name>.service, with the card's other models
+# (EmbeddingGemma 2, the end-of-turn checker, the reranker) beside it. The server runs Gemma 4 E4B (gemma4: NVIDIA's
+# Nemotron-3.5-Bolt-E4B) and refuses anything else; the Qwen3.6-35B-A3B server and its options left on 2026-11-11 (eklow
+# DECISIONS). The instances share the card and the side models' ports, so at most one runs: each conflicts with the others,
+# and starting one stops the one running (systemctl start, or a mode switch such as the house's llm-mode).
 let
   cfg = config.services.eklow;
 
@@ -21,11 +22,10 @@ let
       options = {
         model = lib.mkOption {
           type = lib.types.path;
-          example = lib.literalExpression "/models/stock-EKK8.gguf";
+          example = lib.literalExpression "inputs.eklow.packages.x86_64-linux.bolt-e4b";
           description = ''
-            The chat model's GGUF, in the formats the engines run: Qwen3.6-35B-A3B or a finetune of it (Q4_K or Q4_0
-            experts, Q8_0 dense matrices, a Q6_K head; stock Qwen3.6, Ornith-1.5 and Sage-A1.5 are served and
-            measured), or Gemma 4 E4B as NVIDIA publishes Nemotron-3.5-Bolt-E4B (Q4_K_M, the whole model on the card).
+            The chat model's GGUF: Gemma 4 E4B as NVIDIA publishes Nemotron-3.5-Bolt-E4B (Q4_K_M, the whole model on the card;
+            the flake's `bolt-e4b`).
           '';
         };
 
@@ -45,18 +45,6 @@ let
           '';
         };
 
-        expertProfile = lib.mkOption {
-          type = lib.types.nullOr lib.types.path;
-          default = null;
-          example = lib.literalExpression ''"''${config.services.eklow.package}/share/eklow/ornith-1.5-experts.json"'';
-          description = ''
-            The routing profile of the model (which experts of each layer are busiest): the package's share/eklow has
-            stock Qwen3.6's (qwen36-experts.json) and Ornith-1.5's (ornith-1.5-experts.json). The experts that fit the card stay
-            on it, the rest are computed on the CPU from
-            pinned memory. null: every expert on the card, which no MoE served here fits at long contexts.
-          '';
-        };
-
         slots = lib.mkOption {
           type = lib.types.ints.positive;
           default = 2;
@@ -66,131 +54,52 @@ let
         contextSize = lib.mkOption {
           type = lib.types.nullOr lib.types.ints.positive;
           default = null;
-          description = "Context of each slot, in tokens; null: the model's full window (Qwen3.6 262144, Bolt 65536).";
+          description = "Context of each slot, in tokens; null: the model's full window (Bolt 65536).";
         };
 
         kvInt8 = lib.mkOption {
           type = lib.types.nullOr lib.types.bool;
           default = null;
           description = ''
-            Keep the attention layers' K/V in int8, which 2 x 262144 of Qwen3.6 needs (fp16 would not fit beside the weights);
-            fp16 decodes a few percent faster at depth. null: the server's default for the model (int8 for Qwen3.6, fp16 for
-            Bolt, whose 2 x 65536 take 2 GiB in fp16).
+            Keep the global layers' K/V in int8 (`--kv-int8`), half of fp16's; true or false is passed as --kv-int8 or
+            --kv-fp16. null: the server's default, fp16 (2 x 65536 take 2.2 GiB).
           '';
         };
 
         mmproj = lib.mkOption {
           type = lib.types.nullOr lib.types.path;
           default = null;
-          example = lib.literalExpression ''
-            pkgs.fetchurl {
-              name = "mmproj-Ornith-1.5-35B-A3B-bf16.gguf";
-              url = "https://huggingface.co/bartowski/Ornith-1.5-35B-A3B-GGUF/resolve/64b0493d34/mmproj-Ornith-1.5-35B-A3B-bf16.gguf";
-              sha256 = "...";
-            }
-          '';
+          example = lib.literalExpression "inputs.eklow.packages.x86_64-linux.bolt-e4b-mmproj";
           description = ''
-            The chat model's vision projector (llama.cpp's mmproj GGUF: Qwen3.6's tower, or a Gemma 4 one for Bolt),
-            for image_url parts in /v1/chat/completions; null refuses them. The encoder's weights and scratch come out of
-            the experts' share of the card.
+            The chat model's vision projector (llama.cpp's mmproj GGUF: Google's Gemma 4 E4B tower, which Bolt carries
+            unchanged; the flake's `bolt-e4b-mmproj`), for image_url parts in /v1/chat/completions; null refuses them.
           '';
         };
 
         draft = lib.mkOption {
           type = lib.types.nullOr lib.types.path;
           default = null;
-          example = lib.literalExpression "/models/Qwen3.6-35B-A3B-DFlash2-inco-Q8_0.gguf";
+          example = lib.literalExpression "inputs.eklow.packages.x86_64-linux.bolt-e4b-dflash";
           description = ''
-            A DFlash draft GGUF (arch "dflash") for speculative decoding, accepted losslessly; null decodes plain. Qwen3.6:
-            a DFlash 2 draft (Inco AI's serves stock Qwen3.6 and Ornith-1.5 alike, DECISIONS 2026-11-01), ~0.8 GiB of the
-            card. Bolt: NVIDIA's Nemotron-3.5-Bolt-E4B-DFlash.
+            A plain DFlash draft GGUF (arch "dflash") for speculative decoding, accepted losslessly; null decodes plain.
+            Bolt's is NVIDIA's Nemotron-3.5-Bolt-E4B-DFlash in Q8_0 (the flake's `bolt-e4b-dflash`, 547 MiB of the card).
           '';
         };
 
         draftBlock = lib.mkOption {
           type = lib.types.nullOr (lib.types.ints.between 2 16);
           default = null;
-          description = "Tokens of a verify block (the last sampled one and the drafted ones); null: Qwen3.6 4, or the draft's trained block if smaller (a block costs ~8.5 ms a row beyond the first on this card; 4 measured best); Bolt the draft's trained block, 8 (dense, its rows are cheap).";
-        };
-
-        prefillGroup = lib.mkOption {
-          type = lib.types.ints.positive;
-          default = 1;
-          description = ''
-            Qwen3.6 only: prefill chunks a lone long prompt may run layer by layer as one group (`--group`), so that each
-            cold expert crosses PCIe once per layer per group instead of once per chunk: 8 prefills 1.2-1.4x faster for
-            ~185 MB of card memory (3 experts a layer fewer; DECISIONS 2026-11-03). 1: plain chunks.
-          '';
-        };
-
-        prefillGroupBusy = lib.mkOption {
-          type = lib.types.ints.unsigned;
-          default = 0;
-          description = ''
-            Qwen3.6 only: the most tokens a group may take while another slot is generating (`--group-busy`): a group
-            stalls that stream for its whole length (4096: its longest pause 4-5 s against ~2 s with plain chunks). 0:
-            plain chunks then.
-          '';
-        };
-
-        chatTemplate = lib.mkOption {
-          type = lib.types.nullOr (
-            lib.types.enum [
-              "stock"
-              "ornith"
-              "sage"
-            ]
-          );
-          default = null;
-          description = ''
-            Qwen3.6 only: which of the Qwen3.6 chat templates eklow renders the model's repo uses, when the GGUF's own is not
-            one eklow knows (the official Ornith GGUFs carry Unsloth's edit): stock drops earlier turns' reasoning from the
-            prompt, ornith keeps it, sage is stock plus Sage-A1.5's verification switch. null: recognized from the GGUF,
-            which then must carry one of the published templates exactly.
-          '';
-        };
-
-        snapshotMiB = lib.mkOption {
-          type = lib.types.nullOr lib.types.ints.unsigned;
-          default = null;
-          description = ''
-            Qwen3.6 only: pinned host memory for snapshots of the DeltaNet state (64 MiB each), which let a conversation's
-            or a document's prefix be reused; 0 keeps none, and only a slot's live sequence is reused. null: the server's
-            default, 4096.
-          '';
-        };
-
-        kvPool = lib.mkOption {
-          type = lib.types.nullOr lib.types.ints.unsigned;
-          default = null;
-          example = 262144;
-          description = ''
-            Qwen3.6 only: the K/V pool of all the slots together, in positions (`--kv-pool`); each slot may still use up to
-            contextSize. With 2 slots of 262144 and a pool of 262144 the K/V costs half and the card keeps that memory's
-            worth of experts more (on fiona 91 a layer instead of 48). When the pool runs out an idle slot gives its pages
-            back and re-prefills later; a request that does not fit waits. null: slots x contextSize, a pool per slot.
-          '';
-        };
-
-        verification = lib.mkOption {
-          type = lib.types.nullOr lib.types.bool;
-          default = null;
-          description = ''
-            Sage-A1.5's template only: turn its verification protocol on by default (`--verification on`) for conversations
-            with a system message; a request may still send its own `verification`. null: the server's default, off.
-          '';
+          description = "Tokens of a verify block (the last sampled one and the drafted ones); null: the draft's trained block, 8 for Bolt's.";
         };
 
         preserveThinking = lib.mkOption {
           type = lib.types.nullOr lib.types.bool;
           default = null;
           description = ''
-            Stock's and Sage-A1.5's templates, and Bolt's: keep earlier assistant turns' reasoning in the prompt by default
-            (`--preserve-thinking on`, the template variable preserve_thinking; Bolt's keeps it for turns that called tools);
-            a request may still send its own. Off, every
-            new user message re-renders the turn before it without its reasoning, and the server prefills that whole turn
-            again (an agentic turn of 190k tokens would take three minutes on fiona). Ornith's template always keeps it. null: the
-            server's default, off.
+            Keep earlier assistant turns' reasoning in the prompt by default (`--preserve-thinking on`, Bolt's template variable
+            preserve_thinking: turns that called tools keep it); a request may still send its own. Off, the next user message
+            re-renders the last turn's tool loop without its reasoning and the server prefills that loop again; on, the window
+            fills 1.2-1.7x faster (eklow DECISIONS 2026-11-11). null: the server's default, off.
           '';
         };
 
@@ -221,11 +130,6 @@ in
         "model"
         "draft"
         "draftBlock"
-        "prefillGroup"
-        "prefillGroupBusy"
-        "chatTemplate"
-        "expertProfile"
-        "snapshotMiB"
         "mmproj"
         "port"
         "alias"
@@ -233,10 +137,27 @@ in
         "contextSize"
         "kvInt8"
         "extraArgs"
-      ];
+      ]
+    ++
+      map
+        (
+          o:
+          lib.mkRemovedOptionModule [
+            "services"
+            "eklow"
+            o
+          ] "it was the Qwen3.6-35B-A3B server's, which eklow no longer has (2026-11-11)."
+        )
+        [
+          "prefillGroup"
+          "prefillGroupBusy"
+          "chatTemplate"
+          "expertProfile"
+          "snapshotMiB"
+        ];
 
   options.services.eklow = {
-    enable = lib.mkEnableOption "eklow, Qwen3.6-35B-A3B finetunes (with DFlash 2 speculative decoding) or Nemotron-3.5-Bolt-E4B, and EmbeddingGemma 2, on an Intel Arc A770M behind an OpenAI-compatible API";
+    enable = lib.mkEnableOption "eklow: Nemotron-3.5-Bolt-E4B with a DFlash draft, EmbeddingGemma 2, vega's end-of-turn checker and Qwen3-Reranker on an Intel Arc A770M behind OpenAI-compatible APIs";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -250,15 +171,11 @@ in
       default = { };
       example = lib.literalExpression ''
         {
-          ornith = {
-            model = /models/Ornith-1.5-35B-A3B-Q4_K-Q8_0.gguf;
-            alias = "ornith-1.5-35b-a3b";
-            expertProfile = "''${config.services.eklow.package}/share/eklow/ornith-1.5-experts.json";
-          };
           bolt = {
-            model = /models/Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf;
+            model = inputs.eklow.packages.x86_64-linux.bolt-e4b;
             alias = "nemotron-3.5-bolt-e4b";
-            port = 8083;
+            draft = inputs.eklow.packages.x86_64-linux.bolt-e4b-dflash;
+            mmproj = inputs.eklow.packages.x86_64-linux.bolt-e4b-mmproj;
           };
         }
       '';
@@ -308,7 +225,7 @@ in
       default = 280;
       description = ''
         Rows an image becomes at most in EmbeddingGemma 2's input (Google's default is 280, the projector's maximum
-        1120). Qwen3.6's encoder has its own budget (`--image-max-tokens`).
+        1120); the chat model's projector takes the same budget.
       '';
     };
 
@@ -551,14 +468,6 @@ in
               (toString inst.contextSize)
             ]
             ++ lib.optional (inst.kvInt8 != null) (if inst.kvInt8 then "--kv-int8" else "--kv-fp16")
-            ++ lib.optionals (inst.expertProfile != null) [
-              "--expert-profile"
-              inst.expertProfile
-            ]
-            ++ lib.optionals (inst.snapshotMiB != null) [
-              "--snapshot-mib"
-              (toString inst.snapshotMiB)
-            ]
             ++ lib.optionals (inst.draft != null) [
               "--draft"
               inst.draft
@@ -566,24 +475,6 @@ in
             ++ lib.optionals (inst.draftBlock != null) [
               "--draft-block"
               (toString inst.draftBlock)
-            ]
-            ++ lib.optionals (inst.prefillGroup > 1) [
-              "--group"
-              (toString inst.prefillGroup)
-              "--group-busy"
-              (toString inst.prefillGroupBusy)
-            ]
-            ++ lib.optionals (inst.chatTemplate != null) [
-              "--chat-template"
-              inst.chatTemplate
-            ]
-            ++ lib.optionals (inst.kvPool != null) [
-              "--kv-pool"
-              (toString inst.kvPool)
-            ]
-            ++ lib.optionals (inst.verification != null) [
-              "--verification"
-              (if inst.verification then "on" else "off")
             ]
             ++ lib.optionals (inst.preserveThinking != null) [
               "--preserve-thinking"

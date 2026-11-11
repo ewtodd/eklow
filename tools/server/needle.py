@@ -20,7 +20,7 @@ def build(hay_a, hay_b, bytes_a, bytes_b, out):
         text = text[:cut] + note + text[cut:]
         content = text + "\n\n" + QUESTION
         open(f"{out}/req-{key}.txt", "w").write(content)
-        body = {"model": "qwen3.6-35b-a3b", "stream": True, "max_tokens": 700, "temperature": 0,
+        body = {"model": "nemotron-3.5-bolt-e4b", "stream": True, "max_tokens": 700, "temperature": 0,
                 "reasoning_effort": "none", "stream_options": {"include_usage": True},
                 "messages": [{"role": "user", "content": content}]}
         json.dump(body, open(f"{out}/req-{key}.json", "w"))

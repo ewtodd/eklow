@@ -14,7 +14,7 @@ namespace eklow::xmx::fmt {
 
 namespace detail {
 
-constexpr int64_t kThreads1 = 4096, kThreadsN = 8192, kThreadsGrouped = 8192;  // as xmx.cpp's
+constexpr int64_t kThreads1 = 4096, kThreadsN = 8192;  // as xmx.cpp's
 
 template <int R>
 SYCL_ESIMD_FUNCTION inline esimd::simd<float, R> load_scales(const float* p) {
@@ -158,60 +158,6 @@ inline int pick_t(int64_t target, int64_t groups, int64_t kb, int ch) {
   return T;
 }
 
-// The grouped one-row GEMV: gemv_t with the weights from the expert tables per pair and the activation row per
-// pair (xmx.cpp's gemv1_grouped: pairs from pe on are the dense FFN's thirds).
-template <WeightFormat F, int T>
-void gemv_grouped_t(sycl::queue& q, const Activations& a, const Activations* ad, const ExpertTable& w, const int32_t* ids, int64_t P,
-                    int64_t pe, int row_div, float* out) {
-  using D = Dec<F>;
-  constexpr int CH = D::CH, TB = D::TB;
-  constexpr int64_t rec_t = D::REC_T, rec_b = geo(F).rec_bytes;
-  constexpr int slm_base = F == WeightFormat::IQ4_XS ? kIqTableBytes : 0;
-  const int64_t kb = a.k / 32, ng = w.n / 8, n = w.n;
-  const int64_t per = ((kb + T - 1) / T + CH - 1) / CH * CH;
-  const uint8_t* aq = reinterpret_cast<const uint8_t*>(a.q);
-  const float* as = a.s;
-  const uint8_t* aq2 = ad ? reinterpret_cast<const uint8_t*>(ad->q) : aq;
-  const float* as2 = ad ? ad->s : as;
-  const int e_dense = int(w.count) - 3;
-  const uint8_t* const* tt = w.tiles;
-  const sycl::half* const* ts = w.scales;
-  q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(ng), size_t(P), size_t(T)), sycl::range<3>(1, 1, size_t(T))),
-                 [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
-                   constexpr int slm = slm_base + (T > 1 ? T * 32 : 0);
-                   if constexpr (slm > 0) esimd::slm_init<slm>();
-                   const int64_t g = int64_t(it.get_global_id(0)), p = int64_t(it.get_global_id(1));
-                   const int t = int(it.get_local_id(2));
-                   const bool dn = p >= pe;
-                   const int e = dn ? e_dense + int((p - pe) % 3) : ids[p];
-                   const uint8_t* bt = tt[e];
-                   if (!bt) return;  // a cold expert (computed on the host): its work-group has nothing to do
-                   const uint8_t* bm = reinterpret_cast<const uint8_t*>(ts[e]);
-                   const int64_t row = dn ? (p - pe) / 3 : p / row_div;
-                   const uint8_t* ab = (dn ? aq2 : aq) + (row / 8) * kb * 256 + (row % 8) * 32;
-                   const float* sb = (dn ? as2 : as) + (row / 8) * kb * 8 + row % 8;
-                   if constexpr (F == WeightFormat::IQ4_XS) {
-                     D::fill_table(t, T);
-                     esimd::barrier();
-                   }
-                   Acc<1> acc[1];
-                   acc[0] = 0;
-                   const int64_t b0 = int64_t(t) * per, b1 = std::min(kb, b0 + per);
-                   if (b0 < b1) run_tiles<F, 1, 1>(bt + g * kb * TB, bm + g * (kb / rec_t) * rec_b, b0, b1, ab, 0, sb, 0, acc);
-                   if constexpr (T > 1) {
-                     esimd::slm_block_store<float, 8>(slm_base + t * 32, acc[0]);
-                     esimd::barrier();
-                     if (t == 0) {
-                       esimd::simd<float, 8> sum = 0;
-                       for (int u = 0; u < T; ++u) sum += esimd::slm_block_load<float, 8>(slm_base + u * 32);
-                       esimd::block_store<float, 8>(out + p * n + g * 8, sum);
-                     }
-                   } else {
-                     esimd::block_store<float, 8>(out + p * n + g * 8, acc[0]);
-                   }
-                 });
-}
-
 }  // namespace detail
 
 // Entry points, explicitly instantiated per format (xmx_gemv_<format>.cpp). `a` is int8 activations (a.m <= 32).
@@ -226,23 +172,6 @@ void gemv(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
   else if (row_tiles <= 1) gemv_tdisp<F, 8, 1>(T, q, a, w, out);
   else if (row_tiles <= 2) gemv_tdisp<F, 8, 2>(T, q, a, w, out);
   else gemv_tdisp<F, 8, 4>(T, q, a, w, out);
-}
-
-template <WeightFormat F>
-void gemv_grouped(sycl::queue& q, const Activations& a, const Activations* ad, const ExpertTable& w, const int32_t* ids, int64_t P, int64_t pe,
-                  int64_t row_div, float* out) {
-  using namespace detail;
-  using D = Dec<F>;
-  if (a.k % (32 * D::CH)) throw std::runtime_error("xmx: decode GEMV needs K a multiple of 32 x the format's chunk");
-  const int T = pick_t(kThreadsGrouped, w.n / 8 * P, a.k / 32, D::CH);
-  switch (T) {
-    case 1: gemv_grouped_t<F, 1>(q, a, ad, w, ids, P, pe, int(row_div), out); break;
-    case 2: gemv_grouped_t<F, 2>(q, a, ad, w, ids, P, pe, int(row_div), out); break;
-    case 4: gemv_grouped_t<F, 4>(q, a, ad, w, ids, P, pe, int(row_div), out); break;
-    case 8: gemv_grouped_t<F, 8>(q, a, ad, w, ids, P, pe, int(row_div), out); break;
-    case 16: gemv_grouped_t<F, 16>(q, a, ad, w, ids, P, pe, int(row_div), out); break;
-    default: gemv_grouped_t<F, 32>(q, a, ad, w, ids, P, pe, int(row_div), out); break;
-  }
 }
 
 }  // namespace eklow::xmx::fmt

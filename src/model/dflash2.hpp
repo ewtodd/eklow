@@ -1,36 +1,26 @@
-// The DFlash 2 draft (Inco AI, August 2026; z-lab's dflash/model.py, DFlash2DraftModel) for Qwen3.6-35B-A3B and its
-// finetunes, from the GGUF llama.cpp's converter writes (arch "dflash"), and what the engine needs of the target: its
-// token embedding table and its output head. DECISIONS 2026-10-31 and TASK qwen/dflash have the whole story; in short:
+// A plain DFlash draft (z-lab's DFlash, arXiv 2602.06036, dflash/model.py's DFlashDraftModel; NVIDIA's
+// Nemotron-3.5-Bolt-E4B-DFlash is one) from the GGUF llama.cpp's converter writes (arch "dflash"), and what the engine needs of
+// the target: its token embedding table and its output head.
 //
-//   context   per committed token the target's 8 layer outputs (layers 1, 6, ..., 37), 16,384 values, go through `fc`
-//             and a norm (`enc.output_norm`), and per draft layer become K = rope(k_norm(k_proj(.))), V = v_proj(.) in the
-//             draft's cache, a sliding window (2,048 or 4,096 positions);
-//   block     [anchor, MASK x (B-1)] at positions p..p+B-1, embedded with the target's table, through six layers:
-//               n = rmsnorm(x); dyn = conv_proj(n); n' = conv(n, dyn, side 0);
-//               q, k, v = n' W; q, k normed per head, roped (NeoX, base 1e7, all 128 dims); attention over the window's
-//               context keys and the block's own, non-causal in the block; a = conv(o_proj(.), dyn, side 1); x += a;
-//               n = rmsnorm(x); dyn = conv_proj(n); m = conv(n, dyn, 0); x += conv(down(silu(gate m) * up m), dyn, 1);
-//             then a final rmsnorm; the target's head on rows 1..B-1 gives each position's logits;
-//   selector  the top 16 candidates of each position (their logits the unary scores) and the lattice of pair scores
-//             unary[b] + <pred_codebook[prev] * hidden_projection(h), succ_codebook[cand b]>, walked from the anchor.
-// The convolution is a 2-tap causal one over the block's positions only, per channel base[side][tap][c] plus a
-// coefficient per token and group of 16 channels from conv_proj (model.py: GroupedDynamicCausalConv).
+//   context   per committed token the target's layer outputs at the draft's target layers go through `fc` and a norm
+//             (`enc.output_norm`), and per draft layer become K = rope(k_norm(k_proj(.))), V = v_proj(.) in the draft's cache;
+//   block     [anchor, MASK x (B-1)] at positions p..p+B-1, embedded with the target's table (its rows scaled: a Gemma-family
+//             target's sqrt(hidden)), through the layers:
+//               n = rmsnorm(x); q, k, v = n W; q, k normed per head, roped (NeoX); attention over the context and the block;
+//               x += o_proj(attention); n = rmsnorm(x); x += down(silu(gate n) * up n);
+//             then a final rmsnorm; the target's head on rows 1..B-1 gives each position's logits, through the final softcap
+//             cap * tanh(x / cap) (monotone, so the top 16 are the raw logits').
+// There is no candidate selector: each position has its own distribution, so a Lattice has the same row of unary scores for
+// every predecessor and serve::walk samples each position from it (temperature 0: its argmax). A layer is sliding (its
+// window; causal inside the block for z-lab's drafts, not for NVIDIA's) or full (the slot's whole context; not causal inside
+// the block). The full layer's cache is Options::full_context positions per slot, a ring: the whole context when that is large
+// enough, otherwise a window of the last full_context positions.
 //
-// Dflash2Ref is the reference forward (fp32, plain SYCL, ref.hpp's kernels and ref_dflash.hpp's); Dflash2 the serving
-// forward (src/model/dflash2_fast.cpp): the matmuls on the matrix units in the draft file's own format, attention
-// through attn::attend on a ring cache with a key range per token, the convolutions and the selector as kernels of
-// src/kernels/dflash.*, the target's head on the card with the top 16 of each row taken there.
-//
-// Plain DFlash drafts (z-lab's DFlash, arXiv 2602.06036; z-lab also published one for Gemma 4 26B A4B, since removed from eklow; DECISIONS
-// 2026-11-03) run through the same classes: Dflash2Config::plain. Their layers have no convolutions:
-//   n = rmsnorm(x); q, k, v = n W; ...; x += o_proj(attention); n = rmsnorm(x); x += down(silu(gate n) * up n);
-// the target's embedding rows are scaled (a Gemma-family target: sqrt(hidden)) and the head's logits go through the final softcap
-// cap * tanh(x / cap) (monotone, so the top 16 are the raw logits'). There is no selector: each position has its own
-// distribution, so a Lattice has the same row of unary scores for every predecessor and serve::walk samples each
-// position from it (temperature 0: its argmax). A layer is sliding (the window of 2,048; causal inside the block, as
-// z-lab's model.py and vLLM mask it) or full (the slot's whole context; not causal inside the block). The full layer's
-// cache is Options::full_context positions per slot, a ring: the whole context when that is large enough, otherwise a
-// window of the last full_context positions.
+// Dflash2Ref is the reference forward (fp32, plain SYCL, ref.hpp's kernels and ref_dflash.hpp's); Dflash2 the serving forward
+// (src/model/dflash2_fast.cpp): the matmuls on the matrix units in the draft file's own format, attention through
+// attn::attend on a ring cache with a key range per token, the target's head on the card with the top 16 of each row taken
+// there. The names keep the "2" of DFlash 2 (Qwen3.6's drafts, with convolutions and a selector), which eklow ran until
+// 2026-11-11.
 #pragma once
 
 #include <sycl/sycl.hpp>
@@ -52,15 +42,12 @@ namespace eklow::model {
 
 struct Dflash2Config {
   int n_layer, n_embd, n_ff, n_head, n_head_kv, head_dim, n_vocab;
-  int window;      // the sliding window (keys a query sees: positions q - window + 1 .. q); the full layers of a plain draft have none
+  int window;      // the sliding window (keys a query sees: positions q - window + 1 .. q); the full layers have none
   int block_size;  // B the draft was trained for
-  int conv_kernel, conv_group, rank, top_k;
+  int top_k;       // the candidates kept per position (16)
   int mask_token;
   std::vector<int> target_layers;  // the target's layers whose outputs it reads (the GGUF stores each plus one)
   float eps, rope_base;
-  // Plain DFlash drafts (see above): no convolutions, no selector (conv_kernel, conv_group and rank are 0, top_k 16: the
-  // candidates kept per position).
-  bool plain = false;
   float embed_scale = 1.0f;   // the target's embedding rows are multiplied by it (dflash.embedding_scale; Gemma: sqrt(hidden))
   float softcap = 0.0f;       // dflash.final_logit_softcapping: logits become softcap * tanh(logit / softcap); 0: none
   bool block_causal = false;  // sliding layers attend causally inside the block (z-lab's model.py: a layer is causal when it slides)
@@ -72,8 +59,7 @@ struct Dflash2Config {
     return false;
   }
   int n_feat() const { return int(target_layers.size()) * n_embd; }
-  // Throws when the file is not a DFlash 2 or plain DFlash draft this code knows how to run. A plain draft's GGUF has no
-  // vocabulary size: n_vocab is the length of its tokenizer.ggml.tokens (the target's), which the constructors check
+  // Throws when the file is not a DFlash draft this code knows how to run. The GGUF has no vocabulary size: n_vocab is the length of its tokenizer.ggml.tokens (the target's), which the constructors check
   // against the target's embedding table.
   static Dflash2Config from_gguf(const gguf::File& f);
 };
@@ -87,8 +73,8 @@ void plain_lattice(serve::Lattice& lat, float softcap);
 class Dflash2Weights {
  public:
   struct Layer {
-    ref::Weight wq, wk, wv, wo, gate, up, down, conv_attn, conv_ffn;  // conv_*: the kernel projections
-    const float *attn_norm, *q_norm, *k_norm, *ffn_norm, *base_attn, *base_ffn;  // base_*: [side][tap][hidden]
+    ref::Weight wq, wk, wv, wo, gate, up, down;
+    const float *attn_norm, *q_norm, *k_norm, *ffn_norm;
   };
   static Dflash2Weights upload(const gguf::File& draft, const gguf::File& target, const Dflash2Config& c, sycl::queue& q);
   Dflash2Weights(Dflash2Weights&&) noexcept;
@@ -96,7 +82,7 @@ class Dflash2Weights {
   Dflash2Weights(const Dflash2Weights&) = delete;
   ~Dflash2Weights();
 
-  ref::Weight fc, sel_hidden, sel_pred, sel_succ;  // sel_*: rows of `rank` per token id
+  ref::Weight fc;
   ref::Weight tok_embd, head;                      // the target's, [n_vocab] rows of n_embd
   const float *hidden_norm = nullptr, *out_norm = nullptr;
   std::vector<Layer> layers;

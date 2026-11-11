@@ -55,25 +55,24 @@ OwnedTarget::~OwnedTarget() {
 
 struct Dflash2::Impl {
   struct LayerW {
-    xmx::Weight qkv, wo, gate_up, down, conv_attn, conv_ffn;
-    const float *attn_norm, *q_norm, *k_norm, *ffn_norm, *base_attn, *base_ffn;
+    xmx::Weight qkv, wo, gate_up, down;
+    const float *attn_norm, *q_norm, *k_norm, *ffn_norm;
   };
   std::vector<LayerW> layers;
-  xmx::Weight fc, kv_all, sel_hidden;
+  xmx::Weight fc, kv_all;
   const float *hidden_norm = nullptr, *out_norm = nullptr, *inv_freq = nullptr;
-  ref::Weight sel_pred{}, sel_succ{};
   Dflash2Target target{};
   int pages = 0;
   std::vector<void*> ck, cv;
-  std::vector<void*> cks, cvs;      // the scales of an int8 cache (the full layer of a plain draft)
+  std::vector<void*> cks, cvs;      // the scales of an int8 cache (the full layer)
   std::vector<attn::Cache> caches;  // per layer
   int64_t full_window = 0;          // the full layer's ring: positions it keeps
   bool causal = false;              // sliding layers attend causally inside the block
   attn::Scratch scratch;
   xmx::Activations act_e, act_o, act_f, act_g, inj_feat, inj_e;
   // block pass buffers
-  float *x, *n1, *cvb, *dyn, *qkv, *Qh, *Kh, *Vh, *att, *ob, *gu, *logits, *hid, *gate, *unary, *pred, *succ, *lat;
-  int32_t *cand, *pred_ids, *tscr_ids, *meta, *packed, *packed_full = nullptr;
+  float *x, *n1, *qkv, *Qh, *Kh, *Vh, *att, *ob, *gu, *logits, *hid, *unary;
+  int32_t *cand, *tscr_ids, *meta, *packed, *packed_full = nullptr;
   uint8_t* emb_rows = nullptr;  // host_table: a row of the token table per block (its anchor), then the mask's
   float* tscr_vals;
   // injection buffers
@@ -97,9 +96,8 @@ struct Dflash2::Impl {
     for (void* p : allocs) sycl::free(p, *q);
     for (auto& l : layers) {
       xmx::free_weight(*q, l.qkv), xmx::free_weight(*q, l.wo), xmx::free_weight(*q, l.gate_up), xmx::free_weight(*q, l.down);
-      xmx::free_weight(*q, l.conv_attn), xmx::free_weight(*q, l.conv_ffn);
     }
-    xmx::free_weight(*q, fc), xmx::free_weight(*q, kv_all), xmx::free_weight(*q, sel_hidden);
+    xmx::free_weight(*q, fc), xmx::free_weight(*q, kv_all);
     for (xmx::Activations* a : {&act_e, &act_o, &act_f, &act_g, &inj_feat, &inj_e}) xmx::free_activations(*q, *a);
     for (void* p : ck) sycl::free(p, *q);
     for (void* p : cv) sycl::free(p, *q);
@@ -117,8 +115,7 @@ Dflash2::Dflash2(sycl::queue& q, const gguf::File& draft, const Dflash2Target& t
   s.target = target;
   if (opt.slots * 1 > kMaxRows || opt.max_block > kMaxRows) throw std::runtime_error("dflash2: too many slots or too large a block");
   const int E = c_.n_embd, Hkv = c_.n_head_kv, D = c_.head_dim, H = c_.n_head, F = c_.n_feat();
-  const int nc = c_.plain ? 0 : 2 * c_.conv_kernel * (E / c_.conv_group);
-  if (c_.plain && c_.n_vocab != target.tok_embd.n)
+  if (c_.n_vocab != target.tok_embd.n)
     throw std::runtime_error(draft.path() + ": its vocabulary (" + std::to_string(c_.n_vocab) + " tokens) is not the target's (" + std::to_string(target.tok_embd.n) + " rows)");
   end_.assign(size_t(opt.slots), 0);
   first_.assign(size_t(opt.slots), 0);
@@ -159,19 +156,8 @@ Dflash2::Dflash2(sycl::queue& q, const gguf::File& draft, const Dflash2Target& t
     q.memcpy(d, t.data, t.nbytes).wait();
     return static_cast<const float*>(d);
   };
-  auto raw = [&](const std::string& name) {
-    const gguf::Tensor& t = need(name);
-    uint8_t* d = s.dev<uint8_t>(t.nbytes);
-    q.memcpy(d, t.data, t.nbytes).wait();
-    return ref::Weight{t.type, int64_t(t.ne[0]), int64_t(t.ne[1]), d, t.nbytes / t.ne[1]};
-  };
 
   s.fc = stacked({&need("fc.weight")}, false);
-  if (!c_.plain) {
-    s.sel_hidden = stacked({&need("selector_hidden.weight")}, false);
-    s.sel_pred = raw("selector_predecessor.weight");
-    s.sel_succ = raw("selector_successor.weight");
-  }
   s.hidden_norm = vec("enc.output_norm.weight", E);
   s.out_norm = vec("output_norm.weight", E);
   std::vector<const gguf::Tensor*> kv_parts;
@@ -182,18 +168,10 @@ Dflash2::Dflash2(sycl::queue& q, const gguf::File& draft, const Dflash2Target& t
     L.wo = stacked({&need(b + "attn_output.weight")}, false);
     L.gate_up = stacked({&need(b + "ffn_gate.weight"), &need(b + "ffn_up.weight")}, true);
     L.down = stacked({&need(b + "ffn_down.weight")}, false);
-    if (!c_.plain) {
-      L.conv_attn = stacked({&need(b + "attn_conv_proj.weight")}, false);
-      L.conv_ffn = stacked({&need(b + "ffn_conv_proj.weight")}, false);
-    }
     L.attn_norm = vec(b + "attn_norm.weight", E);
     L.q_norm = vec(b + "attn_q_norm.weight", D);
     L.k_norm = vec(b + "attn_k_norm.weight", D);
     L.ffn_norm = vec(b + "ffn_norm.weight", E);
-    if (!c_.plain) {
-      L.base_attn = vec(b + "attn_conv_base", int64_t(2) * c_.conv_kernel * E);
-      L.base_ffn = vec(b + "ffn_conv_base", int64_t(2) * c_.conv_kernel * E);
-    }
     kv_parts.push_back(&need(b + "attn_k.weight"));
     kv_parts.push_back(&need(b + "attn_v.weight"));
     s.layers.push_back(L);
@@ -206,8 +184,8 @@ Dflash2::Dflash2(sycl::queue& q, const gguf::File& draft, const Dflash2Target& t
   q.memcpy(invd, inv.data(), inv.size() * sizeof(float)).wait();
   s.inv_freq = invd;
 
-  // The ring caches: pages of 256 positions per slot, enough for the window, a block and the page it starts in. A plain
-  // draft's full layer has the same ring over opt.full_context positions (int8 or fp16).
+  // The ring caches: pages of 256 positions per slot, enough for the window, a block and the page it starts in. A full
+  // layer has the same ring over opt.full_context positions (int8 or fp16).
   s.pages = int((int64_t(window_) + opt.max_block + attn::kPage - 1) / attn::kPage) + 1;
   s.causal = c_.block_causal;
   if (opt.sliding_causal >= 0) s.causal = opt.sliding_causal > 0;
@@ -246,8 +224,6 @@ Dflash2::Dflash2(sycl::queue& q, const gguf::File& draft, const Dflash2Target& t
   const size_t R = kMaxRows, V = size_t(c_.n_vocab), K = size_t(c_.top_k);
   s.x = s.dev<float>(R * E);
   s.n1 = s.dev<float>(R * E);
-  s.cvb = s.dev<float>(R * E);
-  s.dyn = s.dev<float>(R * nc);
   s.qkv = s.dev<float>(R * (H + 2 * Hkv) * D);
   s.Qh = s.dev<float>(R * H * D);
   s.Kh = s.dev<float>(R * Hkv * D);
@@ -257,13 +233,8 @@ Dflash2::Dflash2(sycl::queue& q, const gguf::File& draft, const Dflash2Target& t
   s.gu = s.dev<float>(R * 2 * c_.n_ff);
   s.logits = s.dev<float>(R * V);
   s.hid = s.dev<float>(R * E);
-  s.gate = s.dev<float>(R * c_.rank);
   s.unary = s.dev<float>(R * K);
-  s.pred = s.dev<float>(R * K * c_.rank);
-  s.succ = s.dev<float>(R * K * c_.rank);
-  s.lat = s.dev<float>(R * K * K);
   s.cand = s.dev<int32_t>(R * K);
-  s.pred_ids = s.dev<int32_t>(R * K);
   const size_t chunks = size_t(dflash::topk_chunks(c_.n_vocab));
   s.tscr_ids = s.dev<int32_t>(R * chunks * 16);
   s.tscr_vals = s.dev<float>(R * chunks * 16);
@@ -309,7 +280,7 @@ void Dflash2::inject(int slot, const float* feats, int64_t pos0, int64_t n) {
   if (pos0 > end_[size_t(slot)]) end_[size_t(slot)] = first_[size_t(slot)] = first_full_[size_t(slot)] = pos0;  // a gap: the context restarts here
   const int64_t next = pos0 + n;
   const int64_t from = std::max<int64_t>(pos0, next - window_ + 1);  // the oldest row a block at `next` or later can see
-  // A plain draft's full layer sees further back (its ring's size): rows from there on go to its cache alone.
+  // A full layer sees further back (its ring's size): rows from there on go to its cache alone.
   const int64_t from_full = full_window_ > 0 ? std::max<int64_t>(pos0, next - full_window_ + 1) : from;
   if (from > pos0 && end_[size_t(slot)] <= pos0) first_[size_t(slot)] = from;
   if (from_full > pos0 && end_[size_t(slot)] <= pos0) first_full_[size_t(slot)] = from_full;
@@ -342,8 +313,8 @@ void Dflash2::inject(int slot, const float* feats, int64_t pos0, int64_t n) {
 
 std::vector<serve::Lattice> Dflash2::lattices(const std::vector<Request>& reqs, int B, Profile* profile, BlockDebug* debug) {
   Impl& s = *p_;
-  const int E = c_.n_embd, H = c_.n_head, Hkv = c_.n_head_kv, D = c_.head_dim, K = c_.top_k, Rk = c_.rank;
-  const int nb = int(reqs.size()), R = nb * B, P = nb * (B - 1), nc = c_.plain ? 0 : 2 * c_.conv_kernel * (E / c_.conv_group);
+  const int E = c_.n_embd, H = c_.n_head, Hkv = c_.n_head_kv, D = c_.head_dim, K = c_.top_k;
+  const int nb = int(reqs.size()), R = nb * B, P = nb * (B - 1);
   const bool full_layers = c_.has_full();
   if (nb == 0) return {};
   if (B < 2 || B > opt_.max_block || R > kMaxRows) throw std::runtime_error("dflash2: block of " + std::to_string(B) + " tokens x " + std::to_string(nb) + " requests is out of range");
@@ -355,8 +326,8 @@ std::vector<serve::Lattice> Dflash2::lattices(const std::vector<Request>& reqs, 
     field += t - t0;
     t0 = t;
   };
-  // Per row: token, position, slot, first and last key; per block: the anchor. A plain draft's full layers have their own
-  // first and last key per row (after the others).
+  // Per row: token, position, slot, first and last key; per block: the anchor. The full layers have their own first and
+  // last key per row (after the others).
   std::vector<int32_t> meta(size_t((full_layers ? 8 : 6) * kMaxRows), 0);
   attn::TileList list(D), list_full(D);
   for (int b = 0; b < nb; ++b) {
@@ -380,7 +351,7 @@ std::vector<serve::Lattice> Dflash2::lattices(const std::vector<Request>& reqs, 
   }
   const std::vector<int32_t> packed = list.packed(), packed_full = full_layers ? list_full.packed() : std::vector<int32_t>();
   if (packed.size() > 8192 || packed_full.size() > 8192) throw std::runtime_error("dflash2: tile list too long");
-  int32_t *tok = s.meta, *pos = s.meta + R, *slot = s.meta + 2 * R, *lo = s.meta + 3 * R, *hi = s.meta + 4 * R, *anchors = s.meta + 5 * R;
+  int32_t *tok = s.meta, *pos = s.meta + R, *slot = s.meta + 2 * R, *lo = s.meta + 3 * R, *hi = s.meta + 4 * R;
   q_.memcpy(s.meta, meta.data(), size_t((full_layers ? 8 : 6) * R) * sizeof(int32_t));
   q_.memcpy(s.packed, packed.data(), packed.size() * sizeof(int32_t));
   if (full_layers) q_.memcpy(s.packed_full, packed_full.data(), packed_full.size() * sizeof(int32_t));
@@ -411,16 +382,7 @@ std::vector<serve::Lattice> Dflash2::lattices(const std::vector<Request>& reqs, 
     };
     fast::rmsnorm(q_, s.x, L.attn_norm, R, E, c_.eps, s.n1);
     stage("n1", s.n1, size_t(R) * E);
-    if (!c_.plain) {
-      xmx::quantize(q_, s.n1, R, s.act_e);
-      xmx::matmul(q_, s.act_e, L.conv_attn, s.dyn);
-      stage("dyn", s.dyn, size_t(R) * nc);
-      dflash::conv(q_, s.n1, s.dyn, L.base_attn, 0, R, B, E, c_.conv_group, s.cvb, false);
-      stage("conv", s.cvb, size_t(R) * E);
-      xmx::quantize(q_, s.cvb, R, s.act_e);
-    } else {
-      xmx::quantize(q_, s.n1, R, s.act_e);
-    }
+    xmx::quantize(q_, s.n1, R, s.act_e);
     xmx::matmul(q_, s.act_e, L.qkv, s.qkv);
     dflash::heads(q_, s.qkv, int64_t(H + 2 * Hkv) * D, R, H, Hkv, 0, int64_t(H) * D, int64_t(H + Hkv) * D, L.q_norm, L.k_norm, c_.eps, pos, s.inv_freq, s.Qh,
                   s.Kh, s.Vh);
@@ -436,20 +398,10 @@ std::vector<serve::Lattice> Dflash2::lattices(const std::vector<Request>& reqs, 
     }
     xmx::quantize(q_, s.att, R, s.act_o);
     xmx::matmul(q_, s.act_o, L.wo, s.ob);
-    if (!c_.plain) {
-      dflash::conv(q_, s.ob, s.dyn, L.base_attn, 1, R, B, E, c_.conv_group, s.x, true);
-    } else {
-      ref::add(q_, s.x, s.ob, int64_t(R) * E, s.x);
-    }
+    ref::add(q_, s.x, s.ob, int64_t(R) * E, s.x);
     stage("x_mid", s.x, size_t(R) * E);
     fast::rmsnorm(q_, s.x, L.ffn_norm, R, E, c_.eps, s.n1);
     xmx::quantize(q_, s.n1, R, s.act_e);
-    if (!c_.plain) {
-      xmx::matmul(q_, s.act_e, L.conv_ffn, s.dyn);
-      dflash::conv(q_, s.n1, s.dyn, L.base_ffn, 0, R, B, E, c_.conv_group, s.cvb, false);
-      stage("conv2", s.cvb, size_t(R) * E);
-      xmx::quantize(q_, s.cvb, R, s.act_e);
-    }
     xmx::matmul_geglu(q_, s.act_e, L.gate_up, s.act_f, s.gu, xmx::Glu::Silu);
     if (debug && l == debug->stage_layer) {  // the GLU's output, from the int8 activations' dequantization
       std::vector<float> h(size_t(R) * c_.n_ff);
@@ -465,11 +417,7 @@ std::vector<serve::Lattice> Dflash2::lattices(const std::vector<Request>& reqs, 
     }
     xmx::matmul(q_, s.act_f, L.down, s.ob);
     stage("down", s.ob, size_t(R) * E);
-    if (!c_.plain) {
-      dflash::conv(q_, s.ob, s.dyn, L.base_ffn, 1, R, B, E, c_.conv_group, s.x, true);
-    } else {
-      ref::add(q_, s.x, s.ob, int64_t(R) * E, s.x);
-    }
+    ref::add(q_, s.x, s.ob, int64_t(R) * E, s.x);
     if (debug) {
       debug->layers.emplace_back(size_t(R) * E);
       q_.memcpy(debug->layers.back().data(), s.x, size_t(R) * E * sizeof(float)).wait();
@@ -477,53 +425,30 @@ std::vector<serve::Lattice> Dflash2::lattices(const std::vector<Request>& reqs, 
   }
   fast::rmsnorm(q_, s.x, s.out_norm, R, E, c_.eps, s.x);
   lap(profile ? profile->layers_ms : t0);
-  // Rows 1..B-1 of each block: the head, the top 16, the hidden projection.
+  // Rows 1..B-1 of each block: the head and the top 16.
   for (int b = 0; b < nb; ++b) q_.memcpy(s.hid + size_t(b) * (B - 1) * E, s.x + size_t(b * B + 1) * E, size_t(B - 1) * E * sizeof(float));
   xmx::quantize(q_, s.hid, P, s.act_e);
   xmx::matmul(q_, s.act_e, s.target.head, s.logits);
   lap(profile ? profile->head_ms : t0);
-  if (c_.plain) {  // no selector: each position's top 16 of its own logits, softcapped on the host
-    dflash::topk16(q_, s.logits, P, c_.n_vocab, s.tscr_ids, s.tscr_vals, s.cand, s.unary);
-    std::vector<int32_t> hcand(size_t(P) * K);
-    std::vector<float> hun(size_t(P) * K);
-    q_.memcpy(hcand.data(), s.cand, hcand.size() * sizeof(int32_t));
-    q_.memcpy(hun.data(), s.unary, hun.size() * sizeof(float)).wait();
-    lap(profile ? profile->select_ms : t0);
-    std::vector<serve::Lattice> out(static_cast<size_t>(nb));
-    for (int b = 0; b < nb; ++b) {
-      serve::Lattice& l = out[size_t(b)];
-      l.top_k = K;
-      const size_t p0 = size_t(b) * (B - 1);
-      l.cand.assign(hcand.begin() + long(p0 * K), hcand.begin() + long((p0 + B - 1) * K));
-      l.unary.assign(hun.begin() + long(p0 * K), hun.begin() + long((p0 + B - 1) * K));
-      plain_lattice(l, c_.softcap);
-    }
-    if (debug) {
-      debug->hidden.resize(size_t(P) * E);
-      q_.memcpy(debug->hidden.data(), s.hid, debug->hidden.size() * sizeof(float)).wait();
-    }
-    return out;
-  }
-  xmx::matmul(q_, s.act_e, s.sel_hidden, s.gate);
+  // Each position's top 16 of its own logits, softcapped on the host.
   dflash::topk16(q_, s.logits, P, c_.n_vocab, s.tscr_ids, s.tscr_vals, s.cand, s.unary);
-  dflash::predecessor_ids(q_, s.cand, anchors, nb, B - 1, s.pred_ids);
-  ref::embed(q_, s.sel_pred, s.pred_ids, int64_t(P) * K, 1.0f, s.pred);
-  ref::embed(q_, s.sel_succ, s.cand, int64_t(P) * K, 1.0f, s.succ);
-  ref::selector_lattice(q_, s.unary, s.gate, s.pred, s.succ, P, K, Rk, s.lat);
   std::vector<int32_t> hcand(size_t(P) * K);
-  std::vector<float> hun(size_t(P) * K), hlat(size_t(P) * K * K);
+  std::vector<float> hun(size_t(P) * K);
   q_.memcpy(hcand.data(), s.cand, hcand.size() * sizeof(int32_t));
-  q_.memcpy(hun.data(), s.unary, hun.size() * sizeof(float));
-  q_.memcpy(hlat.data(), s.lat, hlat.size() * sizeof(float)).wait();
+  q_.memcpy(hun.data(), s.unary, hun.size() * sizeof(float)).wait();
   lap(profile ? profile->select_ms : t0);
   std::vector<serve::Lattice> out(static_cast<size_t>(nb));
   for (int b = 0; b < nb; ++b) {
     serve::Lattice& l = out[size_t(b)];
     l.top_k = K;
     const size_t p0 = size_t(b) * (B - 1);
-    l.cand.assign(hcand.begin() + p0 * K, hcand.begin() + (p0 + B - 1) * K);
-    l.unary.assign(hun.begin() + p0 * K, hun.begin() + (p0 + B - 1) * K);
-    l.score.assign(hlat.begin() + p0 * K * K, hlat.begin() + (p0 + B - 1) * K * K);
+    l.cand.assign(hcand.begin() + long(p0 * K), hcand.begin() + long((p0 + B - 1) * K));
+    l.unary.assign(hun.begin() + long(p0 * K), hun.begin() + long((p0 + B - 1) * K));
+    plain_lattice(l, c_.softcap);
+  }
+  if (debug) {
+    debug->hidden.resize(size_t(P) * E);
+    q_.memcpy(debug->hidden.data(), s.hid, debug->hidden.size() * sizeof(float)).wait();
   }
   return out;
 }

@@ -1,13 +1,9 @@
-// eklow-dflash-test: the DFlash 2 draft's checks (TASK qwen/dflash).
+// eklow-dflash-test: the DFlash draft's checks (src/model/dflash2.*).
 //
-//   eklow-dflash-test torch   --draft GGUF --target GGUF --oracle DIR --tokens FILE --ref FILE.bin [--window W]
-//       the reference forward against model.py run in PyTorch (ref_torch.py's output) on the target's real hidden states
-//   eklow-dflash-test fast    ... same inputs: the serving forward against the reference forward
 //   eklow-dflash-test time    --draft GGUF --target GGUF: timings on the card
 //   eklow-dflash-test plain   --draft Q8_0.gguf --target GGUF --feats F.f32 --anchors a,b,.. --ctx N [--block B] [--window W] [--full-context N] [--no-int8]
 //       a plain DFlash draft (z-lab's kind; the one built for was Gemma 4 26B A4B's, since removed) on fixed features: the serving forward against the reference (tools/dflash_test/ref_torch_plain.py makes the inputs)
 //   eklow-dflash-test dump    --draft GGUF --target GGUF [--ctx N] [--block B] [--window W]: hashes of the serving forward's lattices on fixed random features
-// The inputs are what ref_torch.py read: ORACLE_DIR holds eklow-oracle's l_out-N.f32 for the draft's target layers.
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -42,7 +38,7 @@ struct Args {
 
 Args parse(int argc, char** argv) {
   Args a;
-  if (argc < 2) throw std::runtime_error("usage: eklow-dflash-test torch|fast|time ...");
+  if (argc < 2) throw std::runtime_error("usage: eklow-dflash-test plain|dump|accept|matmul|time ...");
   a.cmd = argv[1];
   for (int i = 2; i < argc; ++i) {
     const std::string k = argv[i];
@@ -75,38 +71,6 @@ Args parse(int argc, char** argv) {
     else throw std::runtime_error("unknown argument " + k);
   }
   return a;
-}
-
-// ref_torch.py's records.
-struct Record {
-  bool is_float;
-  std::vector<uint32_t> shape;
-  std::vector<float> f;
-  std::vector<int32_t> i;
-};
-std::map<std::string, Record> read_records(const std::string& path) {
-  std::ifstream in(path, std::ios::binary);
-  if (!in) throw std::runtime_error("cannot read " + path);
-  std::map<std::string, Record> out;
-  uint32_t nl;
-  while (in.read(reinterpret_cast<char*>(&nl), 4)) {
-    std::string name(nl, 0);
-    in.read(name.data(), nl);
-    uint8_t dt;
-    uint32_t nd;
-    in.read(reinterpret_cast<char*>(&dt), 1);
-    in.read(reinterpret_cast<char*>(&nd), 4);
-    Record r;
-    r.is_float = dt == 0;
-    r.shape.resize(nd);
-    in.read(reinterpret_cast<char*>(r.shape.data()), 4 * nd);
-    size_t n = 1;
-    for (auto s : r.shape) n *= s;
-    if (r.is_float) r.f.resize(n), in.read(reinterpret_cast<char*>(r.f.data()), 4 * n);
-    else r.i.resize(n), in.read(reinterpret_cast<char*>(r.i.data()), 4 * n);
-    out[name] = std::move(r);
-  }
-  return out;
 }
 
 std::vector<float> read_f32(const std::string& path, size_t n) {
@@ -168,143 +132,6 @@ struct Err {
   double rel() const { return sq_ref > 0 ? std::sqrt(sq_err / sq_ref) : 0; }
 };
 
-int cmd_torch(const Args& a) {
-  sycl::queue q(rt::pick_device(), sycl::property::queue::in_order{});
-  const auto draft = gguf::File::open(a.draft), target = gguf::File::open(a.target);
-  const auto cfg = model::Dflash2Config::from_gguf(draft);
-  const auto recs = read_records(a.ref);
-  const auto& meta = recs.at("meta").i;
-  const int B = meta[0], window = meta[1], n_tok = meta[2], n_blocks = meta[3];
-  std::printf("draft %s: block %d window %d, %d tokens, %d blocks\n", a.draft.c_str(), B, window, n_tok, n_blocks);
-  const auto weights = model::Dflash2Weights::upload(draft, target, cfg, q);
-  const auto feats = load_features(cfg, a.oracle, n_tok);
-  const auto tokens = load_tokens(a.tokens);
-  std::vector<int64_t> ps;
-  for (const auto& [name, r] : recs)
-    if (name.rfind("path", 0) == 0) ps.push_back(std::stoll(name.substr(4)));
-  std::sort(ps.begin(), ps.end());
-  model::Dflash2Ref ref(q, cfg, weights, n_tok + 16, window);
-  Err he, ue, le;
-  int path_ok = 0, cand_diff = 0;
-  int64_t next = 0;
-  for (int64_t p : ps) {
-    ref.inject(std::span<const float>(feats.data() + size_t(next) * cfg.n_feat(), size_t(p - next) * cfg.n_feat()), next, p - next);
-    next = p;
-    model::BlockDebug dbg;
-    const serve::Lattice lat = ref.block(tokens[size_t(p)], p, B, &dbg);
-    const serve::Lattice s = by_id(lat);
-    const auto& hid = recs.at("hid" + std::to_string(p)).f;
-    const auto& cand = recs.at("cand" + std::to_string(p)).i;
-    const auto& un = recs.at("unary" + std::to_string(p)).f;
-    const auto& lt = recs.at("lat" + std::to_string(p)).f;
-    const auto& path = recs.at("path" + std::to_string(p)).i;
-    Err h, u, l;
-    for (size_t i = 0; i < hid.size(); ++i) h.add(dbg.hidden[i], hid[i]);
-    int cd = 0;
-    for (size_t i = 0; i < cand.size(); ++i) cd += cand[i] != s.cand[i];
-    for (size_t i = 0; i < un.size(); ++i) u.add(s.unary[i], un[i]);
-    for (size_t i = 0; i < lt.size(); ++i) l.add(s.score[i], lt[i]);
-    std::mt19937_64 rng(1);
-    const serve::DraftBlock blk = serve::walk(lat, 0.0f, rng);
-    bool ok = true;
-    for (int i = 0; i < B - 1; ++i) ok &= blk.tokens[size_t(i)] == path[size_t(i)];
-    std::printf("p=%4lld hidden rel %.2e max %.2e | candidates differing %d | unary max %.2e | lattice max %.2e rel %.2e | greedy path %s\n",
-                (long long)p, h.rel(), h.max_abs, cd, u.max_abs, l.max_abs, l.rel(), ok ? "equal" : "DIFFERENT");
-    he.sq_err += h.sq_err, he.sq_ref += h.sq_ref, he.max_abs = std::max(he.max_abs, h.max_abs);
-    ue.max_abs = std::max(ue.max_abs, u.max_abs);
-    le.sq_err += l.sq_err, le.sq_ref += l.sq_ref, le.max_abs = std::max(le.max_abs, l.max_abs);
-    path_ok += ok, cand_diff += cd;
-  }
-  std::printf("total: hidden rel %.2e (max %.2e), unary max %.2e, lattice rel %.2e (max %.2e), %d of %zu greedy paths equal, %d candidates differ\n",
-              he.rel(), he.max_abs, ue.max_abs, le.rel(), le.max_abs, path_ok, ps.size(), cand_diff);
-  return 0;
-}
-
-// The serving forward against the reference forward on the same weights (the draft's Q8_0 file), block by block: three
-// comparisons, each of unary scores (the head's top-16 logits), lattice scores and the greedy walk: serving vs the exact
-// fp32 reference, the reference with the serving activations' rounding emulated vs exact (what that rounding costs by
-// itself), and serving vs the emulating reference (what is left).
-int cmd_fast(const Args& a) {
-  sycl::queue q(rt::pick_device(), sycl::property::queue::in_order{});
-  const auto draft = gguf::File::open(a.draft), target = gguf::File::open(a.target);
-  const auto cfg = model::Dflash2Config::from_gguf(draft);
-  const auto recs = read_records(a.ref);
-  const auto& meta = recs.at("meta").i;
-  const int B = meta[0], window = meta[1], n_tok = meta[2];
-  const auto weights = model::Dflash2Weights::upload(draft, target, cfg, q);
-  const model::OwnedTarget owned(q, target);
-  model::Dflash2::Options opt;
-  opt.max_block = B;
-  opt.window = window;
-  model::Dflash2 fast(q, draft, owned.view(), opt);
-  std::printf("draft %s: block %d window %d, %d tokens; the draft holds %.0f MiB on the card\n", a.draft.c_str(), B, window, n_tok,
-              double(fast.bytes()) / 1048576.0);
-  const auto feats = load_features(cfg, a.oracle, n_tok);
-  float* dfeats = sycl::malloc_device<float>(feats.size(), q);
-  q.memcpy(dfeats, feats.data(), feats.size() * sizeof(float)).wait();
-  const auto tokens = load_tokens(a.tokens);
-  std::vector<int64_t> ps;
-  for (const auto& [name, r] : recs)
-    if (name.rfind("path", 0) == 0) ps.push_back(std::stoll(name.substr(4)));
-  std::sort(ps.begin(), ps.end());
-  model::Dflash2Ref exact(q, cfg, weights, n_tok + 16, window, a.jitter != 0 ? true : false, a.jitter), emu(q, cfg, weights, n_tok + 16, window, true);
-  int64_t next = 0;
-  struct Pair {
-    const char* name;
-    Err u, l;
-    int tok_ok = 0, tok_all = 0, set_diff = 0;
-  } pairs[3] = {{"serving vs exact"}, {"emulated vs exact"}, {"serving vs emulated"}};
-  for (int64_t p : ps) {
-    const std::span<const float> rows(feats.data() + size_t(next) * cfg.n_feat(), size_t(p - next) * cfg.n_feat());
-    exact.inject(rows, next, p - next);
-    emu.inject(rows, next, p - next);
-    fast.inject(0, dfeats + next * cfg.n_feat(), next, p - next);
-    next = p;
-    model::BlockDebug rd, ed, fd;
-    rd.stage_layer = ed.stage_layer = fd.stage_layer = a.stage_layer;
-    const serve::Lattice lat[3] = {by_id(fast.lattices({{0, tokens[size_t(p)], p}}, B, nullptr, &fd)[0]), by_id(emu.block(tokens[size_t(p)], p, B, &ed)),
-                                   by_id(exact.block(tokens[size_t(p)], p, B, &rd))};
-    const int pa[3][2] = {{0, 2}, {1, 2}, {0, 1}};
-    std::printf("p=%4lld", (long long)p);
-    for (int k = 0; k < 3; ++k) {
-      const serve::Lattice &x = lat[pa[k][0]], &y = lat[pa[k][1]];
-      Err u, l;
-      int cd = 0, same = 0;
-      for (size_t i = 0; i < y.cand.size(); ++i) cd += x.cand[i] != y.cand[i];
-      for (size_t i = 0; i < y.unary.size(); ++i) u.add(x.unary[i], y.unary[i]);
-      for (size_t i = 0; i < y.score.size(); ++i) l.add(x.score[i], y.score[i]);
-      std::mt19937_64 rng(1);
-      const auto xb = serve::walk(x, 0.0f, rng), yb = serve::walk(y, 0.0f, rng);
-      for (int i = 0; i < B - 1; ++i) same += xb.tokens[size_t(i)] == yb.tokens[size_t(i)];
-      std::printf(" | %s: cand diff %2d unary rel %.1e tokens %d/%d", pairs[k].name, cd, u.rel(), same, B - 1);
-      Pair& pr = pairs[k];
-      pr.u.sq_err += u.sq_err, pr.u.sq_ref += u.sq_ref, pr.u.max_abs = std::max(pr.u.max_abs, u.max_abs);
-      pr.l.sq_err += l.sq_err, pr.l.sq_ref += l.sq_ref, pr.l.max_abs = std::max(pr.l.max_abs, l.max_abs);
-      pr.tok_ok += same, pr.tok_all += B - 1, pr.set_diff += cd;
-    }
-    std::printf("\n");
-    if (a.verbose) {
-      for (size_t i = 0; i < ed.stages.size(); ++i) {
-        Err e;
-        for (size_t j = 0; j < ed.stages[i].second.size(); ++j) e.add(fd.stages[i].second[j], ed.stages[i].second[j]);
-        std::printf("   layer %d %s: serving vs emulated rel %.2e max %.2e (signal rms %.2e)\n", a.stage_layer, ed.stages[i].first.c_str(), e.rel(), e.max_abs,
-                    std::sqrt(e.sq_ref / double(ed.stages[i].second.size())));
-      }
-      for (size_t l = 0; l < ed.layers.size(); ++l) {
-        Err e, at;
-        for (size_t i = 0; i < ed.layers[l].size(); ++i) e.add(fd.layers[l][i], ed.layers[l][i]);
-        for (size_t i = 0; i < ed.parts[l].size(); ++i) at.add(fd.parts[l][i], ed.parts[l][i]);
-        std::printf("   layer %zu: attention output rel %.2e, residual stream rel %.2e\n", l, at.rel(), e.rel());
-      }
-    }
-  }
-  for (const Pair& pr : pairs)
-    std::printf("total %-20s: unary rel %.2e (max %.2e), lattice rel %.2e (max %.2e), greedy tokens equal %d of %d, %d candidates differ\n", pr.name, pr.u.rel(),
-                pr.u.max_abs, pr.l.rel(), pr.l.max_abs, pr.tok_ok, pr.tok_all, pr.set_diff);
-  sycl::free(dfeats, q);
-  return 0;
-}
-
 // A plain DFlash draft (z-lab's kind; the one built for was Gemma 4 26B A4B's, since removed) on fixed features and anchors (ref_torch_plain.py writes the feature file and compares
 // the reference forward with model.py; eklow-dflash-host runs that reference without a card): blocks at positions
 // ctx, ctx + 3, ... after injecting the features of the rows before them, drafted by the serving forward (the draft's Q8_0
@@ -315,7 +142,6 @@ int cmd_plain(const Args& a) {
   sycl::queue q(rt::pick_device(), sycl::property::queue::in_order{});
   const auto draft = gguf::File::open(a.draft), target = gguf::File::open(a.target);
   const auto cfg = model::Dflash2Config::from_gguf(draft);
-  if (!cfg.plain) throw std::runtime_error("plain: not a plain DFlash draft");
   const int B = a.block ? a.block : cfg.block_size, window = a.window, nb = int(a.anchors.size());
   if (nb == 0 || a.ctx <= 0 || a.feats.empty()) throw std::runtime_error("plain: needs --feats, --anchors and --ctx");
   const int64_t n_rows = a.ctx + 3 * nb;
@@ -534,7 +360,7 @@ int cmd_matmul(const Args& a) {
   sycl::queue q(rt::pick_device(), sycl::property::queue::in_order{});
   const auto draft = gguf::File::open(a.draft);
   const auto cfg = model::Dflash2Config::from_gguf(draft);
-  for (const char* name : {"blk.0.attn_conv_proj.weight", "blk.0.attn_q.weight", "blk.0.ffn_down.weight", "fc.weight"}) {
+  for (const char* name : {"blk.0.attn_q.weight", "blk.0.ffn_down.weight", "fc.weight"}) {
     const gguf::Tensor& t = *draft.tensor(name);
     auto* raw = sycl::malloc_device<uint8_t>(t.nbytes, q);
     q.memcpy(raw, t.data, t.nbytes).wait();
@@ -578,8 +404,6 @@ int cmd_matmul(const Args& a) {
 int main(int argc, char** argv) {
   try {
     const Args a = parse(argc, argv);
-    if (a.cmd == "torch") return cmd_torch(a);
-    if (a.cmd == "fast") return cmd_fast(a);
     if (a.cmd == "plain") return cmd_plain(a);
     if (a.cmd == "dump") return cmd_dump(a);
     if (a.cmd == "matmul") return cmd_matmul(a);

@@ -44,8 +44,6 @@ struct Kind {
 };
 constexpr Kind kKinds[] = {{"sliding", 256, 8, 1024, false}, {"global", 512, 1, 0, false},
                            {"sliding8", 256, 8, 1024, true}, {"global8", 512, 1, 0, true},
-                           // Qwen3.6's attention layers: 16 query heads over 2 K/V heads of 256, paged, no window
-                           {"qwen", 256, 2, 0, false}, {"qwen8", 256, 2, 0, true},
                            // Bolt's (Gemma 4 E4B, with --heads 8): sliding layers of 256 over 2 K/V heads, window 512, in fp16;
                            // global layers of 512 over 2 K/V heads, fp16 or int8
                            {"bolt-sliding", 256, 2, 512, false}, {"bolt-global", 512, 2, 0, false}, {"bolt-global8", 512, 2, 0, true}};

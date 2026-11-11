@@ -1,15 +1,15 @@
-// eklow-qfmt-test: the Qwen weight formats' kernels (xmx.hpp, xmx_fmt.hpp) on the card, checked and timed.
+// eklow-qfmt-test: the weight formats' kernels (xmx.hpp, xmx_fmt.hpp) on the card, checked and timed.
 //
 //   eklow-qfmt-test [--formats Q8_0,Q4_K,Q5_K,Q6_K,IQ4_XS,Q4_0] [--gguf Q4_K=PATH ...] [--check] [--bench]
 //                   [--gemm] [--rows 1,2,8,16,32] [--json FILE]
 //
 // --check: for each format, tensors of the given GGUFs (real ones: --gguf FORMAT=PATH, each tensor in the format's
-//   type) and random valid blocks at the Qwen shapes: the decode matmul against (1) an fp32 dot of ggml's own
+//   type) and random valid blocks at Bolt's shapes: the decode matmul against (1) an fp32 dot of ggml's own
 //   dequantization with the fp32 activations (the int8 activation quantization shows: ~1e-2) and (2) an exact CPU
-//   emulation of the quantized arithmetic (~1e-6); the SwiGLU and GeGLU fusions and the grouped GEMVs likewise.
-// --bench: GB/s of weight read per format, Qwen shape and row count (decode), against the 399 GB/s the card reads;
+//   emulation of the quantized arithmetic (~1e-6); the SwiGLU and GeGLU fusions likewise.
+// --bench: GB/s of weight read per format, shape and row count (decode), against the 399 GB/s the card reads;
 //   each call reads a different copy of the matrix (a pool larger than the 16 MB L2).
-// --gemm: the fp16 GEMM's TFLOPS at 2,048 and 4,096 rows and the grouped expert GEMMs (check and bench both).
+// --gemm: the fp16 GEMM's TFLOPS at 2,048 and 4,096 rows (check and bench both).
 #include <sycl/sycl.hpp>
 
 #include <algorithm>
@@ -48,14 +48,15 @@ const FormatInfo kFormats[] = {
     {"Q6_K", gguf::Type::Q6_K, xmx::WeightFormat::Q6_K},    {"IQ4_XS", gguf::Type::IQ4_XS, xmx::WeightFormat::IQ4_XS},
 };
 
-// Qwen3.6-35B-A3B's matrices (hidden 2048): K, N.
+// Bolt's matrices (Gemma 4 E4B, hidden 2560): K, N.
 struct Shape {
   const char* name;
   int64_t k, n;
 };
-const Shape kQwen[] = {
-    {"expert gate|up", 2048, 1024}, {"expert down", 512, 2048},   {"attn_qkv / attn_q", 2048, 8192}, {"attn_gate", 2048, 4096},
-    {"ssm_out / attn_output", 4096, 2048}, {"attn_k / attn_v", 2048, 512}, {"head", 2048, 248320},
+const Shape kShapes[] = {
+    {"ffn gate|up", 2560, 20480},       {"ffn_down", 10240, 2560},          {"attn_q (sliding)", 2560, 2048},
+    {"attn_k / attn_v (sliding)", 2560, 512}, {"attn_q (global)", 2560, 4096}, {"attn_k / attn_v (global)", 2560, 1024},
+    {"attn_output (global)", 4096, 2560}, {"head", 2560, 262144},
 };
 
 std::vector<int64_t> parse_list(const std::string& s) {
@@ -333,96 +334,8 @@ void check_rows_of(sycl::queue& q, const FormatInfo& f, json::Writer& jw) {
   xmx::free_weight(q, mat.w);
 }
 
-// The grouped GEMVs against xmx::matmul per pair on the same experts (same arithmetic: ~1e-6), gate_up with SwiGLU.
-void check_grouped(sycl::queue& q, const FormatInfo& f, json::Writer& jw) {
-  const int64_t k = 2048, n2 = 1024, nd = 2048, kd = 512, NE = 8;
-  std::vector<Mat> gu, dn;
-  std::vector<xmx::Weight> guw, dnw;
-  for (int64_t e = 0; e < NE; ++e) {
-    gu.push_back(make_mat(q, f, n2, k, true));
-    dn.push_back(make_mat(q, f, nd, kd, false));
-    guw.push_back(gu.back().w);
-    dnw.push_back(dn.back().w);
-  }
-  xmx::ExpertTable tg = xmx::make_expert_table(q, guw), td = xmx::make_expert_table(q, dnw);
-  for (int64_t P : {8, 16, 32}) {
-    const int64_t rows = (P + 7) / 8;
-    xmx::Activations act = xmx::alloc_activations(q, 32, k), one = xmx::alloc_activations(q, 32, k);
-    xmx::Activations actd = xmx::alloc_activations(q, 32, kd), oned = xmx::alloc_activations(q, 32, kd);
-    auto* xd = sycl::malloc_device<float>(size_t(32 * k), q);
-    auto* xdd = sycl::malloc_device<float>(size_t(32 * kd), q);
-    auto* yg = sycl::malloc_device<float>(size_t(P * n2), q);
-    auto* yr = sycl::malloc_device<float>(size_t(n2), q);
-    auto* ygd = sycl::malloc_device<float>(size_t(P * nd), q);
-    auto* yrd = sycl::malloc_device<float>(size_t(nd), q);
-    auto* idd = sycl::malloc_device<int32_t>(size_t(P), q);
-    std::vector<int32_t> ids(static_cast<size_t>(P));
-    for (auto& i : ids) i = int32_t(g_rng() % uint32_t(NE));
-    q.memcpy(idd, ids.data(), ids.size() * 4);
-    const auto x = random_x(rows, k), xdn = random_x(P, kd);
-    q.memcpy(xd, x.data(), x.size() * 4);
-    q.memcpy(xdd, xdn.data(), xdn.size() * 4).wait();
-    xmx::quantize(q, xd, rows, act);
-    xmx::quantize(q, xdd, P, actd);
-    xmx::matmul_grouped(q, act, tg, idd, P, 8, yg);
-    xmx::matmul_grouped(q, actd, td, idd, P, 1, ygd);
-    q.wait();
-    std::vector<float> hg(static_cast<size_t>(P * n2)), hgd(static_cast<size_t>(P * nd)), hr(static_cast<size_t>(n2)), hrd(static_cast<size_t>(nd));
-    q.memcpy(hg.data(), yg, hg.size() * 4);
-    q.memcpy(hgd.data(), ygd, hgd.size() * 4).wait();
-    double num = 0, den = 0, numd = 0, dend = 0;
-    for (int64_t p = 0; p < P; ++p) {
-      xmx::quantize(q, xd + (p / 8) * k, 1, one);
-      xmx::matmul(q, one, gu[size_t(ids[size_t(p)])].w, yr);
-      xmx::quantize(q, xdd + p * kd, 1, oned);
-      xmx::matmul(q, oned, dn[size_t(ids[size_t(p)])].w, yrd);
-      q.memcpy(hr.data(), yr, hr.size() * 4);
-      q.memcpy(hrd.data(), yrd, hrd.size() * 4).wait();
-      for (int64_t i = 0; i < n2; ++i) num += double(hg[size_t(p * n2 + i)] - hr[size_t(i)]) * (hg[size_t(p * n2 + i)] - hr[size_t(i)]), den += double(hr[size_t(i)]) * hr[size_t(i)];
-      for (int64_t i = 0; i < nd; ++i) numd += double(hgd[size_t(p * nd + i)] - hrd[size_t(i)]) * (hgd[size_t(p * nd + i)] - hrd[size_t(i)]), dend += double(hrd[size_t(i)]) * hrd[size_t(i)];
-    }
-    // The fused SwiGLU on the grouped output: the same GLU kernel as the single one's, on the same bytes.
-    xmx::Activations glu = xmx::alloc_activations(q, 32, n2 / 2);
-    auto* scr = sycl::malloc_device<float>(size_t(P * n2), q);
-    xmx::matmul_geglu_grouped(q, act, tg, idd, P, 8, glu, scr, xmx::Glu::Silu);
-    q.wait();
-    std::vector<int8_t> hq(static_cast<size_t>(glu.m_pad * (n2 / 2)));
-    std::vector<float> hs(static_cast<size_t>(glu.m_pad * (n2 / 2) / 32));
-    q.memcpy(hq.data(), glu.q, hq.size());
-    q.memcpy(hs.data(), glu.s, hs.size() * 4).wait();
-    double numg = 0, deng = 0;
-    for (int64_t p = 0; p < P; ++p)
-      for (int i = 0; i < 64; ++i) {
-        const int64_t c = int64_t(g_rng() % uint32_t(n2 / 2));
-        // the interleaved halves: tile 2j gate, 2j+1 up of 8 columns -> hg holds [gate | up] in the repack's column order
-        const int64_t tile = c / 8, col = tile * 16 + c % 8;
-        const double gate = hg[size_t(p * n2 + col)], up = hg[size_t(p * n2 + col + 8)];
-        const double ref = silu(gate) * up;
-        const double got = double(hq[size_t(xmx::act_index(p, c, n2 / 2 / 32))]) * double(hs[size_t(xmx::act_scale_index(p, c, n2 / 2 / 32))]);
-        numg += (got - ref) * (got - ref);
-        deng += ref * ref;
-      }
-    const double r1 = std::sqrt(num / den), r2 = std::sqrt(numd / dend), r3 = std::sqrt(numg / std::max(deng, 1e-30));
-    std::printf("  %-8s grouped P=%2lld  gate_up vs matmul %9.2e  down %9.2e  SwiGLU(int8) vs fp32 %9.2e %s\n", f.name, (long long)P, r1, r2, r3,
-                (r1 < 1e-5 && r2 < 1e-5 && r3 < 3e-2) ? "" : "  <-- OUT OF BAND");
-    jw.begin_object().kv("format", f.name).kv("pairs", P).kv("gate_up_vs_matmul", r1).kv("down_vs_matmul", r2).kv("swiglu_vs_fp32", r3).end_object();
-    for (void* p : {static_cast<void*>(xd), static_cast<void*>(xdd), static_cast<void*>(yg), static_cast<void*>(yr), static_cast<void*>(ygd),
-                    static_cast<void*>(yrd), static_cast<void*>(idd), static_cast<void*>(scr)})
-      sycl::free(p, q);
-    xmx::free_activations(q, act);
-    xmx::free_activations(q, one);
-    xmx::free_activations(q, actd);
-    xmx::free_activations(q, oned);
-    xmx::free_activations(q, glu);
-  }
-  xmx::free_expert_table(q, tg);
-  xmx::free_expert_table(q, td);
-  for (auto& m : gu) xmx::free_weight(q, m.w);
-  for (auto& m : dn) xmx::free_weight(q, m.w);
-}
-
 void bench_decode(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>& rows, json::Writer& jw) {
-  for (const Shape& s : kQwen) {
+  for (const Shape& s : kShapes) {
     if (s.k % refs::block_k(f.type)) continue;
     const bool head = s.n > 100000;
     Mat mat = make_mat(q, f, s.n, s.k, false);
@@ -477,79 +390,11 @@ void bench_q6_head(sycl::queue& q, const FormatInfo& f, const std::vector<int64_
   sycl::free(yd, q);
 }
 
-// The grouped decode GEMVs over 256 experts: the engine's gate_up + SwiGLU and down, P pairs of 8 distinct-ish experts.
-void bench_grouped(sycl::queue& q, const FormatInfo& f, json::Writer& jw) {
-  const int64_t NE = 256;
-  for (const bool gate_up : {true, false}) {
-    const int64_t k = gate_up ? 2048 : 512, n = gate_up ? 1024 : 2048;
-    Mat mat = make_mat(q, f, n, k, gate_up);
-    std::vector<xmx::Weight> experts;
-    const uint64_t tb = f.format == xmx::WeightFormat::Q4_0 ? xmx::weight_tile_bytes(k, n) : xmx::weight_tile_bytes(f.format, k, n);
-    for (int64_t e = 0; e < NE; ++e) {
-      xmx::Weight w = mat.w;
-      if (e) {
-        w.tiles = sycl::malloc_device<uint8_t>(size_t(tb), q);
-        w.scales = reinterpret_cast<sycl::half*>(sycl::malloc_device<uint8_t>(size_t(mat.bytes - tb), q));
-        if (!w.tiles || !w.scales) throw std::runtime_error("out of device memory for the expert pool");
-        q.memcpy(w.tiles, mat.w.tiles, size_t(tb));
-        q.memcpy(w.scales, mat.w.scales, size_t(mat.bytes - tb));
-      }
-      experts.push_back(w);
-    }
-    q.wait();
-    xmx::ExpertTable table = xmx::make_expert_table(q, experts);
-    for (int64_t P : {8, 16, 32}) {
-      const int64_t row_div = gate_up ? 8 : 1, rows = (P + row_div - 1) / row_div;
-      xmx::Activations act = xmx::alloc_activations(q, 32, k);
-      auto* xd = sycl::malloc_device<float>(size_t(32 * k), q);
-      auto* yg = sycl::malloc_device<float>(size_t(P * n), q);
-      auto* idsets = sycl::malloc_device<int32_t>(size_t(32 * P), q);
-      std::vector<int32_t> all(static_cast<size_t>(32 * P));
-      int64_t distinct = 0;
-      for (int s = 0; s < 32; ++s) {
-        for (int64_t p = 0; p < P; ++p) all[size_t(s * P + p)] = int32_t(g_rng() % uint32_t(NE));
-        std::vector<int32_t> u(all.begin() + s * P, all.begin() + (s + 1) * P);
-        std::sort(u.begin(), u.end());
-        distinct += std::unique(u.begin(), u.end()) - u.begin();
-      }
-      q.memcpy(idsets, all.data(), all.size() * 4);
-      const auto x = random_x(rows, k);
-      q.memcpy(xd, x.data(), x.size() * 4).wait();
-      xmx::quantize(q, xd, rows, act);
-      const double t = best_time(q, 32, [&](int i) { xmx::matmul_grouped(q, act, table, idsets + i * P, P, row_div, yg); });
-      const double gbps = double(distinct) / 32 * double(mat.bytes) / t / 1e9;
-      std::printf("  %-8s grouped %-12s P=%2lld  distinct %5.1f  %9.4f ms %8.0f GB/s\n", f.name, gate_up ? "gate|up" : "down", (long long)P,
-                  double(distinct) / 32, t * 1e3, gbps);
-      jw.begin_object().kv("format", f.name).kv("grouped", gate_up ? "gate_up" : "down").kv("pairs", P).kv("distinct", double(distinct) / 32)
-          .kv("ms", t * 1e3).kv("weight_gbps", gbps).end_object();
-      if (gate_up) {
-        xmx::Activations glu = xmx::alloc_activations(q, 32, n / 2);
-        auto* scr = sycl::malloc_device<float>(size_t(P * n), q);
-        const double tg = best_time(q, 32, [&](int i) { xmx::matmul_geglu_grouped(q, act, table, idsets + i * P, P, row_div, glu, scr, xmx::Glu::Silu); });
-        std::printf("  %-8s grouped %-12s P=%2lld  distinct %5.1f  %9.4f ms %8.0f GB/s\n", f.name, "  + SwiGLU", (long long)P, double(distinct) / 32,
-                    tg * 1e3, double(distinct) / 32 * double(mat.bytes) / tg / 1e9);
-        jw.begin_object().kv("format", f.name).kv("grouped", "gate_up_swiglu").kv("pairs", P).kv("ms", tg * 1e3)
-            .kv("weight_gbps", double(distinct) / 32 * double(mat.bytes) / tg / 1e9).end_object();
-        sycl::free(scr, q);
-        xmx::free_activations(q, glu);
-      }
-      sycl::free(xd, q);
-      sycl::free(yg, q);
-      sycl::free(idsets, q);
-      xmx::free_activations(q, act);
-    }
-    xmx::free_expert_table(q, table);
-    for (int64_t e = 1; e < NE; ++e) xmx::free_weight(q, experts[size_t(e)]);
-    xmx::free_weight(q, mat.w);
-  }
-}
-
-
-// The fp16 GEMM on the Qwen shapes at 2,048 and 4,096 rows, plain and with the SwiGLU epilogue (gate|up interleaved).
+// The fp16 GEMM on Bolt's shapes at 2,048 and 4,096 rows, plain and with the GeGLU epilogue (gate|up interleaved).
 void bench_gemm(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>& rows, json::Writer& jw) {
-  for (const Shape& s : kQwen) {
+  for (const Shape& s : kShapes) {
     if (s.n > 100000 || s.k % refs::block_k(f.type)) continue;
-    const bool glu = std::string(s.name) == "expert gate|up";
+    const bool glu = std::string(s.name) == "ffn gate|up";
     for (int variant = 0; variant < (glu ? 2 : 1); ++variant) {
       Mat mat = make_mat(q, f, s.n, s.k, variant == 1);
       const int64_t max_m = *std::max_element(rows.begin(), rows.end());
@@ -561,13 +406,13 @@ void bench_gemm(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>&
         q.memcpy(xd, x.data(), x.size() * 4).wait();
         xmx::quantize(q, xd, m, act);
         const double t = best_time(q, 6, [&](int) {
-          if (variant == 1) xmx::matmul_geglu(q, act, mat.w, out, nullptr, xmx::Glu::Silu);
+          if (variant == 1) xmx::matmul_geglu(q, act, mat.w, out, nullptr, xmx::Glu::Gelu);
           else xmx::matmul(q, act, mat.w, yd);
         });
         const double tf = 2.0 * double(m) * double(s.n) * double(s.k) / t / 1e12;
-        std::printf("  %-8s %-24s %4lldx%-7lld rows %4lld  %9.3f ms %7.1f TFLOPS %s\n", f.name, variant ? "expert gate|up + SwiGLU" : s.name, (long long)s.k,
+        std::printf("  %-8s %-24s %4lldx%-7lld rows %4lld  %9.3f ms %7.1f TFLOPS %s\n", f.name, variant ? "ffn gate|up + GeGLU" : s.name, (long long)s.k,
                     (long long)s.n, (long long)m, t * 1e3, tf, variant ? "(GLU epilogue, TFLOPS counted on the stacked matrix)" : "");
-        jw.begin_object().kv("format", f.name).kv("shape", variant ? "expert gate|up + SwiGLU" : s.name).kv("k", s.k).kv("n", s.n).kv("rows", m)
+        jw.begin_object().kv("format", f.name).kv("shape", variant ? "ffn gate|up + GeGLU" : s.name).kv("k", s.k).kv("n", s.n).kv("rows", m)
             .kv("ms", t * 1e3).kv("tflops", tf).end_object();
       }
       sycl::free(xd, q);
@@ -579,119 +424,6 @@ void bench_gemm(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>&
   }
 }
 
-// The grouped fp16 GEMMs (prefill's MoE) on 256 experts, 2,048 tokens each routed to 8 of them (Qwen's: gate|up 2048 -> 2 x 512 with
-// SwiGLU, down 512 -> 2048): against the dense fp16 path per expert (same arithmetic: ~1e-6..1e-4) and timed.
-void grouped16(sycl::queue& q, const FormatInfo& f, int64_t tile, bool check, json::Writer& jw) {
-  const int64_t T = 2048, NU = 8, P = T * NU, NE = 256, E = 2048, Fe = 512;
-  std::vector<Mat> gum, dnm;
-  std::vector<xmx::Weight> gu, dn;
-  for (int64_t e = 0; e < NE; ++e) {
-    gum.push_back(make_mat(q, f, 2 * Fe, E, true));
-    dnm.push_back(make_mat(q, f, E, Fe, false));
-    gu.push_back(gum.back().w);
-    dn.push_back(dnm.back().w);
-    if (!check) {  // timing only: the host copies are not needed
-      gum.back().host.clear();
-      dnm.back().host.clear();
-    }
-  }
-  xmx::ExpertTable tab_gu = xmx::make_expert_table(q, gu), tab_dn = xmx::make_expert_table(q, dn);
-  std::vector<int32_t> ids(static_cast<size_t>(P)), perm(static_cast<size_t>(NE));
-  for (int64_t t = 0; t < T; ++t) {
-    std::iota(perm.begin(), perm.end(), 0);
-    std::shuffle(perm.begin(), perm.end(), g_rng);
-    for (int64_t j = 0; j < NU; ++j) ids[size_t(t * NU + j)] = perm[size_t(j)];
-  }
-  const auto x = random_x(T, E);
-  const int64_t max_tiles = (P + tile - 1) / tile + NE, rows = max_tiles * tile;
-  auto* idd = sycl::malloc_device<int32_t>(size_t(P), q);
-  auto* rowp = sycl::malloc_device<int32_t>(size_t(P), q);
-  auto* scr = sycl::malloc_device<int32_t>(size_t((P / 256 + 2) * NE), q);
-  auto* tiles = sycl::malloc_device<int32_t>(size_t(4 + 4 * max_tiles), q);
-  auto* xd = sycl::malloc_device<float>(size_t(T * E), q);
-  auto* a = sycl::malloc_device<sycl::half>(size_t(rows * E), q);
-  auto* h = sycl::malloc_device<sycl::half>(size_t(rows * Fe), q);
-  auto* y = sycl::malloc_device<float>(size_t(rows * E), q);
-  q.memcpy(idd, ids.data(), ids.size() * 4);
-  q.memcpy(xd, x.data(), x.size() * 4).wait();
-  q.memset(a, 0, size_t(rows * E) * 2).wait();
-  fast::moe_group(q, idd, P, NE, tile, scr, tiles, rowp);
-  fast::moe_gather(q, xd, rowp, P, NU, E, a);
-  xmx::matmul_geglu_grouped16(q, a, tab_gu, tiles, max_tiles, tile, h, xmx::Glu::Silu);
-  xmx::matmul_grouped16(q, h, tab_dn, tiles, max_tiles, tile, y);
-  q.wait();
-  double rel_gu = 0, rel_dn = 0;
-  if (check) {
-    std::vector<int32_t> hrow(static_cast<size_t>(P)), htiles(static_cast<size_t>(4 + 4 * max_tiles));
-    q.memcpy(hrow.data(), rowp, hrow.size() * 4);
-    q.memcpy(htiles.data(), tiles, htiles.size() * 4).wait();
-    std::vector<std::vector<int64_t>> by_expert(static_cast<size_t>(NE));
-    for (int64_t p = 0; p < P; ++p) by_expert[size_t(ids[size_t(p)])].push_back(p);
-    std::vector<sycl::half> hh(static_cast<size_t>(rows * Fe));
-    std::vector<float> hy(static_cast<size_t>(rows * E));
-    q.memcpy(hh.data(), h, hh.size() * 2);
-    q.memcpy(hy.data(), y, hy.size() * 4).wait();
-    xmx::Activations ain = xmx::alloc_activations(q, 4096, E), ah = xmx::alloc_activations(q, 4096, Fe);
-    auto* xe = sycl::malloc_device<float>(size_t(4096 * E), q);
-    auto* ye = sycl::malloc_device<float>(size_t(4096 * E), q);
-    std::vector<float> hye(static_cast<size_t>(4096 * E));
-    double ngu = 0, dgu = 0, ndn = 0, ddn = 0;
-    for (int64_t e = 0; e < NE; e += 7) {  // a spread of experts
-      const auto& prs = by_expert[size_t(e)];
-      if (prs.empty()) continue;
-      const int64_t cnt = int64_t(prs.size()), m = std::max<int64_t>(cnt, xmx::kFp16Rows + 1);
-      std::vector<float> xs(static_cast<size_t>(m * E), 0.0f);
-      for (int64_t i = 0; i < cnt; ++i) std::copy_n(x.begin() + (prs[size_t(i)] / NU) * E, E, xs.begin() + i * E);
-      q.memcpy(xe, xs.data(), xs.size() * 4).wait();
-      xmx::quantize(q, xe, m, ain);
-      xmx::matmul_geglu(q, ain, gu[size_t(e)], ah, nullptr, xmx::Glu::Silu);
-      xmx::matmul(q, ah, dn[size_t(e)], ye);
-      std::vector<sycl::half> rh(static_cast<size_t>(ah.m_pad * Fe));
-      q.memcpy(rh.data(), ah.h, rh.size() * 2);
-      q.memcpy(hye.data(), ye, size_t(m * E) * 4).wait();
-      for (int64_t i = 0; i < cnt; ++i) {
-        const int64_t row = hrow[size_t(prs[size_t(i)])];
-        for (int64_t c = 0; c < Fe; ++c) {
-          const double g = double(float(hh[size_t(xmx::act16_index(row, c, Fe / 16))])), r = double(float(rh[size_t(xmx::act16_index(i, c, Fe / 16))]));
-          ngu += (g - r) * (g - r);
-          dgu += r * r;
-        }
-        for (int64_t c = 0; c < E; ++c) {
-          const double g = double(hy[size_t(row * E + c)]), r = double(hye[size_t(i * E + c)]);
-          ndn += (g - r) * (g - r);
-          ddn += r * r;
-        }
-      }
-    }
-    rel_gu = std::sqrt(ngu / std::max(dgu, 1e-30));
-    rel_dn = std::sqrt(ndn / std::max(ddn, 1e-30));
-    sycl::free(xe, q);
-    sycl::free(ye, q);
-    xmx::free_activations(q, ain);
-    xmx::free_activations(q, ah);
-  }
-  std::vector<int32_t> htl(static_cast<size_t>(4));
-  q.memcpy(htl.data(), tiles, 16).wait();
-  const int64_t used_rows = htl[0] * tile;
-  const double t_gu = best_time(q, 10, [&](int) { xmx::matmul_geglu_grouped16(q, a, tab_gu, tiles, max_tiles, tile, h, xmx::Glu::Silu); });
-  const double t_dn = best_time(q, 10, [&](int) { xmx::matmul_grouped16(q, h, tab_dn, tiles, max_tiles, tile, y); });
-  const double fl_gu = 2.0 * double(P) * double(E) * double(2 * Fe), fl_dn = 2.0 * double(P) * double(Fe) * double(E);
-  std::printf("  %-8s grouped16 tile %3lld  gate|up+SwiGLU %8.3f ms %6.1f TFLOPS (%6.1f padded)   down %8.3f ms %6.1f TFLOPS (%6.1f padded)", f.name,
-              (long long)tile, t_gu * 1e3, fl_gu / t_gu / 1e12, fl_gu * double(used_rows) / double(P) / t_gu / 1e12, t_dn * 1e3, fl_dn / t_dn / 1e12,
-              fl_dn * double(used_rows) / double(P) / t_dn / 1e12);
-  if (check) std::printf("   vs dense: gate|up %.2e  down %.2e %s", rel_gu, rel_dn, (rel_gu < 1e-3 && rel_dn < 1e-3) ? "" : "  <-- OUT OF BAND");
-  std::printf("\n");
-  jw.begin_object().kv("format", f.name).kv("tile", tile).kv("ms_gate_up", t_gu * 1e3).kv("ms_down", t_dn * 1e3).kv("tflops_gate_up", fl_gu / t_gu / 1e12)
-      .kv("tflops_down", fl_dn / t_dn / 1e12).kv("tflops_gate_up_padded", fl_gu * double(used_rows) / double(P) / t_gu / 1e12)
-      .kv("tflops_down_padded", fl_dn * double(used_rows) / double(P) / t_dn / 1e12).kv("rel_gate_up", rel_gu).kv("rel_down", rel_dn).end_object();
-  for (void* p : {static_cast<void*>(idd), static_cast<void*>(rowp), static_cast<void*>(scr), static_cast<void*>(tiles), static_cast<void*>(xd),
-                  static_cast<void*>(a), static_cast<void*>(h), static_cast<void*>(y)})
-    sycl::free(p, q);
-  xmx::free_expert_table(q, tab_gu);
-  xmx::free_expert_table(q, tab_dn);
-  for (auto& w : gu) xmx::free_weight(q, w);
-  for (auto& w : dn) xmx::free_weight(q, w);
-}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -742,38 +474,35 @@ int main(int argc, char** argv) {
             xmx::free_weight(q, mat.w);
           }
         }
-        for (const Shape& s : kQwen) {
+        for (const Shape& s : kShapes) {
           if (s.n > 100000 || s.k % refs::block_k(f.type)) continue;
           Mat mat = make_mat(q, f, s.n, s.k, false);
           check_matmul(q, f, s.name, mat, rows, jw);
           xmx::free_weight(q, mat.w);
         }
-        for (xmx::Glu act : {xmx::Glu::Silu, xmx::Glu::Gelu}) check_glu(q, f, 2048, 1024, act, rows, jw);
-        check_grouped(q, f, jw);
+        for (xmx::Glu act : {xmx::Glu::Silu, xmx::Glu::Gelu}) check_glu(q, f, 2560, 2048, act, rows, jw);
         check_rows_of(q, f, jw);
         jw.end_array();
       }
       if (gemm) {
         jw.key(std::string("gemm_check_") + f.name).begin_array();
         const std::vector<int64_t> big = {64, 256, 2048};
-        for (const Shape& s : kQwen) {
+        for (const Shape& s : kShapes) {
           if (s.n > 100000 || s.k % refs::block_k(f.type)) continue;
           Mat mat = make_mat(q, f, s.n, s.k, false);
           check_matmul(q, f, s.name, mat, big, jw, true);
           xmx::free_weight(q, mat.w);
         }
-        for (xmx::Glu act : {xmx::Glu::Silu, xmx::Glu::Gelu}) check_glu(q, f, 2048, 1024, act, big, jw, true);
+        for (xmx::Glu act : {xmx::Glu::Silu, xmx::Glu::Gelu}) check_glu(q, f, 2560, 2048, act, big, jw, true);
         jw.end_array();
         jw.key(std::string("gemm_") + f.name).begin_array();
         bench_gemm(q, f, {2048, 4096}, jw);
-        for (int64_t tile : {64, 128}) grouped16(q, f, tile, tile == 64, jw);
         jw.end_array();
       }
       if (bench) {
         jw.key(std::string("decode_") + f.name).begin_array();
         bench_decode(q, f, rows, jw);
         if (f.format == xmx::WeightFormat::Q6_K) bench_q6_head(q, f, rows, jw);
-        bench_grouped(q, f, jw);
         jw.end_array();
       }
     }

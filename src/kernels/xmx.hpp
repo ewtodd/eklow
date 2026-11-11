@@ -131,45 +131,4 @@ enum class Glu : uint8_t { Gelu, Silu };
 // int8 path goes through `scratch` (fp32, m x n).
 void matmul_geglu(sycl::queue& q, const Activations& a, const Weight& w, Activations& out, float* scratch, Glu act = Glu::Gelu);
 
-// A layer's experts of one shape, as device tables of their tile and scale pointers (the experts
-// stay separate xmx::Weights; the grouped kernels index the tables by expert id).
-// An expert with null tiles is cold (it lives in host memory): the grouped GEMVs skip its pairs and
-// leave their output rows as they were.
-struct ExpertTable {
-  int64_t k = 0, n = 0, count = 0;
-  const uint8_t** tiles = nullptr;
-  const sycl::half** scales = nullptr;
-  WeightFormat format = WeightFormat::Q4_0;  // of every expert in the table
-};
-ExpertTable make_expert_table(sycl::queue& q, const std::vector<Weight>& experts);
-void free_expert_table(sycl::queue& q, ExpertTable& t);
-
-// Grouped one-row GEMVs on int8 activations: for pairs p < P, out[p][:] = W_{ids[p]} * a[p / row_div][:]
-// (ids on the device). out is [P][n], fp32.
-void matmul_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, const int32_t* ids, int64_t P,
-                    int64_t row_div, float* out);
-// The grouped gate_up (interleaved experts) then GeGLU into P-row int8 `out`, through `scratch` [P][n].
-void matmul_geglu_grouped(sycl::queue& q, const Activations& a, const ExpertTable& w, const int32_t* ids, int64_t P,
-                          int64_t row_div, Activations& out, float* scratch, Glu act = Glu::Gelu);
-
-// Decode MoE with the dense FFN's gate|up as three more "experts": the table's last three entries are
-// the dense gate|up's thirds (3 x n columns, each a contiguous range of tiles). Pairs 0..P-1 are the
-// experts' (activation row p / row_div of `a`), then 3 per dense row t of `ad` (t < rows_d). One grouped
-// GEMV, one GeGLU launch: the experts into `out` (P rows), the dense row t into `out_d` (3n wide).
-// scratch holds (P + 3 rows_d) rows of the third's width.
-void matmul_geglu_grouped_dense(sycl::queue& q, const Activations& a, const Activations& ad, const ExpertTable& w, const int32_t* ids,
-                                int64_t P, int64_t row_div, int64_t rows_d, Activations& out, Activations& out_d, float* scratch,
-                                Glu act = Glu::Gelu);
-
-// Grouped fp16 GEMMs for prefill (the MoE's experts over all their tokens at once). `a` holds the
-// rows sorted by expert in the fp16 activation layout (act16_index, width w.k), in row tiles of
-// `tile_rows` (32, 64 or 128) that each belong to one expert: `tiles` is the list fast::moe_group
-// builds. The grid is sized for max_tiles; groups past the list exit. matmul_grouped16 writes fp32
-// out[row][n]; the GeGLU form (w interleaved gate_up) writes fp16 activations of width n/2 to `out`
-// in the same layout. Rows of a tile past its expert's count hold garbage that nothing reads.
-void matmul_grouped16(sycl::queue& q, const sycl::half* a, const ExpertTable& w, const int32_t* tiles, int64_t max_tiles,
-                      int64_t tile_rows, float* out);
-void matmul_geglu_grouped16(sycl::queue& q, const sycl::half* a, const ExpertTable& w, const int32_t* tiles, int64_t max_tiles,
-                            int64_t tile_rows, sycl::half* out, Glu act = Glu::Gelu);
-
 }  // namespace eklow::xmx

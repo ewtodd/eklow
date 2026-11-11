@@ -205,18 +205,6 @@ void gemv_any(sycl::queue& q, const Activations& a, const Weight& w, float* out)
   }
 }
 
-void gemv_grouped_any(sycl::queue& q, const Activations& a, const Activations* ad, const ExpertTable& w, const int32_t* ids, int64_t P,
-                      int64_t pe, int64_t row_div, float* out) {
-  switch (w.format) {
-    case WeightFormat::Q8_0I: return gemv_grouped<WeightFormat::Q8_0I>(q, a, ad, w, ids, P, pe, row_div, out);
-    case WeightFormat::Q4_K: return gemv_grouped<WeightFormat::Q4_K>(q, a, ad, w, ids, P, pe, row_div, out);
-    case WeightFormat::Q5_K: return gemv_grouped<WeightFormat::Q5_K>(q, a, ad, w, ids, P, pe, row_div, out);
-    case WeightFormat::Q6_K: return gemv_grouped<WeightFormat::Q6_K>(q, a, ad, w, ids, P, pe, row_div, out);
-    case WeightFormat::IQ4_XS: return gemv_grouped<WeightFormat::IQ4_XS>(q, a, ad, w, ids, P, pe, row_div, out);
-    default: throw std::runtime_error("xmx: no grouped decode GEMV for this weight format");
-  }
-}
-
 }  // namespace fmt
 
 }  // namespace eklow::xmx

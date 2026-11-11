@@ -10,7 +10,7 @@ root=$(git rev-parse --show-toplevel)
 bc=$(dirname "$(dirname "$(command -v clang++)")")/lib/dpcpp-7/sycl/libsycl-nativecpu_utils.bc
 clang++ -c "$bc" -o "$out/nativecpu_utils.o" 2>/dev/null
 clang++ -std=gnu++20 -O2 -fsycl -fsycl-targets=native_cpu -DEKLOW_HOST_NO_FP16 -I"$root/src" -Wno-deprecated-declarations \
-  "$root"/src/kernels/ref.cpp "$root"/src/kernels/ref_dflash.cpp "$root"/src/model/dflash2.cpp "$root"/src/model/gguf.cpp \
+  "$root"/src/kernels/ref.cpp "$root"/src/kernels/ref_dflash.cpp "$root"/src/model/dflash2.cpp "$root"/src/model/gguf.cpp "$root"/src/core/json_value.cpp "$root"/src/core/json.cpp \
   "$root"/src/serve/spec.cpp "$root"/src/serve/sampler.cpp "$root"/tools/dflash_test/host_test.cpp "$out/nativecpu_utils.o" \
   -o "$out/eklow-dflash-host"
 echo "built $out/eklow-dflash-host"

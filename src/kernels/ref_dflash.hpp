@@ -1,7 +1,6 @@
-// Reference kernels of the DFlash 2 draft (src/model/dflash2.*): plain SYCL, fp32, like ref.hpp's. They are the
-// draft's own operations (the grouped dynamic convolution, attention over explicit key ranges, the top-k of a
-// logits row, the selector's lattice); the rest of the reference forward uses ref.hpp's kernels. Like those they only
-// enqueue, on an in-order queue.
+// Reference kernels of the DFlash draft (src/model/dflash2.*): plain SYCL, fp32, like ref.hpp's. They are the draft's own
+// operations (attention over explicit key ranges, the top-k of a logits row); the rest of the reference forward uses
+// ref.hpp's kernels. Like those they only enqueue, on an in-order queue.
 #pragma once
 
 #include <sycl/sycl.hpp>
@@ -12,13 +11,6 @@
 
 namespace eklow::ref {
 
-// model.py's GroupedDynamicCausalConv (side `side` of `base` [2][kernel][hidden]), over `rows` rows that are blocks of
-// `block_len` consecutive tokens (a tap never reads across a block's start):
-//   out[t][c] = sum_tap (base[side][tap][c] + dyn[t][side * kernel * groups + tap * groups + c / group]) * x[t - tap][c]
-// for taps with t - tap in the same block; dyn is [rows][2 * kernel * groups].
-void grouped_conv(sycl::queue& q, const float* x, const float* dyn, const float* base, int side, int64_t rows, int64_t block_len,
-                  int64_t hidden, int64_t kernel, int64_t group, float* out);
-
 // Attention of n_tok queries over keys K, V [n_keys][n_head_kv][head_dim] whose first row is position key0: query t
 // (n_head heads, head h reads K/V head h / (n_head / n_head_kv)) sees the keys at positions lo[t]..hi[t] inclusive
 // (device arrays), softmax(scale q.k) v. Out [n_tok][n_head][head_dim].
@@ -28,14 +20,6 @@ void attention_ranges(sycl::queue& q, const float* Q, const float* K, const floa
 // The k largest of each of `rows` rows of n values: ids[r][0..k) and vals[r][0..k) by descending value, equal values
 // by ascending id.
 void topk_rows(sycl::queue& q, const float* x, int64_t rows, int64_t n, int64_t k, int32_t* ids, float* vals);
-
-// The selector's lattice for P positions of top-k candidates (model.py's CandidateSelector.select, without the walk):
-//   out[i][a][b] = unary[i][b] + sum_r pred[i][a][r] * gate[i][r] * succ[i][b][r]
-// pred [P][k][rank] are the predecessor codebook's rows of the previous position's candidates (position 0: row 0 of
-// its slice holds the anchor's, and is used for every a), succ [P][k][rank] those of this position's candidates,
-// gate [P][rank] the hidden projection, unary [P][k] the candidates' logits. out [P][k][k].
-void selector_lattice(sycl::queue& q, const float* unary, const float* gate, const float* pred, const float* succ, int64_t P,
-                      int64_t k, int64_t rank, float* out);
 
 // out = silu(gate) * up, silu(x) = x / (1 + exp(-x)) (SwiGLU)
 void silu_mul(sycl::queue& q, const float* gate, const float* up, int64_t n, float* out);

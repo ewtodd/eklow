@@ -1019,10 +1019,6 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
     // 8 query heads over 2 K/V heads of 256 in fp16: Bolt's sliding layers (a ring) and Qwen3.5-0.8B's (vega's reader,
     // src/vega/reader.hpp: a cache of one prompt).
     run<256, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
-  } else if (c.head_dim == 256 && group == 8) {
-    // Qwen3.6's attention layers: 16 query heads over 2 K/V heads of 256.
-    if (c.int8()) run<256, 8, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
-    else run<256, 8, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   } else if (c.head_dim == 512 && group == 16) {
     if (c.int8()) run<512, 16, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
     else run<512, 16, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);

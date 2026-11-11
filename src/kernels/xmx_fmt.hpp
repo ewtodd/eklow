@@ -504,11 +504,6 @@ struct GemmMetaOf<F, true> {
 // dispatch over them (xmx_fmt.cpp).
 template <WeightFormat F>
 void gemv(sycl::queue& q, const Activations& a, const Weight& w, float* out);
-template <WeightFormat F>
-void gemv_grouped(sycl::queue& q, const Activations& a, const Activations* ad, const ExpertTable& w, const int32_t* ids, int64_t P,
-                  int64_t pe, int64_t row_div, float* out);
 void gemv_any(sycl::queue& q, const Activations& a, const Weight& w, float* out);
-void gemv_grouped_any(sycl::queue& q, const Activations& a, const Activations* ad, const ExpertTable& w, const int32_t* ids, int64_t P,
-                      int64_t pe, int64_t row_div, float* out);
 
 }  // namespace eklow::xmx::fmt

@@ -1,14 +1,12 @@
-// eklow-ref-run: eklow's reference forward pass (qwen35moe or gemma4, fp32) over one prompt, written in eklow-oracle's
+// eklow-ref-run: eklow's reference forward pass (Gemma 4 E4B, fp32) over one prompt, written in eklow-oracle's
 // dump format so tools/ref/compare_dumps.py can set the two side by side.
 //
 //   eklow-ref-run --model GGUF --out DIR (--tokens-json FILE | --tokens 2,105,...)
-//                 [--tensors PREFIX,...] [--logits-last N] [--routing FILE]
+//                 [--tensors PREFIX,...] [--logits-last N]
 //
 // --tokens-json reads the ids from an oracle's tokens.json, so both runs see the same tokens.
 // --tensors: graph names by prefix, a trailing $ for an exact name (default l_out-,result_norm); --logits-last: only the last N
 // positions' logits (default all).
-// --routing: also record each token's selected expert ids (MoE models) to FILE as raw int32
-// little-endian, layer by layer and token by token, with a FILE.json sidecar.
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -22,7 +20,6 @@
 #include "core/json.hpp"
 #include "core/json_value.hpp"
 #include "model/gemma4.hpp"
-#include "model/qwen35.hpp"
 #include "model/gguf.hpp"
 #include "rt/device.hpp"
 
@@ -45,7 +42,7 @@ double since(std::chrono::steady_clock::time_point t0) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, out, tokens_json, tokens_arg, routing_file;
+  std::string model, out, tokens_json, tokens_arg;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   int64_t logits_last = 0;
   for (int i = 1; i < argc; ++i) {
@@ -57,10 +54,9 @@ int main(int argc, char** argv) {
     else if (a == "--tokens") tokens_arg = next();
     else if (a == "--tensors") prefixes = split(next(), ',');
     else if (a == "--logits-last") logits_last = std::atoll(next().c_str());
-    else if (a == "--routing") routing_file = next();
     else {
       std::fprintf(stderr, "usage: eklow-ref-run --model GGUF --out DIR (--tokens-json FILE | --tokens IDS) "
-                           "[--tensors PREFIX,...] [--logits-last N] [--routing FILE]\n");
+                           "[--tensors PREFIX,...] [--logits-last N]\n");
       return 2;
     }
   }
@@ -81,23 +77,11 @@ int main(int argc, char** argv) {
     auto t0 = std::chrono::steady_clock::now();
     auto f = gguf::File::open(model);
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
-    const bool gemma = f.at("general.architecture").as_string() == "gemma4";
-    if (gemma && !routing_file.empty()) throw std::runtime_error("--routing: Gemma 4 E4B has no experts");
-    std::optional<model::Qwen35Config> qcfg;
-    std::optional<model::Qwen35Weights> qw;
-    std::optional<model::Gemma4Config> gcfg;
-    std::optional<model::Gemma4Weights> gw;
-    if (gemma) {
-      gcfg = model::Gemma4Config::from_gguf(f);
-      gw.emplace(model::Gemma4Weights::upload(f, *gcfg, q));
-    } else {
-      // Layers are streamed to the card one at a time; the embedding, head and output norm stay on it.
-      qcfg = model::Qwen35Config::from_gguf(f);
-      qw.emplace(model::Qwen35Weights::upload(f, *qcfg, q));
-    }
-    const int n_vocab = gemma ? gcfg->n_vocab : qcfg->n_vocab, n_layer = gemma ? gcfg->n_layer : qcfg->n_layer,
-              n_used = gemma ? 0 : qcfg->n_expert_used;
-    std::printf("loaded %.2f GiB onto %s in %.1f s\n", (gemma ? gw->bytes : qw->bytes) / 1073741824.0,
+    if (f.at("general.architecture").as_string() != "gemma4") throw std::runtime_error(model + ": not a gemma4 GGUF");
+    const model::Gemma4Config gcfg = model::Gemma4Config::from_gguf(f);
+    const model::Gemma4Weights gw = model::Gemma4Weights::upload(f, gcfg, q);
+    const int n_vocab = gcfg.n_vocab;
+    std::printf("loaded %.2f GiB onto %s in %.1f s\n", gw.bytes / 1073741824.0,
                 q.get_device().get_info<sycl::info::device::name>().c_str(), since(t0));
 
     json::Writer index;
@@ -123,16 +107,8 @@ int main(int argc, char** argv) {
     };
 
     t0 = std::chrono::steady_clock::now();
-    std::vector<int32_t> routing;
-    auto logits = gemma ? model::reference_forward(q, *gcfg, *gw, tokens, logits_last, &sink)
-                        : model::reference_forward(q, *qcfg, *qw, tokens, logits_last, &sink, routing_file.empty() ? nullptr : &routing);
+    auto logits = model::reference_forward(q, gcfg, gw, tokens, logits_last, &sink);
     std::printf("reference forward over %zu tokens: %.1f s\n", tokens.size(), since(t0));
-    if (!routing_file.empty()) {
-      std::ofstream(routing_file, std::ios::binary)
-          .write(reinterpret_cast<const char*>(routing.data()), std::streamsize(routing.size() * sizeof(int32_t)));
-      std::ofstream(routing_file + ".json") << "{\"layers\": " << n_layer << ", \"tokens\": "
-                                            << tokens.size() << ", \"used\": " << n_used << "}\n";
-    }
     std::ofstream(out + "/logits.f32", std::ios::binary)
         .write(reinterpret_cast<const char*>(logits.data()), std::streamsize(logits.size() * sizeof(float)));
     index.end_array().kv("logits_rows", int64_t(logits.size() / size_t(n_vocab))).end_object();

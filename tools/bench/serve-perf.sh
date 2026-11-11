@@ -2,7 +2,7 @@
 # The README's performance numbers: eklow-server with production flags under the GPU lock, then serve_perf.py's depth
 # and GSM8K runs against it; the server's startup lines and both results land in OUT. Run on fiona from a built tree.
 #   tools/bench/serve-perf.sh OUT MODEL_GGUF ALIAS [eklow-server flags]
-#   tools/bench/serve-perf.sh ~/eklow-bench/qwen MODEL.gguf qwen36 --expert-profile data/qwen36-experts.json
+#   tools/bench/serve-perf.sh ~/eklow-bench/bolt Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf nemotron-3.5-bolt-e4b --draft DRAFT.gguf
 # DOCS (default ~/eklow-bench/data) holds qwen-DEPTH.txt and gsm48.jsonl; DEPTHS overrides serve_perf.py's depths.
 set -euo pipefail
 # A second server beside fiona's production eklow service (eklow-<instance>.service) starves it into UR_RESULT_ERROR_OUT_OF_RESOURCES on
@@ -18,8 +18,8 @@ mkdir -p "$out"
 flock ~/eklow-perf/gpu.lock bash -c '
   set -euo pipefail
   out=$1; model=$2; alias=$3; docs=$4; port=$5; shift 5
-  nix develop path:. -c ./build/eklow-server --model "$model" --alias "$alias" --port $port --slots 2 --ctx 262144 \
-    --kv-int8 --embed-model ~/models/embeddinggemma-2-Q8_0.gguf --embed-port $((port + 1)) "$@" >"$out/serve.log" 2>&1 &
+  nix develop path:. -c ./build/eklow-server --model "$model" --alias "$alias" --port $port --slots 2 --ctx 65536 \
+    --embed-model ~/models/embeddinggemma-2-Q8_0.gguf --embed-port $((port + 1)) "$@" >"$out/serve.log" 2>&1 &
   srv=$!
   trap "kill $srv 2>/dev/null; wait $srv 2>/dev/null" EXIT
   for i in $(seq 600); do curl -sf localhost:$port/health >/dev/null && break; sleep 1; done

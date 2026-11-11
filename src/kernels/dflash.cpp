@@ -37,19 +37,6 @@ void heads(sycl::queue& q, const float* src, int64_t ld, int64_t n_tok, int nq, 
   });
 }
 
-void conv(sycl::queue& q, const float* x, const float* dyn, const float* base, int side, int64_t rows, int64_t block_len, int64_t hidden,
-          int64_t group, float* out, bool accumulate) {
-  const int64_t groups = hidden / group;
-  q.parallel_for(sycl::range<2>(size_t(rows), size_t(hidden)), [=](sycl::id<2> id) {
-    const int64_t t = int64_t(id[0]), c = int64_t(id[1]);
-    const bool has_prev = t % block_len != 0;
-    const float* d = dyn + t * 4 * groups + int64_t(side) * 2 * groups + c / group;  // kernel size 2: [side][tap][group]
-    float acc = (base[(int64_t(side) * 2) * hidden + c] + d[0]) * x[t * hidden + c];
-    if (has_prev) acc += (base[(int64_t(side) * 2 + 1) * hidden + c] + d[groups]) * x[(t - 1) * hidden + c];
-    out[t * hidden + c] = accumulate ? out[t * hidden + c] + acc : acc;
-  });
-}
-
 int64_t topk_chunks(int64_t n) { return (n + kChunk - 1) / kChunk; }
 
 namespace {
@@ -119,13 +106,6 @@ void topk16(sycl::queue& q, const float* x, int64_t rows, int64_t n, int32_t* sc
       for (int j = 0; j < kPer; ++j)
         if (id[j] == mi && v[j] == m) v[j] = kNegInf, id[j] = std::numeric_limits<int32_t>::max();
     }
-  });
-}
-
-void predecessor_ids(sycl::queue& q, const int32_t* cand, const int32_t* anchors, int64_t blocks, int64_t P, int32_t* ids) {
-  q.parallel_for(sycl::range<3>(size_t(blocks), size_t(P), kTop), [=](sycl::id<3> id) {
-    const int64_t b = int64_t(id[0]), i = int64_t(id[1]), a = int64_t(id[2]);
-    ids[(b * P + i) * kTop + a] = i == 0 ? anchors[b] : cand[(b * P + i - 1) * kTop + a];
   });
 }
 

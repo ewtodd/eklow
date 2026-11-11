@@ -38,24 +38,20 @@ function(eklow_sycl target)
   target_link_options(${target} PRIVATE -fsycl -fsycl-targets=${EKLOW_SYCL_TARGETS})
 endfunction()
 
-# Serving text layer: the tokenizer (and, later, the chat template and output parser). No device code.
+# Serving text layer: Gemma 4's tokenizer, chat template and output parser; Qwen's tokenizer (vega's reader and the reranker). No device code.
 add_library(eklow_text STATIC
   src/text/chat_gemma4.cpp
-  src/text/chat_qwen36.cpp
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
   src/text/output_parser_gemma4.cpp
-  src/text/output_parser_qwen.cpp
   src/text/tokenizer_qwen.cpp
-  src/text/tool_schema.cpp
   src/text/unicode.cpp
 )
 target_link_libraries(eklow_text PUBLIC eklow_host)
 
-# Images for the vision encoders (EmbeddingGemma 2's tower, Qwen3-VL's): decoding (stb_image, vendored) and preparation. No device code.
+# Images for the Gemma vision towers (Bolt's and EmbeddingGemma 2's): decoding (stb_image, vendored) and preparation. No device code.
 add_library(eklow_image STATIC
   src/image/gemma4_image.cpp
-  src/image/qwen3vl_image.cpp
   src/image/stb_image.cpp
 )
 target_include_directories(eklow_image PUBLIC src third_party)
@@ -67,12 +63,6 @@ target_link_libraries(eklow-image-prep PRIVATE eklow_image)
 add_executable(eklow-tok tools/tok/main.cpp)
 target_link_libraries(eklow-tok PRIVATE eklow_text)
 
-add_executable(eklow-chat tools/chat/main.cpp)
-target_link_libraries(eklow-chat PRIVATE eklow_text)
-
-add_executable(eklow-parse tools/parse/main.cpp)
-target_link_libraries(eklow-parse PRIVATE eklow_text)
-
 # Device runtime: picking the card. SYCL plus Level Zero.
 add_library(eklow_rt STATIC src/rt/device.cpp src/rt/copy_engine.cpp)
 target_include_directories(eklow_rt PUBLIC src)
@@ -83,7 +73,6 @@ eklow_sycl(eklow_rt)
 add_library(eklow_model STATIC
   src/kernels/attention.cpp
   src/kernels/fast.cpp
-  src/kernels/gdn.cpp
   src/kernels/dense.cpp
   src/kernels/gdn_seq.cpp
   src/kernels/gemma_fast.cpp
@@ -99,16 +88,13 @@ add_library(eklow_model STATIC
   src/model/embed_gemma2.cpp
   src/model/vision_gemma4v.cpp
   src/model/vision_gemma4v_fast.cpp
-  src/model/vision_qwen3vl.cpp
-  src/model/vision_qwen3vl_fast.cpp
   src/kernels/vision_attn.cpp
-  src/model/qwen35.cpp
   src/model/gemma4.cpp
 )
 target_link_libraries(eklow_model PUBLIC eklow_host eklow_image eklow_rt)
 eklow_sycl(eklow_model)
 
-# The Qwen weight formats' kernels, checked against ggml's dequantization and timed (TASK qwen/mm).
+# The weight formats' kernels on the matrix units, checked against ggml's dequantization and timed.
 add_executable(eklow-qfmt-test tools/qfmt_test/main.cpp)
 target_link_libraries(eklow-qfmt-test PRIVATE eklow_model)
 eklow_sycl(eklow-qfmt-test)
@@ -121,17 +107,9 @@ add_executable(eklow-vision tools/vision/main.cpp)
 target_link_libraries(eklow-vision PRIVATE eklow_model)
 eklow_sycl(eklow-vision)
 
-add_executable(eklow-vision-qwen tools/vision/qwen_main.cpp)
-target_link_libraries(eklow-vision-qwen PRIVATE eklow_model)
-eklow_sycl(eklow-vision-qwen)
-
 add_executable(eklow-attn-test tools/attn_test/main.cpp)
 target_link_libraries(eklow-attn-test PRIVATE eklow_model)
 eklow_sycl(eklow-attn-test)
-
-add_executable(eklow-gdn-test tools/gdn_test/main.cpp)
-target_link_libraries(eklow-gdn-test PRIVATE eklow_model)
-eklow_sycl(eklow-gdn-test)
 
 add_executable(eklow-dequant-test tools/dequant_test/main.cpp)
 target_link_libraries(eklow-dequant-test PRIVATE eklow_model)
@@ -168,17 +146,8 @@ target_include_directories(eklow-vega PRIVATE ${HTTPLIB_INCLUDE_DIR})
 target_link_libraries(eklow-vega PRIVATE eklow_vega Threads::Threads)
 eklow_sycl(eklow-vega)
 
-# The serving forward pass: KV cache, batched steps over several sequences.
-add_library(eklow_engine STATIC src/engine/engine.cpp)
-target_link_libraries(eklow_engine PUBLIC eklow_model eklow_cpu)
-eklow_sycl(eklow_engine)
-
-add_executable(eklow-engine-run tools/engine_run/main.cpp)
-target_link_libraries(eklow-engine-run PRIVATE eklow_engine)
-eklow_sycl(eklow-engine-run)
-
-# Gemma 4 E4B (Nemotron-3.5-Bolt-E4B) beside Qwen3.6: its engine and tools under *_gemma4 names and the gemma4 inner
-# namespace; eklow-server dispatches on the GGUF's architecture.
+# Gemma 4 E4B (Nemotron-3.5-Bolt-E4B)'s serving forward pass: paged K/V, batched steps over several sequences, verify blocks.
+# Its engine and tools keep the *_gemma4 names and the gemma4 inner namespace of when Qwen3.6's stood beside them.
 add_library(eklow_engine_gemma4 STATIC src/engine/engine_gemma4.cpp)
 target_link_libraries(eklow_engine_gemma4 PUBLIC eklow_model)
 eklow_sycl(eklow_engine_gemma4)
@@ -191,17 +160,7 @@ add_executable(eklow-engine-bench-gemma4 tools/engine_bench_gemma4/main.cpp)
 target_link_libraries(eklow-engine-bench-gemma4 PRIVATE eklow_engine_gemma4)
 eklow_sycl(eklow-engine-bench-gemma4)
 
-add_executable(eklow-engine-bench tools/engine_bench/main.cpp)
-target_link_libraries(eklow-engine-bench PRIVATE eklow_engine)
-eklow_sycl(eklow-engine-bench)
-
 # The tool-call grammar: host code over the vocabulary, tested against the output parser.
-add_library(eklow_grammar STATIC src/serve/tool_grammar_qwen.cpp)
-target_link_libraries(eklow_grammar PUBLIC eklow_text)
-
-add_executable(eklow-grammar-test-qwen tools/grammar_test/main.cpp)
-target_link_libraries(eklow-grammar-test-qwen PRIVATE eklow_grammar)
-
 add_library(eklow_grammar_gemma4 STATIC src/serve/tool_grammar_gemma4.cpp)
 target_link_libraries(eklow_grammar_gemma4 PUBLIC eklow_text)
 
@@ -214,83 +173,45 @@ target_link_libraries(eklow-chat-gemma4 PRIVATE eklow_text)
 add_executable(eklow-parse-gemma4 tools/parse_gemma4/main.cpp)
 target_link_libraries(eklow-parse-gemma4 PRIVATE eklow_text)
 
-# Serving: the request layer (OpenAI surface, Qwen3.6's chat template and tokenizer), the scheduler (continuous batching,
-# speculative decoding with a DFlash 2 draft, snapshots of the recurrent state) and the server. The sampler and the
-# acceptance are eklow_spec's.
-add_library(eklow_serve STATIC src/serve/openai.cpp src/serve/scheduler.cpp)
-target_link_libraries(eklow_serve PUBLIC eklow_spec eklow_grammar eklow_text eklow_engine)
-eklow_sycl(eklow_serve)
-
-# Gemma 4's request layer and scheduler (the sampler is eklow_spec's, shared).
+# Serving: the request layer (OpenAI surface, Gemma 4's chat template), the scheduler (continuous batching, speculative
+# decoding with a DFlash draft) and the server. The sampler and the acceptance are eklow_spec's.
 add_library(eklow_serve_gemma4 STATIC src/serve/openai_gemma4.cpp src/serve/scheduler_gemma4.cpp)
 target_link_libraries(eklow_serve_gemma4 PUBLIC eklow_spec eklow_grammar_gemma4 eklow_text eklow_engine_gemma4)
 eklow_sycl(eklow_serve_gemma4)
 
-# One server binary: tools/server/main.cpp is the Qwen server and the dispatch on the GGUF's architecture,
-# tools/server/gemma4_main.cpp the Gemma 4 server.
 add_executable(eklow-prompt-gemma4 tools/prompt_gemma4/main.cpp)
 target_link_libraries(eklow-prompt-gemma4 PRIVATE eklow_serve_gemma4)
 eklow_sycl(eklow-prompt-gemma4)
 
-add_executable(eklow-server tools/server/main.cpp tools/server/gemma4_main.cpp)
+add_executable(eklow-server tools/server/main.cpp)
 target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
-target_link_libraries(eklow-server PRIVATE eklow_serve eklow_serve_gemma4 eklow_vega eklow_rerank Threads::Threads)
+target_link_libraries(eklow-server PRIVATE eklow_serve_gemma4 eklow_vega eklow_rerank Threads::Threads)
 eklow_sycl(eklow-server)
 # The streams' keep-alive (tools/server/keepalive.hpp), host only.
 add_executable(eklow-keepalive-test tools/server/keepalive_test.cpp)
 target_include_directories(eklow-keepalive-test PRIVATE ${HTTPLIB_INCLUDE_DIR})
 target_link_libraries(eklow-keepalive-test PRIVATE Threads::Threads)
 
-add_executable(eklow-prompt tools/prompt/main.cpp)
-target_link_libraries(eklow-prompt PRIVATE eklow_serve)
-eklow_sycl(eklow-prompt)
-# parse_chat with --verification on (Sage's template), host only: eklow-verification-test VOCAB_GGUF.
-add_executable(eklow-verification-test tools/prompt/verification_test.cpp)
-target_link_libraries(eklow-verification-test PRIVATE eklow_serve)
-eklow_sycl(eklow-verification-test)
 add_executable(eklow-gguf tools/gguf/main.cpp)
 target_link_libraries(eklow-gguf PRIVATE eklow_host)
-
-# CPU GEMVs for the cold experts (TASK: m6/cpu-experts): Q4_0 in q4_gemv.cpp, the Qwen formats in qgemv.cpp. Plain host
-# code, AVX-VNNI, so the flags are per source file and there is no -fsycl.
-add_library(eklow_cpu STATIC src/cpu/q4_gemv.cpp src/cpu/qgemv.cpp)
-target_include_directories(eklow_cpu PUBLIC src)
-target_compile_options(eklow_cpu PRIVATE -O3 -mavx2 -mfma -mf16c -mavxvnni)
-target_link_libraries(eklow_cpu PUBLIC Threads::Threads)
 
 # eklow-probe: what the card offers (memory, transfers, launch/sync and wake latency).
 add_executable(eklow-probe tools/probe/probe.cpp)
 target_link_libraries(eklow-probe PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-probe)
 
-# eklow-xmx-bench: dpas layouts checked against the CPU, XMX throughput, the Q4_0 inner loops and
-add_executable(eklow-copy-bench tools/copy_bench/main.cpp)
-add_executable(eklow-tax tools/copy_bench/tax.cpp)
-target_link_libraries(eklow-tax PRIVATE eklow_model)
-eklow_sycl(eklow-tax)
-target_link_libraries(eklow-copy-bench PRIVATE eklow_model)
-eklow_sycl(eklow-copy-bench)
-
-# VRAM read bandwidth.
+# eklow-xmx-bench: dpas layouts checked against the CPU, XMX throughput, the Q4_0 inner loops and VRAM read bandwidth.
 add_executable(eklow-xmx-bench tools/xmx_bench/main.cpp)
 target_link_libraries(eklow-xmx-bench PRIVATE eklow_host eklow_rt)
 eklow_sycl(eklow-xmx-bench)
 
-install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-chat eklow-parse eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-gdn-test eklow-embed eklow-vision eklow-vision-qwen eklow-image-prep eklow-engine-run eklow-engine-bench eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-prompt-gemma4 eklow-server eklow-vega eklow-rerank eklow-prompt eklow-grammar-test-qwen RUNTIME DESTINATION bin)
-# The Qwen finetunes' routing profiles, for eklow-server --expert-profile (which experts stay on the card).
+install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-embed eklow-vision eklow-image-prep eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-prompt-gemma4 eklow-server eklow-vega eklow-rerank RUNTIME DESTINATION bin)
 install(TARGETS eklow-grammar-test-gemma4 eklow-chat-gemma4 eklow-parse-gemma4 RUNTIME DESTINATION bin)
-install(FILES data/qwen36-experts.json data/ornith-1.5-experts.json DESTINATION share/eklow)
 
-# The CPU GEMVs of the Qwen formats for the cold experts, checked and timed (TASK qwen/mm).
-add_executable(eklow-cpu-qgemv-test tools/cpu_qgemv_test/main.cpp)
-target_compile_options(eklow-cpu-qgemv-test PRIVATE -O2 -mavx2 -mf16c)
-target_link_libraries(eklow-cpu-qgemv-test PRIVATE eklow_cpu eklow_host)
-install(TARGETS eklow-cpu-qgemv-test RUNTIME DESTINATION bin)
-
-# DFlash 2 drafting and speculative decoding (TASK qwen/dflash): the draft's kernels and model, the acceptance of a
-# drafted block, and their checks. Appended here so as not to touch the lists above.
+# DFlash drafting and speculative decoding: the draft's kernels and model, the acceptance of a drafted block, and their
+# checks.
 target_sources(eklow_model PRIVATE src/kernels/ref_dflash.cpp src/kernels/dflash.cpp src/model/dflash2.cpp src/model/dflash2_fast.cpp)
-# The sampler and the acceptance of a drafted block (eklow_serve links them).
+# The sampler and the acceptance of a drafted block (eklow_serve_gemma4 links them).
 add_library(eklow_spec STATIC src/serve/sampler.cpp src/serve/spec.cpp)
 target_link_libraries(eklow_spec PUBLIC eklow_host)
 
@@ -310,11 +231,7 @@ target_link_libraries(eklow-dflash-test PRIVATE eklow_model eklow_spec)
 eklow_sycl(eklow-dflash-test)
 install(TARGETS eklow-dflash-test RUNTIME DESTINATION bin)
 
-# The scheduler's K/V pool decisions (src/serve/kv_pool.hpp), host only.
-add_executable(eklow-kvpool-test tools/server/kv_pool_test.cpp)
-target_include_directories(eklow-kvpool-test PRIVATE src)
-
 # The /metrics rendering (tools/server/metrics.hpp), host only (the scheduler's header pulls in the engine's, so it builds like the server).
 add_executable(eklow-metrics-test tools/server/metrics_test.cpp)
-target_link_libraries(eklow-metrics-test PRIVATE eklow_serve)
+target_link_libraries(eklow-metrics-test PRIVATE eklow_serve_gemma4)
 eklow_sycl(eklow-metrics-test)

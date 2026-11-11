@@ -1,8 +1,6 @@
-// The serving kernels of the qwen35moe engine (Qwen3.6-35B-A3B) that kernels/fast.hpp does not have: the gated attention's
-// heads, the sigmoid gate and the quantization for the output projection, the residual and the norm of the MoE's input, the
-// MoE's tail (routed sum, shared expert under its sigmoid gate, residual, the next layer's norm), and a row gather for the
-// captured hidden states and the logits rows. They only enqueue; the queue must be in order. Checked end to end through the
-// engine's dumps against the reference forward (eklow-engine-run).
+// Two kernels of the qwen35moe engine (Qwen3.6-35B-A3B, removed 2026-11-11) that outlived it: the gated attention's heads, which
+// vega's reader (Qwen3.5-0.8B, the same attention) runs, and a row gather, which Bolt's engine uses for the hidden states its
+// draft reads. They only enqueue; the queue must be in order.
 #pragma once
 
 #include <sycl/sycl.hpp>
@@ -25,37 +23,7 @@ void attn_heads(sycl::queue& q, const float* qkv, int64_t n_tok, int64_t n_head,
                 const float* q_norm, const float* k_norm, float eps, const int32_t* pos, const int* sections, const float* inv_freq,
                 float* Q, float* K, float* V, float* G);
 
-// act = quantize(x * sigmoid(gate)) for rows of `cols` (a multiple of 1024), in the form matmul takes for `rows` rows.
-void gate_quant(sycl::queue& q, const float* x, const float* gate, int64_t rows, int64_t cols, xmx::Activations& act);
-
-// x_out = x + o (o null: x_out is x and is not written), then n = rmsnorm(x_out) * w, written to h_out (if given) and
-// quantized into act (if given). cols a multiple of 128, at most 8192. x_out may be x.
-void add_norm_quant(sycl::queue& q, const float* o, const float* x, const float* w, float eps, int64_t rows, int64_t cols,
-                    float* x_out, xmx::Activations* act, float* h_out);
-
-// The layer's tail, per row: s = sum_i weights[t][i] * y[t * n_used + i] (y given: decode's expert outputs, [pair][cols]) or
-// moe[t] (the prefill's already summed rows); x_out = x2 + s + sigmoid(sgate[t * ld_sg]) * shared[t]; and with w_next the
-// next layer's norm of x_out into h_out (if given) and act (if given). x_out may not be x2.
-void moe_tail(sycl::queue& q, const float* x2, const float* y, const float* weights, int64_t n_used, const float* moe,
-              const float* sgate, int64_t ld_sg, const float* shared, const float* w_next, float eps, int64_t rows, int64_t cols,
-              float* x_out, xmx::Activations* act, float* h_out);
-
-// Layer-major prefill's accumulation into the residual stream, in place, per element:
-//   x[t] += (sum_i weights[t * n_used + i] * y[rows[t * n_used + i]]  over the pairs with a row >= 0)
-//         + extra[extra_row[t]]                                         (extra_row[t] >= 0)
-//         + sigmoid(sgate[t * ld_sg]) * shared[t]
-// y / weights / rows, extra / extra_row and shared / sgate are each optional (null: that part is left out). One pass for the hot
-// experts and the shared expert, one for each wave of streamed experts, one for the CPU's share.
-void moe_accumulate(sycl::queue& q, float* x, const float* y, const float* weights, const int32_t* rows, int64_t n_used, const float* extra,
-                    const int32_t* extra_row, const float* shared, const float* sgate, int64_t ld_sg, int64_t n_tok, int64_t cols);
-
-// out[i] = half(x[i]), i < n.
-void to_half(sycl::queue& q, const float* x, int64_t n, sycl::half* out);
-
 // dst[r][col0 .. col0 + cols) = x[idx[r]][0 .. cols), r < n (dst rows are ld floats apart).
 void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t n, int64_t cols, float* dst, int64_t ld, int64_t col0);
-
-// dst[r][c] = src[r][c] for the columns [c0, c0 + n) of dst's rows, src rows `n` wide (assembles a matrix from parts).
-void copy_cols(sycl::queue& q, const float* src, int64_t rows, int64_t n, float* dst, int64_t ld, int64_t c0);
 
 }  // namespace eklow::qwenk
