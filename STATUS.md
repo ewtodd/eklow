@@ -5,6 +5,15 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
 
 ## Now (2026-11-03)
 
+- **Nemotron-3.5-Bolt-E4B on eklow, not deployed** (2026-11-10, branch `gemma/bolt-e4b`; DECISIONS 2026-11-10, six entries):
+  NVIDIA's post-trained Gemma 4 E4B, from the Q4_K_M file NVIDIA ships, beside Qwen3.6 in the same `eklow-server` (it dispatches
+  on `general.architecture`; the Gemma 4 engine, server and text layer back from `cc713a0`, dense, with per-layer inputs and
+  shared K/V). The fp32 reference matches transformers to KL 5e-8 at 16k; the engine sits inside transformers' own bf16 distance.
+  On fiona at production's shape (2 x 65,536 fp16, EmbeddingGemma 2 beside, 5.71 + 2.20 GiB): prefill 3,549 / 2,920 / 2,273 tok/s
+  at 8k / 32k / 60k, decode 44.8 / 39.3 / 35.6 tok/s plain and 90.8 / 87.9 / 64.6 with NVIDIA's DFlash draft (blocks of 8,
+  lossless by chi-square). Chat images through Google's E4B projector (the same tower) in 0.10 s. fiona's replay: 27 and 27 of 54
+  in two runs against llama.cpp CUDA's 32 of 54 (within noise, all of it in three house points). The module runs it as an instance
+  (`model`, `alias`, `port`; `draft`, `mmproj` as for Qwen). The owner deploys.
 - **Sage-A1.5 is ready to serve, not deployed** (2026-11-07, DECISIONS "Sage-A1.5 on eklow" and "Sage-A1.5's chat template"):
   `--chat-template sage` (recognised from the GGUF), `--verification on|off` (on only for conversations with system text);
   0 differences against Hugging Face on 28,017 cases. Its EKK8 is on Hugging Face (below), with KL 0.0127 at 4k against its Q8_0.
@@ -15,8 +24,8 @@ Live state, written as a handoff (2026-11-02). Design and targets: `DESIGN.md`; 
   layers, 256 routed experts of 512 + one shared, 8 used) with **DFlash 2** speculative decoding and **image input**
   (Qwen3-VL's encoder behind `--mmproj`). Two targets so far, same architecture: stock
   `Qwen/Qwen3.6-35B-A3B` and `ornith-ai/Ornith-1.5-35B-A3B`. `qwen/main` went into `main` on 2026-11-02.
-- **Gemma 4 was removed from eklow on 2026-11-07** (the owner: Qwen3.6 and its finetunes only, for now; DECISIONS 2026-11-07):
-  `eklow-server` refuses any GGUF whose architecture is not `qwen35moe`. EmbeddingGemma 2 (and its vision tower) stays. The
+- **Gemma 4 was removed from eklow on 2026-11-07** (the owner: Qwen3.6 and its finetunes only, for now; DECISIONS 2026-11-07),
+  and came back as Bolt on 2026-11-10 (above); until then `eklow-server` refused any GGUF whose architecture was not `qwen35moe`. EmbeddingGemma 2 (and its vision tower) stays. The
   last state of the 26B's engine, server, draft path and tools is `d9ffaf0` (the restore beside Qwen) and `9775e98` (its
   speculative path; z-lab's draft measured and dropped). The plain-DFlash draft code (per-layer sliding/full attention, tied
   head, softcap) stays, with its tests in `tools/dflash_test`.

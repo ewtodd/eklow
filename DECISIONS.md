@@ -2630,3 +2630,268 @@ strip as the same page cut off, the PNG as the "LLM+" logo, the second turn's pr
 same-size pictures told apart, the refusals unchanged. The text path is untouched (no `checkq`); `check-qwen.sh`
 against the oracle no longer applies to pictures the oracle letterboxes.
 
+## 2026-11-10 — Nemotron-3.5-Bolt-E4B: the model, and its reference forward against transformers
+
+The owner wants NVIDIA's Nemotron-3.5-Bolt-E4B (a post-trained Gemma 4 E4B, 64K context) to become fiona, the house's
+Signal assistant, in Sage-A1.5's place, served by eklow (no llama.cpp stopgap). Branch `gemma/bolt-e4b`, off `main` bff9d5f.
+
+**The model** (the BF16 repo's text_config; the GGUF says the same): 42 layers of hidden 2,560, a dense GeGLU of 10,240
+(tanh gelu), 8 query heads over 2 K/V heads; five sliding layers (window 512, head 256, RoPE base 1e4 over all of it) to every
+global one (head 512, base 1e6, proportional RoPE: `rope_freqs` turns the first 64 of 256 pairs and leaves the rest, factors of
+1e30); V projections on the global layers too (`attention_k_eq_v` false, unlike the 12B and 26B); tied head, softcap 30.
+Two things neither Gemma 4 that eklow served had:
+- **Per-layer inputs** (PLE, as EmbeddingGemma 2 has half of): a 256-wide input per layer, `(rmsnorm_256(per_layer_model_proj .
+  x / sqrt(2560)) * proj_norm + per_layer_token_embd[token][layer] * 16) / sqrt(2)`, from a table of 262,144 x 10,752 (Q8_0,
+  2.9 GiB of the file); each layer then adds `rmsnorm(proj . (gelu(inp_gate . x) * P[layer])) * post_norm` after its FFN and
+  before `layer_output_scale`.
+- **Shared K/V**: the last 18 layers (24-41) have no K/V of their own; transformers' `store_full_length_kv` keeps the K/V of the
+  last layer of each kind before them, so sliding layers read layer 22's and global layers (29, 35, 41) layer 23's, with their
+  own queries. The GGUF still carries those layers' K/V projections (the BF16 repo's `model-frozen-shared-kv.safetensors`,
+  which transformers drops on load); eklow never loads them. Only 24 layers keep a cache.
+
+NVIDIA's file mixes Q4_K (most matrices), Q6_K (some V and down projections), Q8_0 (the token table and the per-layer table) and
+BF16 (`per_layer_model_proj`); 6.18 GB, 5.71 GiB of what the forward reads.
+
+**The reference** (`model/gemma4.*`, `eklow-ref-run` on a gemma4 GGUF): transformers' `Gemma4TextModel` in fp32 on the reference
+kernels, weights dequantized as ggml stores them. **The yardstick** (`tools/ref/bolt_hf_ref.py`): transformers 5.22.2 itself, fp32
+on the 4090 (TF32 off, chunks of 2,048 through its DynamicCache, the two tables and the head on the CPU), either on the BF16
+checkpoint or on the GGUF's own tensors dequantized by the gguf package, so that both sides run the same numbers. The mapping
+checks itself: every GGUF tensor against the checkpoint's, norms identical, quantized matrices 2-20% relative L2, so the
+converter folded nothing into the values.
+
+Prompts (Bolt's tokenizer and template, thinking on): `chat` (54 tokens: a system line and a question) and `long16k` / `long32k`
+(16,384 / 32,768 tokens: eklow's README, DESIGN and DECISIONS as a user turn with a question after them). Over all positions of
+`chat` and the last 256 of the long ones:
+
+| | chat (54) | 16k (last 256) | 32k (last 256) |
+|---|---|---|---|
+| eklow's reference vs transformers, GGUF weights, fp32 | 54/54, mean KL 3.1e-11 | 256/256, 5.3e-8 (max 1.3e-6) | not run (below) |
+| transformers in bf16 vs fp32, GGUF weights | 54/54, 8.2e-4 | 251/256, 9.3e-4 | 256/256, 8.4e-4 |
+| transformers on the BF16 checkpoint vs the GGUF's weights, fp32 | 50/54, 1.6e-1 | 230/256, 1.2e-1 | 230/256, 1.0e-1 |
+
+So the reference is transformers' arithmetic (the rest is fp32 rounding), and Q4_K_M itself moves the logits 100 times more than
+bf16 activations do. The 16k run took 7,255 s on the card (the reference attention is a work-group per query and head, a group
+reduction per key); 32k was not run on it, and the engine at 32k is held to transformers directly (next entries).
+
+## 2026-11-10 — Nemotron-3.5-Bolt-E4B's text layer: Bolt's chat template beside Google's
+
+`gemma/bolt-text` (off `main` bff9d5f; host only, e-workstation; merged into `gemma/bolt-e4b`). Bolt is NVIDIA's post-trained
+Gemma 4 E4B, served from `Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf` (nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB @ 1db54d5b, sha256
+c8af2b8a...). That file's `tokenizer.chat_template` is the BF16 repository's `chat_template.jinja` byte for byte
+(nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-BF16 @ 49843eed, 20,161 bytes). Its tokenizer is Google's (`tokenizer.json` is the 12B's
+byte for byte): `tok_compare.py` on the GGUF found 0 differences in 25,133 strings (1.41M tokens). The template port, output
+parser and tool grammar removed in `cc4b4b5` are back from `cc713a0`, unchanged except as follows.
+
+**Template.** Bolt's is Google's (18,683 bytes) with three changes. The port takes them as a variant, `Gemma4Template::Bolt`.
+`gemma4_template_of` recognises either file by FNV-1a and length and refuses anything else.
+- `conversational_mode` (`ChatOptions::conversational_mode`) makes the system message its own trimmed text, a blank line, then
+  "You are having a spoken conversation with the user. Respond as briefly as possible while still addressing their questions
+  fully." With no system or developer message, the instruction becomes the system message. If the text already is the
+  instruction, nothing is added. List content is joined first. A null or numeric content raises (Jinja iterates it); without
+  the switch it renders nothing.
+- An assistant message with tool calls renders its content after its reasoning and before the calls, instead of after their
+  responses.
+- With thinking off, the generation prompt ends at `<|turn>model\n`, without the empty `<|channel>thought\n<channel|>`.
+
+`gemma4_chat_compare.py` against transformers 5.22.2: for Bolt 21,014 cases (1,008 hand-written, every branch crossed with
+tools, generation prompt, thinking, preserve_thinking and conversational_mode; 6 that both must reject; 20,000 random): 20,915
+identical, 99 rejected by both, 0 differences, and the 3,381,625 tokens match Hugging Face's. Seed 12: 20,923 identical, 91
+rejected by both, 0 differences. Google's template: 20,504 of 20,508 identical, 4 rejected by both, 0 differences. Undoing each
+change gives 6,411, 7,337 and 7,046 differences.
+
+**Parser.** Nothing was needed for Bolt's order. It gains tool_choice "none": `OutputParser(tok, in_thinking, calls=false)`
+bans and refuses `<|tool_call>` in content as well. The turn ends on generation_config's eos_token_id, 1 `<eos>`, 106
+`<turn|>` and 50 `<|tool_response>`. `gemma4_parse_compare.py` (now also reading turns from inside the thought channel)
+recovered all 20,000 turns of seed 5 and of seed 6 exactly.
+
+**Grammar**, on Bolt's vocabulary: 2,000 of 2,000 and 5,000 of 5,000 calls accepted token by token; 1,997 and 4,991 walks
+closed, none failed to parse; 120 of 120 bans exactly when refused, and the ban lists are ascending.
+
+**Open: a closed turn after content and a call.** When the last messages are an assistant message with content and tool calls
+and then its tool responses, both templates write `<turn|>\n` after the responses (`has_content` counts the content wherever it
+was written), and the generation prompt opens no new turn: the prompt ends `…<tool_response|><turn|>\n`, plus
+`<|channel>thought\n` with thinking on. Hugging Face and vLLM render it so, and so does the port.
+
+## 2026-11-10 — Bolt's serving forward: the Gemma 4 engine back, dense, with per-layer inputs and shared K/V
+
+`engine/engine_gemma4.*` is the 26B's engine of `cc713a0` without its MoE (routing, cold experts, streaming, placement: Bolt is
+dense and all 5.71 GiB of it go on the card), with what Bolt needs:
+- The file's formats on the matrix units through `xmx::repack_format` (Q4_K, Q6_K, Q8_0 as Q8_0I; BF16 as F16, which has the
+  fp16 GEMM only: `per_layer_model_proj` runs as an fp16 GEMM whatever the rows). Q, K and V stack only while their types
+  agree (some V are Q6_K beside Q4_K Q and K), each part into its own block, and `fast::qkv_heads` takes each from its columns.
+- The per-layer inputs: the embeddings' projection, then `fast::ple_inputs` (per-layer norm, the token's Q8_0 table row on the
+  card, the scales) in place; per layer `inp_gate` on the layer's output, `fast::ple_gate` (gelu times the layer's slice,
+  quantized for the next matmul), `proj`, and the norm, residual, layer scale and next attention norm in one
+  `residual_norm_quant`.
+- K/V sharing: only the first 24 layers own a cache (20 sliding rings of window + chunk, 4 page pools), the last 18 attend over
+  their source's with their own queries and write nothing.
+- Attention for 8 query heads over 2 K/V heads: `run<256, 4>` (sliding, fp16) and `run<512, 4>` in int8 too (fp16 existed for
+  EmbeddingGemma 2). `eklow-attn-test --heads 8 --only bolt-*` against `ref::attention`: sliding rel L2 1.0e-4, global 3.6e-4,
+  global int8 8.9e-3, all ok, with and without image spans.
+- The head is always the matrix units' (Q8_0I) and the token rows come from the GGUF's mapping, so a draft can share both.
+
+**Against transformers** (fp32, the GGUF's weights; the band is transformers' own bf16 against its fp32, the precision it is
+usually served in), `eklow-engine-run-gemma4`:
+
+| | top-1 | mean KL | the bf16 band |
+|---|---|---|---|
+| chat, one chunk (fp16 GEMMs) | 54/54 | 3.2e-5 | 54/54, 8.2e-4 |
+| chat, a 30-token chunk then 24 decoded (int8 activations throughout) | 54/54 | 4.5e-3 (decoded: 1.1e-3) | |
+| 16k, chunks of 2,048 | 255/256 | 3.8e-5 | 251/256, 9.3e-4 |
+| 16k, chunks of 1,024, the last 64 decoded | 255/256 | 4.6e-4 (decoded: 63/64, 1.7e-3; bf16 on those 64: 62/64, 9.9e-4) | |
+| 16k, int8 global K/V | 255/256 | 6.1e-5 | |
+| 32k, chunks of 2,048 | 255/256 | 2.8e-5 | 256/256, 8.4e-4 |
+
+A second slot running the same prompt a chunk behind gives the same logits bit for bit (`--twin`: 256/256, KL 0). Verify blocks
+of 4, 8 and 16 (accepting 1-16 tokens, rewound with `truncate`) against the same tokens decoded one at a time pass the run's
+checks (mean KL under 0.05), the captured rows of the draft's layers 5, 11, 17, 23 and 35 within 0.8-1.8% relative RMS of the
+plain run's. The int8 activations of the small-batch matmuls make a 30-row chunk and a decode step the noisiest paths, as for
+Qwen: the gate for Bolt is top-1 >= 250/256 and mean KL <= 2e-3 over a long prompt's last 256 positions, <= 5e-3 over decoded
+ones.
+
+**Speed** (`eklow-engine-bench-gemma4`, fiona, real text, chunks of 2,048):
+
+| | 1 slot, fp16 K/V | 2 slots of 65,280 | 1 slot, int8 K/V |
+|---|---|---|---|
+| prefill of 8k / 32k from empty | 3,606 / 3,063 tok/s | 3,601 / - | 3,599 / - |
+| prefill at depth 8k / 32k / 61k (two chunks) | 3,304 / 2,541 / 1,999 tok/s | 3,281 / 2,525 / - | - / 2,529 / 1,927 |
+| decode at 0 / 8k / 32k / 65k, tok/s per sequence | 50.1 / 46.1 / 40.3 / 36.0 | - / 43.5 / 35.5 / 29.6 | - / 45.2 / 40.8 / 38.1 |
+
+A decode step at 8k (profiled, 23.6 ms with the marks): the gate|up GEMVs 5.5 ms (~225 GB/s of their 1.24 GB), down 3.2 ms, the
+per-layer inputs 3.5 ms (five small launches a layer), sliding attention 2.4 ms (69 us a layer over 512 keys), the head 2.0 ms
+(335 GB/s of 671 MB), Q/K/V 1.6 ms, the output projection 1.5 ms. About 3.2 ms of each step is the host enqueueing ~720 launches.
+
+**On the card** (fiona, the production shape: 2 x 65,536 fp16, EmbeddingGemma 2 and its projector, Bolt's projector; 5.71 GiB of
+weights, 2.20 GiB of K/V, the projectors 354 + 269 MiB): `serve_test.py basic` all ok (whole and streamed, reasoning_content, a
+tool call with typed arguments though Gemma's grammar does not enforce types, the tool's answer, stop strings, max_tokens,
+seeds, two at once equal to their solo runs, cancel, prefix reuse, the developer role). `image_test.py`: the ducks photo read as
+"a serene mountain lake ... a few ducks are swimming near the edge", the fruit bowl as a table with berries, the second turn
+cached 341 of 360, two same-size pictures told apart, the refusals unchanged, an image embedding beside it. An image took
+11.3-11.6 s to encode then: Bolt's tower (Google's E4B tower) clamps every linear's input and output (`use_clipped_linears`; bounds
+as tight as +-1.9 on some layers' attention output), which `VisionGemma4V`'s matrix-unit path refused, so it ran on the reference
+kernels, which in turn never found the bounds (they looked for `NAME..input_max`). Both fixed (`6eb97f3`): the matrix-unit path
+clamps where each GEMM's input is written and its output read (q, k and v share their input's bounds, as gate and up do, checked
+at load). The ducks photo: fast against the fixed reference rel L2 2.2e-3 (row cosine >= 0.99993); against transformers'
+Gemma4VisionModel and embedder in fp32 on the picture pre-sized as a PNG, rel L2 1.9e-3 (>= 0.99997); as the JPEG, 8.5e-2 with a
+median row cosine of 0.9994 and a few sky rows at 0.83-0.90, which is stb_image and the resize against Pillow, amplified by the
+clamps (the reference path gives the same). 0.10 s an image.
+
+**Qwen unchanged.** The whole tree builds; on fiona `eklow-grammar-test-qwen` (stock and Ornith: 2,000/2,000 walks, 828/828 bans),
+`eklow-spec-test`, `eklow-kvpool-test`, `eklow-keepalive-test`, `eklow-verification-test` (34 checks) and `eklow-metrics-test` pass,
+and `bench.sh checkq ekk8` is identical, line for line, to `docs/bench/margin-2026-11-08/checkq-ekk8.txt` (long 244-248/256, chat
+27/27).
+
+Through the server (`serve_perf.py depth`; documents of 8,192, 32,768 and 61,440 Bolt tokens cut from one text, so each deeper
+one reuses the last's prefix: the rates are the server's own, over the uncached part):
+
+| | 8k | 32k | 60k |
+|---|---|---|---|
+| prefill (uncached tokens, from what the slot held) | 3,549 tok/s (8,207 from 11; TTFT 2.3 s) | 2,920 tok/s (24,591 from 8,203) | 2,273 tok/s (28,687 from 32,779) |
+| decode, median of 3 | 44.8 tok/s | 39.3 tok/s | 35.6 tok/s |
+| the next question on the same document | TTFT 0.11 s | 0.15 s | 0.21 s |
+
+## 2026-11-10 — Bolt in eklow-server: the Gemma 4 server back, dense, beside Qwen's
+
+`eklow-server` reads `general.architecture` first, as it did from 2026-11-03 to 2026-11-07: `qwen35moe` runs the Qwen server
+(unchanged), `gemma4` the Gemma server (`tools/server/gemma4_main.cpp`, `serve/{openai,scheduler}_gemma4.*`, restored from
+`cc713a0` and adapted), anything else is refused naming both. What changed against the 26B's server:
+- No experts: no profile, placement, streaming or card margin; `--expert-profile`, `--experts-on-card`, `--card-margin-mib`,
+  `--draft-reserve-mib` and `--verification` are refused by name with the Qwen-only flags. Defaults: `--ctx 65536` (Bolt's
+  window; more is refused), fp16 K/V (`--kv-int8` halves the global layers').
+- The template is recognised as Bolt's or Google's by fingerprint; `chat_template_kwargs.conversational_mode` and
+  `preserve_thinking` (top level too) reach it; `--preserve-thinking on|off` sets the default.
+- `tool_choice: "none"` renders the tools as `"auto"` does and bans `<|tool_call>` (the parser's `calls=false`; no grammar),
+  as the Qwen server does since 2026-11-08, so son-of-anton's last step of a long tool loop reuses the cached prompt.
+- An image's rows are causal: Gemma 4 E2B and E4B leave `use_bidirectional_attention` unset, and transformers masks their images
+  as text on every layer (the 26B let an image see all of itself on the sliding layers). Their per-layer inputs take the pad
+  token's table rows, as transformers' Gemma4Model does.
+- Bolt's vision tower is Google's Gemma 4 E4B tower unchanged: all 657 tensors of its 16 blocks and the projection compared equal,
+  bit for bit, between the BF16 checkpoint and ggml-org's `mmproj-gemma-4-E4B-it-BF16.gguf` (ggml-org/gemma-4-E4B-it-GGUF @
+  27cd6836, sha256 fc1c6a1b...), which `--mmproj` therefore takes.
+
+`eklow-prompt-gemma4` (back from `cc713a0`) renders a request as the server does: each of the ten points of fiona's replay (5,326 to
+192,998 tokens: the play, house and ricky system prompts with son-of-anton's tool list, tool calls with content, tool results,
+thinking on) is token for token what transformers' `apply_chat_template` gives.
+
+## 2026-11-10 — NVIDIA's DFlash draft for Bolt: lossless, twice the decode
+
+`nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB-DFlash` @ 0949a2eb (`Nemotron-3.5-Bolt-E4B-DFlash-BF16.gguf`, 737 MB): a plain DFlash
+draft (no convolution or selector) of five Qwen3-style layers, hidden 2,560, 32 heads over 8 of 128, all sliding (window 1,024),
+block 8, reading the target's layers 5, 11, 17, 23 and 35 (`dflash.target_layers` [6, 12, 18, 24, 36] is each id + 1, as for
+the other drafts; the NVFP4 repo's config.json says `target_layer_ids` [5, 11, 17, 23, 35]), no token table or head of its own:
+it embeds with the target's table times sqrt(2,560) and scores with the target's head. Quantized to Q8_0 with llama.cpp's
+`llama-quantize` (399 MB, sha256 46968a8f...), since the serving forward takes Q8_0; the eklow draft code ran it unchanged
+(its host reference on random features first) but for one thing:
+- The file says `attention.causal` false, and NVIDIA's card says the block is drafted "in a single non-causal forward pass";
+  eklow had made a plain draft's sliding layers causal inside the block (z-lab's model.py, whose GGUFs carry no such key).
+  `Dflash2Config::block_causal` now follows the key when there is one.
+
+Tried and dropped: the target's soft-cap (30) on the draft's 16 candidates (the draft scores through the target's head, and its
+file names no soft-cap of its own). Acceptance fell from 3.05 to 1.30 tokens a verify on GSM8K: the draft was trained on raw
+logits.
+
+Through the server (fiona, production's shape plus the draft: 547 MiB on the card, 5.38 GiB still free; one stream unless said,
+temperature 1, thinking on; `serve_perf.py`):
+
+| | plain | blocks of 4 | blocks of 8 (the default) |
+|---|---|---|---|
+| prose at 8k, decode tok/s (tokens a verify) | 43.7-44.8 | 77.4 (2.49) | 90.8-96.7 (2.96-3.15) |
+| prose at 32k | 38.5-39.3 | 64.3 (2.38) | 80.9-87.9 (3.13-3.42) |
+| prose at 60k | 35.6 | | 64.6 (2.83) |
+| GSM8K, 48 requests one at a time, aggregate | 44.0 | 89.3 (2.80) | 92.2 (3.05) |
+| GSM8K two at a time, aggregate | | | 158.0 (3.89) |
+
+Prefill is unchanged by the draft (3,495-3,510 tok/s at 8k). NVIDIA's card (llama.cpp, draft length 7, an RTX 5090, MT-Bench):
+3.63 tokens a step at temperature 1 overall, 2.92 on writing, 5.67 on math.
+
+**Lossless.** `serve_test.py sample` (the first answer token of a high-entropy prompt at temperature 1): with the draft against
+without, 1,500 + 1,500 p = 0.062, then 3,000 + 3,000 p = 0.026, the largest cells moving in opposite directions between the two
+runs (Sloth 128 / 91, then 177 / 234); pooled, 4,500 + 4,500 p = 0.226. Plain against plain (1,500 and 3,000) p = 0.233. The
+soft-capped variant against plain, 3,000 + 3,000, p = 0.206. Greedy outputs are not identical token for token: a verify block's
+rows are computed in another shape than a decode step's (the int8 GEMVs' K-splits and the attention's tiles depend on the rows),
+so the logits differ in their last bits and a near-tie can go the other way. `serve_test.py compare` on the four greedy
+prompts: one identical, two parting after 696 and 1,117 characters, and the haiku prompt's very first choice (to think or not)
+flipped: with the draft it answers without reasoning, alone and beside another request alike. Plain decoding carries the same
+caveat between step shapes (DECISIONS 2026-10-24, the serving forward pass), though on Bolt the plain server's two requests at
+once matched their solo runs in full. Identical greedy output with a draft would need every int8 kernel's arithmetic to be
+independent of the rows in a step: not done.
+
+## 2026-11-10 — fiona's replay on eklow's Bolt
+
+The private replay set on e-workstation (ten real moments of fiona's chats, P1 to P10 here: four from house, two from
+play, four from ricky; with today's system prompts and son-of-anton's tool list, graded by rule or by a person), against
+`eklow-server` on fiona through an ssh tunnel: production's shape (2 x 65,536 fp16, EmbeddingGemma 2 beside), no draft, six
+samples a point, one request at a time. Sampling is the GGUF's and the card's: temperature 1, top-p 0.95, top-k 64 (llama.cpp
+adds its own min-p 0.05 by default; eklow does not). Every request's prompt was checked first: eklow renders each point token
+for token as transformers does. The ten prompts are 5,326-58,670 tokens (P10, 192,998, exceeds the 64K window and gets
+llama.cpp's 400, as on llama.cpp).
+
+Two runs of 6 samples a point, the answers a person grades read by me to the owner's standard for llama.cpp's run, against
+llama.cpp CUDA's run of the same file (with the owner's readings):
+
+| point | llama.cpp | eklow, run 1 | eklow, run 2 |
+|---|---|---|---|
+| P1 (house) | 0 | 0 | 1 |
+| P2 (house) | 4 | 3 | 1 |
+| P3 (house) | 5 | 3 | 3 |
+| P4 (house) | 5 | 3 | 4 |
+| P5 (play) | 0 | 0 | 0 |
+| P6 (play) | 0 | 0 | 0 |
+| P7 (ricky) | 6 | 6 | 6 |
+| P8 (ricky) | 6 | 6 | 6 |
+| P9 (ricky) | 6 | 6 | 6 |
+| P10 (ricky, 192,998 tokens) | error | error | error |
+| **of 54** | **32** | **27** | **27** |
+
+54 of 108 (50%) against 32 of 54 (59%): a difference of 1.1 standard errors, so within noise, but both runs sit below, and all of
+it is in P2-P4, where the same kinds of answer come out in both engines at other rates.
+
+The text layer's open quirk (a turn closed after content and a call) is in two of the points: P8's and P9's prompts end
+`<tool_response|><turn|>\n<|channel>thought\n`, as transformers renders them. All 12 answers to them passed on eklow, and all 12 on
+llama.cpp, so the port keeps rendering it as Hugging Face does.
+
+One difference between the two engines is sampling: llama.cpp's server adds min-p 0.05 to the GGUF's temperature, top-k and
+top-p unless told otherwise; eklow (and the model card) has none. P2-P4 again with `"min_p": 0.05` added to every request by a
+forwarder in front of eklow (my readings likewise): P2 2, P3 5, P4 4, 11 of 18 against 9 and 8 without it and llama.cpp's 14.
+Suggestive, not shown at 6 samples a point. A request may send `min_p` itself; whether eklow should default to 0.05 for Bolt is
+the owner's call (not changed).

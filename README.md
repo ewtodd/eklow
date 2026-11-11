@@ -1,18 +1,21 @@
 # eklow
 
 A from-scratch serving engine for **Qwen3.6-35B-A3B** and its finetunes (stock Qwen3.6, **Ornith-1.5**,
-**Sage-A1.5**), in our own Q4_K / Q8_0 mix, on a single Intel Arc A770M, a 16 GB laptop GPU, in a machine with 32 GB of
-RAM, with **DFlash 2** speculative decoding and **EmbeddingGemma 2** beside it in the same process. It serves an
+**Sage-A1.5**), in our own Q4_K / Q8_0 mix, and for **Nemotron-3.5-Bolt-E4B** (NVIDIA's post-trained Gemma 4 E4B, in the
+Q4_K_M file NVIDIA ships), on a single Intel Arc A770M, a 16 GB laptop GPU, in a machine with 32 GB of
+RAM, with **DFlash** speculative decoding and **EmbeddingGemma 2** beside it in the same process. It serves an
 OpenAI-compatible API with continuous batching, prefix reuse over the model's recurrent state, thinking,
 grammar-constrained tool calls, image input, and two slots of the model's full 262,144-token context.
 
 C++20 and SYCL/ESIMD on Level Zero; no Python at runtime; every kernel is our own (no oneDNN, no oneMKL, no
 llama.cpp). It builds with Nix against the fleet's nixpkgs (intel-llvm, compute-runtime).
 
-It is *vertical*: one model family, one card. It was built in a week by Claude (Opus 5.5 and Sonnet 5.5), with an
+It is *vertical*: two model families, one card. It was built in a week by Claude (Opus 5.5 and Sonnet 5.5), with an
 engineering log (`DECISIONS.md`) that records every measurement and dead end along the way. It served Gemma 4 (26B A4B
 and 12B) first, then Qwen3.6 from 2026-11-02 in its place; the 26B ran again beside Qwen's from 2026-11-03 to
-2026-11-07 and was then removed (DECISIONS 2026-11-07; `9775e98` is its last state).
+2026-11-07 and was then removed (DECISIONS 2026-11-07; `9775e98` is its last state). Gemma 4 came back on 2026-11-10 as
+Bolt, a dense E4B with per-layer inputs and shared K/V (DECISIONS 2026-11-10), its engine and server beside Qwen's in the
+same binary.
 
 ## The machine
 
@@ -118,6 +121,18 @@ two GEMMs.
 
 Embeddings do not wait for a prefill: 91-238 ms during the needle test's 88k and 167k prefills.
 
+- **Nemotron-3.5-Bolt-E4B** (2026-11-10): NVIDIA's Q4_K_M file whole on the card (5.71 GiB), two slots of 65,536 in fp16
+  (2.20 GiB), EmbeddingGemma 2 and both projectors beside it; `serve_perf.py depth` on documents cut from one text (each deeper
+  one reuses the last's prefix, so prefill is over the uncached part; DECISIONS 2026-11-10).
+
+| | Nemotron-3.5-Bolt-E4B |
+|---|---|
+| prefill at 8k / 32k / 60k | 3,549 / 2,920 / 2,273 tok/s (TTFT 2.3 s for 8k from empty) |
+| decode at 8k / 32k / 60k, plain | 44.8 / 39.3 / 35.6 tok/s |
+| the same with NVIDIA's DFlash draft in blocks of 8 | 90.8 / 87.9 / 64.6 tok/s (2.8-3.4 tokens a verify) |
+| GSM8K (48 requests, thinking on), 1 / 2 at a time, with the draft | 92.2 / 158.0 tok/s aggregate (plain one at a time: 44.0) |
+| an image (280 tokens) | 0.10 s to encode |
+
 ## Accuracy
 
 Correctness is checked logit by logit against eklow's own fp32 reference forward pass (`eklow-ref-run`: plain SYCL
@@ -127,6 +142,11 @@ kernels, fp32 activations, weights dequantized as ggml stores them).
   1,024 and 2,048, decoding, and verifying blocks of 8 and 16 that accept 3 to 5 tokens. Stock Qwen3.6 in the production
   file (EKK8: Q4_K experts, Q8_0 dense matrices, Q6_K head): top-1 237-246 of 256 at a median KL of 1.7-3.5e-3; Ornith in
   EK8: 201-221 of 256 (DECISIONS 2026-11-01).
+
+- **Nemotron-3.5-Bolt-E4B** (DECISIONS 2026-11-10): eklow's fp32 reference matches transformers 5.22.2 run on the GGUF's own
+  weights (top-1 54/54 at mean KL 3e-11 on a chat prompt, 256/256 at 5e-8 over a 16k prompt's last 256 positions); the engine,
+  against the same, 255/256 at 2.8-6.1e-5 over the last 256 of 16k and 32k prompts in 2,048-token chunks, 1.7e-3 over decoded
+  positions, all inside transformers' own bf16-against-fp32 distance on the same prompts (8-10e-4) for prefill.
 
 The int8 activations of the small-batch matmuls make a step's results depend on its shape, so two runs of one request
 agree token for token only until a near-tie goes the other way (a request decoded alone and beside another do too).
@@ -220,12 +240,25 @@ curl http://localhost:8081/v1/chat/completions -H 'Content-Type: application/jso
 }'
 ```
 
-The model files are ours (`tools/weights/` makes them: the published Qwen3.6, Ornith and Sage checkpoints requantized
+Nemotron-3.5-Bolt-E4B, from the file NVIDIA publishes, with its DFlash draft (`llama-quantize`d to Q8_0) and Google's Gemma 4 E4B
+projector (ggml-org's, the same tower bit for bit):
+
+```sh
+eklow-server --model Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf --alias nemotron-3.5-bolt-e4b \
+  --draft Nemotron-3.5-Bolt-E4B-DFlash-Q8_0.gguf --mmproj mmproj-gemma-4-E4B-it-BF16.gguf \
+  --embed-model embeddinggemma-2-Q8_0.gguf --embed-port 8082 --host 0.0.0.0 --port 8083
+```
+
+Bolt's defaults are its own: two slots of its 65,536-token window, fp16 K/V, blocks of the draft's trained 8. Its chat template
+(Bolt's, recognised from the GGUF) takes `chat_template_kwargs` `enable_thinking` (on unless the request says otherwise),
+`conversational_mode` and `preserve_thinking`.
+
+The Qwen model files are ours (`tools/weights/` makes them: the published Qwen3.6, Ornith and Sage checkpoints requantized
 to EKK8 or EK8). The server prints what it placed where: the weights and KV on the card, how many experts a layer stayed
-there, the streaming slots, the pinned memory, the draft and the snapshots' budget. A GGUF whose architecture is not
-`qwen35moe` is refused before any device is touched. The package installs the profiles as
-`share/eklow/qwen36-experts.json` and `ornith-1.5-experts.json`. The comment at the top of `tools/server/main.cpp`
-explains every flag.
+there, the streaming slots, the pinned memory, the draft and the snapshots' budget. A GGUF whose architecture is neither
+`qwen35moe` nor `gemma4` is refused before any device is touched. The package installs the profiles as
+`share/eklow/qwen36-experts.json` and `ornith-1.5-experts.json`. The comments at the top of `tools/server/main.cpp` and
+`gemma4_main.cpp` explain every flag.
 
 The flake's NixOS module serves named instances, as unholy's does: `services.eklow.instances.<name>` (`model`, `alias`,
 `port`, `expertProfile`, `mmproj`, `contextSize`, `slots`, `kvInt8`, `extraArgs`, `draft`, `draftBlock`, `prefillGroup`,
@@ -279,7 +312,7 @@ This is not a general-purpose engine:
 | `src/engine` | the serving forward passes: steps of prefill chunks, decode tokens and verify blocks, the paged cache, the DeltaNet states and their snapshots, expert placement, cold experts |
 | `src/kernels` | XMX matmuls for the files' formats (int8 GEMVs for decode, fp16 GEMMs for prefill, grouped expert forms), the Gated DeltaNet, flash attention over the paged cache and long prefill attention in key segments, the DFlash 2 draft's kernels, fused small kernels and routing (`fast`, `qwen_fast`); `ref` holds the reference kernels |
 | `src/cpu` | the AVX-VNNI GEMVs for the cold experts |
-| `src/model` | GGUF loading, Qwen3.6's configuration and reference forward pass, the DFlash 2 draft, the vision encoders, EmbeddingGemma 2 |
+| `src/model` | GGUF loading, Qwen3.6's and Gemma 4 E4B's configurations and reference forward passes, the DFlash 2 draft, the vision encoders, EmbeddingGemma 2 |
 | `src/serve`, `src/text` | the scheduler, OpenAI layer and tool-call grammar, the sampler and lossless acceptance; tokenizers, chat templates and output parsers |
 | `src/rt` | device selection and free memory, the copy engine |
 | `tools/` | `eklow-server`, the engine and kernel benchmarks and tests, the reference runs (`tools/ref`), the weights' tooling (`tools/weights`), the server tests and benchmark (`tools/server`, `tools/bench`) |
