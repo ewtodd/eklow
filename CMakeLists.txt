@@ -266,6 +266,11 @@ add_library(eklow_spec STATIC src/serve/sampler.cpp src/serve/spec.cpp)
 target_link_libraries(eklow_spec PUBLIC eklow_host)
 
 # The acceptance's statistical test: host code over the sampler only.
+# The sampler against llama.cpp's own (tools/sampler_test: llama_ref.cpp is built against a libllama by build-llama-ref.sh).
+add_executable(eklow-sampler-test tools/sampler_test/main.cpp)
+target_link_libraries(eklow-sampler-test PRIVATE eklow_spec)
+target_include_directories(eklow-sampler-test PRIVATE src)
+
 add_executable(eklow-spec-test tools/dflash_test/spec_test.cpp)
 target_link_libraries(eklow-spec-test PRIVATE eklow_spec)
 target_include_directories(eklow-spec-test PRIVATE src)

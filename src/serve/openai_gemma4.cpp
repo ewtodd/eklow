@@ -248,14 +248,13 @@ ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, cons
   }
   if (int64_t(r.prompt.size()) >= d.max_ctx) throw context_exceeded(int64_t(r.prompt.size()), d.max_ctx);
 
-  if (const json::Value* v = field(body, "temperature"); v && !v->is_null()) r.sampling.temperature = float(number(*v, "temperature"));
-  if (const json::Value* v = field(body, "top_p"); v && !v->is_null()) r.sampling.top_p = float(number(*v, "top_p"));
-  if (const json::Value* v = field(body, "top_k"); v && !v->is_null()) r.sampling.top_k = int32_t(number(*v, "top_k"));
-  if (const json::Value* v = field(body, "min_p"); v && !v->is_null()) r.sampling.min_p = float(number(*v, "min_p"));
-  if (const json::Value* v = field(body, "presence_penalty"); v && !v->is_null()) r.sampling.presence_penalty = float(number(*v, "presence_penalty"));
-  if (const json::Value* v = field(body, "frequency_penalty"); v && !v->is_null()) r.sampling.frequency_penalty = float(number(*v, "frequency_penalty"));
-  if (const json::Value* v = field(body, "seed"); v && !v->is_null()) r.sampling.seed = uint64_t(number(*v, "seed"));
-  else r.sampling.seed = std::random_device{}();
+  // llama-server's sampling fields over the server's defaults (llama.cpp's, then the GGUF's); a random seed unless one is sent.
+  r.sampling.seed = std::random_device{}();
+  try {
+    apply_request_sampling(body, r.sampling, [&](const std::string& t) { return tok.encode(t, false); });
+  } catch (const std::invalid_argument& e) {
+    throw bad(e.what());
+  }
   for (const char* k : {"max_completion_tokens", "max_tokens"})
     if (const json::Value* v = field(body, k); v && !v->is_null() && r.max_tokens == 0) {
       r.max_tokens = int64_t(number(*v, k));

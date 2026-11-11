@@ -593,7 +593,13 @@ int gemma4_server_main(int argc, char** argv) {
           was_active = active, prev = cur, eprev = ecur, t_prev = now;
         }
       });
-    serve::gemma4::ChatDefaults defaults{serve::SamplingParams{}, ec.max_ctx, *which, preserve_thinking};
+    // The sampling defaults: llama.cpp's, under the GGUF's general.sampling.* (as llama-server takes them).
+    serve::SamplingParams sampling;
+    serve::apply_gguf_sampling(file, sampling);
+    serve::gemma4::ChatDefaults defaults{sampling, ec.max_ctx, *which, preserve_thinking};
+    std::fprintf(stderr, "eklow-server: sampling defaults: temperature %.2f, top_k %d, top_p %.2f, min_p %.2f, penalty_last_n %d, repeat %.2f\n",
+                 double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p), int(sampling.penalty_last_n),
+                 double(sampling.repeat_penalty));
     std::fprintf(stderr, "eklow-server: %s's chat template; earlier turns' reasoning %s by default\n", text::gemma4_template_name(*which),
                  preserve_thinking ? "kept (--preserve-thinking on)" : "as the template drops it");
     if (images) defaults.encode_image = [&](std::span<const uint8_t> bytes) { return (*images)(bytes); };

@@ -159,6 +159,8 @@ bool Scheduler::admit() {
     q.called = false;
     q.parser = std::make_unique<text::OutputParser>(tok_, r->in_thinking, r->calls_allowed);
     q.sampler = std::make_unique<Sampler>(r->sampling);
+    // llama-server's sampler has seen the prompt: its penalties' window starts in it.
+    q.sampler->accept(std::span<const int32_t>(r->prompt));
     q.grammar = r->tools.empty() ? nullptr : std::make_unique<ToolGrammar>(vocab_, r->tools);
     q.req = std::move(r);
     waiting_.pop_front();
@@ -230,7 +232,10 @@ void Scheduler::step() {
     if (seqs_[s].req && seqs_[s].next_token >= 0) gen.push_back(int(s));
   std::vector<DraftBlock> blocks(seqs_.size());
   // The block of a request: the server's, or its own (a request may ask for another, or 0 for plain decode).
-  auto block_of = [&](const Seq& q) { return q.req->draft_block < 0 ? c_.draft_block : q.req->draft_block; };
+  // A sampler whose next distribution cannot be stated (mirostat) decodes plain.
+  auto block_of = [&](const Seq& q) {
+    return !q.sampler->speculative() ? 0 : q.req->draft_block < 0 ? c_.draft_block : q.req->draft_block;
+  };
   std::vector<int> speculate(seqs_.size(), 0);  // per slot: the block size B it verifies this step (0: a decode token)
   if (spec) {
     Timer timer(mu_, stats_.draft_s);

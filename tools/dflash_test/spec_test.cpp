@@ -3,8 +3,9 @@
 // verify steps (a deliberately poor drafter, so every branch runs: acceptance, rejection with a residual, the bonus
 // token), compared with the exact distribution plain sampling has (enumerated through Sampler::distribution) by a
 // chi-square test, for temperature, top-k, top-p, min-p, penalties, bans, a grammar's allowed sets and all of them
-// together; greedy runs must match plain greedy exactly. Two broken variants of verify must fail the same test (the
-// check that the test can see), and the refactored Sampler::sample must draw what the previous implementation did.
+// together, and llama.cpp's other stages (typical, top-n-sigma, XTC's random removal, dynamic temperature, a repeat penalty
+// whose window runs into the drafted block, a reordered chain); greedy runs must match plain greedy exactly. Two broken
+// variants of verify must fail the same test (the check that the test can see).
 //
 //   eklow-spec-test [trials]
 #include <algorithm>
@@ -22,118 +23,6 @@
 #include "serve/sampler.hpp"
 #include "serve/spec.hpp"
 
-namespace old_sampler {
-// The Sampler as it was before Sampler::distribution (git 692bb33), verbatim, to check that sample() still draws the
-// same tokens from the same seed.
-class OldSampler {
- public:
-  explicit OldSampler(const eklow::serve::SamplingParams& p);
-  int32_t sample(std::span<const float> logits, const std::vector<int32_t>* allowed = nullptr, const std::vector<int32_t>* banned = nullptr);
-  void accept(int32_t id) { ++counts_[id]; }
-
- private:
-  eklow::serve::SamplingParams p_;
-  std::mt19937_64 rng_;
-  std::unordered_map<int32_t, int32_t> counts_;
-  std::vector<std::pair<float, int32_t>> cand_;
-};
-}  // namespace old_sampler
-
-
-namespace old_sampler {
-using namespace eklow::serve;
-
-OldSampler::OldSampler(const SamplingParams& p) : p_(p), rng_(p.seed) {}
-
-int32_t OldSampler::sample(std::span<const float> logits, const std::vector<int32_t>* allowed, const std::vector<int32_t>* banned) {
-  const int32_t V = int32_t(logits.size());
-  auto adjusted = [&](int32_t id) {
-    float l = logits[size_t(id)];
-    if (auto it = counts_.find(id); it != counts_.end()) l -= p_.presence_penalty + p_.frequency_penalty * float(it->second);
-    return l;
-  };
-  auto by_logit = [](const auto& a, const auto& b) { return a.first > b.first || (a.first == b.first && a.second < b.second); };
-  const bool bans = banned && !banned->empty();
-  // The first banned id above `after` (V when none): the loops over the vocabulary below compare each id with it only.
-  size_t b = 0;
-  auto next_ban = [&](int32_t after) {
-    while (bans && b < banned->size() && (*banned)[b] <= after) ++b;
-    return bans && b < banned->size() ? std::min((*banned)[b], V) : V;
-  };
-  cand_.clear();
-  if (allowed) {
-    if (allowed->empty()) throw std::runtime_error("sampler: no token allowed");
-    for (int32_t id : *allowed)
-      if (!bans || !std::binary_search(banned->begin(), banned->end(), id)) cand_.push_back({adjusted(id), id});
-    if (cand_.empty())
-      for (int32_t id : *allowed) cand_.push_back({adjusted(id), id});
-  } else if (p_.top_k > 0 || p_.temperature <= 0) {
-    // The k best in one pass over the vocabulary, as a heap whose front is the worst kept (greedy keeps one): the
-    // same set nth_element over all 262k candidates picked, at a fraction of its 1.2 ms a token.
-    const size_t keep = p_.temperature <= 0 ? 1 : size_t(p_.top_k);
-    for (int32_t id = 0, ban = next_ban(-1); id < V; ++id) {
-      if (id == ban) {
-        ban = next_ban(id);
-        continue;
-      }
-      const std::pair<float, int32_t> c{counts_.empty() ? logits[size_t(id)] : adjusted(id), id};
-      if (cand_.size() < keep) {
-        cand_.push_back(c);
-        std::push_heap(cand_.begin(), cand_.end(), by_logit);
-      } else if (by_logit(c, cand_.front())) {
-        std::pop_heap(cand_.begin(), cand_.end(), by_logit);
-        cand_.back() = c;
-        std::push_heap(cand_.begin(), cand_.end(), by_logit);
-      }
-    }
-  } else {
-    cand_.reserve(size_t(V));
-    for (int32_t id = 0, ban = next_ban(-1); id < V; ++id) {
-      if (id == ban) {
-        ban = next_ban(id);
-        continue;
-      }
-      cand_.push_back({counts_.empty() ? logits[size_t(id)] : adjusted(id), id});
-    }
-  }
-  if (p_.temperature <= 0) return std::min_element(cand_.begin(), cand_.end(), by_logit)->second;
-
-  // top-k first: it bounds the sort that top-p needs (selection, then sorting only the k).
-  const size_t k = p_.top_k > 0 ? std::min(size_t(p_.top_k), cand_.size()) : cand_.size();
-  if (k < cand_.size()) std::nth_element(cand_.begin(), cand_.begin() + std::ptrdiff_t(k - 1), cand_.end(), by_logit);
-  cand_.resize(k);
-  std::sort(cand_.begin(), cand_.end(), by_logit);
-  // Softmax at the temperature, in double.
-  std::vector<double> prob(k);
-  const double top = cand_[0].first;
-  double sum = 0;
-  for (size_t i = 0; i < k; ++i) sum += prob[i] = std::exp((double(cand_[i].first) - top) / double(p_.temperature));
-  for (auto& x : prob) x /= sum;
-  size_t n = k;
-  while (n > 1 && prob[n - 1] == 0) --n;  // underflowed: never picked, not even by the fallback below
-  if (p_.min_p > 0)
-    while (n > 1 && prob[n - 1] < double(p_.min_p) * prob[0]) --n;
-  if (p_.top_p < 1) {
-    double acc = 0;
-    for (size_t i = 0; i < n; ++i) {
-      acc += prob[i];
-      if (acc >= double(p_.top_p)) {
-        n = i + 1;
-        break;
-      }
-    }
-  }
-  double total = 0;
-  for (size_t i = 0; i < n; ++i) total += prob[i];
-  double r = std::uniform_real_distribution<double>(0, total)(rng_);
-  for (size_t i = 0; i < n; ++i) {
-    r -= prob[i];
-    if (r <= 0) return cand_[i].second;
-  }
-  return cand_[n - 1].second;
-}
-
-}  // namespace old_sampler
 
 using namespace eklow::serve;
 
@@ -384,6 +273,7 @@ int main(int argc, char** argv) {
     c.sp.min_p = min_p;
     c.sp.presence_penalty = pres;
     c.sp.frequency_penalty = freq;
+    c.sp.penalty_last_n = 64;
     c.bans = bans;
     c.grammar = grammar;
     cases.push_back(c);
@@ -399,31 +289,25 @@ int main(int argc, char** argv) {
   mk("grammar", 1.0f, 0, 1.0f, 0, 0, 0, false, true);
   mk("grammar + bans", 0.8f, 0, 1.0f, 0, 0, 0, true, true);
   mk("everything", 0.9f, 5, 0.9f, 0.05f, 0.6f, 0.4f, true, true);
+  // llama.cpp's other stages, each on its own over llama.cpp's defaults (top-k 40, top-p 0.95, min-p 0.05).
+  auto more = [&](const char* name, auto set) {
+    Case c;
+    c.name = name;
+    set(c.sp);
+    cases.push_back(c);
+  };
+  more("defaults (llama.cpp's)", [](SamplingParams&) {});
+  more("typical 0.8", [](SamplingParams& p) { p.typical_p = 0.8f; p.min_p = 0; });
+  more("top-n-sigma 1.0", [](SamplingParams& p) { p.top_n_sigma = 1.0f; p.min_p = 0; });
+  more("xtc 0.5 / 0.1", [](SamplingParams& p) { p.xtc_probability = 0.5f; p.xtc_threshold = 0.1f; p.min_p = 0; });
+  more("dynatemp 0.5", [](SamplingParams& p) { p.dynatemp_range = 0.5f; p.temperature = 1.0f; });
+  more("repeat 1.5 over the last 2", [](SamplingParams& p) { p.repeat_penalty = 1.5f; p.penalty_last_n = 2; p.min_p = 0; });
+  more("temperature first, then top-k 5", [](SamplingParams& p) { p.samplers = {Stage::Temperature, Stage::TopK, Stage::MinP}; p.top_k = 5; p.temperature = 0.7f; });
 
   int failures = 0;
+  // 1. (Was: the refactored sampler against the previous one; since 2026-11-11 the chain is llama.cpp's, checked against
+  // libllama itself by tools/sampler_test.)
   // 1. The refactored sampler draws what the old one did, whatever the filters.
-  {
-    long diff = 0, n = 0;
-    for (const Case& c : cases) {
-      SamplingParams sp = c.sp;
-      sp.seed = 99;
-      Sampler a(sp);
-      old_sampler::OldSampler b(sp);
-      Constraints cons{&c, {}, {}};
-      std::vector<int32_t> ctx;
-      for (int i = 0; i < 5000; ++i) {
-        const RowConstraint rc = cons.at(ctx);
-        const auto l = target_logits(ctx);
-        const int32_t x = a.sample(l, rc.allowed, rc.banned), y = b.sample(l, rc.allowed, rc.banned);
-        diff += x != y, ++n;
-        a.accept(x), b.accept(y);
-        ctx.push_back(x);
-        if (ctx.size() > 6) ctx.clear(), a = Sampler(sp), b = old_sampler::OldSampler(sp);
-      }
-    }
-    std::printf("sampler: %ld of %ld draws differ from the previous implementation's: %s\n", diff, n, diff ? "FAIL" : "ok");
-    failures += diff != 0;
-  }
   // 2. Distribution tests.
   for (const Case& c : cases) {
     std::map<std::vector<int32_t>, double> exact;
@@ -438,8 +322,9 @@ int main(int argc, char** argv) {
       long steps = 0, kept = 0;
       if (variant == 0) {
         for (long t = 0; t < trials; ++t) {
-          Sampler s(sp);
-          s = Sampler(SamplingParams{sp.temperature, sp.top_k, sp.top_p, sp.min_p, sp.presence_penalty, sp.frequency_penalty, uint64_t(t * 2 + 1)});
+          SamplingParams st = sp;
+          st.seed = uint64_t(t * 2 + 1);
+          Sampler s(st);
           ++seen_plain[plain_sequence(c, s)];
         }
         double st;
@@ -449,7 +334,9 @@ int main(int argc, char** argv) {
         failures += z >= 4;
       }
       for (long t = 0; t < trials; ++t) {
-        Sampler s(SamplingParams{sp.temperature, sp.top_k, sp.top_p, sp.min_p, sp.presence_penalty, sp.frequency_penalty, uint64_t(t * 2 + 1000003)});
+        SamplingParams st = sp;
+        st.seed = uint64_t(t * 2 + 1000003);
+        Sampler s(st);
         std::mt19937_64 drng(uint64_t(t) * 7 + 5);
         ++seen_spec[spec_sequence(c, s, drng, mode, steps, kept)];
       }

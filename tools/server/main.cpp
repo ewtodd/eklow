@@ -623,12 +623,9 @@ static int qwen_server_main(int argc, char** argv) {
     if (verification == "on" && tmpl != text::QwenTemplate::Sage)
       throw std::runtime_error(std::string("--verification on needs the sage chat template (this is ") + text::qwen36_template_name(tmpl) + ")");
     const text::QwenTokenizer tok = text::QwenTokenizer::from_gguf(file);
-    // The sampling defaults the model's card gives, from the GGUF (llama.cpp's general.sampling.*).
+    // The sampling defaults: llama.cpp's, under the GGUF's general.sampling.* (as llama-server takes them).
     serve::SamplingParams sampling;
-    if (const gguf::Value* v = file.find("general.sampling.temp")) sampling.temperature = float(v->as_float());
-    if (const gguf::Value* v = file.find("general.sampling.top_k")) sampling.top_k = int32_t(v->as_int());
-    if (const gguf::Value* v = file.find("general.sampling.top_p")) sampling.top_p = float(v->as_float());
-    if (const gguf::Value* v = file.find("general.sampling.min_p")) sampling.min_p = float(v->as_float());
+    serve::apply_gguf_sampling(file, sampling);
     std::unique_ptr<gguf::File> draft_file;
     model::Dflash2Config draft_cfg{};
     if (!draft_path.empty()) {
