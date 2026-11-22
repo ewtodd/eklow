@@ -28,8 +28,19 @@ with its measurements); what eklow is and its numbers: `README.md`.
 - **`GET /metrics` on Bolt's server** (DECISIONS 2026-11-11), for llmtop. It is checked against llmtop's parser, not yet on
   the card.
 - **Branch `serve/disk-prefix-cache`** (DECISIONS 2026-11-22): the disk prefix cache, prefill-only requests (`max_tokens` 0),
-  and the fix of the rings' rewind (a slot that changed conversation kept stale sliding K/V). Host-checked only: the store's
-  test passes here and on fiona, everything builds, and the module evaluates.
+  and the fix of the rings' rewind. Checked on the card on 2026-11-22.
+  - **The rewind bug is in production (main) and the fix removes it.** A slot that changed conversation past a shared stretch
+    kept stale sliding K/V: 54 of 64 top-1 and mean KL 0.59 against a fresh prefill. Through the server, main answered 2 of 3
+    such turns wrongly; the fix matches a fresh slot exactly.
+  - **A restore is bit for bit** a rewind in place. It brings back 149k positions a second from the disk cold (250k warm).
+    A 20k conversation's turn after its slot went elsewhere gives its first token in 0.55 s instead of 4.5-6 s, with the
+    same greedy text. That holds after a restart too.
+  - **Storing costs nothing measurable** (prefill at 32k 3,043 against 3,025 tok/s; decode unchanged).
+  - **Prefill-only requests** do what they should: the next turn's first token comes in 0.047 s; a request arriving during one
+    waits 0.041 s; with both slots busy one gives its slot up.
+  - The draft's rings are not stored (a restore prefills ~1k positions again, ~0.45 s of the 0.55); not worth it yet.
+  - `serve_test.py basic` fails three stream and seed checks on main's build as on the branch (pre-existing, the draft's
+    shapes).
 
 ## Open, in order
 
@@ -39,15 +50,20 @@ with its measurements); what eklow is and its numbers: `README.md`.
    - the checker's golden states and its 29 turns;
    - the reranker against llama.cpp f16;
    - `serve_test.py basic` and decode at 8k.
-2. **`serve/disk-prefix-cache` on the card** (~30 minutes in a pause of `eklow-bolt`; DECISIONS 2026-11-22, "Not run"): the
-   rewind against main's, a restore against a cold prefill, prefill-only requests, and what storing costs. Then the restore
-   rate goes into `RestoreCost`. son-of-anton's prefill-only requests should name `eklow/nemotron-3.5-bolt-e4b`.
-3. **Text-to-speech and speech-to-text** on the same card, beside Bolt (planned).
-4. **The checker's cut-offs** sit where its fitted features put them. Offtopic's cut-off lies inside the mass of its
+2. **`serve/disk-prefix-cache` to main and fiona.**
+   - The rewind fix (`cc69ee4`) can go first, alone.
+   - For the cache, fiona needs a key (an agenix secret for `services.eklow.prefixCache.keyFile`).
+   - son-of-anton's prefill-only requests should name `eklow/nemotron-3.5-bolt-e4b`.
+   - Open: the draft's acceptance after a restore on a longer answer (the card run's was 10 tokens), and the queue in the
+     periodic line under real traffic (the writer fell behind once during a cold 30k prefill; nothing was lost).
+3. **`serve_test.py basic`'s stream and seed checks** fail on main's build with the draft (pre-existing): the checks expect
+   token-identical output across step shapes, which int8 rounding does not give.
+4. **Text-to-speech and speech-to-text** on the same card, beside Bolt (planned).
+5. **The checker's cut-offs** sit where its fitted features put them. Offtopic's cut-off lies inside the mass of its
    answers, so any implementation flips some of its flags (DECISIONS "vega's checker").
-5. **Dead attention cases** of the Gemma 4 26B and 12B (head 512 groups 8 and 16, head 256 group 2), still in `attend` and
+6. **Dead attention cases** of the Gemma 4 26B and 12B (head 512 groups 8 and 16, head 256 group 2), still in `attend` and
    `eklow-attn-test`.
-6. **fp16 activations** for the small-batch matmuls, only if the min-p edge turns out to matter.
+7. **fp16 activations** for the small-batch matmuls, only if the min-p edge turns out to matter.
 
 ## Where things are
 

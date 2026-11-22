@@ -3437,8 +3437,8 @@ so is the window before `keep - window`, which the re-prefilled positions' slidi
 Those positions were computed against another sequence's K/V, and every sliding layer above them carried it on. It happens
 whenever a slot changes conversation past a shared stretch: a slot holding one chat's 30k tokens, and another chat sharing its
 first few thousand. Now such a rewind starts the sequence over (`ring_safe_keep`, serve/prefix_policy.hpp), or restores it
-from the disk. The engine's comment on `truncate` said the same wrong thing and is corrected. Not measured on the card yet
-(below).
+from the disk. The engine's comment on `truncate` said the same wrong thing and is corrected. On the card the bug reproduced
+on main and the fix removes it (below, "On the card").
 
 **What a page holds.** A page is 256 positions (attn::kPage), in two parts, each a file:
 - *global*: the K and V of the 4 global layers that own K/V, as the pool holds them (2 heads x 512, fp16): **4 MiB, 16 KiB
@@ -3464,16 +3464,16 @@ driver and cpp-httplib, for code that must not be home-made.
 
 **Writes.** After every step the global parts of the pages it filled are copied to pinned host buffers (48 of 4 MiB) on the
 engine's queue, which is in order, so the copies run before the next step writes anything; a writer thread waits for each
-copy, seals it in place and writes it. Without a free buffer a page waits for a later step, and before a slot's sequence is cut
-or replaced the rest go, waiting for buffers. Sliding parts are written at two moments, while the rings still hold them: when
+copy, seals it in place and writes it. Without a free buffer a page waits in its slot for a later step (or the engine's idle
+loop), and before a slot's sequence is cut or replaced, or the server stops, the rest go, waiting for buffers. Sliding parts are written at two moments, while the rings still hold them: when
 a prompt's prefill ends and when a request ends. Each time the restore point is the full pages held less the draft's reach, and
 the sliding parts of the `window_pages` (2) pages below it are stored: 20 MiB a point. A turn adds its new global pages and
 up to two points.
 
 **Restore.** At admission (the keys are hashed on the request's thread at submit) the store gives the deepest point t, at
 most (P - 1) / 256 less the draft's reach in pages, with every global part below it and the sliding parts of [t - 2, t), and
-never inside an image. The restore wins if the prefill it saves takes longer than 0.02 s + t x 256 / 60,000 positions a second
-(prefill counted at 2,500 tok/s): 20k positions from the disk are taken over a slot that holds 0, not over one that holds
+never inside an image. The restore wins if the prefill it saves takes longer than 0.02 s + t x 256 / 100,000 positions a
+second (prefill counted at 2,500 tok/s; the restore rate from the card, below): 20k positions from the disk are taken over a slot that holds 0, not over one that holds
 19.8k. It goes into the free slot given a request least recently. The sliding parts are read first (a broken one leaves the
 slot untouched), then the slot adopts t pages and the global parts are read 8 at a time by 8 threads and copied in; a broken
 page releases the slot and the request prefills from 0 (`failed_restores`).
@@ -3482,9 +3482,15 @@ page releases the slot and the request prefills from 0 (`failed_restores`).
 window 1,024) of K/V it computed from the target's hidden states at layers 5, 11, 17, 23 and 35, which the target's K/V does
 not hold. A restore does not bring it back. Instead a restore stops the draft's reach (4 pages) short of what the prompt
 reaches, so that at least 1,025 positions are prefilled after it, and the scheduler's capture of a prompt's last `reach` rows
-refills the draft's whole context, as for any prompt. Cost: ~0.3-0.45 s of prefill a restore. Storing the draft's rings
-instead (5 x 2 x 8 heads x 128 x fp16 = 20 KiB a position, 20 MiB a point, and an export and import in `Dflash2`) waits on
-what that prefill measures on the card.
+refills the draft's whole context, as for any prompt. Storing the draft's rings instead would take 5 x 2 x 8 heads x 128 x
+fp16 = 20 KiB a position, 20 MiB a point, and an export and import in `Dflash2`.
+
+On the card, a restored turn's first token came 0.553 s after it was sent, against 4.47 s without the cache. Of the 0.553 s,
+~0.45 s is the 1,178 positions prefilled after the point at ~2,600 tok/s, which stored rings would mostly save. A reply on
+Signal waits longer than that anyway (recall alone takes up to 2 s, then the reply's own decode), so the rings are not worth
+it now. The draft's acceptance after a restore (1.43 tokens a verify, 3 accepted in 7) against a cold prefill (1.67, 4 in 6)
+came from a 10-token answer, too few to tell anything. A restore does not change what the draft sees: either way its context
+is the prefill's capture of the prompt's last 1,024 rows. A longer answer's comparison is open.
 
 **Prefill-only requests.** `max_tokens` (or `max_completion_tokens`) 0, refused before as not positive, puts the prompt into a
 slot and the disk and generates nothing, like llama.cpp's `n_predict` 0. The lowest priority:
@@ -3503,15 +3509,15 @@ another server (son-of-anton's own, while eklow is down) a `max_tokens` of 0 is 
 **Measured on fiona's host** (CPU only, niced, beside the running service): AES-256-GCM seals 6.9 GB/s and opens 5.3 on one
 thread; 80 pages (a 20k conversation's 320 MiB of global K/V) read and opened by 8 threads from the page cache in 34 ms
 (600k positions a second). From the disk cold, the NV3's reads bound it (~3 GB/s, ~0.1 s); the copies to the card add 27 ms at
-11.7 GB/s. So a 20k conversation should come back in ~0.15-0.25 s plus the 1,025 positions after it (~0.4 s) against ~7 s;
-the 60,000 positions a second the restore decision assumes is a third of that, until the card measures it.
+11.7 GB/s. So a 20k conversation should come back in ~0.15-0.25 s plus the 1,025 positions after it (~0.4 s) against ~7 s.
+The card measured it (below).
 
 **Module.** `services.eklow.prefixCache.{enable, keyFile, maxGiB}` (200 by default): the instance's StateDirectory
 (`/var/lib/eklow-<name>/prefix-cache`, the dynamic user's) and the key through `LoadCredential` (`%d/prefix-cache-key`), so
 an agenix file may stay root-only. The server's flags are `--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N]`;
 the cache needs a key.
 
-**Checks** (no card: fiona's A770M serves production).
+**Host checks.**
 - `eklow-prefix-store-test`: the chain, AES-GCM against flipped bits of the data, header, tag and key, the key file's forms,
   parts written and read back, dedup, a full queue, restore points, broken, truncated and renamed files, a restart's scan,
   eviction order (least recently used, then deepest, sliding before global), and the policy (the rewind limit; that a prompt
@@ -3522,23 +3528,99 @@ the cache needs a key.
 - The module evaluates with the cache on (the flags, StateDirectory, LoadCredential beside the checker's RuntimeDirectory),
   with it off (the unit as before), and asserts a key.
 
-**Not run: on the card, in a pause of `eklow-bolt` (~20-30 minutes).** Two tools carry the checks, built and checked to
-start on fiona:
-- `eklow-prefix-engine-test` (the engine, three slots, the last 64 positions' logits) runs the rewind four ways (main's, the
-  fix's, a fresh prefill, and a valid reuse with main's chunk shapes, so that main's against it is the stale K/V alone). It
-  restores 74 pages from the store, cold (the files dropped from the page cache) and warm, against the same slot rewound in
-  place, which should agree bit for bit. It also times the export, the writes and the restore.
-- `tools/server/prefix_serve_test.py` drives a server for the rest: `rewind`, `cold` and `cache` (restores, prefill-only, the
-  draft's acceptance after a restore), and `overhead`.
+**On the card.** The checks ran in one pause of `eklow-bolt` on 2026-11-22, 15:43:58 to 15:48:29 CST (a script outside the
+repository, run on fiona; production resumed and answered chat, embeddings, the checker and the reranker at 15:48:33).
+- Two tools carry them:
+  - `eklow-prefix-engine-test` drives the engine: three slots, the last 64 positions' logits;
+  - `tools/server/prefix_serve_test.py` drives a server.
+- The test servers had production's shape without the side models: Bolt at 2 x 65,536 in fp16, the draft in blocks of 8, the
+  projector, `preserve_thinking` on.
+- main's server is production's package; `cc69ee4` is the fix alone.
 
-1. `serve_test.py basic` with this build and no cache, against main's: nothing else changed.
-2. The rewind: a slot holding a long sequence, then a prompt sharing only its first few thousand tokens; greedy output and
-   first logits from this build (it starts over) and main's (it keeps `keep - window`), each against a fresh server. Expect
-   main's to differ, this one's not.
-3. The cache: conversation A (20k), two others that take both slots, then A again: `restored_tokens`, the time to the first
-   token, and greedy output with `"speculative": false` against a cold prefill of the same prompt; then the draft's acceptance
-   on the turn after a restore.
-4. Prefill-only: one before A's next turn (that turn's cached tokens), a request arriving during one (its wait), and one
-   taken over by a request when both slots are busy.
-5. The cost of storing: decode at 8k and prefill at 32k with and without `--prefix-cache`, and the restore rate, to set
-   `RestoreCost`.
+*The rewind, in the engine.* A is 8,192 tokens; B is A's first 3,000, then 3,000 others. "Valid" prefills B from main's point
+(2,488) in a slot whose rings still hold the window, so it has main's chunk shapes, and main against valid is the stale K/V
+alone.
+
+| B's last 64 positions | top-1 | mean KL | worst KL | largest logit difference |
+|---|---|---|---|---|
+| valid against fresh (chunk shapes) | 64/64 | 8.1e-9 | 2.0e-7 | 0.10 |
+| main's rewind against valid | 54/64 | 0.592 | 5.26 | 25.7 |
+| the fix against fresh | 64/64 | 0 | 0 | 0 |
+
+*The rewind, through the servers* (`rewind`: B fresh, then A, then B again; greedy, plain decode; three conversations).
+- main's build reused 2,001, 4,123 and 2,883 positions. Two of its three second answers differ from the fresh ones, and both
+  are wrong:
+  - "The last function above is not provided in the text, so I cannot tell you what it does.", for a prompt that ends in one;
+  - a description of `printf("%d\n",ans);` where the fresh answer described the `main` function around it.
+- `cc69ee4` reused nothing and gave the fresh answers to the character, all three.
+- The bug is in production, and the fix removes it.
+
+*A restore, in the engine* (20,000 tokens; the point is 74 pages, 18,944 positions).
+- Restored cold and restored warm each agree with the same slot rewound in place bit for bit: top-1 64/64, KL 0, largest
+  difference 0. The pages read back equal the exported bytes. The slot rewound in place against the whole prefill: KL 4.0e-6
+  (chunk shapes).
+- Times:
+  - prefill of 20,000 from empty: 6.16 s (3,246 tok/s);
+  - export of 74 global parts to host memory: 0.030 s (10.25 GB/s, 0.41 ms a page);
+  - sealing and writing 76 files (316 MiB) into the page cache: 0.106 s (3.14 GB/s);
+  - the restore cold (the files dropped from the page cache): 0.127 s, **149k positions a second**;
+  - the restore warm: 0.076 s, 250k.
+- `RestoreCost::restore_pos_s` goes from 60,000 to 100,000: two thirds of the cold rate, for a disk busy with the cache's own
+  writes.
+
+*A restore, through the server* (`cold` on the branch without the cache, `cache` with it). A's second turn is 20,634 tokens,
+sent after two 8k conversations took both slots.
+
+| | without the cache | restored |
+|---|---|---|
+| prompt / cached | 20,634 / 6,837 | 20,634 / 19,456, all from the disk |
+| first token | 4.47 s | 0.553 s |
+| greedy text, plain | `iteratee`, `beforeSendPerformed`, `sendPerformed` | the same |
+| the draft, tokens a verify | 1.67 (4 of 6, 10 tokens) | 1.43 (3 of 7, 10 tokens) |
+
+The cold run reused 6,837 positions of another conversation's slot (the two test documents begin alike), so it prefilled
+13,797; all 20,634 would take ~6.2 s. A restart of the cached server scanned back its 383 global and 19 sliding parts
+(1.7 GiB) and restored the same turn: 19,456 from the disk, first token in 0.57 s.
+
+*Prefill-only requests* (the same server).
+- Before a turn: after two other conversations took the slots, a prefill-only request for A's third turn took 0.67 s (19,456
+  restored, 1,204 prefilled) and answered `prefill` {positions 20,660, complete true}. The turn itself then had 20,659 of
+  20,660 tokens cached and gave its first token in 0.047 s.
+- Beside a request: a 23-token request sent 1 s into a cold 30k prefill-only request gave its first token in 0.041 s. The
+  prefill-only request finished after it, complete (24,260 positions, 9.20 s).
+- Given up: a prefill-only request (28,513 tokens) ran, then a 400-token request beside it, then a third request found both
+  slots busy. The third answered in 0.050 s. The prefill-only request ended after 2.01 s with {positions 3,072, complete
+  false}, and the long request went on (312 tokens).
+- Their chunks of 512 prefill at 2,091-2,645 tok/s, against 3,000 and more in chunks of 2,048.
+
+*The cost of storing* (`overhead`, the same requests on the branch without and with the cache): inside the noise. The export
+is 0.41 ms a page on the engine's queue, ~3 ms in a step of 2,048.
+
+| | without | with |
+|---|---|---|
+| prefill of 29,712, cold | 3,043 tok/s | 3,025 |
+| decode at 8k, plain | 44.5 tok/s | 44.7 |
+| decode at 8k, with the draft | 93.5 tok/s | 99.4 |
+
+*The writer behind.* During the cold 29,712-token prefill the periodic line said "75 parts stored, 4 not".
+- What happened: four calls of `store_pages` found all 48 buffers on their way to the disk. The prefill fills 8 pages a
+  step, 12 a second, so the writer had fallen more than 6 steps behind for a moment.
+- Nothing was lost. Such pages wait in their slot for a later call, and before a slot's sequence is cut they are stored,
+  waiting for buffers.
+- Two gaps, fixed after the run:
+  - the line counted these deferrals as parts not stored. It now says "calls found no buffer free (their pages waited)",
+    keeps "sliding parts not stored" for parts the rings no longer held, and shows the store's queue;
+  - an idle slot never retried its waiting pages. `store_waiting` now runs after every step, while the engine is idle, and
+    waiting at a stop.
+- Why the writer fell behind is not known. It seals and writes at 3.1 GB/s into the page cache, ~60 times what the prefill
+  needs. The likely stall is the disk's writeback after 1.7 GiB in two minutes (fiona's NV3 has no DRAM); the queue in the
+  line will show it.
+
+*`serve_test.py basic`* fails three checks on main's build (production's package), with the same numbers on this branch with
+and without the cache:
+- "stream: same reasoning and content as whole" (725 against 833 characters);
+- "stream: finish and usage";
+- "seed: same seed, same output" (two adjectives swapped).
+
+main's run also failed "two at once" (a near-tie). These failures are older than this branch: they come from the draft's
+verify shapes against plain decode (int8 rounding depends on the step's shape). The other 22-23 checks pass.

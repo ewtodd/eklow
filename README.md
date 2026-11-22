@@ -111,8 +111,10 @@ draft against 3,000 without.
 - **Scheduling.** Continuous batching of two slots with chunked prefill (2,048 tokens a sequence a step), generating slots
   first. Prefix reuse keeps a slot's K/V for the next turn. The K/V cache is paged for the global layers, with rings for
   the sliding ones.
-- **A prefix cache on disk** (`--prefix-cache`, not yet measured on the card). The K/V of prompts and replies goes to disk
-  page by page, so a conversation whose slot went to another one is read back instead of prefilled.
+- **A prefix cache on disk** (`--prefix-cache`). The K/V of prompts and replies goes to disk page by page, so a conversation
+  whose slot went to another one is read back instead of prefilled.
+  - A restore is bit for bit what a prefill gives, at 149k positions a second from the disk. A 20k conversation's turn starts
+    in 0.55 s instead of 4.5-6 s, and storing costs nothing measurable (DECISIONS 2026-11-22).
   - Pages are named by a SHA-256 chain over their tokens and sealed with AES-256-GCM under a key file.
   - The least recently used pages go first past the size cap, a conversation's last pages before its first.
   - A request with `max_tokens` 0 is prefill-only: its prompt goes into a slot and the disk, and nothing is generated. It
