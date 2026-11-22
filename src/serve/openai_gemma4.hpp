@@ -63,6 +63,7 @@ struct ChatRequest {
   std::vector<ImageInput> images;  // the prompt's image spans (their positions hold ids below zero naming the rows)
   SamplingParams sampling;
   int64_t max_tokens = 0;
+  bool prefill_only = false;  // max_tokens (or max_completion_tokens) 0: the prompt into a slot and the disk cache, nothing generated
   std::vector<std::string> stop;
   bool stream = false, include_usage = false, thinking = false, tools = false;
   bool in_thinking = false;  // the prompt ends inside the thought channel

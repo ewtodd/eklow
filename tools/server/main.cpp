@@ -10,6 +10,7 @@
 //                [--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]]
 //                [--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]]
 //                [--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S]
+//                [--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N]]
 //
 // --ctx is the context of each slot (positions), Bolt's full 65,536 by default; --batch the tokens of one engine step
 // and --chunk the prefill tokens of one sequence in a step (2,048). The whole model fits on the card (5.7 GiB with the
@@ -31,6 +32,10 @@
 // /v1/systemone, tools/server/systemone.hpp) and the reranker (--rerank-*: POST /v1/rerank, tools/server/rerank.hpp) are each on
 // a port and queue of their own, with GET /v1/models and GET /health, a request at a time with the scheduler held, as the
 // embeddings are.
+// --prefix-cache keeps the K/V of prompts and replies on disk, page by page (serve/prefix_store.hpp), AES-256-GCM sealed under
+// the key in --prefix-cache-key (32 bytes, or 64 hex digits) and at most --prefix-cache-gib GiB (200), so that a conversation
+// whose slot went to another one is read back instead of prefilled. A chat request with max_tokens 0 is prefill-only: its
+// prompt goes into a slot and the disk, nothing is generated, and it waits for the engine to be otherwise idle.
 // The log (stdout, unholy's form, each line prefixed with the local time): a line per chat request as it ends
 // (finish reason; prompt, cached and completion tokens; queue, time to first token, prefill and decode tok/s), a
 // line per embedding request, a line per rejected request, and every --log-interval seconds (10; 0 for none) while
@@ -51,6 +56,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -106,12 +113,19 @@ std::string fmt(const char* f, A... a) {
 
 // A chat request as it ended: why, its tokens, and its times (prefill over the uncached part of the prompt).
 std::string request_line(const serve::gemma4::RequestLog& l) {
-  std::string out = "request " + l.tag + ": " + l.reason;
+  std::string out = "request " + l.tag + ": " + (l.prefill_only ? "prefill-only " : "") + l.reason;
   if (!l.error.empty()) out += " (" + l.error + ")";
   out += fmt(" | prompt %lld", (long long)l.prompt_tokens);
-  if (l.cached_tokens > 0 && l.image_tokens > 0) out += fmt(" (%lld cached, %lld image)", (long long)l.cached_tokens, (long long)l.image_tokens);
-  else if (l.cached_tokens > 0) out += fmt(" (%lld cached)", (long long)l.cached_tokens);
-  else if (l.image_tokens > 0) out += fmt(" (%lld image)", (long long)l.image_tokens);
+  std::string notes;
+  if (l.cached_tokens > 0) notes += fmt("%lld cached", (long long)l.cached_tokens);
+  if (l.restored_tokens > 0) notes += fmt(", %lld of them from the disk", (long long)l.restored_tokens);
+  if (l.image_tokens > 0) notes += (notes.empty() ? "" : ", ") + fmt("%lld image", (long long)l.image_tokens);
+  if (!notes.empty()) out += " (" + notes + ")";
+  if (l.prefill_only) {
+    out += fmt(", %lld in the slot | queue %.2f s", (long long)l.held, l.queue_s);
+    if (l.prefill_s > 0 && l.held > l.cached_tokens) out += fmt(", prefill %.1f tok/s", double(l.held - l.cached_tokens) / l.prefill_s);
+    return out;
+  }
   out += fmt(", completion %lld | queue %.2f s", (long long)l.completion_tokens, l.queue_s);
   if (l.ttft_s >= 0) {
     out += fmt(", ttft %.2f s", l.ttft_s);
@@ -156,6 +170,24 @@ std::string engine_line(const serve::gemma4::Scheduler::Stats& a, const serve::g
     out += fmt(" | embeddings %lld requests, %lld inputs, %.1f tok/s", (long long)(eb.requests - ea.requests), (long long)(eb.inputs - ea.inputs),
                double(eb.tokens - ea.tokens) / dt);
   return out;
+}
+
+// What names a file in the disk cache's keys: its resolved path (a Nix store path names its content), its size, and a hash of its
+// first and last MiB (a file replaced in place under the same name).
+std::string file_identity(const std::string& path) {
+  std::error_code ec;
+  const std::filesystem::path real = std::filesystem::canonical(path, ec);
+  const uint64_t size = std::filesystem::file_size(path, ec);
+  std::ifstream f(path, std::ios::binary);
+  std::string ends(size_t(std::min<uint64_t>(size, 1 << 20)), '\0');
+  f.read(ends.data(), std::streamsize(ends.size()));
+  if (size > (1u << 21)) {
+    std::string tail(1 << 20, '\0');
+    f.seekg(std::streamoff(size - (1u << 20)));
+    f.read(tail.data(), std::streamsize(tail.size()));
+    ends += tail;
+  }
+  return real.string() + " " + std::to_string(size) + " " + serve::chain_root(ends).hex();
 }
 
 void reply_error(httplib::Response& res, const serve::gemma4::ApiError& e) {
@@ -392,6 +424,8 @@ int main(int argc, char** argv) {
   std::string rerank_path, rerank_alias = "qwen3-reranker-0.6b";
   int rerank_port = 0;
   int64_t rerank_max_tokens = 4096;
+  std::string prefix_dir, prefix_key;
+  int64_t prefix_gib = 200;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -435,6 +469,9 @@ int main(int argc, char** argv) {
     else if (a == "--rerank-port") rerank_port = std::atoi(next().c_str());
     else if (a == "--rerank-alias") rerank_alias = next();
     else if (a == "--rerank-max-tokens") rerank_max_tokens = std::atoll(next().c_str());
+    else if (a == "--prefix-cache") prefix_dir = next();
+    else if (a == "--prefix-cache-key") prefix_key = next();
+    else if (a == "--prefix-cache-gib") prefix_gib = std::atoll(next().c_str());
     else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" || a == "--kv-pool" ||
                a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib" || a == "--expert-profile" ||
                a == "--experts-on-card" || a == "--card-margin-mib" || a == "--verification" || a == "--draft-reserve-mib") {
@@ -445,7 +482,8 @@ int main(int argc, char** argv) {
                            "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--preserve-thinking on|off] [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] "
                            "[--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] "
                            "[--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]] "
-                           "[--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S]\n");
+                           "[--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S] "
+                           "[--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N]]\n");
       return 2;
     }
   }
@@ -463,6 +501,10 @@ int main(int argc, char** argv) {
   }
   if (!checker_reader.empty() && (checker_vega.empty() || checker_port <= 0 || checker_max_tokens < 1024)) {
     std::fprintf(stderr, "eklow-server: --checker-reader needs --checker-vega, --checker-port and a --checker-max-tokens of 1024 or more\n");
+    return 2;
+  }
+  if (!prefix_dir.empty() && (prefix_key.empty() || prefix_gib < 1)) {
+    std::fprintf(stderr, "eklow-server: --prefix-cache needs --prefix-cache-key (the cache holds conversations: it is always encrypted) and a --prefix-cache-gib of 1 or more\n");
     return 2;
   }
   if (!rerank_path.empty() && (rerank_port <= 0 || rerank_max_tokens < 256)) {
@@ -622,6 +664,24 @@ int main(int argc, char** argv) {
     serve::gemma4::SchedulerConfig sc{batch, chunk, ec.max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }};
     sc.draft = draft.get();
     if (draft) sc.draft_block = draft_block;
+    // The disk prefix cache, before the scheduler, which writes into it until it stops.
+    std::unique_ptr<serve::PrefixStore> store;
+    if (!prefix_dir.empty()) {
+      serve::PrefixStore::Options so;
+      so.dir = prefix_dir;
+      so.max_bytes = uint64_t(prefix_gib) << 30;
+      so.key = serve::read_key_file(prefix_key);
+      so.max_queued = sc.store_buffers + size_t(2 * eng.window_pages() * slots) + 8;  // the scheduler's buffers, so a put never finds the queue full
+      store = std::make_unique<serve::PrefixStore>(so);
+      // The keys' root: what the K/V depends on besides the tokens (the image rows' too, when the prompt has images).
+      std::string fp = "model " + file_identity(model_path) + " | " + eng.kv_fingerprint();
+      if (!mmproj_path.empty()) fp += " | mmproj " + file_identity(mmproj_path) + " image-tokens " + std::to_string(image_tokens);
+      sc.store = store.get();
+      sc.store_root = serve::chain_root(fp);
+      const auto pb = eng.page_bytes();
+      std::fprintf(stderr, "eklow-server: prefix cache %s, up to %lld GiB, AES-256-GCM: a page (%lld positions) is %.1f MiB of global K/V, %.1f MiB of sliding K/V at a restore point\n",
+                   prefix_dir.c_str(), (long long)prefix_gib, (long long)attn::kPage, double(pb.global) / 1048576.0, double(pb.sliding) / 1048576.0);
+    }
     serve::gemma4::Scheduler sched(eng, tok, sc);
     if (images) images->bind(&sched);
     if (embed_images) embed_images->bind(&sched);
@@ -644,7 +704,18 @@ int main(int argc, char** argv) {
           const auto ecur = embed_stats.snapshot();
           const auto now = std::chrono::steady_clock::now();
           const bool active = cur.steps != prev.steps || cur.active > 0 || cur.waiting > 0 || ecur.requests != eprev.requests;
-          if (active || was_active) log_line(engine_line(prev, cur, eprev, ecur, seconds(now - t_prev), capacity));
+          if (active || was_active) {
+            std::string line = engine_line(prev, cur, eprev, ecur, seconds(now - t_prev), capacity);
+            if (store) {
+              const auto st = store->stats();
+              line += fmt(" | disk %.1f GiB in %llu files, %lld restores (%lld positions), %lld parts stored", double(st.bytes) / 1073741824.0,
+                          (unsigned long long)st.files, (long long)(cur.restores - prev.restores), (long long)(cur.restored_tokens - prev.restored_tokens),
+                          (long long)(cur.stored_parts - prev.stored_parts));
+              if (cur.unstored_parts > prev.unstored_parts) line += fmt(", %lld not", (long long)(cur.unstored_parts - prev.unstored_parts));
+              if (cur.failed_restores > prev.failed_restores) line += fmt(", %lld failed restores", (long long)(cur.failed_restores - prev.failed_restores));
+            }
+            log_line(line);
+          }
           was_active = active, prev = cur, eprev = ecur, t_prev = now;
         }
       });
@@ -696,6 +767,7 @@ int main(int argc, char** argv) {
       r->images = std::move(cr.images);
       r->sampling = cr.sampling;
       r->max_tokens = cr.max_tokens;
+      r->prefill_only = cr.prefill_only;
       r->stop = cr.stop;
       r->in_thinking = cr.in_thinking;
       r->tools = cr.tool_names;

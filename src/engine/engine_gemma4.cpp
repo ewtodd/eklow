@@ -182,6 +182,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   }
   group_sliding_ = H / hkv_sliding_;
   group_global_ = H / hkv_global_;
+  n_ring_ = n_ring;
   ring_pages_ = (cfg_.window + c_.max_chunk + attn::kPage - 1) / attn::kPage;
   ring_layer_stride_ = int64_t(c_.n_slots) * ring_pages_ * hkv_sliding_ * attn::kPage * cfg_.head_dim_sliding;
   const size_t ring_elems = size_t(ring_layer_stride_ * n_ring);
@@ -310,6 +311,111 @@ void Engine::release(int slot) {
   for (int32_t p : s.pages) free_pages_.push_back(p);
   s.pages.clear();
   s.length = 0;
+}
+
+namespace {
+// Raised when a change makes the K/V the engine computes for the same tokens differ (a kernel's arithmetic, a fix): the disk
+// prefix cache's keys include it, so pages from before it are never read back.
+constexpr int kKvRevision = 1;
+}  // namespace
+
+Engine::PageBytes Engine::page_bytes() const {
+  const size_t g = size_t(hkv_global_ * attn::kPage * cfg_.head_dim_global), s = size_t(hkv_sliding_ * attn::kPage * cfg_.head_dim_sliding);
+  PageBytes b;
+  b.global = global_.size() * 2 * g * (c_.int8_global_kv ? 1 : 2) + (c_.int8_global_kv ? global_.size() * 2 * (g / 16) * sizeof(sycl::half) : 0);
+  b.sliding = size_t(n_ring_) * 2 * s * sizeof(sycl::half);
+  return b;
+}
+
+bool Engine::ring_holds(int slot, int64_t page) const {
+  const int64_t L = slots_.at(size_t(slot)).length;
+  if (page < 0 || (page + 1) * attn::kPage > L) return false;
+  // The newest page the rings may hold rows of: a verify block's rejected rows reach kMaxVerify - 1 positions past the
+  // sequence, into the ring page of the page ring_pages before it.
+  const int64_t newest = (L - 1 + kMaxVerify - 1) / attn::kPage;
+  return page > newest - ring_pages_;
+}
+
+sycl::event Engine::export_page(int slot, int64_t page, uint8_t* global, uint8_t* sliding) {
+  const Slot& s = slots_.at(size_t(slot));
+  if (page < 0 || (page + 1) * attn::kPage > s.length) throw std::runtime_error("engine: export of a page the slot does not hold whole");
+  if (sliding && !ring_holds(slot, page)) throw std::runtime_error("engine: export of a page the rings no longer hold");
+  sycl::event ev;
+  if (global) {
+    const size_t g = size_t(hkv_global_ * attn::kPage * cfg_.head_dim_global), elem = c_.int8_global_kv ? 1 : 2;
+    const size_t phys = size_t(s.pages[size_t(page)]);
+    uint8_t* out = global;
+    for (const GlobalCache& gc : global_) {
+      for (void* a : {gc.k, gc.v}) {
+        ev = q_.memcpy(out, static_cast<const uint8_t*>(a) + phys * g * elem, g * elem);
+        out += g * elem;
+      }
+      if (c_.int8_global_kv)
+        for (const sycl::half* a : {gc.ks, gc.vs}) {
+          ev = q_.memcpy(out, a + phys * (g / 16), (g / 16) * sizeof(sycl::half));
+          out += (g / 16) * sizeof(sycl::half);
+        }
+    }
+  }
+  if (sliding) {
+    const size_t e = size_t(hkv_sliding_ * attn::kPage * cfg_.head_dim_sliding);
+    const size_t phys = size_t(slot) * size_t(ring_pages_) + size_t(page % ring_pages_);
+    uint8_t* out = sliding;
+    for (int r = 0; r < n_ring_; ++r)
+      for (const sycl::half* a : {ring_k_, ring_v_}) {
+        ev = q_.memcpy(out, a + r * ring_layer_stride_ + int64_t(phys * e), e * sizeof(sycl::half));
+        out += e * sizeof(sycl::half);
+      }
+  }
+  return ev;
+}
+
+void Engine::adopt(int slot, int64_t pages) {
+  release(slot);
+  ensure_pages(slot, pages * attn::kPage);
+  slots_[size_t(slot)].length = pages * attn::kPage;
+}
+
+sycl::event Engine::import_page(int slot, int64_t page, const uint8_t* global, const uint8_t* sliding) {
+  const Slot& s = slots_.at(size_t(slot));
+  if (page < 0 || (page + 1) * attn::kPage > s.length) throw std::runtime_error("engine: import of a page the slot does not hold");
+  sycl::event ev;
+  if (global) {
+    const size_t g = size_t(hkv_global_ * attn::kPage * cfg_.head_dim_global), elem = c_.int8_global_kv ? 1 : 2;
+    const size_t phys = size_t(s.pages[size_t(page)]);
+    const uint8_t* in = global;
+    for (const GlobalCache& gc : global_) {
+      for (void* a : {gc.k, gc.v}) {
+        ev = q_.memcpy(static_cast<uint8_t*>(a) + phys * g * elem, in, g * elem);
+        in += g * elem;
+      }
+      if (c_.int8_global_kv)
+        for (sycl::half* a : {gc.ks, gc.vs}) {
+          ev = q_.memcpy(a + phys * (g / 16), in, (g / 16) * sizeof(sycl::half));
+          in += (g / 16) * sizeof(sycl::half);
+        }
+    }
+  }
+  if (sliding) {
+    const size_t e = size_t(hkv_sliding_ * attn::kPage * cfg_.head_dim_sliding);
+    const size_t phys = size_t(slot) * size_t(ring_pages_) + size_t(page % ring_pages_);
+    const uint8_t* in = sliding;
+    for (int r = 0; r < n_ring_; ++r)
+      for (sycl::half* a : {ring_k_, ring_v_}) {
+        ev = q_.memcpy(a + r * ring_layer_stride_ + int64_t(phys * e), in, e * sizeof(sycl::half));
+        in += e * sizeof(sycl::half);
+      }
+  }
+  return ev;
+}
+
+std::string Engine::kv_fingerprint() const {
+  std::string s = "gemma4 kv-revision " + std::to_string(kKvRevision) + " layers " + std::to_string(cfg_.n_layer) + " shared " +
+                  std::to_string(cfg_.n_kv_shared) + " window " + std::to_string(cfg_.window) + " kv-heads " + std::to_string(hkv_sliding_) + "/" +
+                  std::to_string(hkv_global_) + " head-dims " + std::to_string(cfg_.head_dim_sliding) + "/" + std::to_string(cfg_.head_dim_global) +
+                  " rings " + std::to_string(n_ring_) + " globals " + std::to_string(global_.size()) + (c_.int8_global_kv ? " int8" : " fp16") + " sliding ";
+  for (bool b : cfg_.sliding) s += b ? '1' : '0';
+  return s;
 }
 
 std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::DumpSink* dump) {

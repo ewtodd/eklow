@@ -196,6 +196,33 @@ in
       description = "The instance started at boot; null starts none (a mode switch starts one).";
     };
 
+    prefixCache = {
+      enable = lib.mkEnableOption ''
+        the disk prefix cache (`--prefix-cache`): the K/V of prompts and replies kept on disk page by page, so that a conversation
+        whose slot went to another one is read back instead of prefilled, and prefill-only requests (max_tokens 0) that put a
+        prompt there ahead of its turn. Each instance keeps its own under /var/lib/eklow-<name>/prefix-cache'';
+
+      keyFile = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "/run/agenix/eklow-prefix-cache-key";
+        description = ''
+          A root-only file with the cache's AES-256-GCM key: 32 bytes, or 64 hex digits (`openssl rand -hex 32`). The pages are
+          conversations, so the cache is always encrypted. The unit reads it through systemd's LoadCredential, so it may stay
+          readable by root alone (agenix's default). A path string, not a Nix path, so the key never enters the store.
+        '';
+      };
+
+      maxGiB = lib.mkOption {
+        type = lib.types.ints.positive;
+        default = 200;
+        description = ''
+          The cache's size on disk. Past it the least recently used pages go, a conversation's last pages before its first. A
+          page of Bolt's (256 positions) is 4 MiB of global K/V; each restore point adds two 10 MiB pages of sliding K/V.
+        '';
+      };
+    };
+
     embedModel = lib.mkOption {
       type = lib.types.nullOr lib.types.path;
       default = pkgs.fetchurl {
@@ -424,6 +451,10 @@ in
         message = "services.eklow.checker: set policy or policyFiles, not both.";
       }
       {
+        assertion = !cfg.prefixCache.enable || cfg.prefixCache.keyFile != null;
+        message = "services.eklow.prefixCache: set keyFile (the cache holds conversations and is always encrypted).";
+      }
+      {
         assertion = lib.all (n: builtins.match "[a-z0-9][a-z0-9-]*" n != null) (
           lib.attrNames cfg.instances
         );
@@ -532,6 +563,15 @@ in
               "--rerank-max-tokens"
               (toString cfg.reranker.maxTokens)
             ]
+            # %d is systemd's credentials directory, where LoadCredential puts the key for the dynamic user.
+            ++ lib.optionals cfg.prefixCache.enable [
+              "--prefix-cache"
+              "/var/lib/${unitName name}/prefix-cache"
+              "--prefix-cache-key"
+              "%d/prefix-cache-key"
+              "--prefix-cache-gib"
+              (toString cfg.prefixCache.maxGiB)
+            ]
             ++ inst.extraArgs
           );
           Restart = "on-failure";
@@ -580,6 +620,12 @@ in
                 ${pkgs.coreutils}/bin/chmod 0500 "$d"
               ''
             );
+        }
+        // lib.optionalAttrs cfg.prefixCache.enable {
+          # /var/lib/private/eklow-<name> for the dynamic user, which systemd hands to the unit's uid at each start.
+          StateDirectory = unitName name;
+          StateDirectoryMode = "0700";
+          LoadCredential = [ "prefix-cache-key:${cfg.prefixCache.keyFile}" ];
         };
       }
     ) cfg.instances;

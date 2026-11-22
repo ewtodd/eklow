@@ -1,10 +1,16 @@
 // Continuous batching over the engine's slots. Each step decodes one token for every sequence that
 // is generating and fills the rest of the batch with prefill chunks of the sequences still reading
 // their prompts. A new request takes the free slot whose cached sequence shares the longest prefix
-// with its prompt and prefills only the rest. Generated tokens go through Gemma 4's output parser;
-// the reader gets reasoning, content and tool calls as they complete. Inside a tool call, sampling
-// is limited to the tokens the tool-call grammar allows, so a request with tools gets no malformed
-// call.
+// with its prompt and prefills only the rest, or, with a disk prefix cache, the least recently used
+// free slot with the prompt's pages read back from the disk, whichever costs less. Generated tokens
+// go through Gemma 4's output parser; the reader gets reasoning, content and tool calls as they
+// complete. Inside a tool call, sampling is limited to the tokens the tool-call grammar allows, so a
+// request with tools gets no malformed call.
+//
+// A prefill-only request (max_tokens 0) puts its prompt into a slot and the disk cache and generates
+// nothing. It has the lowest priority: it starts only when no other request runs or waits, gets no
+// tokens of a step while another request runs, and gives its slot up to a request that finds no free
+// one (it then ends where it got to).
 #pragma once
 
 #include <atomic>
@@ -21,6 +27,8 @@
 
 #include "engine/engine_gemma4.hpp"
 #include "model/dflash2.hpp"
+#include "serve/prefix_policy.hpp"
+#include "serve/prefix_store.hpp"
 #include "serve/sampler.hpp"
 #include "serve/tool_grammar_gemma4.hpp"
 #include "text/output_parser_gemma4.hpp"
@@ -36,6 +44,9 @@ struct Event {
   std::string error;          // with done: the request failed
   int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;  // with done
   int64_t verifies = 0, drafted = 0, accepted = 0;  // with done: speculation (verify blocks, tokens drafted, of them accepted)
+  int64_t restored_tokens = 0;  // with done: of cached_tokens, those read back from the disk cache
+  bool prefill_only = false;    // with done: the request asked for no generation (max_tokens 0)
+  int64_t held = 0;             // with done and prefill_only: the prompt's positions in the slot as it ended (fewer than all when it gave the slot up)
 };
 
 // An image in a prompt: its rows stand for `n` consecutive prompt positions from `start`. The prompt holds, at those
@@ -57,6 +68,8 @@ class Request {
   std::vector<ImageInput> images;  // in order, each within the prompt
   SamplingParams sampling;
   int64_t max_tokens = 0;          // 0: as far as the context allows
+  bool prefill_only = false;       // the prompt into a slot (and the disk cache), nothing generated: the lowest priority
+  std::vector<PageKey> page_keys;  // set by submit with a disk cache: the keys of the prompt's full pages
   std::vector<std::string> stop;   // strings that end the content (not included)
   bool in_thinking = false;        // the prompt ends inside the thought channel
   bool calls_allowed = true;       // false: the parser bans <|tool_call> (tool_choice "none")
@@ -87,6 +100,9 @@ struct RequestLog {
   int64_t prompt_tokens = 0, cached_tokens = 0, completion_tokens = 0;
   int64_t image_tokens = 0;  // of the prompt, rows of images
   int64_t verifies = 0, drafted = 0, accepted = 0;  // speculation: verify blocks, tokens drafted, of them accepted
+  int64_t restored_tokens = 0;  // of cached_tokens, read back from the disk cache
+  bool prefill_only = false;
+  int64_t held = 0;             // prefill_only: the prompt's positions in the slot as it ended
   double queue_s = -1, ttft_s = -1, prefill_s = -1, decode_s = -1;
 };
 
@@ -98,11 +114,21 @@ struct SchedulerConfig {
   // Speculative decoding: the draft (null: plain decode) and the block size B (anchor + B - 1 drafted tokens, 2 to engine::gemma4::kMaxVerify).
   model::Dflash2* draft = nullptr;
   int draft_block = 4;
+  // The disk prefix cache (null: none), the root of its keys (the model's and the cache's fingerprint), and what a restore
+  // is weighed with.
+  PrefixStore* store = nullptr;
+  PageKey store_root{};
+  RestoreCost restore_cost{};
+  size_t store_buffers = 48;  // pinned host buffers for global parts on their way to the disk (Bolt's are 4 MiB)
+  // Prefill-only requests: their chunk (a request that arrives waits at most one of their steps) and how many may wait.
+  int64_t prefill_only_chunk = 512;
+  size_t max_prefill_only_waiting = 8;
 };
 
 class Scheduler {
  public:
   Scheduler(engine::gemma4::Engine& eng, const text::Tokenizer& tok, const SchedulerConfig& c);
+  ~Scheduler();
 
   // Queues a request. Throws std::invalid_argument for one whose prompt does not fit a slot.
   void submit(std::shared_ptr<Request> r);
@@ -127,6 +153,11 @@ class Scheduler {
     // (the first event pushed to the reader - submit) and how many it sums.
     double busy_s = 0, prefill_seq_s = 0, decode_seq_s = 0, first_token_s = 0;
     int64_t first_tokens = 0;
+    // The disk cache: restores, the positions they brought back, and those that failed (a broken page: the request prefilled);
+    // parts queued for the store, and parts not stored (no buffer free, or the rings no longer held them). Prefill-only
+    // requests waiting, and those that gave a slot up.
+    int64_t restores = 0, restored_tokens = 0, failed_restores = 0, stored_parts = 0, unstored_parts = 0;
+    int64_t prefill_only_waiting = 0, preempted = 0;
   };
   Stats stats() const;
 
@@ -149,6 +180,11 @@ class Scheduler {
   struct Seq {
     std::shared_ptr<Request> req;
     std::vector<int32_t> tokens;  // what the engine holds for the slot
+    std::vector<PageKey> chain;   // with a disk cache: the keys of tokens' full pages, as far as computed
+    int64_t chain_stored = 0;     // pages from the start whose global parts are in the store or on their way
+    int64_t restored = 0;         // positions the request's admission read back from the disk
+    int64_t point_stored = 0;     // the restore point (pages) whose sliding parts were last queued
+    uint64_t used = 0;            // the admission that last gave the slot a request (a restore takes the least recent)
     size_t fed = 0;               // prompt tokens in the engine
     int32_t next_token = -1;      // sampled, fed in the next step
     std::unique_ptr<text::OutputParser> parser;
@@ -163,6 +199,14 @@ class Scheduler {
   };
 
   bool admit();
+  // Gives slot `s` request `r`, keeping `keep` positions of its sequence, or with `restore` > 0 that many pages read back from
+  // the disk cache (falling back to a fresh prefill if a page turns out broken). The engine thread, without mu_.
+  void start(int s, std::shared_ptr<Request> r, int64_t keep, int64_t restore);
+  bool restore(int s, const Request& r, int64_t pages);
+  // The disk cache: queues the global parts of the slot's full pages not yet stored (waiting for a buffer if `wait`), and the
+  // sliding parts its restore point needs.
+  void store_pages(int s, bool wait);
+  void store_point(int s);
   void step();
   // Follows a sampled token; returns why the request ends at it ("" if it goes on).
   std::string on_token(int slot, int32_t token);
@@ -178,8 +222,12 @@ class Scheduler {
 
   mutable std::mutex mu_;
   std::condition_variable cv_;
-  std::deque<std::shared_ptr<Request>> waiting_;
+  std::deque<std::shared_ptr<Request>> waiting_, prefill_only_;
   Stats stats_;
+  uint64_t admissions_ = 0;
+  int64_t reach_pages_ = 0;  // the draft's reach in pages: a restore stops that far before the prompt's end (prefix_policy.hpp)
+  class HostPool;
+  std::unique_ptr<HostPool> store_pool_, sliding_pool_, restore_pool_, restore_sliding_pool_;
 
   std::mutex hold_mu_;
   std::condition_variable hold_cv_;

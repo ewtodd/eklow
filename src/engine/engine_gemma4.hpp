@@ -93,7 +93,8 @@ class Engine {
   // Keeps the first `length` positions of a slot's sequence (a prompt that shares only a prefix with the last one) and
   // returns the pages past them. The sliding rings hold only the sequence's last ring_pages x kPage positions: rewinding a
   // slot by more than ring_slack() positions leaves the window before `length` overwritten, and every window before it too,
-  // so prefilling fewer positions again reads stale K/V as well. Such a rewind must start the sequence over (length 0).
+  // so prefilling fewer positions again reads stale K/V as well. Such a rewind must start the sequence over (length 0) or
+  // restore its window (adopt and import_page).
   void truncate(int slot, int64_t length);
   int64_t ring_slack() const { return ring_pages_ * attn::kPage - cfg_.window; }
   // Positions the slot holds (where its next chunk starts).
@@ -102,6 +103,32 @@ class Engine {
   // sliding layers' rings are each slot's for good and are not in it.
   int64_t pool_pages() const { return n_pages_; }
   int64_t free_pages() const { return int64_t(free_pages_.size()); }
+
+  // A slot's K/V page by page, for the disk prefix cache (serve/prefix_store.hpp). A page's K/V comes in two parts, each laid
+  // out layer after layer as the cache holds it (K, V, then an int8 cache's scales): the global layers' (`global` bytes) and
+  // the sliding layers' (`sliding` bytes).
+  struct PageBytes {
+    size_t global = 0, sliding = 0;
+  };
+  PageBytes page_bytes() const;
+  // Pages of sliding K/V a sequence needs below a point to go on from it: the window's.
+  int64_t window_pages() const { return (cfg_.window + attn::kPage - 1) / attn::kPage; }
+  int64_t ring_pages() const { return ring_pages_; }
+  // Whether the slot's rings still hold full page `page` of its sequence whole (a ring keeps its last pages; a verify block's
+  // rejected rows past the sequence may have overwritten the oldest one).
+  bool ring_holds(int slot, int64_t page) const;
+  // Copies full page `page` of the slot's sequence to host memory: its global part to `global` and its sliding part (the rings
+  // must still hold it) to `sliding`; either may be null. Asynchronous on the engine's queue, which is in order, so the next
+  // step's writes come after; the event is the last copy's.
+  sycl::event export_page(int slot, int64_t page, uint8_t* global, uint8_t* sliding);
+  // A restore: the slot forgets its sequence and holds `pages` full pages, which the caller fills with import_page: every
+  // page's global part, and the sliding parts of the last window_pages() (what the next chunk's sliding layers read).
+  void adopt(int slot, int64_t pages);
+  sycl::event import_page(int slot, int64_t page, const uint8_t* global, const uint8_t* sliding);
+  // What a page's K/V depends on besides the model's weights and the tokens: the cache's layout and format, and eklow's K/V
+  // revision (kKvRevision in the .cpp: raised when a change makes the K/V the engine computes differ).
+  std::string kv_fingerprint() const;
+  sycl::queue& queue() { return q_; }
 
   // With a profile set, step waits after each section of the forward pass and adds its wall time under the section's
   // name: slower, for finding where the time goes.
@@ -169,6 +196,7 @@ class Engine {
   };
   std::vector<GlobalCache> global_;
   int64_t ring_layer_stride_ = 0, ring_pages_ = 0, n_pages_ = 0, max_pages_ = 0;
+  int n_ring_ = 0;  // the sliding layers that own a ring (the global ones each own an entry of global_)
   int64_t group_sliding_ = 0, group_global_ = 0, hkv_sliding_ = 0, hkv_global_ = 0;
   int32_t* page_table_ = nullptr;
   std::vector<int32_t> page_table_host_, free_pages_;

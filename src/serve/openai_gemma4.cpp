@@ -255,10 +255,14 @@ ChatRequest parse_chat(const json::Value& body, const text::Tokenizer& tok, cons
   } catch (const std::invalid_argument& e) {
     throw bad(e.what());
   }
+  // 0 asks for no generation: the prompt goes into a slot and the disk prefix cache (eklow's prefill-only request; llama.cpp's
+  // server takes n_predict 0 alike). The first of the two fields that is sent counts.
   for (const char* k : {"max_completion_tokens", "max_tokens"})
-    if (const json::Value* v = field(body, k); v && !v->is_null() && r.max_tokens == 0) {
+    if (const json::Value* v = field(body, k); v && !v->is_null()) {
       r.max_tokens = int64_t(number(*v, k));
-      if (r.max_tokens <= 0) throw bad(std::string(k) + " must be positive");
+      if (r.max_tokens < 0) throw bad(std::string(k) + " must not be negative");
+      r.prefill_only = r.max_tokens == 0;
+      break;
     }
   if (const json::Value* v = field(body, "stop"); v && !v->is_null()) {
     if (v->is_string()) r.stop.push_back(v->as_string());
@@ -294,9 +298,15 @@ std::string ChatResponse::usage_json(const Event& e) const {
   json::Writer w(false);
   w.begin_object().kv("prompt_tokens", e.prompt_tokens).kv("completion_tokens", e.completion_tokens);
   w.kv("total_tokens", e.prompt_tokens + e.completion_tokens);
-  w.key("prompt_tokens_details").begin_object().kv("cached_tokens", e.cached_tokens).end_object();
+  // eklow's own beside cached_tokens: of them, those read back from the disk prefix cache (absent when none were).
+  w.key("prompt_tokens_details").begin_object().kv("cached_tokens", e.cached_tokens);
+  if (e.restored_tokens > 0) w.kv("restored_tokens", e.restored_tokens);
+  w.end_object();
   // eklow's own: what speculative decoding did for the request (absent without a draft).
   if (e.verifies > 0) w.key("speculation").begin_object().kv("verifies", e.verifies).kv("drafted", e.drafted).kv("accepted", e.accepted).end_object();
+  // eklow's own, for a prefill-only request: the prompt's positions in the slot as it ended, and whether that is all of them
+  // (not when it gave its slot up to another request, or was dropped while waiting).
+  if (e.prefill_only) w.key("prefill").begin_object().kv("positions", e.held).kv("complete", e.held == e.prompt_tokens).end_object();
   w.end_object();
   return w.str();
 }

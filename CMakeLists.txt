@@ -17,9 +17,11 @@ set(EKLOW_SYCL_TARGETS "intel_gpu_dg2_g10" CACHE STRING "comma-separated -fsycl-
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(LEVEL_ZERO REQUIRED IMPORTED_TARGET level-zero)
-# cpp-httplib is header-only; its CMake package would also want OpenSSL, which eklow does not use.
+# cpp-httplib is header-only; its CMake package would also want OpenSSL for TLS, which eklow does not serve.
 find_path(HTTPLIB_INCLUDE_DIR httplib.h REQUIRED)
 find_package(Threads REQUIRED)
+# OpenSSL's libcrypto: SHA-256 and AES-256-GCM for the disk prefix cache (src/serve/prefix_store.*).
+find_package(OpenSSL REQUIRED COMPONENTS Crypto)
 
 add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 
@@ -175,8 +177,16 @@ target_link_libraries(eklow-parse-gemma4 PRIVATE eklow_text)
 
 # Serving: the request layer (OpenAI surface, Gemma 4's chat template), the scheduler (continuous batching, speculative
 # decoding with a DFlash draft) and the server. The sampler and the acceptance are eklow_spec's.
+# The disk prefix cache (keys, sealed page files, eviction) is host only, so its test builds without the card's toolchain.
+add_library(eklow_prefix STATIC src/serve/prefix_store.cpp)
+target_include_directories(eklow_prefix PUBLIC src)
+target_link_libraries(eklow_prefix PUBLIC OpenSSL::Crypto Threads::Threads)
+add_executable(eklow-prefix-store-test tools/server/prefix_store_test.cpp)
+target_link_libraries(eklow-prefix-store-test PRIVATE eklow_prefix)
+install(TARGETS eklow-prefix-store-test RUNTIME DESTINATION bin)
+
 add_library(eklow_serve_gemma4 STATIC src/serve/openai_gemma4.cpp src/serve/scheduler_gemma4.cpp)
-target_link_libraries(eklow_serve_gemma4 PUBLIC eklow_spec eklow_grammar_gemma4 eklow_text eklow_engine_gemma4)
+target_link_libraries(eklow_serve_gemma4 PUBLIC eklow_spec eklow_grammar_gemma4 eklow_text eklow_engine_gemma4 eklow_prefix)
 eklow_sycl(eklow_serve_gemma4)
 
 add_executable(eklow-prompt-gemma4 tools/prompt_gemma4/main.cpp)

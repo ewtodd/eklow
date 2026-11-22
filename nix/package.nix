@@ -11,6 +11,7 @@
   httplib,
   makeWrapper,
   ninja,
+  openssl,
   pkg-config,
   syclTargets,
 }:
@@ -39,10 +40,12 @@ intel-llvm.stdenv.mkDerivation {
   ];
 
   # Level Zero itself, for allocations SYCL cannot ask for (uncached host memory in eklow-probe);
-  # cpp-httplib (header-only) for the server.
+  # cpp-httplib (header-only) for the server; OpenSSL's libcrypto for the disk prefix cache's
+  # SHA-256 and AES-256-GCM.
   buildInputs = [
     level-zero
     httplib
+    openssl
   ];
 
   # ocloc dlopens the graphics compiler (libigc) by soname, which is not on its runpath.
