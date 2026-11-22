@@ -3420,3 +3420,117 @@ start from there.
   - `serve_test.py basic` and decode at 8k through the full deployment.
 
   Not run yet.
+
+## 2026-11-22 — the disk prefix cache, prefill-only requests, and the rings' rewind
+
+**Why.** fiona's two slots serve the chat of every son-of-anton instance (work, play, house, ricky, markets and now parents),
+so a conversation that comes back has usually lost its slot to another one and prefills its whole prompt again: ~7 s for 20k
+tokens, ~20 s for 50k (3,549 / 2,920 / 2,273 tok/s at 8k / 32k / 60k). son-of-anton is also to read a group chat's untagged
+messages as they arrive (stored in the session, no reply) and have their prefill done before fiona is tagged. The owner chose
+disk over the host-RAM spill DESIGN's M3 planned: barely slower, and as large as the disk. fiona's disk is a 1 TB Kingston NV3
+NVMe (333 GB free) with ext4 and no LUKS, and the pages are conversations, so they are sealed.
+
+**The rings' rewind** (its own commit, before the rest). A new prompt reused `keep` positions of a slot's sequence; when the
+slot gave back more than `ring_slack()` positions, `admit` kept `window` fewer and prefilled them again. That does not restore
+anything: a sliding ring holds the last ring_pages x 256 positions (2,560 for Bolt), so the window before `keep` is gone, and
+so is the window before `keep - window`, which the re-prefilled positions' sliding layers read (each position looks 511 back).
+Those positions were computed against another sequence's K/V, and every sliding layer above them carried it on. It happens
+whenever a slot changes conversation past a shared stretch: a slot holding one chat's 30k tokens, and another chat sharing its
+first few thousand. Now such a rewind starts the sequence over (`ring_safe_keep`, serve/prefix_policy.hpp), or restores it
+from the disk. The engine's comment on `truncate` said the same wrong thing and is corrected. Not measured on the card yet
+(below).
+
+**What a page holds.** A page is 256 positions (attn::kPage), in two parts, each a file:
+- *global*: the K and V of the 4 global layers that own K/V, as the pool holds them (2 heads x 512, fp16): **4 MiB, 16 KiB
+  a position**;
+- *sliding*: the K and V of the 20 sliding layers' rings (2 heads x 256, fp16): **10 MiB, 40 KiB a position**.
+
+Every page of a stored sequence has its global part. A sliding part is needed only below a restore point (the window the next
+chunk reads), so only those are stored: 56 KiB a position would be 3.5 times the disk for nothing.
+
+**Keys.** A SHA-256 chain: the root hashes a fingerprint (the model file's resolved path, size and a hash of its first and
+last MiB; the projector's, and the image budget, when there is one; `Engine::kv_fingerprint`: the layer layout, heads, head
+dims, window, fp16 or int8, and `kKvRevision`, raised when a change makes the engine's K/V differ); page j's key hashes page
+j-1's and its 256 ids. Equal keys are equal prefixes under the same model and cache. Image rows carry ids that name the image
+(`image_row_id`), so they hash like tokens.
+
+**Files** (`src/serve/prefix_store.*`). `<dir>/<2 hex>/<64 hex>.g` or `.s`: an 84-byte header (magic `EKPC`, version 1, the
+part, the page's depth, the length, the key, the nonce, the tag) and the payload, AES-256-GCM sealed in place with a random
+96-bit nonce under the key file's key, the header's first 56 bytes authenticated with it. The tag is the checksum: a file that
+is short, renamed, flipped or under another key does not open, counts as a miss and is removed. Writes go to `tmp/` and are
+renamed into place, without fsync (a crash costs a miss). The index lives in memory; a start rebuilds it from the headers and
+the files' mtimes (a read touches them). OpenSSL's libcrypto does the SHA-256 and AES-GCM: eklow's first library beside the
+driver and cpp-httplib, for code that must not be home-made.
+
+**Writes.** After every step the global parts of the pages it filled are copied to pinned host buffers (48 of 4 MiB) on the
+engine's queue, which is in order, so the copies run before the next step writes anything; a writer thread waits for each
+copy, seals it in place and writes it. Without a free buffer a page waits for a later step, and before a slot's sequence is cut
+or replaced the rest go, waiting for buffers. Sliding parts are written at two moments, while the rings still hold them: when
+a prompt's prefill ends and when a request ends. Each time the restore point is the full pages held less the draft's reach, and
+the sliding parts of the `window_pages` (2) pages below it are stored: 20 MiB a point. A turn adds its new global pages and
+up to two points.
+
+**Restore.** At admission (the keys are hashed on the request's thread at submit) the store gives the deepest point t, at
+most (P - 1) / 256 less the draft's reach in pages, with every global part below it and the sliding parts of [t - 2, t), and
+never inside an image. The restore wins if the prefill it saves takes longer than 0.02 s + t x 256 / 60,000 positions a second
+(prefill counted at 2,500 tok/s): 20k positions from the disk are taken over a slot that holds 0, not over one that holds
+19.8k. It goes into the free slot given a request least recently. The sliding parts are read first (a broken one leaves the
+slot untouched), then the slot adopts t pages and the global parts are read 8 at a time by 8 threads and copied in; a broken
+page releases the slot and the request prefills from 0 (`failed_restores`).
+
+**The draft's state.** NVIDIA's DFlash draft keeps a state of its own per slot: a ring per layer (5 layers, all sliding,
+window 1,024) of K/V it computed from the target's hidden states at layers 5, 11, 17, 23 and 35, which the target's K/V does
+not hold. A restore does not bring it back. Instead a restore stops the draft's reach (4 pages) short of what the prompt
+reaches, so that at least 1,025 positions are prefilled after it, and the scheduler's capture of a prompt's last `reach` rows
+refills the draft's whole context, as for any prompt. Cost: ~0.3-0.45 s of prefill a restore. Storing the draft's rings
+instead (5 x 2 x 8 heads x 128 x fp16 = 20 KiB a position, 20 MiB a point, and an export and import in `Dflash2`) waits on
+what that prefill measures on the card.
+
+**Prefill-only requests.** `max_tokens` (or `max_completion_tokens`) 0, refused before as not positive, puts the prompt into a
+slot and the disk and generates nothing, like llama.cpp's `n_predict` 0. The lowest priority:
+- it starts only while no other request runs or waits, and the newest 8 wait (an older one is answered at once, held 0);
+- it gets no tokens of a step while another request runs, and chunks of 512 (a request that arrives waits at most one such
+  step, ~0.15 s);
+- a request that finds no free slot takes its slot; it then ends where it got to, its full pages stored.
+
+The answer is a normal completion with no content, `finish_reason` "length", and in `usage` eklow's
+`"prefill": {"positions": N, "complete": true|false}` (N: the prompt's positions in the slot as it ended).
+`prompt_tokens_details` gains `restored_tokens` beside `cached_tokens` for any request that restored. maitred forwards the body
+as JSON and rewrites only `model`, a model's `request_overrides` and the reasoning effort (checked at /etc/nixos's pin
+7e0e964), so 0 arrives as sent. son-of-anton should name `eklow/nemotron-3.5-bolt-e4b`, not the `fiona` route: routed to
+another server (son-of-anton's own, while eklow is down) a `max_tokens` of 0 is refused, or worse.
+
+**Measured on fiona's host** (CPU only, niced, beside the running service): AES-256-GCM seals 6.9 GB/s and opens 5.3 on one
+thread; 80 pages (a 20k conversation's 320 MiB of global K/V) read and opened by 8 threads from the page cache in 34 ms
+(600k positions a second). From the disk cold, the NV3's reads bound it (~3 GB/s, ~0.1 s); the copies to the card add 27 ms at
+11.7 GB/s. So a 20k conversation should come back in ~0.15-0.25 s plus the 1,025 positions after it (~0.4 s) against ~7 s;
+the 60,000 positions a second the restore decision assumes is a third of that, until the card measures it.
+
+**Module.** `services.eklow.prefixCache.{enable, keyFile, maxGiB}` (200 by default): the instance's StateDirectory
+(`/var/lib/eklow-<name>/prefix-cache`, the dynamic user's) and the key through `LoadCredential` (`%d/prefix-cache-key`), so
+an agenix file may stay root-only. The server's flags are `--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N]`;
+the cache needs a key.
+
+**Checks** (no card: fiona's A770M serves production).
+- `eklow-prefix-store-test`: the chain, AES-GCM against flipped bits of the data, header, tag and key, the key file's forms,
+  parts written and read back, dedup, a full queue, restore points, broken, truncated and renamed files, a restart's scan,
+  eviction order (least recently used, then deepest, sliding before global), and the policy (the rewind limit; that a prompt
+  extending a stored sequence reaches the sequence's point; that a restore leaves the draft's reach to prefill; the choice).
+  Passes here and on fiona.
+- Builds: every target (`ninja`) and the package (`nix build .#eklow`); the host tests (`eklow-metrics-test`,
+  `eklow-keepalive-test`, `eklow-spec-test`) pass as before.
+- The module evaluates with the cache on (the flags, StateDirectory, LoadCredential beside the checker's RuntimeDirectory),
+  with it off (the unit as before), and asserts a key.
+
+**Not run: on the card, in a pause of `eklow-bolt` (~30 minutes).**
+1. `serve_test.py basic` with this build and no cache, against main's: nothing else changed.
+2. The rewind: a slot holding a long sequence, then a prompt sharing only its first few thousand tokens; greedy output and
+   first logits from this build (it starts over) and main's (it keeps `keep - window`), each against a fresh server. Expect
+   main's to differ, this one's not.
+3. The cache: conversation A (20k), two others that take both slots, then A again: `restored_tokens`, the time to the first
+   token, and greedy output with `"speculative": false` against a cold prefill of the same prompt; then the draft's acceptance
+   on the turn after a restore.
+4. Prefill-only: one before A's next turn (that turn's cached tokens), a request arriving during one (its wait), and one
+   taken over by a request when both slots are busy.
+5. The cost of storing: decode at 8k and prefill at 32k with and without `--prefix-cache`, and the restore rate, to set
+   `RestoreCost`.

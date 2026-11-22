@@ -3,7 +3,7 @@
 Live state, written as a handoff. Design and history: `DESIGN.md` (the original target) and `DECISIONS.md` (every decision
 with its measurements); what eklow is and its numbers: `README.md`.
 
-## Now (2026-11-11)
+## Now (2026-11-22)
 
 - **fiona runs eklow's milestone in production** (`eklow-bolt.service` since 2026-11-10 22:48): Nemotron-3.5-Bolt-E4B with
   NVIDIA's DFlash draft and Gemma 4's projector, EmbeddingGemma 2 with its projector, vega's end-of-turn checker (the
@@ -27,6 +27,9 @@ with its measurements); what eklow is and its numbers: `README.md`.
   replay set carries the stored reasoning.
 - **`GET /metrics` on Bolt's server** (DECISIONS 2026-11-11), for llmtop. It is checked against llmtop's parser, not yet on
   the card.
+- **Branch `serve/disk-prefix-cache`** (DECISIONS 2026-11-22): the disk prefix cache, prefill-only requests (`max_tokens` 0),
+  and the fix of the rings' rewind (a slot that changed conversation kept stale sliding K/V). Host-checked only: the store's
+  test passes here and on fiona, everything builds, and the module evaluates.
 
 ## Open, in order
 
@@ -36,12 +39,15 @@ with its measurements); what eklow is and its numbers: `README.md`.
    - the checker's golden states and its 29 turns;
    - the reranker against llama.cpp f16;
    - `serve_test.py basic` and decode at 8k.
-2. **Text-to-speech and speech-to-text** on the same card, beside Bolt (planned).
-3. **The checker's cut-offs** sit where its fitted features put them. Offtopic's cut-off lies inside the mass of its
+2. **`serve/disk-prefix-cache` on the card** (~30 minutes in a pause of `eklow-bolt`; DECISIONS 2026-11-22, "Not run"): the
+   rewind against main's, a restore against a cold prefill, prefill-only requests, and what storing costs. Then the restore
+   rate goes into `RestoreCost`. son-of-anton's prefill-only requests should name `eklow/nemotron-3.5-bolt-e4b`.
+3. **Text-to-speech and speech-to-text** on the same card, beside Bolt (planned).
+4. **The checker's cut-offs** sit where its fitted features put them. Offtopic's cut-off lies inside the mass of its
    answers, so any implementation flips some of its flags (DECISIONS "vega's checker").
-4. **Dead attention cases** of the Gemma 4 26B and 12B (head 512 groups 8 and 16, head 256 group 2), still in `attend` and
+5. **Dead attention cases** of the Gemma 4 26B and 12B (head 512 groups 8 and 16, head 256 group 2), still in `attend` and
    `eklow-attn-test`.
-5. **fp16 activations** for the small-batch matmuls, only if the min-p edge turns out to matter.
+6. **fp16 activations** for the small-batch matmuls, only if the min-p edge turns out to matter.
 
 ## Where things are
 

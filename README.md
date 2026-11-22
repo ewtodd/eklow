@@ -111,6 +111,12 @@ draft against 3,000 without.
 - **Scheduling.** Continuous batching of two slots with chunked prefill (2,048 tokens a sequence a step), generating slots
   first. Prefix reuse keeps a slot's K/V for the next turn. The K/V cache is paged for the global layers, with rings for
   the sliding ones.
+- **A prefix cache on disk** (`--prefix-cache`, not yet measured on the card). The K/V of prompts and replies goes to disk
+  page by page, so a conversation whose slot went to another one is read back instead of prefilled.
+  - Pages are named by a SHA-256 chain over their tokens and sealed with AES-256-GCM under a key file.
+  - The least recently used pages go first past the size cap, a conversation's last pages before its first.
+  - A request with `max_tokens` 0 is prefill-only: its prompt goes into a slot and the disk, and nothing is generated. It
+    runs only when nothing else does, and gives its slot up to a request that needs one.
 - **Image input** (`--mmproj`). Pictures are prepared as Hugging Face's processor does and encoded on the matrix units by
   Google's Gemma 4 E4B tower, which Bolt carries unchanged.
 - **Embeddings** (`--embed-model`, `--embed-mmproj`). EmbeddingGemma 2 runs on its own queue and port. It takes text and
@@ -170,6 +176,10 @@ curl http://localhost:8085/v1/rerank -H 'Content-Type: application/json' -d '{
 }'
 ```
 
+With `--prefix-cache DIR --prefix-cache-key KEYFILE [--prefix-cache-gib 200]` the server keeps K/V on disk. The key file holds
+32 bytes, or 64 hex digits (`openssl rand -hex 32 > KEYFILE`). A prefill-only request is a chat request with `"max_tokens": 0`.
+It answers with no content, `finish_reason` "length", and `usage.prefill` (`positions` in the slot, `complete`).
+
 The defaults are Bolt's own: two slots of its 65,536-token window, fp16 K/V, blocks of the draft's trained 8. The server
 prints what it put on the card, part by part, and the free memory left. It refuses a GGUF of any other architecture before
 it touches the device. The comment at the top of `tools/server/main.cpp` explains every flag.
@@ -186,6 +196,8 @@ The flake's module, `services.eklow`, serves named chat instances, each as the u
 - Instances exclude each other (one card), and `autoStart` names the one started at boot.
 - `checker.policyFiles` takes a private laya policy as three root-only files (agenix's, say), which the unit copies into its
   runtime directory for its dynamic user.
+- `prefixCache.{enable, keyFile, maxGiB}` keeps each instance's disk prefix cache in `/var/lib/eklow-<name>/prefix-cache`. The
+  key file may be root-only: the unit reads it through `LoadCredential`.
 
 ```nix
 services.eklow = {
@@ -235,7 +247,7 @@ This is not a general-purpose engine:
 | `src/kernels` | XMX matmuls for the files' formats (int8 GEMVs for decode, fp16 GEMMs for prefill), flash attention over the paged cache and long prefill attention in key segments, the draft's kernels, the DeltaNet prefill of vega's reader (`gdn_seq`), fused small kernels; `ref` holds the reference kernels |
 | `src/model` | GGUF loading, Gemma 4 E4B's configuration and reference forward pass, the DFlash draft, the Gemma vision tower, EmbeddingGemma 2, Qwen3-Reranker |
 | `src/vega` | vega's checker: the Qwen3.5-0.8B reader, vegaml's prompt and engine, laya's policies and System One |
-| `src/serve`, `src/text` | the scheduler, OpenAI layer and tool-call grammar, the sampler and lossless acceptance; the tokenizers (Gemma's, and Qwen's for the reader and the reranker), Gemma 4's chat templates and output parser |
+| `src/serve`, `src/text` | the scheduler, OpenAI layer and tool-call grammar, the sampler and lossless acceptance, the disk prefix cache (`prefix_store`, `prefix_policy`); the tokenizers (Gemma's, and Qwen's for the reader and the reranker), Gemma 4's chat templates and output parser |
 | `src/rt`, `src/image` | device selection and free memory, the copy engine; image decoding and preparation |
 | `tools/` | `eklow-server` (`tools/server`), the engine, kernel and draft tests and benchmarks, the checker's and the reranker's tools and references (`tools/vega`, `tools/rerank`), the reference runs (`tools/ref`), the server tests and benchmarks (`tools/server`, `tools/bench`) |
 | `nix/` | the package, the NixOS module, the model files (`models.nix`), and llama.cpp's CPU backend as the oracle |
@@ -245,8 +257,9 @@ This is not a general-purpose engine:
 
 ## Third-party code and credits
 
-eklow links [cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT) for its HTTP server and vendors stb_image (public
-domain / MIT) to decode pictures; it carries no other code from other projects.
+eklow links [cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT) for its HTTP server and OpenSSL's libcrypto
+(Apache-2.0) for the disk prefix cache's SHA-256 and AES-256-GCM, and vendors stb_image (public domain / MIT) to decode
+pictures; it carries no other code from other projects.
 
 The models' math follows llama.cpp's graphs (MIT), and llama.cpp is also the oracle (`nix/oracle.nix` builds it); the
 quantized layouts are ggml's. The chat templates are ports of the Gemma 4 and Nemotron-3.5-Bolt-E4B `chat_template.jinja`.
