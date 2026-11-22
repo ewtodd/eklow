@@ -10,7 +10,7 @@
 //                [--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]]
 //                [--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]]
 //                [--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S]
-//                [--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N]]
+//                [--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N] [--prefix-cache-buffers N]]
 //
 // --ctx is the context of each slot (positions), Bolt's full 65,536 by default; --batch the tokens of one engine step
 // and --chunk the prefill tokens of one sequence in a step (2,048). The whole model fits on the card (5.7 GiB with the
@@ -34,8 +34,10 @@
 // embeddings are.
 // --prefix-cache keeps the K/V of prompts and replies on disk, page by page (serve/prefix_store.hpp), AES-256-GCM sealed under
 // the key in --prefix-cache-key (32 bytes, or 64 hex digits) and at most --prefix-cache-gib GiB (200), so that a conversation
-// whose slot went to another one is read back instead of prefilled. A chat request with max_tokens 0 is prefill-only: its
-// prompt goes into a slot and the disk, nothing is generated, and it waits for the engine to be otherwise idle.
+// whose slot went to another one is read back instead of prefilled. --prefix-cache-buffers is the pinned host buffers (4 MiB
+// each for Bolt, 48 by default) that pages take to the disk; fewer make pages wait in their slot sooner (the checks use 2). A
+// chat request with max_tokens 0 is prefill-only: its prompt goes into a slot and the disk, nothing is generated, and it
+// waits for the engine to be otherwise idle.
 // The log (stdout, unholy's form, each line prefixed with the local time): a line per chat request as it ends
 // (finish reason; prompt, cached and completion tokens; queue, time to first token, prefill and decode tok/s), a
 // line per embedding request, a line per rejected request, and every --log-interval seconds (10; 0 for none) while
@@ -425,7 +427,7 @@ int main(int argc, char** argv) {
   int rerank_port = 0;
   int64_t rerank_max_tokens = 4096;
   std::string prefix_dir, prefix_key;
-  int64_t prefix_gib = 200;
+  int64_t prefix_gib = 200, prefix_buffers = 48;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -472,6 +474,7 @@ int main(int argc, char** argv) {
     else if (a == "--prefix-cache") prefix_dir = next();
     else if (a == "--prefix-cache-key") prefix_key = next();
     else if (a == "--prefix-cache-gib") prefix_gib = std::atoll(next().c_str());
+    else if (a == "--prefix-cache-buffers") prefix_buffers = std::atoll(next().c_str());
     else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" || a == "--kv-pool" ||
                a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib" || a == "--expert-profile" ||
                a == "--experts-on-card" || a == "--card-margin-mib" || a == "--verification" || a == "--draft-reserve-mib") {
@@ -483,7 +486,7 @@ int main(int argc, char** argv) {
                            "[--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] "
                            "[--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]] "
                            "[--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S] "
-                           "[--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N]]\n");
+                           "[--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N] [--prefix-cache-buffers N]]\n");
       return 2;
     }
   }
@@ -503,8 +506,9 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "eklow-server: --checker-reader needs --checker-vega, --checker-port and a --checker-max-tokens of 1024 or more\n");
     return 2;
   }
-  if (!prefix_dir.empty() && (prefix_key.empty() || prefix_gib < 1)) {
-    std::fprintf(stderr, "eklow-server: --prefix-cache needs --prefix-cache-key (the cache holds conversations: it is always encrypted) and a --prefix-cache-gib of 1 or more\n");
+  if (!prefix_dir.empty() && (prefix_key.empty() || prefix_gib < 1 || prefix_buffers < 1)) {
+    std::fprintf(stderr, "eklow-server: --prefix-cache needs --prefix-cache-key (the cache holds conversations: it is always encrypted), a --prefix-cache-gib "
+                         "and a --prefix-cache-buffers of 1 or more\n");
     return 2;
   }
   if (!rerank_path.empty() && (rerank_port <= 0 || rerank_max_tokens < 256)) {
@@ -667,6 +671,7 @@ int main(int argc, char** argv) {
     // The disk prefix cache, before the scheduler, which writes into it until it stops.
     std::unique_ptr<serve::PrefixStore> store;
     if (!prefix_dir.empty()) {
+      sc.store_buffers = size_t(prefix_buffers);
       serve::PrefixStore::Options so;
       so.dir = prefix_dir;
       so.max_bytes = uint64_t(prefix_gib) << 30;

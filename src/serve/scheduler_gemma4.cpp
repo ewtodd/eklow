@@ -370,8 +370,8 @@ bool Scheduler::restore(int s, const Request& r, int64_t pages) {
   return ok;
 }
 
-void Scheduler::store_pages(int s, bool wait) {
-  if (!c_.store) return;
+int64_t Scheduler::store_pages(int s, bool wait) {
+  if (!c_.store) return 0;
   Seq& q = seqs_[size_t(s)];
   const int64_t full = int64_t(q.tokens.size()) / attn::kPage;
   extend_chain(c_.store_root, q.chain, q.tokens, full);
@@ -394,12 +394,21 @@ void Scheduler::store_pages(int s, bool wait) {
     std::lock_guard lk(mu_);
     stats_.stored_parts += queued, stats_.deferred_stores += deferred;
   }
+  return queued;
 }
 
-void Scheduler::store_waiting(bool wait) {
-  if (!c_.store) return;
+int64_t Scheduler::store_waiting(bool wait) {
+  if (!c_.store) return 0;
+  int64_t queued = 0;
   for (size_t s = 0; s < seqs_.size(); ++s)
-    if (int64_t(seqs_[s].tokens.size()) / attn::kPage > seqs_[s].chain_stored) store_pages(int(s), wait);
+    if (int64_t(seqs_[s].tokens.size()) / attn::kPage > seqs_[s].chain_stored) queued += store_pages(int(s), wait);
+  return queued;
+}
+
+bool Scheduler::pages_waiting() const {
+  for (const Seq& q : seqs_)
+    if (int64_t(q.tokens.size()) / attn::kPage > q.chain_stored) return true;
+  return false;
 }
 
 void Scheduler::store_point(int s) {
@@ -443,9 +452,15 @@ Scheduler::Hold::~Hold() {
 
 void Scheduler::run(const std::atomic<bool>& stop) {
   uint64_t seen = 0;  // releases_ at the last step
+  int64_t idle_stored = 0;  // pages that waited for a buffer, queued while idle since the backlog began
   while (!stop.load()) {
     if (!admit()) {
-      store_waiting(false);  // an idle slot's pages that waited for a buffer
+      // An idle slot's pages that waited for a buffer; one line once none is left.
+      idle_stored += store_waiting(false);
+      if (idle_stored > 0 && !pages_waiting()) {
+        std::fprintf(stderr, "eklow-server: prefix cache: %lld pages that waited for a buffer stored while idle\n", (long long)idle_stored);
+        idle_stored = 0;
+      }
       std::unique_lock lk(mu_);
       cv_.wait_for(lk, std::chrono::milliseconds(100), [&] { return !waiting_.empty() || !prefill_only_.empty() || stop.load(); });
       continue;
@@ -473,7 +488,8 @@ void Scheduler::run(const std::atomic<bool>& stop) {
   }
   // Pages still waiting for a buffer go to the disk before the server stops.
   try {
-    store_waiting(true);
+    if (const int64_t n = store_waiting(true); n > 0)
+      std::fprintf(stderr, "eklow-server: prefix cache: %lld pages that waited for a buffer stored at the stop\n", (long long)n);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-server: prefix cache: pages not stored at the stop: %s\n", e.what());
   }

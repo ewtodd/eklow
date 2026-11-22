@@ -204,12 +204,13 @@ class Scheduler {
   // the disk cache (falling back to a fresh prefill if a page turns out broken). The engine thread, without mu_.
   void start(int s, std::shared_ptr<Request> r, int64_t keep, int64_t restore);
   bool restore(int s, const Request& r, int64_t pages);
-  // The disk cache: queues the global parts of the slot's full pages not yet stored (waiting for a buffer if `wait`), and the
-  // sliding parts its restore point needs.
-  void store_pages(int s, bool wait);
+  // The disk cache: queues the global parts of the slot's full pages not yet stored (waiting for a buffer if `wait`; returns how
+  // many it queued), and the sliding parts its restore point needs.
+  int64_t store_pages(int s, bool wait);
   void store_point(int s);
-  // store_pages for every slot, idle ones too, whose full pages are not all stored.
-  void store_waiting(bool wait);
+  // store_pages for every slot, idle ones too, whose full pages are not all stored; whether any slot has such pages.
+  int64_t store_waiting(bool wait);
+  bool pages_waiting() const;
   void step();
   // Follows a sampled token; returns why the request ends at it ("" if it goes on).
   std::string on_token(int slot, int32_t token);

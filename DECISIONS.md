@@ -3612,6 +3612,9 @@ is 0.41 ms a page on the engine's queue, ~3 ms in a step of 2,048.
     keeps "sliding parts not stored" for parts the rings no longer held, and shows the store's queue;
   - an idle slot never retried its waiting pages. `store_waiting` now runs after every step, while the engine is idle, and
     waiting at a stop.
+- The server says when that happened: "N pages that waited for a buffer stored while idle" once an idle engine has stored
+  the last of them, and "... stored at the stop". `--prefix-cache-buffers N` sets the buffers (48), so that a check can make
+  pages wait on purpose with 2.
 - Why the writer fell behind is not known. It seals and writes at 3.1 GB/s into the page cache, ~60 times what the prefill
   needs. The likely stall is the disk's writeback after 1.7 GiB in two minutes (fiona's NV3 has no DRAM); the queue in the
   line will show it.
