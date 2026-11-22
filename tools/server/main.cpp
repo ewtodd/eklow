@@ -711,7 +711,10 @@ int main(int argc, char** argv) {
               line += fmt(" | disk %.1f GiB in %llu files, %lld restores (%lld positions), %lld parts stored", double(st.bytes) / 1073741824.0,
                           (unsigned long long)st.files, (long long)(cur.restores - prev.restores), (long long)(cur.restored_tokens - prev.restored_tokens),
                           (long long)(cur.stored_parts - prev.stored_parts));
-              if (cur.unstored_parts > prev.unstored_parts) line += fmt(", %lld not", (long long)(cur.unstored_parts - prev.unstored_parts));
+              if (st.queued > 0) line += fmt(", %llu queued", (unsigned long long)st.queued);
+              if (cur.deferred_stores > prev.deferred_stores)
+                line += fmt(", %lld calls found no buffer free (their pages waited)", (long long)(cur.deferred_stores - prev.deferred_stores));
+              if (cur.unstored_parts > prev.unstored_parts) line += fmt(", %lld sliding parts not stored", (long long)(cur.unstored_parts - prev.unstored_parts));
               if (cur.failed_restores > prev.failed_restores) line += fmt(", %lld failed restores", (long long)(cur.failed_restores - prev.failed_restores));
             }
             log_line(line);

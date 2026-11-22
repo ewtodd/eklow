@@ -103,6 +103,7 @@ class PrefixStore {
     uint64_t written = 0, written_bytes = 0, dropped = 0, deduplicated = 0;
     uint64_t read = 0, read_bytes = 0, broken = 0, evicted = 0, evicted_bytes = 0;
     bool scanned = false;  // the startup scan of the directory is done
+    uint64_t queued = 0;   // parts waiting for the writer now, or being written
   };
   Stats stats() const;
   // Waits until the startup scan is done and every queued part is written (for tests and shutdown).

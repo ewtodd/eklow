@@ -154,9 +154,10 @@ class Scheduler {
     double busy_s = 0, prefill_seq_s = 0, decode_seq_s = 0, first_token_s = 0;
     int64_t first_tokens = 0;
     // The disk cache: restores, the positions they brought back, and those that failed (a broken page: the request prefilled);
-    // parts queued for the store, and parts not stored (no buffer free, or the rings no longer held them). Prefill-only
-    // requests waiting, and those that gave a slot up.
-    int64_t restores = 0, restored_tokens = 0, failed_restores = 0, stored_parts = 0, unstored_parts = 0;
+    // parts queued for the store; calls that found every buffer on its way to the disk, whose pages wait in their slot for a
+    // later one (none is lost: a slot's sequence is not cut before they go); sliding parts not stored because the rings no
+    // longer held them. Prefill-only requests waiting, and those that gave a slot up.
+    int64_t restores = 0, restored_tokens = 0, failed_restores = 0, stored_parts = 0, deferred_stores = 0, unstored_parts = 0;
     int64_t prefill_only_waiting = 0, preempted = 0;
   };
   Stats stats() const;
@@ -207,6 +208,8 @@ class Scheduler {
   // sliding parts its restore point needs.
   void store_pages(int s, bool wait);
   void store_point(int s);
+  // store_pages for every slot, idle ones too, whose full pages are not all stored.
+  void store_waiting(bool wait);
   void step();
   // Follows a sampled token; returns why the request ends at it ("" if it goes on).
   std::string on_token(int slot, int32_t token);

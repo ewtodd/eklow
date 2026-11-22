@@ -34,11 +34,13 @@ inline SlidingPages point_pages(int64_t held, int64_t page, int64_t reach_pages,
 }
 
 // Whether a restore of `disk` positions beats prefilling from `keep` (the slot's reuse): the prefill it saves against the
-// time to read, open and copy the pages. The rates are estimates for fiona (DECISIONS 2026-11-22).
+// time to read, open and copy the pages. Measured on fiona (DECISIONS 2026-11-22, "On the card").
 struct RestoreCost {
-  double prefill_tok_s = 2500;   // Bolt's prefill at depth (3,549 at 8k, 2,273 at 60k)
-  double restore_pos_s = 60000;  // positions a second a restore brings back (16 KiB of global K/V each)
-  double fixed_s = 0.02;         // the sliding parts and the start of a restore
+  double prefill_tok_s = 2500;  // Bolt's prefill at depth (3,246 at 20k from empty, 2,273 at 60k)
+  // Positions a second a restore brings back (16 KiB of global K/V each). Measured: 149k from the disk cold, 250k from the page
+  // cache. Two thirds of the cold rate, for a disk busy with the cache's own writes, which then still shows the restore's worth.
+  double restore_pos_s = 100000;
+  double fixed_s = 0.02;  // the sliding parts and the start of a restore
 };
 inline bool prefer_restore(int64_t keep, int64_t disk, const RestoreCost& c) {
   if (disk <= keep) return false;

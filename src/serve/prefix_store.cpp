@@ -24,8 +24,6 @@ constexpr char kMagic[4] = {'E', 'K', 'P', 'C'};
 constexpr uint32_t kVersion = 1;
 constexpr size_t kAad = 56;  // the header up to the nonce: magic, version, part, depth, length, key
 
-
-
 struct CipherCtx {
   EVP_CIPHER_CTX* c = EVP_CIPHER_CTX_new();
   ~CipherCtx() { EVP_CIPHER_CTX_free(c); }
@@ -332,7 +330,9 @@ bool PrefixStore::put(const PageKey& k, Part p, int64_t depth, uint8_t* data, si
 
 PrefixStore::Stats PrefixStore::stats() const {
   std::lock_guard lk(mu_);
-  return stats_;
+  Stats s = stats_;
+  s.queued = queue_.size() + (busy_ ? 1 : 0);
+  return s;
 }
 
 void PrefixStore::flush() {

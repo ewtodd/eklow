@@ -375,13 +375,13 @@ void Scheduler::store_pages(int s, bool wait) {
   Seq& q = seqs_[size_t(s)];
   const int64_t full = int64_t(q.tokens.size()) / attn::kPage;
   extend_chain(c_.store_root, q.chain, q.tokens, full);
-  int64_t queued = 0, skipped = 0;
+  int64_t queued = 0, deferred = 0;
   while (q.chain_stored < full) {
     const int64_t j = q.chain_stored;
     if (!c_.store->has(q.chain[size_t(j)], Part::Global)) {
       uint8_t* buf = store_pool_->take(wait);
-      if (!buf) {  // the writer is behind: the page goes after a later step
-        ++skipped;
+      if (!buf) {  // every buffer is on its way to the disk: the rest wait in the slot for a later call (store_waiting)
+        ++deferred;
         break;
       }
       sycl::event ev = eng_.export_page(s, j, buf, nullptr);
@@ -390,10 +390,16 @@ void Scheduler::store_pages(int s, bool wait) {
     }
     ++q.chain_stored;
   }
-  if (queued || skipped) {
+  if (queued || deferred) {
     std::lock_guard lk(mu_);
-    stats_.stored_parts += queued, stats_.unstored_parts += skipped;
+    stats_.stored_parts += queued, stats_.deferred_stores += deferred;
   }
+}
+
+void Scheduler::store_waiting(bool wait) {
+  if (!c_.store) return;
+  for (size_t s = 0; s < seqs_.size(); ++s)
+    if (int64_t(seqs_[s].tokens.size()) / attn::kPage > seqs_[s].chain_stored) store_pages(int(s), wait);
 }
 
 void Scheduler::store_point(int s) {
@@ -439,6 +445,7 @@ void Scheduler::run(const std::atomic<bool>& stop) {
   uint64_t seen = 0;  // releases_ at the last step
   while (!stop.load()) {
     if (!admit()) {
+      store_waiting(false);  // an idle slot's pages that waited for a buffer
       std::unique_lock lk(mu_);
       cv_.wait_for(lk, std::chrono::milliseconds(100), [&] { return !waiting_.empty() || !prefill_only_.empty() || stop.load(); });
       continue;
@@ -463,6 +470,12 @@ void Scheduler::run(const std::atomic<bool>& stop) {
     stats_.busy_s += dt;
     stats_.prefill_seq_s += dt * step_prefill_seqs_;
     stats_.decode_seq_s += dt * step_decode_seqs_;
+  }
+  // Pages still waiting for a buffer go to the disk before the server stops.
+  try {
+    store_waiting(true);
+  } catch (const std::exception& e) {
+    std::fprintf(stderr, "eklow-server: prefix cache: pages not stored at the stop: %s\n", e.what());
   }
 }
 
@@ -703,9 +716,8 @@ void Scheduler::step() {
       }
     }
   }
-  // Pages the step filled go to the disk cache (finish has done its slot's).
-  for (size_t s = 0; s < seqs_.size(); ++s)
-    if (seqs_[s].req) store_pages(int(s), false);
+  // Pages the step filled go to the disk cache, and an idle slot's that waited for a buffer (finish has done its slot's).
+  store_waiting(false);
 }
 
 std::string Scheduler::on_token(int slot, int32_t token) {
