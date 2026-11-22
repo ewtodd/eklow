@@ -91,9 +91,9 @@ class Engine {
   // Forgets a slot's sequence and returns its pages.
   void release(int slot);
   // Keeps the first `length` positions of a slot's sequence (a prompt that shares only a prefix with the last one) and
-  // returns the pages past them. The sliding rings still hold what was overwritten there: rewinding a slot by more than
-  // ring_slack() positions leaves the last window before `length` stale, and the caller must keep window positions fewer
-  // and prefill them again.
+  // returns the pages past them. The sliding rings hold only the sequence's last ring_pages x kPage positions: rewinding a
+  // slot by more than ring_slack() positions leaves the window before `length` overwritten, and every window before it too,
+  // so prefilling fewer positions again reads stale K/V as well. Such a rewind must start the sequence over (length 0).
   void truncate(int slot, int64_t length);
   int64_t ring_slack() const { return ring_pages_ * attn::kPage - cfg_.window; }
   // Positions the slot holds (where its next chunk starts).

@@ -134,10 +134,12 @@ bool Scheduler::admit() {
     if (best < 0) break;
     Seq& q = seqs_[size_t(best)];
     const size_t r_prompt = r->prompt.size();
-    // At least the prompt's last token is fed again, for its logits.
-    // A prefix never ends inside an image (its rows are prefilled together), nor, after the rewind, does the window.
+    // At least the prompt's last token is fed again, for its logits. A prefix never ends inside an image (its rows are
+    // prefilled together). Going on from `keep` needs the window before it in the sliding rings, which still hold it only
+    // when the slot gives back at most ring_slack() positions; otherwise every window before `keep` is overwritten too
+    // (prefilling fewer positions again would read stale K/V), and the sequence starts over.
     int64_t keep = cut_before_image(*r, int64_t(std::min(best_lcp, r->prompt.size() - 1)));
-    if (int64_t(q.tokens.size()) - keep > eng_.ring_slack()) keep = cut_before_image(*r, std::max<int64_t>(0, keep - eng_.model().window));
+    if (int64_t(q.tokens.size()) - keep > eng_.ring_slack()) keep = 0;
     // A slot whose live sequence parts from the prompt after a long shared stretch is a conversation whose last answer the
     // template rendered back differently from how it was sampled (a token boundary, stripped whitespace): say where (the Qwen
     // scheduler's line, 655209e; image rows, ids below zero, have no bytes).
