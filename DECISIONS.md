@@ -3522,7 +3522,15 @@ the cache needs a key.
 - The module evaluates with the cache on (the flags, StateDirectory, LoadCredential beside the checker's RuntimeDirectory),
   with it off (the unit as before), and asserts a key.
 
-**Not run: on the card, in a pause of `eklow-bolt` (~30 minutes).**
+**Not run: on the card, in a pause of `eklow-bolt` (~20-30 minutes).** Two tools carry the checks, built and checked to
+start on fiona:
+- `eklow-prefix-engine-test` (the engine, three slots, the last 64 positions' logits) runs the rewind four ways (main's, the
+  fix's, a fresh prefill, and a valid reuse with main's chunk shapes, so that main's against it is the stale K/V alone). It
+  restores 74 pages from the store, cold (the files dropped from the page cache) and warm, against the same slot rewound in
+  place, which should agree bit for bit. It also times the export, the writes and the restore.
+- `tools/server/prefix_serve_test.py` drives a server for the rest: `rewind`, `cold` and `cache` (restores, prefill-only, the
+  draft's acceptance after a restore), and `overhead`.
+
 1. `serve_test.py basic` with this build and no cache, against main's: nothing else changed.
 2. The rewind: a slot holding a long sequence, then a prompt sharing only its first few thousand tokens; greedy output and
    first logits from this build (it starts over) and main's (it keeps `keep - window`), each against a fresh server. Expect

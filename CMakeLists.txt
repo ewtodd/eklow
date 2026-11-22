@@ -245,3 +245,9 @@ install(TARGETS eklow-dflash-test RUNTIME DESTINATION bin)
 add_executable(eklow-metrics-test tools/server/metrics_test.cpp)
 target_link_libraries(eklow-metrics-test PRIVATE eklow_serve_gemma4)
 eklow_sycl(eklow-metrics-test)
+
+# The disk prefix cache and the rings' rewind on the card: logits against fresh prefills, a restore against a rewind in place,
+# and the costs (tools/server/prefix_engine_test.cpp).
+add_executable(eklow-prefix-engine-test tools/server/prefix_engine_test.cpp)
+target_link_libraries(eklow-prefix-engine-test PRIVATE eklow_engine_gemma4 eklow_prefix eklow_text)
+eklow_sycl(eklow-prefix-engine-test)
