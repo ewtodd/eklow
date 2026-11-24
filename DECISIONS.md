@@ -4126,3 +4126,28 @@ CUDA):
 
 The card session: eklow-bolt was stopped from 14:39 to 16:23 CST for the two kernel workers and these runs, and restarted
 (healthy).
+
+## 2026-11-24 — Inkling M3: residency in the experts' kernels (`moe::upload(..., hot)`, `ffn(..., cold_rows)`)
+
+A layer can keep only some experts on the card. `upload(..., const std::vector<bool>* hot)` repacks the hot experts (and
+their per-expert scales) compacted into slots in id order; `Layer::slot_of` ([n_expert] int32, -1 = cold, inside `base`
+so `rebase` moves it; null with every expert hot) and `n_hot` say where they are, `bytes` is the hot experts' only (546.8
+MiB x n_hot / 128 for NVFP4 layers). The group kernel maps ids through `slot_of`, leaves cold pairs out of the tile lists
+and gives them row -1 (gather and combine skip them), so cold pairs cost no GEMV or GEMM work. `ffn(..., cold_rows)` adds
+`cold_rows[t]` (device fp32 [n_tok][n_embd]) to each token's sum after the hot experts'. With every expert hot and no
+cold_rows the path is unchanged (same kernels, same times: 0.19 ms at 1 token, 9.7 at 512, 22 at 2,048 on layer 6).
+
+Checked on layers 0, 6 (NVFP4) and 20 (Q5_K/Q8_0) with the busiest 100, 75, 50 and 25% of experts by the router over the
+synthetic inputs (the cold rows from the reference ops with the hot pairs' weights zeroed), at 1, 2, 3, 8, 32, 512 and
+2,048 tokens: card + cold rows against the all-reference result 2e-4 to 4e-4 (NVFP4) and 7e-4 to 1.4e-3 (Q5_K/Q8_0), the
+same as all-hot. Time of the card's part (layer 6; pairs on the card: share of (token, slot) pairs whose expert is hot):
+
+| hot | 1 tok | 2 tok | 512 | 2,048 | pairs on card at 2,048 |
+|---|---|---|---|---|---|
+| 100% | 0.191 ms | 0.295 | 9.7 | 22.5 | 100% |
+| 75% | 0.170 | 0.279 | 7.6 | 18.3 | 93% |
+| 50% | 0.122 | 0.219 | 5.3 | 13.4 | 74% |
+| 25% | 0.071 | 0.175 | 2.8 | 7.7 | 42% |
+
+The time follows the pairs left on the card (and the experts they touch), not the share of experts. These numbers are
+random inputs, whose routing is flatter than real text's.

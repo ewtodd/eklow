@@ -251,7 +251,7 @@ SYCL_ESIMD_FUNCTION inline esimd::simd<float, 8> situ8(esimd::simd<float, 8> g, 
 //   tl[0] = number of tiles, tl[1] = rows used (segments start at multiples of 8); from tl[4], four ints a tile: expert,
 //   first row, rows holding pairs. An expert's pairs fill its segment in token order (stable, so results do not depend on
 //   scheduling); a segment is cut into tiles of T rows. rop[p] = pair p's row.
-void group(sycl::queue& q, const int32_t* ids, int64_t P, int64_t E, int T, int32_t* tl, int32_t* rop) {
+void group(sycl::queue& q, const int32_t* ids, const int32_t* slot_of, int64_t P, int64_t E, int T, int32_t* tl, int32_t* rop) {
   // 128 items: item i counts the pairs of its contiguous chunk per expert (hist[i][e], 16 bits), item e then turns column
   // e of the table into the chunks' starts within expert e and the expert's count, one item lays out the segments and
   // tiles, and item i places its chunk's pairs: stable, deterministic, no atomics.
@@ -263,7 +263,10 @@ void group(sycl::queue& q, const int32_t* ids, int64_t P, int64_t E, int T, int3
       const int lid = int(it.get_local_id(0));
       for (int e = 0; e < e_n; ++e) hist[lid * kExperts + e] = 0;
       const int p0 = lid * chunk, p1 = sycl::min(p0 + chunk, p_n);
-      for (int p = p0; p < p1; ++p) hist[lid * kExperts + ids[p]] += 1;
+      for (int p = p0; p < p1; ++p) {
+        const int e = slot_of ? slot_of[ids[p]] : ids[p];
+        if (e >= 0) hist[lid * kExperts + e] += 1;
+      }
       sycl::group_barrier(it.get_group());
       if (lid < e_n) {
         int run = 0;
@@ -293,7 +296,11 @@ void group(sycl::queue& q, const int32_t* ids, int64_t P, int64_t E, int T, int3
       }
       sycl::group_barrier(it.get_group());
       for (int p = p0; p < p1; ++p) {
-        const int e = ids[p];
+        const int e = slot_of ? slot_of[ids[p]] : ids[p];
+        if (e < 0) {
+          rop[p] = -1;
+          continue;
+        }
         rop[p] = start[e] + int(hist[lid * kExperts + e]);
         hist[lid * kExperts + e] += 1;
       }
@@ -310,6 +317,7 @@ struct Gather {
   void operator()(sycl::id<2> id) const SYCL_ESIMD_KERNEL {
     const int p = int(id[0]), j = int(id[1]);
     const int row = rop[p], kh = k / 16;
+    if (row < 0) return;
     esimd::simd<float, 64> v = esimd::block_load<float, 64>(x + int64_t(p / n_used) * k + j * 64);
     esimd::simd<sycl::half, 64> hv = v;
 #pragma unroll
@@ -324,6 +332,7 @@ struct Combine {
   const float* w;
   const int32_t* rop;
   float* out;
+  const float* cold;  // or null
   int32_t n_used, n;
   void operator()(sycl::id<2> id) const SYCL_ESIMD_KERNEL {
     const int t = int(id[0]), j = int(id[1]);
@@ -331,8 +340,10 @@ struct Combine {
     for (int i = 0; i < n_used; ++i) {
       const float wt = w[t * n_used + i];
       const int row = rop[t * n_used + i];
+      if (row < 0) continue;
       acc += wt * esimd::block_load<float, 128>(y + int64_t(row) * n + j * 128);
     }
+    if (cold) acc += esimd::block_load<float, 128>(cold + int64_t(t) * n + j * 128);
     esimd::block_store<float, 128>(out + int64_t(t) * n + j * 128, acc);
   }
 };
@@ -722,12 +733,22 @@ void rebase(sycl::queue&, Layer& L, uint8_t* new_base) {
   L.base = new_base;
   L.gate_up_scale = L.gate_up_scale_offset ? reinterpret_cast<const float*>(new_base + L.gate_up_scale_offset) : nullptr;
   L.down_scale = L.down_scale_offset ? reinterpret_cast<const float*>(new_base + L.down_scale_offset) : nullptr;
+  L.slot_of = L.slot_of_offset ? reinterpret_cast<const int32_t*>(new_base + L.slot_of_offset) : nullptr;
 }
 
 Layer upload(sycl::queue& q, const ref::Weight& gate_up_raw, uint64_t gate_up_stride, const float* gate_up_scale,
-             const ref::Weight& down_raw, uint64_t down_stride, const float* down_scale, int64_t n_expert) {
+             const ref::Weight& down_raw, uint64_t down_stride, const float* down_scale, int64_t n_expert, const std::vector<bool>* hot) {
   Layer L;
   L.n_expert = n_expert;
+  std::vector<int32_t> hot_ids, slot(size_t(n_expert), -1);
+  for (int64_t e = 0; e < n_expert; ++e)
+    if (!hot || (*hot)[size_t(e)]) {
+      slot[size_t(e)] = int32_t(hot_ids.size());
+      hot_ids.push_back(int32_t(e));
+    }
+  const bool all_hot = int64_t(hot_ids.size()) == n_expert;
+  const int64_t n_hot = int64_t(hot_ids.size());
+  L.n_hot = n_hot;
   L.n_embd = gate_up_raw.k;
   L.n_ff = gate_up_raw.n / 2;
   if (down_raw.k != L.n_ff || down_raw.n != L.n_embd) throw std::runtime_error("moe: down's shape does not match gate_up's");
@@ -739,32 +760,43 @@ Layer upload(sycl::queue& q, const ref::Weight& gate_up_raw, uint64_t gate_up_st
   L.down.expert_bytes = expert_bytes(L.down);
   uint64_t off = 0;
   L.gate_up.offset = off;
-  off = align(off + uint64_t(n_expert) * L.gate_up.expert_bytes);
+  off = align(off + uint64_t(n_hot) * L.gate_up.expert_bytes);
   L.down.offset = off;
-  off = align(off + uint64_t(n_expert) * L.down.expert_bytes);
+  off = align(off + uint64_t(n_hot) * L.down.expert_bytes);
   if (gate_up_scale) {
     L.gate_up_scale_offset = off;
-    off = align(off + uint64_t(n_expert) * 4);
+    off = align(off + uint64_t(n_hot) * 4);
   }
   if (down_scale) {
     L.down_scale_offset = off;
+    off = align(off + uint64_t(n_hot) * 4);
+  }
+  if (!all_hot) {
+    L.slot_of_offset = off;
     off = align(off + uint64_t(n_expert) * 4);
   }
   L.bytes = off;
-  uint8_t* base = sycl::malloc_device<uint8_t>(size_t(L.bytes), q);
+  uint8_t* base = sycl::malloc_device<uint8_t>(size_t(std::max<uint64_t>(L.bytes, 256)), q);
   if (!base) throw std::runtime_error("moe: out of device memory for a layer's experts");
   rebase(q, L, base);
-  if (gate_up_scale) q.memcpy(L.base + L.gate_up_scale_offset, gate_up_scale, size_t(n_expert) * 4);
-  if (down_scale) q.memcpy(L.base + L.down_scale_offset, down_scale, size_t(n_expert) * 4);
+  auto put_scales = [&](const float* sc, uint64_t at) {
+    std::vector<float> v(size_t(n_hot), 0.0f);
+    for (int64_t i = 0; i < n_hot; ++i) v[size_t(i)] = sc[hot_ids[size_t(i)]];
+    q.memcpy(L.base + at, v.data(), v.size() * 4).wait();
+  };
+  if (gate_up_scale) put_scales(gate_up_scale, L.gate_up_scale_offset);
+  if (down_scale) put_scales(down_scale, L.down_scale_offset);
+  if (!all_hot) q.memcpy(L.base + L.slot_of_offset, slot.data(), slot.size() * 4).wait();
 
   // Staging: a few experts at a time through the card, repacked there.
   auto one = [&](const ref::Weight& raw, uint64_t stride, const Table& t, bool interleave) {
     constexpr int G = 8;
     uint8_t* stage = sycl::malloc_device<uint8_t>(size_t(stride) * G, q);
     if (!stage) throw std::runtime_error("moe: out of device memory for staging");
-    for (int64_t e0 = 0; e0 < n_expert; e0 += G) {
-      const int cnt = int(std::min<int64_t>(G, n_expert - e0));
-      q.memcpy(stage, raw.data + uint64_t(e0) * stride, size_t(stride) * size_t(cnt)).wait();
+    for (int64_t e0 = 0; e0 < n_hot; e0 += G) {
+      const int cnt = int(std::min<int64_t>(G, n_hot - e0));
+      for (int i = 0; i < cnt; ++i) q.memcpy(stage + uint64_t(i) * stride, raw.data + uint64_t(hot_ids[size_t(e0 + i)]) * stride, size_t(stride));
+      q.wait();
       uint8_t* dst = L.base + t.offset + uint64_t(e0) * t.expert_bytes;
       switch (t.format) {
         case Format::NVFP4:
@@ -913,7 +945,7 @@ void profile_print(bool print) {
 }
 
 void ffn(sycl::queue& q, const Layer& L, const float* x, int64_t n_tok, const int32_t* ids, const float* w, int64_t n_used,
-         float situ_beta, float situ_linear_beta, Scratch& s, float* out) {
+         float situ_beta, float situ_linear_beta, Scratch& s, float* out, const float* cold_rows) {
   if (n_used != s.n_used || L.n_embd != s.n_embd || L.n_ff != s.n_ff) throw std::runtime_error("moe: scratch shape differs from the layer's");
   // Tokens above which the GEMM beats the GEMVs (measured on layers 6 and 20, DECISIONS 2026-11-24, "Inkling M2: the experts")
   const int64_t gemm_min = env_int("EKLOW_MOE_GEMM_MIN", L.gate_up.format == Format::NVFP4 ? 448 : 256);
@@ -932,7 +964,7 @@ void ffn(sycl::queue& q, const Layer& L, const float* x, int64_t n_tok, const in
     const bool use_gemm = tc > gemm_min;
     const int T = use_gemm ? 16 * wm : kGemvRows;
     const int64_t tiles = std::min<int64_t>(P, (P + T - 1) / T + L.n_expert);
-    stage(0, [&] { group(q, ids + t0 * n_used, P, L.n_expert, T, s.tl, s.rop); });
+    stage(0, [&] { group(q, ids + t0 * n_used, L.slot_of, P, L.n_hot, T, s.tl, s.rop); });
     stage(1, [&] {
       q.parallel_for(sycl::range<2>(size_t(P), size_t(L.n_embd / 64)), Gather{x + t0 * L.n_embd, s.rop, s.a, int32_t(n_used), int32_t(L.n_embd)});
     });
@@ -950,7 +982,7 @@ void ffn(sycl::queue& q, const Layer& L, const float* x, int64_t n_tok, const in
       gemms<kGemmWM, 1, 1>(q, L, s, tiles, situ_beta, situ_linear_beta, prof);
     }
     stage(4, [&] {
-      q.parallel_for(sycl::range<2>(size_t(tc), size_t(L.n_embd / 128)), Combine{s.y, w + t0 * n_used, s.rop, out + t0 * L.n_embd, int32_t(n_used), int32_t(L.n_embd)});
+      q.parallel_for(sycl::range<2>(size_t(tc), size_t(L.n_embd / 128)), Combine{s.y, w + t0 * n_used, s.rop, out + t0 * L.n_embd, cold_rows ? cold_rows + t0 * L.n_embd : nullptr, int32_t(n_used), int32_t(L.n_embd)});
     });
   }
   g_prof[5] += 1;
