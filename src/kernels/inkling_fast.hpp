@@ -54,4 +54,9 @@ void control_input(sycl::queue& q, const float* cur, const float* msg, int64_t T
 // out[r][:] = x[idx[r]][:] for r < rows, n columns.
 void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t rows, int64_t n, float* out);
 
+// The step's routing and expert inputs into host memory (USM host allocations), for the cold experts: ids and w
+// [T][n_used], x [T][n_embd]. Returns the kernel's event (the host waits on it alone).
+sycl::event pack_host(sycl::queue& q, const int32_t* ids, const float* w, const float* x, int64_t T, int64_t n_used, int64_t n_embd,
+                      int32_t* hids, float* hw, float* hx);
+
 }  // namespace eklow::inkling

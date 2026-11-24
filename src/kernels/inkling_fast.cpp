@@ -275,4 +275,16 @@ void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t row
   });
 }
 
+sycl::event pack_host(sycl::queue& q, const int32_t* ids, const float* w, const float* x, int64_t T, int64_t n_used, int64_t n_embd,
+                      int32_t* hids, float* hw, float* hx) {
+  return q.parallel_for(sycl::range<2>(size_t(T), size_t(n_embd)), [=](sycl::id<2> id) {
+    const int64_t t = int64_t(id[0]), e = int64_t(id[1]);
+    hx[t * n_embd + e] = x[t * n_embd + e];
+    if (e < n_used) {
+      hids[t * n_used + e] = ids[t * n_used + e];
+      hw[t * n_used + e] = w[t * n_used + e];
+    }
+  });
+}
+
 }  // namespace eklow::inkling

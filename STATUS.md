@@ -18,7 +18,12 @@ with its measurements); what eklow is and its numbers: `README.md`.
     NVFP4 experts on the matrix units and the biased attention, inside llama.cpp's spread at 67 to 32,950 tokens, decode
     steps matching llama.cpp's greedy tokens. 637 tok/s prefill at 12k; decode 12.0 tok/s with every expert on the card
     (which fits only beside a short context and without Bolt's side models).
-  - Next: M3, memory (where the experts live beside the side models and 2 x 64k of K/V); then M4, the server and the replay.
+  - **M3 is done** (DECISIONS "Inkling M3: memory, ..." and its two kernel entries): placement by a routing profile, cold
+    experts on the CPU in decode and staged onto the card in prefill, two slots of 64k, checkpoints and rewind. In
+    production's shape (2.53 GiB kept for the side models): decode 11.4 to 10.7 tok/s at 67 to 33k positions, prefill ~365
+    tok/s, inside llama.cpp's spread.
+  - Next: M4, eklow-server for Inkling and the private replay through it; speed (prefill's cold-set copies, the per-layer
+    small kernels, the MTP draft) after.
 
 - **fiona runs eklow's milestone in production** (`eklow-bolt.service` since 2026-11-10 22:48): Nemotron-3.5-Bolt-E4B with
   NVIDIA's DFlash draft and Gemma 4's projector, EmbeddingGemma 2 with its projector, vega's end-of-turn checker (the
@@ -59,10 +64,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 ## Open, in order
 
-0. **Inkling M3**: memory. The weights are 15.16 GiB (experts 13.8); the side models take ~2.3 GiB and 2 x 64k of K/V
-   ~4.4 GiB (fp16; 8 full applications x 2 slots). Experts must split between the card and the host by use (the looped
-   layers 6-17 run three times a token), as llama.cpp's --n-cpu-moe or the old Qwen path's streaming did; then the prefix
-   cache with the convolution states. M2's whole-layer staging is a stopgap (2.6 tok/s).
+0. **Inkling M4**: eklow-server for Inkling (the text layer is ported; the tool grammar, sampling, metrics, checkpoint at
+   each prefill's end and rewind on the next turn), side models beside it, then the private replay through it against the
+   4090's 110/126. Open choices for the owner: the text layer's llama.cpp quirks (DECISIONS "the text layer"), and whether
+   the side models move to the Iris Xe (needs non-XMX kernels; about half the cold pairs).
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):
    - the kernel tests;
    - the draft's lattices and the embeddings, against main's build;

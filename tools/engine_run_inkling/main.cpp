@@ -2,15 +2,26 @@
 // format, for tools/ref/inkling/compare.py against M0 (llama.cpp) or eklow-ref-run's reference.
 //
 //   eklow-engine-run-inkling --model GGUF --out DIR --tokens-json FILE [--tensors PREFIX,...] [--dump-last N]
-//                            [--chunk N] [--max-ctx N] [--stage L,L,...] [--teacher DIR] [--gen-json FILE] [--profile]
+//                            [--chunk N] [--max-ctx N] [--slots N] [--experts PROFILE.json] [--reserve-gib G]
+//                            [--teacher DIR] [--gen-json FILE] [--profile]
 //
 // The prompt is prefilled in chunks of --chunk tokens (default 1024); the last chunk is its final --dump-last positions
 // (default all of a prompt that fits one chunk), whose tensors and logits are written (as the oracle's --dump-last). With
 // --gen-json (an oracle's gen.json) its tokens but the last are then decoded one a step and logits_gen.f32 gets the logits
 // of every step, row 0 the prompt's last position's (as the oracle's --generate writes them). --teacher DIR continues each
-// layer application from DIR's l_out-<slot> (all positions of the prompt, [n_tok][n_embd]) during the prefill. --stage
-// keeps those layers' experts in host memory. --profile prints where the prefill's and the decode's time goes.
+// layer application from DIR's l_out-<slot> (all positions of the prompt, [n_tok][n_embd]) during the prefill. --experts
+// places the experts by that routing profile (the busiest on the card while free memory less 1 GiB and --reserve-gib
+// holds them, the rest on the CPU); --slots and --max-ctx size the K/V as a server would (the prompt runs in slot 0).
+// --profile prints where the prefill's and the decode's time goes. --rewind (with --gen-json) checkpoints the slot after the
+// prefill, decodes, rewinds to the checkpoint and decodes the same tokens again: the logits must not change.
+// --cpu-max-tokens N: steps up to N tokens run the cold experts on the CPU, longer ones stage them on the card.
+// --twin (with --gen-json, two slots): the prompt and its decode run in slots 0 and 1 in the same steps, and the two
+// slots' logits are compared (they differ only by the batch shape's rounding). --twin-tokens FILE puts another prompt
+// (an oracle's tokens.json) in slot 1 instead, and slot 0's decode logits go to DIR/logits_gen_twin.f32, to be set beside
+// a one-slot run's logits_gen.f32.
 #include <chrono>
+#include <cmath>
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
@@ -56,11 +67,13 @@ std::vector<int32_t> ids_of(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string model, out, tokens_json, teacher_dir, gen_json;
+  std::string model, out, tokens_json, teacher_dir, gen_json, twin_tokens;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
-  int64_t chunk = 1024, max_ctx = 0, dump_last = 0;
-  std::vector<int> stage;
-  bool profile = false;
+  int64_t chunk = 1024, max_ctx = 0, dump_last = 0, slots = 1;
+  std::string experts;
+  double reserve_gib = 0;
+  int64_t cpu_max_tokens = -1;
+  bool profile = false, rewind = false, twin = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -71,13 +84,20 @@ int main(int argc, char** argv) {
     else if (a == "--dump-last") dump_last = std::atoll(next().c_str());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
     else if (a == "--max-ctx") max_ctx = std::atoll(next().c_str());
-    else if (a == "--stage") for (const auto& s : split(next(), ',')) stage.push_back(std::atoi(s.c_str()));
+    else if (a == "--experts") experts = next();
+    else if (a == "--reserve-gib") reserve_gib = std::atof(next().c_str());
+    else if (a == "--slots") slots = std::atoll(next().c_str());
     else if (a == "--teacher") teacher_dir = next();
     else if (a == "--gen-json") gen_json = next();
     else if (a == "--profile") profile = true;
+    else if (a == "--rewind") rewind = true;
+    else if (a == "--twin") twin = true;
+    else if (a == "--twin-tokens") twin_tokens = next(), twin = true;
+    else if (a == "--cpu-max-tokens") cpu_max_tokens = std::atoll(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-run-inkling --model GGUF --out DIR --tokens-json FILE [--tensors P,...] [--dump-last N]\n"
-                           "       [--chunk N] [--max-ctx N] [--stage L,...] [--teacher DIR] [--gen-json FILE] [--profile]\n");
+                           "       [--chunk N] [--max-ctx N] [--slots N] [--experts PROFILE] [--reserve-gib G] [--teacher DIR]\n"
+                           "       [--gen-json FILE] [--profile]\n");
       return 2;
     }
   }
@@ -93,15 +113,19 @@ int main(int argc, char** argv) {
     auto f = gguf::File::open(model);
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     engine::inkling::Config cfg;
-    cfg.n_slots = 1;
+    cfg.n_slots = int(slots);
     cfg.max_ctx = max_ctx;
     cfg.max_batch = cfg.max_chunk = chunk;
     cfg.max_logits = int(last);
-    cfg.staged_expert_layers = stage;
+    cfg.expert_profile = experts;
+    cfg.card_reserve_bytes = uint64_t(reserve_gib * 1073741824.0);
+    if (cpu_max_tokens >= 0) cfg.cpu_max_tokens = cpu_max_tokens;
     engine::inkling::Engine eng(q, f, cfg);
-    std::printf("engine: %.2f GiB of weights on %s, %.2f GiB of experts in host memory, %.2f GiB of caches, %.1f s\n",
+    std::printf("engine: %.2f GiB of weights on %s, %lld cold experts (%.2f GiB) on the CPU, %.2f GiB of caches, %.2f GiB free "
+                "before the experts, %.1f s\n",
                 eng.weight_bytes() / 1073741824.0, q.get_device().get_info<sycl::info::device::name>().c_str(),
-                eng.host_expert_bytes() / 1073741824.0, eng.cache_bytes() / 1073741824.0, since(t0));
+                (long long)eng.cold_experts(), eng.host_expert_bytes() / 1073741824.0, eng.cache_bytes() / 1073741824.0,
+                eng.free_at_placement() / 1073741824.0, since(t0));
 
     // The dumps: the last chunk's tensors only.
     std::filesystem::create_directories(out);
@@ -163,17 +187,95 @@ int main(int argc, char** argv) {
       prof.clear();
     }
 
+    if (twin) {
+      if (slots < 2 || gen.empty()) throw std::runtime_error("--twin needs --slots 2 and --gen-json");
+      // slot 0 again from the start, and slot 1 beside it in every step
+      eng.release(0);
+      const int64_t VO = eng.model().n_vocab_out;
+      auto kl_top = [&](const float* a, const float* b, double& kl, bool& same) {
+        double ma = -1e30, mb = -1e30;
+        int64_t ia = 0, ib = 0;
+        for (int64_t v = 0; v < VO; ++v) {
+          if (a[v] > ma) ma = a[v], ia = v;
+          if (b[v] > mb) mb = b[v], ib = v;
+        }
+        double za = 0, zb = 0;
+        for (int64_t v = 0; v < VO; ++v) za += std::exp(a[v] - ma), zb += std::exp(b[v] - mb);
+        kl = 0;
+        for (int64_t v = 0; v < VO; ++v) {
+          const double pa = std::exp(a[v] - ma) / za;
+          if (pa > 0) kl += pa * ((a[v] - ma - std::log(za)) - (b[v] - mb - std::log(zb)));
+        }
+        same = ia == ib;
+      };
+      double worst = 0, sum = 0;
+      int agree = 0, rows = 0;
+      std::vector<float> l;
+      // slot 1's prompt: the same, or another one (then it decodes its own prompt's first tokens again as filler)
+      const std::vector<int32_t> other = twin_tokens.empty() ? tokens : ids_of(twin_tokens);
+      const int64_t n1 = int64_t(other.size());
+      std::ofstream tg;
+      if (!twin_tokens.empty()) tg.open(out + "/logits_gen_twin.f32", std::ios::binary);
+      int64_t p0 = 0, p1 = 0;
+      while (p0 < n || p1 < n1) {  // both slots' chunks share a step of at most `chunk` tokens
+        std::vector<engine::inkling::Chunk> cs;
+        if (p0 < n) {
+          const int64_t e = std::min(p0 + chunk / 2, n);
+          cs.push_back({0, p0, std::vector<int32_t>(tokens.begin() + p0, tokens.begin() + e), 1});
+          p0 = e;
+        }
+        if (p1 < n1) {
+          const int64_t e = std::min(p1 + chunk / 2, n1);
+          cs.push_back({1, p1, std::vector<int32_t>(other.begin() + p1, other.begin() + e), 1});
+          p1 = e;
+        }
+        const std::vector<float> r = eng.step(cs);
+        if (cs[0].slot == 0 && p0 == n && (cs.size() == 1 || true)) l = r;
+      }
+      for (size_t i = 0;; ++i) {
+        if (twin_tokens.empty()) {
+          double kl;
+          bool same;
+          kl_top(l.data(), l.data() + VO, kl, same);
+          worst = std::max(worst, kl), sum += kl, agree += same, ++rows;
+        } else {
+          tg.write(reinterpret_cast<const char*>(l.data()), std::streamsize(VO * sizeof(float)));
+        }
+        if (i + 1 >= gen.size()) break;
+        l = eng.step({{0, n + int64_t(i), {gen[i]}, 1}, {1, n1 + int64_t(i), {other[i % size_t(n1)]}, 1}});
+      }
+      if (twin_tokens.empty())
+        std::printf("twin: slots 0 and 1 in the same steps: top-1 %d/%d, KL mean %.2e, max %.2e\n", agree, rows, sum / rows, worst);
+      else
+        std::printf("twin: slot 0's %zu decode logits written beside slot 1's other prompt\n", gen.size());
+      return 0;
+    }
+
     if (!gen.empty()) {
       const int64_t VO = eng.model().n_vocab_out;
       std::ofstream gl(out + "/logits_gen.f32", std::ios::binary);
       gl.write(reinterpret_cast<const char*>(logits.data() + logits.size() - size_t(VO)), std::streamsize(VO * sizeof(float)));
+      if (rewind) eng.checkpoint(0);
+      std::vector<std::vector<float>> first;
       t0 = std::chrono::steady_clock::now();
       for (size_t i = 0; i + 1 < gen.size(); ++i) {
         engine::inkling::Chunk c{0, n + int64_t(i), {gen[i]}, 1};
         const std::vector<float> l = eng.step({c});
         gl.write(reinterpret_cast<const char*>(l.data()), std::streamsize(VO * sizeof(float)));
+        if (rewind) first.push_back(l);
       }
       const double t_dec = since(t0);
+      if (rewind) {
+        if (!eng.rewind(0, n)) throw std::runtime_error("rewind to the prompt's end failed");
+        double worst = 0;
+        for (size_t i = 0; i + 1 < gen.size(); ++i) {
+          engine::inkling::Chunk c{0, n + int64_t(i), {gen[i]}, 1};
+          const std::vector<float> l = eng.step({c});
+          for (size_t v = 0; v < l.size(); ++v) worst = std::max(worst, double(std::fabs(l[v] - first[i][v])));
+        }
+        std::printf("rewind: %zu steps decoded again after a rewind to %lld, largest logit difference %g\n", gen.size() - 1,
+                    (long long)n, worst);
+      }
       std::printf("decode: %zu steps in %.2f s (%.1f tok/s)\n", gen.size() - 1, t_dec, double(gen.size() - 1) / t_dec);
       if (profile)
         for (const auto& [k, v] : prof) std::printf("  decode  %-14s %8.3f s\n", k.c_str(), v);

@@ -126,7 +126,7 @@ eklow_sycl(eklow-dequant-test)
 
 # Inkling 2 Mini's serving engine (M2, DECISIONS 2026-11-24) and its driver over M0's prompts.
 add_library(eklow_inkling STATIC src/engine/engine_inkling.cpp)
-target_link_libraries(eklow_inkling PUBLIC eklow_model)
+target_link_libraries(eklow_inkling PUBLIC eklow_model eklow_cpu)
 eklow_sycl(eklow_inkling)
 add_executable(eklow-engine-run-inkling tools/engine_run_inkling/main.cpp)
 target_link_libraries(eklow-engine-run-inkling PRIVATE eklow_inkling)

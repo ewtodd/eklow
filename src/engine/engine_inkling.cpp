@@ -12,6 +12,10 @@
 #include "kernels/gemma_fast.hpp"
 #include "kernels/inkling_fast.hpp"
 #include "kernels/ref_inkling.hpp"
+#include "rt/device.hpp"
+#include "core/json_value.hpp"
+#include <fstream>
+#include <iterator>
 
 namespace eklow::engine::inkling {
 
@@ -120,12 +124,6 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   output_norm_ = vec("output_norm.weight");
   output_res_query_ = vec("output_res_query.weight");
 
-  std::vector<bool> staged(size_t(NL), false);
-  for (int l : c_.staged_expert_layers) {
-    if (l < 0 || l >= NL) throw std::runtime_error("inkling engine: staged expert layer out of range");
-    staged[size_t(l)] = true;
-  }
-  uint64_t staged_max = 0;
   for (int l = 0; l < NL; ++l) {
     const std::string b = "blk." + std::to_string(l) + ".";
     const bool swa = cfg_.sliding[size_t(l)];
@@ -164,41 +162,9 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     L.ffn_res_query = vec(b + "ffn_res_query.weight");
     L.ffn_norm = vec(b + "ffn_norm.weight");
     if (f.tensor(b + "exp_probs_b.bias")) L.probs_bias = vec(b + "exp_probs_b.bias");
-    // The experts, from the GGUF's mapping (host memory).
-    const gguf::Tensor& gu = need(b + "ffn_gate_up_exps.weight");
-    const gguf::Tensor& dn = need(b + "ffn_down_exps.weight");
-    const int64_t NE = cfg_.n_expert, F = cfg_.n_ff_exp;
-    const uint64_t gs = gu.nbytes / uint64_t(NE), ds = dn.nbytes / uint64_t(NE);
-    const gguf::Tensor* gsc = f.tensor(b + "ffn_gate_up_exps.scale");
-    const gguf::Tensor* dsc = f.tensor(b + "ffn_down_exps.scale");
-    L.experts = moe::upload(q_, ref::Weight{gu.type, E, 2 * F, gu.data, gs / uint64_t(2 * F)}, gs,
-                            gsc ? reinterpret_cast<const float*>(gsc->data) : nullptr,
-                            ref::Weight{dn.type, F, E, dn.data, ds / uint64_t(E)}, ds,
-                            dsc ? reinterpret_cast<const float*>(dsc->data) : nullptr, NE);
-    q_.wait();
-    if (staged[size_t(l)]) {
-      L.host_experts = sycl::malloc_host<uint8_t>(L.experts.bytes, q_);
-      if (!L.host_experts) throw std::runtime_error("inkling engine: out of pinned host memory for staged experts");
-      owned_.push_back(L.host_experts);
-      q_.memcpy(L.host_experts, L.experts.base, L.experts.bytes).wait();
-      sycl::free(L.experts.base, q_);
-      host_expert_bytes_ += L.experts.bytes;
-      staged_max = std::max(staged_max, L.experts.bytes);
-    } else {
-      weight_bytes_ += L.experts.bytes;
-    }
     layers_.push_back(L);
   }
   sycl::free(staging, q_);
-  if (staged_max) {
-    staging_ = sycl::malloc_device<uint8_t>(staged_max, q_);
-    if (!staging_) throw std::runtime_error("inkling engine: out of device memory for the expert staging region");
-    owned_.push_back(staging_);
-    // a staged layer's tables point into the staging region for good; its bytes are copied there before it runs
-    for (auto& L : layers_)
-      if (L.host_experts) moe::rebase(q_, L.experts, staging_);
-    q_.wait();
-  }
   for (int l = cfg_.core_start; l < cfg_.core_end; ++l) {
     static const char* kCtrl[4] = {"q", "k", "v", "ffn"};
     const std::string b = "blk." + std::to_string(l) + ".";
@@ -252,6 +218,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   for (int64_t p = n_pages_ - 1; p >= 0; --p) free_pages_.push_back(int32_t(p));
   slots_.resize(size_t(c_.n_slots));
   conv_ = dev(int64_t(c_.n_slots) * NA * 3 * CC);
+  for (const auto& [p, n] : state_parts(0)) ckpt_bytes_ += n;
   q_.memset(conv_, 0, size_t(c_.n_slots * NA * 3 * CC) * sizeof(float)).wait();
   cache_bytes_ += size_t(c_.n_slots * NA * 3 * CC) * sizeof(float);
 
@@ -296,6 +263,153 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   attn::reserve(q_, attn_scratch_, max_tiles_full_, c_.max_chunk * (H / HK), HK, D, H / HK, c_.max_ctx + attn::kPage, bias_extent);
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, HD));
   moe_scratch_ = moe::reserve(q_, B, cfg_.n_expert_used, E, cfg_.n_ff_exp);
+  place_experts(f);
+  // The cold path's buffers: the step's routing and expert inputs on the host (the card writes them there), the cold
+  // experts' weighted rows back.
+  if (n_cold_ > 0) {
+    const int64_t NU = cfg_.n_expert_used;
+    hx_ = sycl::malloc_host<float>(size_t(B * E), q_);
+    hrows_ = sycl::malloc_host<float>(size_t(B * E), q_);
+    hids_ = sycl::malloc_host<int32_t>(size_t(B * NU), q_);
+    hw_ = sycl::malloc_host<float>(size_t(B * NU), q_);
+    if (!hx_ || !hrows_ || !hids_ || !hw_) throw std::runtime_error("inkling engine: out of pinned host memory");
+    for (void* p : {static_cast<void*>(hx_), static_cast<void*>(hrows_), static_cast<void*>(hids_), static_cast<void*>(hw_)})
+      owned_.push_back(p);
+    cr_ = dev(B * E);
+    pool_ = std::make_unique<cpu::Pool>(c_.cpu_threads);
+  }
+}
+
+void Engine::place_experts(const gguf::File& f) {
+  const int64_t E = cfg_.n_embd, NE = cfg_.n_expert, F = cfg_.n_ff_exp, NL = cfg_.n_layer;
+  struct Src {
+    const gguf::Tensor *gu, *dn, *gsc, *dsc;
+    uint64_t gs, ds;
+  };
+  std::vector<Src> src;
+  for (int l = 0; l < NL; ++l) {
+    const std::string b = "blk." + std::to_string(l) + ".";
+    const gguf::Tensor* gu = f.tensor(b + "ffn_gate_up_exps.weight");
+    const gguf::Tensor* dn = f.tensor(b + "ffn_down_exps.weight");
+    if (!gu || !dn) throw std::runtime_error(f.path() + ": missing experts of layer " + std::to_string(l));
+    src.push_back({gu, dn, f.tensor(b + "ffn_gate_up_exps.scale"), f.tensor(b + "ffn_down_exps.scale"), gu->nbytes / uint64_t(NE),
+                   dn->nbytes / uint64_t(NE)});
+  }
+  // Which experts go on the card: all of them without a profile; with one, the busiest first across every layer (a looped
+  // layer's count is its three passes'), as long as the card's free memory less the margin and the reserve holds them. A
+  // cold expert costs the CPU about its bytes in time and would take about its bytes on the card, so the count alone ranks.
+  std::vector<std::vector<bool>> hot(size_t(NL), std::vector<bool>(size_t(NE), true));
+  if (!c_.expert_profile.empty()) {
+    std::ifstream in(c_.expert_profile);
+    if (!in) throw std::runtime_error("inkling engine: cannot read " + c_.expert_profile);
+    const json::Value doc = json::parse(std::string((std::istreambuf_iterator<char>(in)), {}));
+    const json::Value* dec = doc.find("decode");
+    if (!dec || !dec->is_array() || int64_t(dec->items().size()) != cfg_.n_slot())
+      throw std::runtime_error(c_.expert_profile + ": \"decode\" must hold one row per layer application");
+    std::vector<std::vector<int64_t>> count(size_t(NL), std::vector<int64_t>(size_t(NE), 0));
+    int app = 0;
+    for (const auto& row : dec->items()) {
+      if (!row.is_array() || int64_t(row.items().size()) != NE) throw std::runtime_error(c_.expert_profile + ": a row is not one count per expert");
+      int64_t e = 0;
+      for (const auto& v : row.items()) count[size_t(cfg_.phys(app))][size_t(e++)] += std::atoll(v.int_digits().c_str());
+      ++app;
+    }
+    struct Cand {
+      int64_t count;
+      int layer, expert;
+    };
+    std::vector<Cand> cand;
+    for (int l = 0; l < NL; ++l)
+      for (int64_t e = 0; e < NE; ++e) cand.push_back({count[size_t(l)][size_t(e)], l, int(e)});
+    std::stable_sort(cand.begin(), cand.end(), [](const Cand& a, const Cand& b) { return a.count > b.count; });
+    const std::optional<uint64_t> fm = rt::free_memory(q_.get_device());
+    if (!fm) throw std::runtime_error("inkling engine: the driver does not say how much memory is free");
+    free_at_placement_ = *fm;
+    const uint64_t keep = c_.card_margin_bytes + c_.card_reserve_bytes;
+    // per expert on the card: its two matrices and scales as stored, plus a share of the layer's tables and rounding. The
+    // staging region for the largest cold set comes out of the same memory, and its size depends on the placement: grow
+    // the reserve until the placement it allows needs no more.
+    // (moe's layouts keep NVFP4's bytes and take ~5% more than Q5_K and Q8_0's)
+    auto per = [&](int l) {
+      const uint64_t raw = src[size_t(l)].gs + src[size_t(l)].ds;
+      return (src[size_t(l)].gu->type == gguf::Type::NVFP4 ? raw : raw + raw / 16) + (64 << 10);
+    };
+    uint64_t stage = 0;
+    for (int round = 0; round < 8; ++round) {
+      uint64_t budget = *fm > keep + stage ? *fm - keep - stage : 0;
+      for (auto& row : hot) std::fill(row.begin(), row.end(), false);
+      for (const Cand& c : cand) {
+        if (per(c.layer) > budget) continue;  // a smaller expert of another layer may still fit
+        budget -= per(c.layer);
+        hot[size_t(c.layer)][size_t(c.expert)] = true;
+      }
+      uint64_t need = 0;
+      for (int l = 0; l < NL; ++l)
+        need = std::max(need, uint64_t(std::count(hot[size_t(l)].begin(), hot[size_t(l)].end(), false)) * per(l) + (1 << 20));
+      if (need <= stage) break;
+      stage = need;
+    }
+  }
+  for (int l = 0; l < NL; ++l) {
+    std::vector<bool> cold(static_cast<size_t>(NE));
+    for (int64_t e = 0; e < NE; ++e) cold[size_t(e)] = !hot[size_t(l)][size_t(e)];
+    if (std::find(cold.begin(), cold.end(), true) == cold.end()) continue;
+    Layer& L = layers_[size_t(l)];
+    const Src& sr = src[size_t(l)];
+    const float* gsc = sr.gsc ? reinterpret_cast<const float*>(sr.gsc->data) : nullptr;
+    const float* dsc = sr.dsc ? reinterpret_cast<const float*>(sr.dsc->data) : nullptr;
+    L.cold_set = moe::upload(q_, ref::Weight{sr.gu->type, E, 2 * F, sr.gu->data, sr.gs / uint64_t(2 * F)}, sr.gs, gsc,
+                             ref::Weight{sr.dn->type, F, E, sr.dn->data, sr.ds / uint64_t(E)}, sr.ds, dsc, NE, &cold);
+    q_.wait();
+    L.cold_host = sycl::malloc_host<uint8_t>(L.cold_set.bytes, q_);
+    if (!L.cold_host) throw std::runtime_error("inkling engine: out of pinned host memory for the cold experts");
+    owned_.push_back(L.cold_host);
+    q_.memcpy(L.cold_host, L.cold_set.base, L.cold_set.bytes).wait();
+    sycl::free(L.cold_set.base, q_);
+    L.cold_set.base = nullptr;
+  }
+  // the staging region holds the largest cold set as moe lays it out; the cold sets' tables point into it from now on
+  uint64_t stage_bytes = 0;
+  for (const auto& L : layers_)
+    if (L.cold_host) stage_bytes = std::max(stage_bytes, L.cold_set.bytes);
+  if (stage_bytes > 0) {
+    staging_ = sycl::malloc_device<uint8_t>(stage_bytes, q_);
+    if (!staging_) throw std::runtime_error("inkling engine: out of device memory for the cold experts' staging region");
+    owned_.push_back(staging_);
+    for (auto& L : layers_)
+      if (L.cold_host) moe::rebase(q_, L.cold_set, staging_);
+  }
+  for (int l = 0; l < NL; ++l) {
+    Layer& L = layers_[size_t(l)];
+    const Src& sr = src[size_t(l)];
+    const float* gsc = sr.gsc ? reinterpret_cast<const float*>(sr.gsc->data) : nullptr;
+    const float* dsc = sr.dsc ? reinterpret_cast<const float*>(sr.dsc->data) : nullptr;
+    L.experts = moe::upload(q_, ref::Weight{sr.gu->type, E, 2 * F, sr.gu->data, sr.gs / uint64_t(2 * F)}, sr.gs, gsc,
+                            ref::Weight{sr.dn->type, F, E, sr.dn->data, sr.ds / uint64_t(E)}, sr.ds, dsc, NE, &hot[size_t(l)]);
+    q_.wait();
+    weight_bytes_ += L.experts.bytes;
+    L.cold.assign(size_t(NE), false);
+    L.cold_slot.assign(size_t(NE), -1);
+    for (int64_t e = 0; e < NE; ++e) {
+      if (hot[size_t(l)][size_t(e)]) continue;
+      L.cold[size_t(e)] = true;
+      ++n_cold_;
+      cpu::ExpertRef r;
+      r.gu_type = cpu_type(sr.gu->type);
+      r.dn_type = cpu_type(sr.dn->type);
+      r.gu = sr.gu->data + uint64_t(e) * sr.gs;
+      r.dn = sr.dn->data + uint64_t(e) * sr.ds;
+      r.gu_scale = gsc ? gsc[e] : 1.0f;
+      r.dn_scale = dsc ? dsc[e] : 1.0f;
+      L.cold_slot[size_t(e)] = int32_t(L.cold_ref.size());
+      L.cold_ref.push_back(r);
+      // touch the cold experts' pages now, so that a request does not wait on the page cache
+      volatile uint8_t sink = 0;
+      for (uint64_t o = 0; o < sr.gs; o += 4096) sink ^= r.gu[o];
+      for (uint64_t o = 0; o < sr.ds; o += 4096) sink ^= r.dn[o];
+      host_expert_bytes_ += sr.gs + sr.ds;
+    }
+  }
 }
 
 Engine::~Engine() {
@@ -307,10 +421,7 @@ Engine::~Engine() {
                   static_cast<void*>(attn_scratch_.tv)})
     if (p) sycl::free(p, q_);
   if (moe_scratch_) moe::free_scratch(q_, moe_scratch_);
-  for (auto& L : layers_) {
-    if (L.host_experts) L.experts.base = nullptr;  // the staging region, freed with owned_
-    moe::free_layer(q_, L.experts);
-  }
+  for (auto& L : layers_) moe::free_layer(q_, L.experts);  // the cold sets' bytes are staging_'s, freed with owned_
   for (void* p : owned_) sycl::free(p, q_);
 }
 
@@ -326,13 +437,150 @@ void Engine::ensure_pages(int slot, int64_t positions) {
   }
 }
 
+std::vector<std::pair<uint8_t*, uint64_t>> Engine::state_parts(int slot) const {
+  const int64_t HK = cfg_.n_head_kv, D = cfg_.head_dim, NA = cfg_.n_slot(), CC = cfg_.conv_channels();
+  const uint64_t ring = uint64_t(ring_pages_ * HK * attn::kPage * D) * sizeof(sycl::half);
+  std::vector<std::pair<uint8_t*, uint64_t>> parts;
+  for (sycl::half* base : {ring_k_, ring_v_})
+    for (int a = 0; a < NA; ++a) {
+      const int r = ring_of_[size_t(a)];
+      if (r < 0) continue;
+      parts.push_back({reinterpret_cast<uint8_t*>(base + r * ring_layer_stride_ + int64_t(slot) * ring_pages_ * HK * attn::kPage * D), ring});
+    }
+  parts.push_back({reinterpret_cast<uint8_t*>(conv_ + int64_t(slot) * NA * 3 * CC), uint64_t(NA * 3 * CC) * sizeof(float)});
+  return parts;
+}
+
+void Engine::checkpoint(int slot) {
+  Slot& s = slots_.at(size_t(slot));
+  if (c_.checkpoints <= 0) return;
+  if (int(s.ckpt.size()) < c_.checkpoints) s.ckpt.push_back({});
+  // the free one, else the one at this position, else the oldest
+  Checkpoint* dst = nullptr;
+  for (auto& c : s.ckpt)
+    if (c.pos == s.length) dst = &c;
+  if (!dst)
+    for (auto& c : s.ckpt)
+      if (!dst || c.pos < 0 || (dst->pos >= 0 && c.age < dst->age)) dst = &c;
+  if (!dst->data) {
+    dst->data = sycl::malloc_host<uint8_t>(ckpt_bytes_, q_);
+    if (!dst->data) throw std::runtime_error("inkling engine: out of pinned host memory for a checkpoint");
+    owned_.push_back(dst->data);
+  }
+  uint64_t at = 0;
+  for (const auto& [p, n] : state_parts(slot)) {
+    q_.memcpy(dst->data + at, p, n);
+    at += n;
+  }
+  q_.wait();
+  dst->pos = s.length;
+  dst->age = ++ckpt_age_;
+}
+
+bool Engine::rewind(int slot, int64_t pos) {
+  Slot& s = slots_.at(size_t(slot));
+  if (pos > s.length) return false;
+  const Checkpoint* src = nullptr;
+  for (const auto& c : s.ckpt)
+    if (c.pos == pos) src = &c;
+  if (!src) return false;
+  uint64_t at = 0;
+  for (const auto& [p, n] : state_parts(slot)) {
+    q_.memcpy(p, src->data + at, n);
+    at += n;
+  }
+  q_.wait();
+  const size_t keep = size_t((pos + attn::kPage - 1) / attn::kPage);
+  while (s.pages.size() > keep) {
+    free_pages_.push_back(s.pages.back());
+    s.pages.pop_back();
+  }
+  s.length = pos;
+  // checkpoints past the new end describe a sequence that is gone
+  for (auto& c : s.ckpt)
+    if (c.pos > pos) c.pos = -1;
+  return true;
+}
+
+std::vector<int64_t> Engine::checkpoint_positions(int slot) const {
+  std::vector<int64_t> out;
+  for (const auto& c : slots_.at(size_t(slot)).ckpt)
+    if (c.pos >= 0) out.push_back(c.pos);
+  return out;
+}
+
 void Engine::release(int slot) {
   Slot& s = slots_.at(size_t(slot));
   for (int32_t p : s.pages) free_pages_.push_back(p);
   s.pages.clear();
   s.length = 0;
+  for (auto& c : s.ckpt) c.pos = -1;
   const int64_t per = int64_t(cfg_.n_slot()) * 3 * cfg_.conv_channels();
   q_.memset(conv_ + int64_t(slot) * per, 0, size_t(per) * sizeof(float)).wait();
+}
+
+cpu::QType Engine::cpu_type(gguf::Type t) {
+  switch (t) {
+    case gguf::Type::NVFP4: return cpu::QType::NVFP4;
+    case gguf::Type::Q5_K: return cpu::QType::Q5_K;
+    case gguf::Type::Q8_0: return cpu::QType::Q8_0;
+    default: throw std::runtime_error(std::string("inkling engine: no CPU kernel for experts of type ") + gguf::type_name(t));
+  }
+}
+
+void Engine::cold(const Layer& L, int64_t T, sycl::event packed) {
+  const int64_t E = cfg_.n_embd, NU = cfg_.n_expert_used, F = cfg_.n_ff_exp;
+  packed.wait();
+  // the step's cold pairs by expert, so that each cold expert's weights are read once for all its tokens
+  std::vector<std::vector<std::pair<int32_t, int32_t>>> by(L.cold_ref.size());
+  std::vector<uint8_t> touched(size_t(T), 0);
+  bool any = false;
+  for (int64_t t = 0; t < T; ++t)
+    for (int64_t s = 0; s < NU; ++s) {
+      const int32_t c = L.cold_slot[size_t(hids_[t * NU + s])];
+      if (c < 0) continue;
+      by[size_t(c)].push_back({int32_t(t), int32_t(s)});
+      touched[size_t(t)] = 1;
+      any = true;
+    }
+  if (!any) return;
+  std::memset(hrows_, 0, size_t(T * E) * sizeof(float));
+  if (T == 1) {
+    // one token: its cold experts share the input, one pass over all of them
+    std::vector<cpu::ExpertRef> refs;
+    std::vector<float> wts;
+    for (size_t c = 0; c < by.size(); ++c)
+      for (const auto& pr : by[c]) refs.push_back(L.cold_ref[c]), wts.push_back(hw_[pr.second]);
+    const size_t n = refs.size();
+    if (cold_y_.size() < n * size_t(E)) cold_y_.resize(n * size_t(E));
+    std::vector<float*> ys(n);
+    for (size_t i = 0; i < n; ++i) ys[i] = cold_y_.data() + i * size_t(E);
+    const float* x0 = hx_;
+    cpu::experts_ffn(refs.data(), int(n), E, F, &x0, 1, ys.data(), cfg_.situ_beta, cfg_.situ_linear_beta, *pool_);
+    for (size_t i = 0; i < n; ++i)
+      for (int64_t e = 0; e < E; ++e) hrows_[e] += wts[i] * ys[i][e];
+  } else
+  for (size_t c = 0; c < by.size(); ++c) {
+    const auto& pairs = by[c];
+    if (pairs.empty()) continue;
+    const size_t n = pairs.size();
+    if (cold_y_.size() < n * size_t(E)) cold_y_.resize(n * size_t(E));
+    std::vector<const float*> xs(n);
+    std::vector<float*> ys(n);
+    for (size_t i = 0; i < n; ++i) {
+      xs[i] = hx_ + int64_t(pairs[i].first) * E;
+      ys[i] = cold_y_.data() + i * size_t(E);
+    }
+    cpu::expert_ffn(L.cold_ref[c], E, F, xs.data(), int(n), ys.data(), cfg_.situ_beta, cfg_.situ_linear_beta, *pool_);
+    for (size_t i = 0; i < n; ++i) {
+      const float w = hw_[int64_t(pairs[i].first) * NU + pairs[i].second];
+      float* row = hrows_ + int64_t(pairs[i].first) * E;
+      const float* y = ys[i];
+      for (int64_t e = 0; e < E; ++e) row[e] += w * y[e];
+    }
+  }
+  q_.memcpy(cr_, hrows_, size_t(T * E) * sizeof(float));
+  ref::add(q_, f_, cr_, T * E, f_);
 }
 
 std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::DumpSink* dump, const model::Teacher* teacher) {
@@ -542,14 +790,29 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       dump->put("ffn_moe_topk" + sl, std::vector<float>(h.begin(), h.end()), {NU, T});
     }
     mark("router");
-    if (L.host_experts && staged_layer_ != ip) {
-      q_.memcpy(staging_, L.host_experts, L.experts.bytes);
-      staged_layer_ = ip;
-      mark("stage");
+    // Cold experts: the routing and the inputs go to pinned host memory ahead of the hot experts' kernels; the host waits
+    // for them alone, computes the cold pairs while the card runs the hot ones, and adds their rows after.
+    // Longer steps copy the layer's cold set onto the card and run it there, its rows going into the hot experts' sum.
+    sycl::event packed;
+    const bool cold_cpu = !L.cold_ref.empty() && T <= c_.cpu_max_tokens;
+    const bool cold_card = !L.cold_ref.empty() && !cold_cpu;
+    if (cold_cpu) packed = ik::pack_host(q_, ids_, wts_, h_[0], T, NU, E, hids_, hw_, hx_);
+    if (cold_card) {
+      if (staged_layer_ != ip) {
+        q_.memcpy(staging_, L.cold_host, L.cold_set.bytes);
+        staged_layer_ = ip;
+      }
+      moe::ffn(q_, L.cold_set, h_[0], T, ids_, wts_, NU, cfg_.situ_beta, cfg_.situ_linear_beta, *moe_scratch_, cr_);
+      mark("cold");
     }
-    moe::ffn(q_, L.experts, h_[0], T, ids_, wts_, NU, cfg_.situ_beta, cfg_.situ_linear_beta, *moe_scratch_, f_);
-    emit("ffn_moe_out" + sl, f_, {E, T});
+    moe::ffn(q_, L.experts, h_[0], T, ids_, wts_, NU, cfg_.situ_beta, cfg_.situ_linear_beta, *moe_scratch_, f_,
+             cold_card ? cr_ : nullptr);
     mark("moe");
+    if (cold_cpu) {
+      cold(L, T, packed);
+      mark("cold");
+    }
+    emit("ffn_moe_out" + sl, f_, {E, T});
     ik::short_conv(q_, f_, E, T, E, ch, slot_, base_, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_);
     emit("ffn_out" + sl, o_, {E, T});
     ref::add(q_, cur, o_, T * E, out);

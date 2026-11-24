@@ -4223,3 +4223,55 @@ same as all-hot. Time of the card's part (layer 6; pairs on the card: share of (
 
 The time follows the pairs left on the card (and the experts they touch), not the share of experts. These numbers are
 random inputs, whose routing is flatter than real text's.
+
+## 2026-11-24 — Inkling M3: memory, experts between the card and the CPU, two slots of 64k, checkpoints
+
+The weights are 15.16 GiB (13.8 of them experts). In production's shape, two slots of 65,536 with fp16 K/V (4.63 GiB of
+caches: 8 full applications' pages, 40 sliding rings, the convolution states) and 2.53 GiB kept for the side models that
+share the card, about 6 GiB is left for experts, so most of them run elsewhere. The design is the one eklow measured for
+Gemma 4 26B (2026-10-27): the busiest experts on the card, the rest computed by the CPU in decode and copied onto the card
+for long prefill steps.
+- **The routing profile** (`data/inkling-2-mini-experts.json`, counts only): per layer application and expert, how often
+  the router picked it over the model's own answers (6,883 decode positions) and the prompt positions before them, on 21 real
+  chat requests answered by the model on llama.cpp. A layer's busiest 64 experts carry 76-96% of its decode picks (median
+  87%), the busiest 96 93-100%.
+- **Placement** (`Config::expert_profile`): every (layer, expert) pair ranked by its decode count (a looped layer's three
+  passes add), the busiest first while the card's free memory less a 1 GiB margin, the reserve and the staging region (the
+  largest cold set) holds them. A cold expert costs the CPU about its bytes in time and would take about its bytes on the card,
+  so the count alone ranks. At production's shape: 9.3 GiB free before the experts, ~1,920 of 3,072 experts cold (8.8 GiB).
+- **Decode** (steps of up to 128 tokens): one kernel writes the step's routing and expert inputs into pinned host memory
+  ahead of the hot experts' kernels; the host waits for it alone, computes the cold pairs (`cpu::experts_ffn` in one pass for
+  a single token, `expert_ffn` per expert otherwise) while the card runs the hot ones, and the rows are added after. Their
+  activations are int8, so a cold expert is ~1e-2 off against the card's 3e-4 (llama.cpp quantizes every expert's input to
+  8 bits too).
+- **Prefill** (longer steps): each layer's cold set, repacked once at load into pinned host memory, is copied into the
+  staging region and run on the card, its rows going into the hot experts' combine. On a 12k prompt: 355 tok/s staging every
+  step, 367 with steps up to 256 tokens on the CPU, 180 all on the CPU; the switch sits at 128 tokens.
+- **Checkpoints** (`checkpoint`, `rewind`): a slot's sliding rings and convolution states cannot be rewound by returning
+  pages. A checkpoint copies them (324 MiB a slot at 1,024-token chunks) to pinned host memory; rewind restores one and
+  returns the later pages. Decoding again after a rewind to the prompt's end gives the same logits to the bit.
+
+**Checks** (fiona, production's shape; top-1 and mean KL over the dumped positions):
+
+| prompt | against llama.cpp CUDA | against the reference | decode steps against CUDA |
+|---|---|---|---|
+| short | 63/67, 3.1e-2 | 64/67, 3.3e-2 | 64/64, 1.4e-3 |
+| long (12k) | 234/256, 9.2e-2 | 242/256, 4.0e-2 | 32/32, 1.7e-3 |
+| deep (33k) | 117/128, 8.5e-2 | 120/128, 7.7e-2 | 32/32, 9.9e-4 |
+
+The CPU's int8 experts move the engine further from the fp32 reference than M2's all-on-card run (short 4.8e-3, long
+2.2e-2), and it stays inside llama.cpp's own spread (CPU against CUDA: 5.1e-2, 7.0e-2). Two slots: the tools prompt in slot 0
+beside another prompt in slot 1, in the same steps, against slot 0 alone: 63/64 decode steps, KL 1.8e-3 (the batch shapes'
+rounding, prefill chunked differently).
+
+**Speed** in production's shape: decode 11.4 / 11.2 / 11.0 / 10.7 tok/s at 67 / 1.3k / 12k / 33k positions (12.0 with every
+expert on the card); prefill 363 tok/s at 12k and 369 at 33k (637 nearly all on the card). Prefill now spends about half its
+time copying cold sets, once for each pass of a looped layer. What would buy it back, in the order of what it costs:
+- a smaller margin (0.5 GiB ran clean for the 26B);
+- the side models on the Iris Xe (the owner's suggestion; 2.5 GiB, about 600 more experts hot, roughly half the cold pairs,
+  but their kernels use the A770M's matrix units, which the Iris Xe does not have, so they need new kernel paths);
+- layer-major prefill (each cold set copied once a prompt instead of once a chunk);
+- copying the next cold set on the copy engine during the current layer (the DMA tax measured for the 26B: 1.3-1.9x on the
+  kernels it overlaps).
+
+The card sessions for M3: eklow-bolt stopped 16:46-17:08 CST (with the experts worker's runs), restarted healthy.

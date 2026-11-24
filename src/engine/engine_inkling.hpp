@@ -10,8 +10,9 @@
 // convolution state (the last three inputs of its four short convolutions), per sequence slot. The 8 full-attention
 // applications keep pages from a pool; the 40 sliding ones a ring of window + max_chunk positions per sequence slot.
 //
-// Experts that do not fit stay in pinned host memory, whole layers of them (Config::staged_expert_layers), and are copied
-// onto the card before their layer runs in each step: correct and simple, slow for decode (M3 places experts properly).
+// Experts (M3, DECISIONS 2026-11-24): with a routing profile, the busiest (layer, expert) pairs go on the card as long as its
+// free memory less a margin and a reserve holds them, the rest stay in the GGUF's mapping and run on the CPU
+// (cpu::expert_ffn): a step's cold pairs are computed by the host while the card runs the hot ones, and added.
 #pragma once
 
 #include <sycl/sycl.hpp>
@@ -24,6 +25,8 @@
 #include "kernels/attention.hpp"
 #include "kernels/moe.hpp"
 #include "kernels/xmx.hpp"
+#include "cpu/expert.hpp"
+#include <memory>
 #include "model/dump.hpp"
 #include "model/gguf.hpp"
 #include "model/inkling2.hpp"
@@ -36,8 +39,14 @@ struct Config {
   int64_t max_batch = 1024;  // tokens per step
   int64_t max_chunk = 1024;  // tokens per chunk: the sliding rings hold the window and one chunk
   int64_t max_logits = 64;   // logits rows per step
-  // Physical layers whose experts live in host memory and are copied onto the card each step they run.
-  std::vector<int> staged_expert_layers = {};
+  // The routing profile (JSON, "decode": counts [layer application][expert]); empty: every expert on the card.
+  std::string expert_profile;
+  uint64_t card_margin_bytes = uint64_t(1) << 30;  // free card memory left after the experts
+  uint64_t card_reserve_bytes = 0;                 // and what is loaded after the engine (side models)
+  int cpu_threads = 8;                             // the cold experts' pool, the calling thread included
+  int64_t cpu_max_tokens = 128;                    // steps up to this many tokens run cold experts on the CPU; longer
+                                                   // ones copy the layer's cold set onto the card and run it there
+  int checkpoints = 2;                             // per slot: saved states a sequence can be rewound to (rewind)
 };
 
 struct Chunk {
@@ -62,8 +71,15 @@ class Engine {
   std::vector<float> step(const std::vector<Chunk>& chunks, const model::DumpSink* dump = nullptr,
                           const model::Teacher* teacher = nullptr);
 
-  // Forgets a slot's sequence (its pages and its convolution state).
+  // Forgets a slot's sequence (its pages, its convolution state and its checkpoints).
   void release(int slot);
+  // A slot's state beyond its K/V pages (the sliding rings and the convolution state) cannot be rewound by dropping pages:
+  // checkpoint saves it to pinned host memory at the slot's current length (replacing its oldest checkpoint), and rewind
+  // goes back to a checkpoint's position exactly (its rings and convolution state restored, later pages returned). The
+  // server checkpoints where a prefill ends, so that a next turn that differs from the last answer resumes there.
+  void checkpoint(int slot);
+  bool rewind(int slot, int64_t pos);  // false when the slot has no checkpoint at pos (or pos is past its length)
+  std::vector<int64_t> checkpoint_positions(int slot) const;
   int64_t length(int slot) const { return slots_[size_t(slot)].length; }
 
   void set_profile(std::map<std::string, double>* p) { profile_ = p; }
@@ -71,6 +87,8 @@ class Engine {
   const Config& config() const { return c_; }
   uint64_t weight_bytes() const { return weight_bytes_; }
   uint64_t host_expert_bytes() const { return host_expert_bytes_; }
+  int64_t cold_experts() const { return n_cold_; }
+  uint64_t free_at_placement() const { return free_at_placement_; }
   uint64_t cache_bytes() const { return cache_bytes_; }
 
  private:
@@ -85,8 +103,12 @@ class Engine {
     const sycl::half* rel_tiles = nullptr;  // rel_bias as attn::bias_table prepares it
     const float *k_conv = nullptr, *v_conv = nullptr, *attn_post_conv = nullptr, *ffn_post_conv = nullptr;
     const float *attn_res_query = nullptr, *ffn_res_query = nullptr, *ffn_norm = nullptr, *probs_bias = nullptr;
-    moe::Layer experts;
-    uint8_t* host_experts = nullptr;  // staged layers: the experts' bytes in pinned host memory
+    moe::Layer experts;                    // the hot experts on the card
+    std::vector<bool> cold;                // per expert
+    std::vector<int32_t> cold_slot;        // per expert: its index in cold_ref, or -1
+    std::vector<cpu::ExpertRef> cold_ref;  // the cold experts in the GGUF's mapping
+    moe::Layer cold_set;                   // the same experts repacked, tables pointing into staging_
+    uint8_t* cold_host = nullptr;          // their bytes, pinned
   };
   struct Loop {
     const float* msg_query = nullptr;  // [4][n_embd]
@@ -95,13 +117,24 @@ class Engine {
     const float* forget32[4] = {};
     xmx::Weight gain[4], forget[4];    // the same as fp16 tiles, for the fp16 GEMM of prefill steps
   };
+  struct Checkpoint {
+    int64_t pos = -1;
+    uint64_t age = 0;
+    uint8_t* data = nullptr;  // pinned: every sliding application's ring K, then V, then the convolution state
+  };
   struct Slot {
     int64_t length = 0;
     std::vector<int32_t> pages;
+    std::vector<Checkpoint> ckpt;
   };
 
   float* dev(int64_t n);
   void ensure_pages(int slot, int64_t positions);
+  void place_experts(const gguf::File& f);
+  static cpu::QType cpu_type(gguf::Type t);
+  // A layer application's cold pairs: on the host once `packed` (the routing and inputs in hids_, hw_, hx_) is done, then
+  // their weighted rows added to f_.
+  void cold(const Layer& L, int64_t T, sycl::event packed);
 
   sycl::queue& q_;
   Config c_;
@@ -118,8 +151,15 @@ class Engine {
   const float *tok_norm_ = nullptr, *output_norm_ = nullptr, *output_res_query_ = nullptr;
   std::vector<Layer> layers_;  // physical
   std::vector<Loop> loops_;
-  uint8_t* staging_ = nullptr;  // a staged layer's experts on the card while it runs (their tables point here)
-  int staged_layer_ = -1;       // whose experts staging_ holds now
+  int64_t n_cold_ = 0;
+  uint8_t* staging_ = nullptr;  // a layer's cold set on the card while a long step runs it
+  int staged_layer_ = -1;       // whose cold set staging_ holds
+  uint64_t free_at_placement_ = 0;
+  // The cold path: the step's routing and expert inputs on the host, the cold rows, their device copy, the pool.
+  int32_t* hids_ = nullptr;
+  float *hw_ = nullptr, *hx_ = nullptr, *hrows_ = nullptr, *cr_ = nullptr;
+  std::vector<float> cold_y_;
+  std::unique_ptr<cpu::Pool> pool_;
 
   // K/V: per slot application, a ring (sliding) or pages (full).
   std::vector<int> ring_of_, page_of_;  // per application slot: its ring or page-cache index, -1 otherwise
@@ -131,6 +171,9 @@ class Engine {
   std::vector<Slot> slots_;
   // Convolution state: [seq slot][application][3][conv_channels] fp32.
   float* conv_ = nullptr;
+  uint64_t ckpt_bytes_ = 0, ckpt_age_ = 0;
+  // The copies of a checkpoint, in order: (device pointer, bytes) for a slot.
+  std::vector<std::pair<uint8_t*, uint64_t>> state_parts(int slot) const;
 
   // Workspace, sized for max_batch tokens.
   std::vector<float*> blk_;  // block and stream buffers [B][E]
