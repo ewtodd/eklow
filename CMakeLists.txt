@@ -43,6 +43,7 @@ endfunction()
 # Serving text layer: Gemma 4's tokenizer, chat template and output parser; Qwen's tokenizer (vega's reader and the reranker). No device code.
 add_library(eklow_text STATIC
   src/text/chat_gemma4.cpp
+  src/text/chat_inkling.cpp
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
   src/text/output_parser_gemma4.cpp
@@ -169,6 +170,9 @@ target_link_libraries(eklow_grammar_gemma4 PUBLIC eklow_text)
 
 add_executable(eklow-grammar-test-gemma4 tools/grammar_test_gemma4/main.cpp)
 target_link_libraries(eklow-grammar-test-gemma4 PRIVATE eklow_grammar_gemma4)
+
+add_executable(eklow-chat-inkling tools/chat_inkling/main.cpp)
+target_link_libraries(eklow-chat-inkling PRIVATE eklow_text)
 
 add_executable(eklow-chat-gemma4 tools/chat_gemma4/main.cpp)
 target_link_libraries(eklow-chat-gemma4 PRIVATE eklow_text)
