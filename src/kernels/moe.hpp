@@ -17,6 +17,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <vector>
 
 #include "kernels/ref.hpp"
 
@@ -40,14 +41,21 @@ struct Layer {
   const float* gate_up_scale = nullptr;                      // per expert (NVFP4's second-level scale), or null for 1; inside base
   const float* down_scale = nullptr;
   int64_t n_embd = 0, n_ff = 0, n_expert = 0;
+  // Residency: with only some experts on the card, expert e lives in slot slot_of[e] (-1: cold, computed elsewhere) and the
+  // tables and scales are indexed by slot. slot_of is null when every expert is hot (slot = id). n_hot counts the slots.
+  uint64_t slot_of_offset = 0;
+  const int32_t* slot_of = nullptr;  // inside base
+  int64_t n_hot = 0;
   uint8_t* base = nullptr;  // the one device allocation holding everything above
   uint64_t bytes = 0;       // its size
 };
 
 // The layer's experts from the GGUF's tensors as stored (in host memory; raw.data points at expert 0, expert e at
-// raw.data + e * stride; scales host pointers or null), repacked onto the card. NVFP4 and Q5_K gate_up, NVFP4 and Q8_0 down.
+// raw.data + e * stride; scales host pointers or null, per expert), repacked onto the card. With `hot` (n_expert flags) only the
+// hot experts and their scales are uploaded, compacted into slots in id order; `bytes` is then theirs only. NVFP4 and Q5_K gate_up, NVFP4 and Q8_0 down.
 Layer upload(sycl::queue& q, const ref::Weight& gate_up_raw, uint64_t gate_up_stride, const float* gate_up_scale,
-             const ref::Weight& down_raw, uint64_t down_stride, const float* down_scale, int64_t n_expert);
+             const ref::Weight& down_raw, uint64_t down_stride, const float* down_scale, int64_t n_expert,
+             const std::vector<bool>* hot = nullptr);
 // Frees L.base (not for a rebased layer: its bytes are the engine's).
 void free_layer(sycl::queue& q, Layer& L);
 // Points L at a copy of its bytes at new_base (the engine has copied base..base + bytes there): the tables' addresses and the
@@ -66,7 +74,9 @@ void profile_print(bool print = true);
 
 // out[t][:] for t < n_tok, fp32 [n_tok][n_embd]; x fp32 [n_tok][n_embd]; ids int32 and w fp32 [n_tok][n_used] on the
 // device. Enqueues only (in-order queue).
+// Pairs whose expert is cold are skipped; cold_rows (device fp32 [n_tok][n_embd], when given) is added to each token's sum
+// after the hot experts' (the caller's sum of w * the cold experts' outputs).
 void ffn(sycl::queue& q, const Layer& L, const float* x, int64_t n_tok, const int32_t* ids, const float* w, int64_t n_used,
-         float situ_beta, float situ_linear_beta, Scratch& s, float* out);
+         float situ_beta, float situ_linear_beta, Scratch& s, float* out, const float* cold_rows = nullptr);
 
 }  // namespace eklow::moe

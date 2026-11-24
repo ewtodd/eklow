@@ -67,6 +67,7 @@ int main(int argc, char** argv) {
   int reps = 20;
   uint32_t seed = 1;
   bool check = true, timing = true;
+  std::vector<int> hot_pct = {100, 75, 50, 25};
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&]() { return std::string(i + 1 < argc ? argv[++i] : ""); };
@@ -77,6 +78,10 @@ int main(int argc, char** argv) {
     else if (a == "--seed") seed = uint32_t(std::atoi(next().c_str()));
     else if (a == "--no-check") check = false;
     else if (a == "--no-time") timing = false;
+    else if (a == "--hot") {
+      hot_pct.clear();
+      for (int64_t v : list(next())) hot_pct.push_back(int(v));
+    }
     else {
       std::fprintf(stderr, "unknown argument %s\n", a.c_str());
       return 2;
@@ -221,6 +226,99 @@ int main(int argc, char** argv) {
                       (long long)distinct, bytes / 1e6, bytes / (ms * 1e-3) / 1e9, double(n) / (ms * 1e-3));
           if (std::getenv("EKLOW_MOE_PROFILE")) moe::profile_print();
         }
+      }
+      // ---- residency: only the busiest experts on the card, the rest's weighted sum from the reference ops
+      if (!hot_pct.empty()) {
+        std::vector<int> cnt(size_t(c.NE), 0), order(size_t(c.NE));
+        for (int32_t id : hids) ++cnt[size_t(id)];
+        for (int i = 0; i < c.NE; ++i) order[size_t(i)] = i;
+        std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return cnt[size_t(a)] > cnt[size_t(b)]; });
+        std::vector<moe::Layer> hl;
+        std::vector<std::vector<char>> is_hot;
+        for (int pct : hot_pct) {
+          std::vector<bool> hot(size_t(c.NE), false);
+          std::vector<char> hc(size_t(c.NE), 0);
+          for (int i = 0; i < c.NE * pct / 100; ++i) hot[size_t(order[size_t(i)])] = true, hc[size_t(order[size_t(i)])] = 1;
+          hl.push_back(moe::upload(q, graw, gstride, sg ? reinterpret_cast<const float*>(sg->data) : nullptr, draw, dstride,
+                                   sd ? reinterpret_cast<const float*>(sd->data) : nullptr, c.NE, &hot));
+          is_hot.push_back(hc);
+          std::printf("  hot %3d%%: %lld experts, %.1f MiB on the card\n", pct, (long long)hl.back().n_hot, double(hl.back().bytes) / 1048576.0);
+        }
+        std::vector<float> hw(size_t(T * c.NU));
+        q.memcpy(hw.data(), wts, hw.size() * 4).wait();
+        for (int64_t n : tokens) {
+          const size_t nf = hot_pct.size();
+          std::vector<float*> wm(nf), cold(nf);
+          for (size_t f = 0; f < nf; ++f) {
+            std::vector<float> m(size_t(n * c.NU));
+            for (int64_t i = 0; i < n * c.NU; ++i) m[size_t(i)] = is_hot[f][size_t(hids[size_t(i)])] ? 0.0f : hw[size_t(i)];
+            wm[f] = to_dev(q, m.data(), m.size());
+            cold[f] = sycl::malloc_device<float>(size_t(n * c.E), q);
+          }
+          std::vector<float> ref_out(size_t(n * c.E));
+          {
+            const int64_t chunk = 256;
+            float* gu = sycl::malloc_device<float>(size_t(chunk * c.NU * 2 * c.F), q);
+            float* act = sycl::malloc_device<float>(size_t(chunk * c.NU * c.F), q);
+            float* dn = sycl::malloc_device<float>(size_t(chunk * c.NU * c.E), q);
+            float* ro = sycl::malloc_device<float>(size_t(n * c.E), q);
+            for (int64_t t0c = 0; t0c < n; t0c += chunk) {
+              const int64_t tc = std::min(chunk, n - t0c);
+              ref::matmul_experts(q, rgw, gstride, x + t0c * c.E, false, ids + t0c * c.NU, tc, c.NU, gs, gu);
+              ref::inkling::situ(q, gu, tc * c.NU, c.F, c.beta, c.lb, act);
+              ref::matmul_experts(q, rdw, dstride, act, true, ids + t0c * c.NU, tc, c.NU, ds, dn);
+              ref::inkling::moe_combine(q, dn, wts + t0c * c.NU, tc, c.NU, c.E, ro + t0c * c.E);
+              for (size_t f = 0; f < nf; ++f) ref::inkling::moe_combine(q, dn, wm[f] + t0c * c.NU, tc, c.NU, c.E, cold[f] + t0c * c.E);
+              q.wait();
+            }
+            q.memcpy(ref_out.data(), ro, ref_out.size() * 4).wait();
+            sycl::free(gu, q);
+            sycl::free(act, q);
+            sycl::free(dn, q);
+            sycl::free(ro, q);
+          }
+          for (size_t f = 0; f < nf; ++f) {
+            const moe::Layer& L2 = hl[f];
+            const float* cr = hot_pct[f] == 100 ? nullptr : cold[f];
+            if (check) {
+              moe::ffn(q, L2, x, n, ids, wts, c.NU, c.beta, c.lb, *scratch, out, cr);
+              std::vector<float> got(size_t(n * c.E));
+              q.memcpy(got.data(), out, got.size() * 4).wait();
+              std::vector<double> err(size_t(n), 0.0);
+              for (int64_t t = 0; t < n; ++t) {
+                double d2 = 0, r2 = 0;
+                for (int64_t j = 0; j < c.E; ++j) {
+                  const double r = ref_out[size_t(t * c.E + j)], g = got[size_t(t * c.E + j)];
+                  d2 += (g - r) * (g - r);
+                  r2 += r * r;
+                }
+                err[size_t(t)] = std::sqrt(d2 / std::max(r2, 1e-30));
+              }
+              std::sort(err.begin(), err.end());
+              const bool ok = std::isfinite(err.back()) && err[err.size() / 2] <= 2e-3 && err.back() <= 1e-2;
+              all_ok &= ok;
+              std::printf("  hot %3d%% check %5lld tokens: rel L2 median %.2e max %.2e  %s\n", hot_pct[f], (long long)n, err[err.size() / 2], err.back(), ok ? "ok" : "FAIL");
+            }
+            if (timing) {
+              moe::ffn(q, L2, x, n, ids, wts, c.NU, c.beta, c.lb, *scratch, out, cr);
+              q.wait();
+              const auto s0 = std::chrono::steady_clock::now();
+              const int r = n >= 512 ? std::max(2, reps / 4) : reps;
+              for (int i = 0; i < r; ++i) moe::ffn(q, L2, x, n, ids, wts, c.NU, c.beta, c.lb, *scratch, out, cr);
+              q.wait();
+              const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count() / r;
+              int64_t pairs_hot = 0;
+              for (int64_t i = 0; i < n * c.NU; ++i) pairs_hot += is_hot[f][size_t(hids[size_t(i)])];
+              std::printf("  hot %3d%% time  %5lld tokens: %8.3f ms  (%.0f%% of pairs on the card)\n", hot_pct[f], (long long)n, ms,
+                          100.0 * double(pairs_hot) / double(n * c.NU));
+            }
+          }
+          for (size_t f = 0; f < nf; ++f) {
+            sycl::free(wm[f], q);
+            sycl::free(cold[f], q);
+          }
+        }
+        for (auto& l2 : hl) moe::free_layer(q, l2);
       }
       for (const void* p : {(const void*)rg, (const void*)rd, (const void*)rr, (const void*)norm, (const void*)bias, (const void*)gs, (const void*)ds})
         if (p) sycl::free(const_cast<void*>(p), q);
