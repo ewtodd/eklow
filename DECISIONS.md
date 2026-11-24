@@ -3749,8 +3749,8 @@ Everything the model's text goes through, ported from llama.cpp c74c71a6 (the M0
 against Hugging Face where Hugging Face is the reference. `tools/ref/inkling/text_gates.sh` runs every gate below and
 prints the counts. Host-only targets: `eklow-tok` (learned Inkling), `eklow-chat-inkling`, `eklow-parse-inkling`; the
 fuzz generators are `tools/ref/inkling/chat_fuzz.py` (synthetic text, random numbers and Unicode; no chat content).
-Opening the GGUF needs `NVFP4` (ggml type 40, 64 elements in 36 bytes) in `src/model/gguf.*`: two lines, left to
-`inkling/port` (its forward needs them too), applied only in the worktree that ran these.
+Opening the GGUF needs `NVFP4` (ggml type 40, 64 elements in 36 bytes) in `src/model/gguf.*`, which came with the
+reference forward (the next entry).
 
 **The tokenizer** (`src/text/tokenizer_inkling.*`, from the GGUF).
 - GPT-4o's regex matched by hand over code points, the alternatives tried in order with the regex's own backtracking (the
@@ -3846,3 +3846,57 @@ non-empty one; the port is the PEG written out (strict JSON with its number look
   again per token, as llama.cpp does, but only the current call); a decoded token takes milliseconds.
 
 The tool-call grammar is M4.
+
+## 2026-11-24 — Inkling M1: eklow's reference forward, against llama.cpp
+
+`src/model/inkling2.*` and `src/kernels/ref_inkling.*`: the forward in fp32 and plain SYCL, op for op as llama.cpp
+c74c71a6's `inkling2.cpp` and `inkling2-loop.cpp` build it, on the GGUF's weights as stored (NVFP4 experts with their
+per-expert scale on layers 0-19, Q5_K and Q8_0 on 20-23, Q8_0 dense, BF16 sink and conv-tap projections, F32 router and
+controllers). It runs on the card or, built by `tools/ref/inkling/host-build.sh`, on the host CPU (SYCL's native_cpu; it
+refuses null pointers as kernel arguments, so optional inputs go as flags). M1 ran on e-workstation, beside M0's dumps;
+the DG2 build compiles. `eklow-ref-run` runs it with two checks added: `--teacher DIR` continues every layer from an
+oracle's stream instead of its own, and `--emulate-ggml-cpu` rounds every matmul's activations as ggml's CPU backend does
+(q8_0 with an fp16 scale for Q8_0 and NVFP4 weights, q8_K for Q5_K, bf16 for BF16). `tools/ref/inkling/compare.py` sets a
+dump beside M0's slot by slot.
+
+**llama.cpp disagrees with itself widely on this model**, so "inside its band" is a loose check (top-1 and mean KL over the
+dumped positions):
+
+| prompt | CUDA against CUDA (window-sized sliding caches) | CPU against CUDA | eklow against CUDA | eklow against CPU |
+|---|---|---|---|---|
+| short (67) | | 60/67, 5.1e-2 | 62/67, 3.2e-2 | 63/67, 4.3e-2 |
+| tools (1,339; last 512) | identical | 433/512, 0.46 | 436/512, 0.42 | 434/512, 0.43 |
+| long (11,996; last 256) | 236/256, 3.9e-2 | 242/256, 7.0e-2 | 239/256, 9.6e-2 | 243/256, 3.0e-2 |
+
+- A 0.4% difference at layer 0 (llama.cpp's 8-bit activations against fp32, or two cache layouts) grows to 10-15% by
+  layer 23 over the 48 passes. Median KL stays near 5e-3; the mean is the tail.
+- On the tools prompt's line-numbered file the tail is long: a tenth of positions differ by more than half their norm
+  between any two of the three, with KL up to 17. Q and K are clipped at 22.6, so attention logits reach 45 and near-tied
+  keys in repeated text flip on noise. All three pairs disagree alike, so no implementation is the wrong one there.
+- The two CUDA runs differ only in the sliding caches' size (`swa_full`, M0's first run of the long prompt kept them
+  whole), so even the order of llama.cpp's own sums moves this model by 3.9e-2.
+
+**The tight checks.**
+- Against llama.cpp's CPU backend with its activation rounding emulated and its streams fed in (`--teacher`): Q, K, V and
+  R match to a median of 1e-7 on every slot checked (sliding and full layers, all three passes), the attention outputs to
+  2e-6..5e-5, the router logits to 1e-5..1e-4, with the same 8 experts. That holds before and past position 1,024 on the
+  tools prompt (the sliding window, and the full layers' bias table running out at 1,024). Where a token's stream is not
+  exact it is off by one 8-bit rounding: a 1e-7 difference next to a rounding tie becomes a quantization step (~1e-3 of the
+  vector). Layer 0 traced through: eklow, numpy and llama.cpp agree to 2e-7 through the expert products wherever the
+  inputs are bit-identical.
+- Without the emulation, fed CUDA's streams: 3-9e-3 a layer (llama.cpp's 8-bit activations), the same 8 experts at 93-100%
+  of positions, and the output path exact (the final norm 7e-7; logits KL 1.1e-4, from the head's activations).
+- Decode: llama.cpp CUDA's greedy continuations, scored step by step: eklow's top-1 is CUDA's at 64/64 (short, KL 1.4e-3),
+  63/64 (tools, 3.7e-3) and 32/32 (long, 1.9e-3). llama.cpp's CPU against CUDA: 64/64 (1.4e-3), 64/64 (4.3e-3), and on
+  long its own greedy leaves CUDA's after 24 of 32 tokens.
+- The deep prompt (32,950) was not run: about four hours on the host. It runs in M2, with the same reference on the card.
+
+On 32 host threads the reference takes 27 s for 67 tokens, 3-8 minutes for 1,339 and 30 minutes for 12,027.
+
+What follows for the next milestones:
+- Gates after this are relative: the card's forward against this reference should sit inside llama.cpp's own spread on
+  each prompt, and the replay (M4) is the quality check. Int8 activations on the card, as Bolt's small-batch matmuls use,
+  are the same kind of noise as llama.cpp's.
+- The replay's llama.cpp ran with flash attention (the bias cast to fp16) and fp16 K/V; that is inside the same spread.
+- Under noise the chosen experts change at 1-7% of (position, slot): the hot and cold placement of M3 must not lean on a
+  token's route being stable.

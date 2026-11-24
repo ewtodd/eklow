@@ -3,7 +3,18 @@
 Live state, written as a handoff. Design and history: `DESIGN.md` (the original target) and `DECISIONS.md` (every decision
 with its measurements); what eklow is and its numbers: `README.md`.
 
-## Now (2026-11-22)
+## Now (2026-11-24)
+
+- **Inkling 2 Mini is to replace Bolt** (the owner's decision, DECISIONS 2026-11-24): the port is on branch
+  `inkling/port`, milestone by milestone (M0 ground truth, M1 host reference and text layer, M2 the forward on the card,
+  M3 memory, M4 the server and the replay, M5 vision, M6 the MTP draft). Bolt serves until Inkling wins through eklow.
+  - **M0 is done**: llama.cpp c74c71a6's activations, logits, greedy continuations, rendered turns, parsed outputs and
+    tokens on fixed synthetic prompts (67 to 32,950 tokens), from e-workstation's 4090 (DECISIONS "Inkling M0").
+  - **M1 is done**: eklow's fp32 reference forward (`src/model/inkling2.*`, `src/kernels/ref_inkling.*`), the tokenizer,
+    the chat template and the output parser (DECISIONS "Inkling M1"). The forward matches llama.cpp to 1e-7 per tensor
+    when given llama.cpp's own streams and activation rounding, and free-running sits inside llama.cpp's own CPU-against-CUDA
+    spread, which is wide for this model (mean KL 5e-2 to 0.46). The text layer has 0 differences on every gate.
+  - Next: M2, the forward on the A770M (it needs pauses of `eklow-bolt`); the deep prompt's reference runs there.
 
 - **fiona runs eklow's milestone in production** (`eklow-bolt.service` since 2026-11-10 22:48): Nemotron-3.5-Bolt-E4B with
   NVIDIA's DFlash draft and Gemma 4's projector, EmbeddingGemma 2 with its projector, vega's end-of-turn checker (the
@@ -44,6 +55,9 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 ## Open, in order
 
+0. **Inkling M2**: the forward on the A770M, prefill and decode, against M1's reference (the same SYCL reference runs on
+   the card, which is also how the 32,950-token prompt gets its reference); NVFP4 experts on the matrix units (e2m1 x e4m3
+   dequantizes exactly to fp16), the biased attention with a sink, the 48 slots' K/V and convolution state.
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):
    - the kernel tests;
    - the draft's lattices and the embeddings, against main's build;
@@ -74,7 +88,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
   no server or GPU test may run on the card while any `eklow*` unit is active. `gpu.lock` does not cover the service. A
   test server beside it on 2026-11-11 slowed a real chat turn to 0.9 tok/s for six minutes.
 - The private replay set (real chats, graded points, the checker's 29 turns) stays on e-workstation and fiona, never in
-  the repository.
+  the repository. Inkling's replay harness is `~/Software/fiona-replay-test` (private, never pushed).
+- Inkling's ground truth and tools live on e-workstation in `~/eklow-qwen-data/inkling-port`: `m0/` (the dumps, cases and
+  prompts), `m1/` (eklow's reference dumps), `oracle-inkling` (`nix-build --impure nix/oracle-inkling.nix`), the llama.cpp
+  c74c71a6 sources, Hugging Face's tokenizer and config (c9d02830), and `py` (a Python with numpy, jinja2, tokenizers).
 
 ## How to work on it
 
@@ -90,4 +107,7 @@ with its measurements); what eklow is and its numbers: `README.md`.
   - `eklow-attn-test`, `eklow-qfmt-test --check`, `eklow-dflash-test dump` against the previous build;
   - `tools/server/serve_test.py basic`;
   - the template and parser against Hugging Face (`tools/ref/gemma4_chat_compare.py`, `gemma4_parse_compare.py`);
-  - the side models' own gates: `eklow-vega check`, `tools/rerank/rerank_compare.py gate`, `tools/bench/embed_bench.py`.
+  - the side models' own gates: `eklow-vega check`, `tools/rerank/rerank_compare.py gate`, `tools/bench/embed_bench.py`;
+  - Inkling's: `tools/ref/inkling/text_gates.sh build` (tokenizer, template, parser against llama.cpp and Hugging Face), and
+    the reference forward (`tools/ref/inkling/host-build.sh`, then `eklow-ref-run` with `--teacher` and
+    `--emulate-ggml-cpu` against llama.cpp's CPU dumps, and free-running against M0, `tools/ref/inkling/compare.py`).
