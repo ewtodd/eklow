@@ -46,6 +46,7 @@ add_library(eklow_text STATIC
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
   src/text/output_parser_gemma4.cpp
+  src/text/tokenizer_inkling.cpp
   src/text/tokenizer_qwen.cpp
   src/text/unicode.cpp
 )
