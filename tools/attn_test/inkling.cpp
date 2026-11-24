@@ -483,12 +483,16 @@ int inkling_main(int argc, char** argv) {
             };
             go();
             q.wait();
-            sycl::event e0 = q.single_task([] {});
-            for (int r = 0; r < reps; ++r) go();
-            sycl::event e1 = q.single_task([] {});
-            e1.wait();
-            using namespace sycl::info;
-            return double(e1.get_profiling_info<event_profiling::command_start>() - e0.get_profiling_info<event_profiling::command_end>()) * 1e-9 / reps;
+            double best = 1e30;  // the best of three runs
+            for (int rep3 = 0; rep3 < 3; ++rep3) {
+              sycl::event e0 = q.single_task([] {});
+              for (int r = 0; r < reps; ++r) go();
+              sycl::event e1 = q.single_task([] {});
+              e1.wait();
+              using namespace sycl::info;
+              best = std::min(best, double(e1.get_profiling_info<event_profiling::command_start>() - e0.get_profiling_info<event_profiling::command_end>()) * 1e-9 / reps);
+            }
+            return best;
           };
           const double d_b = timed(ctx, ctx + 1, 100, true), d_p = timed(ctx, ctx + 1, 100, false), d_u = timed(ctx, ctx + 1, 100, true, false);
           const double d2_b = timed(ctx - 1, ctx + 1, 100, true), d2_p = timed(ctx - 1, ctx + 1, 100, false);

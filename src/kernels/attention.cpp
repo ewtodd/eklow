@@ -123,6 +123,7 @@ constexpr int kElem = Q8 ? 1 : 2;
 // differ by at most 1, as consecutive tokens of a chunk do): their windows start at most 1 apart, and 3 tiles (24
 // values) cover every 16-key window.
 constexpr int kBiasPad = 32;
+constexpr int kBiasRows = 4;
 struct BiasArgs {
   const sycl::half* rt = nullptr;   // R tiles [tile][8 rows][16] fp16, the A operands
   const sycl::half* tv = nullptr;   // the table's tiles
@@ -164,8 +165,7 @@ inline void row_bias(esimd::simd<float, 16>* out, const esimd::simd<sycl::half, 
 // is a key of that logit and a zero value), the positions the bias needs, and the row's R as the A operand.
 template <int RPT>
 struct BiasRows {
-  esimd::simd<sycl::half, 16 * RPT> A;
-  esimd::simd<float, 16> bb[RPT];
+  const sycl::half* a_src = nullptr;  // the rows' R, loaded as the bias needs it (from the cache) rather than kept in registers
   int32_t pr[RPT], pmin = std::numeric_limits<int32_t>::max(), pmax = -1;
   // hi: the rows' last keys (-1 for padding rows); sink_at(i): the row's sink; first: this thread's work holds the
   // sink (the first split).
@@ -174,7 +174,6 @@ struct BiasRows {
 #pragma unroll
     for (int i = 0; i < RPT; ++i) {
       pr[i] = hi[i];
-      bb[i] = 0;
       if (hi[i] >= 0) {
         pmin = std::min(pmin, hi[i]), pmax = std::max(pmax, hi[i]);
         if (first) m[i] = sink_at(i), l[i] = 1;
@@ -184,11 +183,19 @@ struct BiasRows {
 #pragma unroll
     for (int i = 0; i < RPT; ++i)
       if (pr[i] < 0) pr[i] = pmin;
-    A = esimd::block_load<sycl::half, 16 * RPT>(a_src);
+    this->a_src = a_src;
     (void)ba;
   }
-  void block(const BiasArgs& ba, int32_t key0) SYCL_ESIMD_FUNCTION {
-    if (pmax >= 0) row_bias<RPT>(bb, A, ba, pr, pmin, pmax, key0);
+  // The bias of rows i0 .. i0 + NR - 1 against the 16 keys from key0 (zero for a thread without rows).
+  template <int NR>
+  void group(const BiasArgs& ba, int32_t key0, int i0, esimd::simd<float, 16>* out) SYCL_ESIMD_FUNCTION {
+    if (pmax < 0) {
+#pragma unroll
+      for (int i = 0; i < NR; ++i) out[i] = 0;
+      return;
+    }
+    const esimd::simd<sycl::half, 16 * NR> a = esimd::block_load<sycl::half, 16 * NR>(a_src + 16 * i0);
+    row_bias<NR>(out, a, ba, pr + i0, pmin, pmax, key0);
   }
 };
 
@@ -309,7 +316,6 @@ struct Flash {
       }
       esimd::slm_block_store<float, 64>(kScores + j * 512, S0);
       esimd::slm_block_store<float, 64>(kScores + j * 512 + 256, S1);
-      if constexpr (BI) br.block(ba, key0);
       esimd::barrier();
       {
         esimd::simd<float, 8 * RPT> s0 = 0, s1 = 0;
@@ -319,12 +325,15 @@ struct Flash {
           s1 += esimd::slm_block_load<float, 8 * RPT>(kScores + t * 512 + 256 + j * RPT * 32);
         }
         const esimd::simd<int, 16> key(key0, 1);
+        esimd::simd<float, 16> bg[kBiasRows];
 #pragma unroll
         for (int i = 0; i < RPT; ++i) {
           esimd::simd<float, 16> sc;
+          if constexpr (BI)
+            if (i % kBiasRows == 0) br.template group<kBiasRows>(ba, key0, i, bg);
           sc.select<8, 1>(0) = s0.template select<8, 1>(i * 8);
           sc.select<8, 1>(8) = s1.template select<8, 1>(i * 8);
-          if constexpr (BI) sc += br.bb[i];
+          if constexpr (BI) sc += bg[i % kBiasRows];
           sc.merge(sc, esimd::simd<float, 16>(-std::numeric_limits<float>::infinity()), (key <= hi[i]) & (key > wlo[i]));
           const float mx = std::max(m[i], esimd::hmax<float>(sc));
           const esimd::simd<float, 16> p = esimd::exp(sc - mx);
@@ -547,7 +556,6 @@ struct FlashGroup {
         }
         esimd::slm_block_store<float, 64>(sc_at, S0);
         esimd::slm_block_store<float, 64>(sc_at + 256, S1);
-        if constexpr (BI) br.block(ba, b * kKeys);
       }
       esimd::barrier();
       if (active) {
@@ -558,12 +566,15 @@ struct FlashGroup {
           s1 += esimd::slm_block_load<float, 8 * RPT>(kScores + (qi * P + t) * 512 + 256 + j * RPT * 32);
         }
         const esimd::simd<int, 16> key(b * kKeys, 1);
+        esimd::simd<float, 16> bg[kBiasRows];
 #pragma unroll
         for (int i = 0; i < RPT; ++i) {
           esimd::simd<float, 16> sc;
+          if constexpr (BI)
+            if (i % kBiasRows == 0) br.template group<kBiasRows>(ba, b * kKeys, i, bg);
           sc.select<8, 1>(0) = s0.template select<8, 1>(i * 8);
           sc.select<8, 1>(8) = s1.template select<8, 1>(i * 8);
-          if constexpr (BI) sc += br.bb[i];
+          if constexpr (BI) sc += bg[i % kBiasRows];
           sc.merge(sc, esimd::simd<float, 16>(-std::numeric_limits<float>::infinity()), (key <= hi[i]) & (key > wlo[i]));
           const float mx = std::max(m[i], esimd::hmax<float>(sc));
           const esimd::simd<float, 16> p = esimd::exp(sc - mx);
