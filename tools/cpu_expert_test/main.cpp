@@ -24,6 +24,7 @@
 #include <immintrin.h>
 
 #include "cpu/expert.hpp"
+#include "cpu/nvfp4.hpp"
 #include "model/gguf.hpp"
 
 using namespace eklow;
@@ -221,6 +222,44 @@ int main(int argc, char** argv) {
     const float beta = 4.0f, lb = 25.0f;
     bool all_ok = true;
     std::printf("threads %d\n", threads);
+    if (check) {
+      // NVFP4 on random bytes (every code, every scale byte including 0, denormals and 0x7f), activations with outliers:
+      // the GEMV against the dequantized rows and the int8-rounded activations, at nx = 1, 3, 4 and 5.
+      const int64_t K = 2304, N = 96;
+      std::mt19937 r2(seed);
+      std::vector<uint8_t> w(size_t(N) * size_t(K / 64) * 36);
+      for (auto& b : w) b = uint8_t(r2());
+      std::vector<float> xr(size_t(5) * size_t(K));
+      std::normal_distribution<float> nd2(0.0f, 1.0f);
+      for (auto& v : xr) v = nd2(r2) * (r2() % 50 == 0 ? 40.0f : 1.0f);
+      std::vector<cpu::NvBlocks> xq(5);
+      std::vector<const cpu::NvBlocks*> xqp(5, nullptr);
+      std::vector<float> y(size_t(5) * size_t(N), 0.0f), row(size_t(K), 0.0f), xf(size_t(K), 0.0f);
+      std::vector<float*> yp(5, nullptr);
+      for (int j = 0; j < 5; ++j) {
+        cpu::nv_quantize_into(&xr[size_t(j) * size_t(K)], K, xq[size_t(j)]);
+        xqp[size_t(j)] = &xq[size_t(j)];
+        yp[size_t(j)] = &y[size_t(j) * size_t(N)];
+      }
+      double worst = 0;
+      for (int nx : {1, 3, 4, 5}) {
+        cpu::gemv_nvfp4_multi(w.data(), K, 0, N, xqp.data(), nx, yp.data());
+        for (int j = 0; j < nx; ++j) {
+          fake_quant(&xr[size_t(j) * size_t(K)], K, 16, xf.data());
+          std::vector<float> rf(size_t(N), 0.0f), got(yp[size_t(j)], yp[size_t(j)] + N);
+          for (int64_t i = 0; i < N; ++i) {
+            dequant_row(gguf::Type::NVFP4, &w[size_t(i) * size_t(K / 64) * 36], K, row.data());
+            double s = 0;
+            for (int64_t t = 0; t < K; ++t) s += double(row[size_t(t)]) * xf[size_t(t)];
+            rf[size_t(i)] = float(s);
+          }
+          worst = std::max(worst, rel_l2(got.data(), rf.data(), N));
+        }
+      }
+      const bool ok = worst <= 1e-5;
+      all_ok &= ok;
+      std::printf("random NVFP4 bytes, %lld rows: max rel L2 against the dequantized reference %.2e  %s\n", (long long)N, worst, ok ? "ok" : "FAIL");
+    }
     for (int64_t L : layers) {
       const std::string b = "blk." + std::to_string(L) + ".";
       const gguf::Tensor &tg = need(f, b + "ffn_gate_up_exps.weight"), &td = need(f, b + "ffn_down_exps.weight");
