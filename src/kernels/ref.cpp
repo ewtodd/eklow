@@ -1,5 +1,6 @@
 #include "kernels/ref.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
@@ -195,6 +196,37 @@ inline float dot_q8_0(const uint8_t* row, const float* x, int64_t k) {
   return acc;
 }
 
+// NVFP4 (64 weights, 36 bytes; ggml's block_nvfp4): 4 UE4M3 scales, one per 16 weights, then 32 bytes of E2M1 codes;
+// in sub-block s byte j holds weight j in its low nibble and weight j + 8 in its high one. ggml decodes the codes doubled
+// (0, 1, 2, 3, 4, 6, 8, 12) and halves the scale; a scale byte 0 or 0x7f decodes to 0. The per-expert second-level scale
+// (the GGUF's .scale tensors) is applied to the product, not here.
+inline float ue4m3_half(uint8_t x) {
+  if (x == 0 || x == 0x7f) return 0.0f;
+  const int e = (x >> 3) & 15, m = x & 7;
+  const float raw = e == 0 ? sycl::ldexp(float(m), -9) : sycl::ldexp(1.0f + float(m) / 8.0f, e - 7);
+  return raw * 0.5f;
+}
+
+inline float e2m1_doubled(uint8_t c) {
+  constexpr int8_t k[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+  return float(k[c & 15]);
+}
+
+inline float dot_nvfp4(const uint8_t* row, const float* x, int64_t k) {
+  float acc = 0;
+  for (int64_t b = 0; b < k / 64; ++b) {
+    const uint8_t* blk = row + b * 36;
+    const float* xb = x + b * 64;
+    for (int s = 0; s < 4; ++s) {
+      const uint8_t* qs = blk + 4 + s * 8;
+      float sum = 0;
+      for (int j = 0; j < 8; ++j) sum += e2m1_doubled(qs[j]) * xb[s * 16 + j] + e2m1_doubled(qs[j] >> 4) * xb[s * 16 + j + 8];
+      acc += ue4m3_half(blk[s]) * sum;
+    }
+  }
+  return acc;
+}
+
 inline float weight_at(gguf::Type t, const uint8_t* row, int64_t i) {
   switch (t) {
     case gguf::Type::F32: return reinterpret_cast<const float*>(row)[i];
@@ -211,6 +243,12 @@ inline float weight_at(gguf::Type t, const uint8_t* row, int64_t i) {
       return half_at(blk) * float(int(j < 16 ? v & 15 : v >> 4) - 8);
     }
     case gguf::Type::Q6_K: return q6k_weight(row + (i / 256) * 210, int(i % 256));
+    case gguf::Type::NVFP4: {
+      const uint8_t* blk = row + (i / 64) * 36;
+      const int j = int(i % 64), s = j / 16, r = j % 16;
+      const uint8_t c = blk[4 + s * 8 + (r % 8)];
+      return ue4m3_half(blk[s]) * e2m1_doubled(r < 8 ? c : c >> 4);
+    }
     case gguf::Type::Q4_K:
     case gguf::Type::Q5_K:
     case gguf::Type::IQ4_XS: {
@@ -232,7 +270,8 @@ void check_type(const Weight& w) {
     case gguf::Type::Q6_K:
     case gguf::Type::Q4_K:
     case gguf::Type::Q5_K:
-    case gguf::Type::IQ4_XS: return;
+    case gguf::Type::IQ4_XS:
+    case gguf::Type::NVFP4: return;
     default: throw std::runtime_error(std::string("ref: no reference kernel for ") + gguf::type_name(w.type));
   }
 }
@@ -249,14 +288,17 @@ void embed(sycl::queue& q, const Weight& table, const int32_t* tokens, int64_t n
    });
 }
 
-void rmsnorm(sycl::queue& q, const float* x, const float* w, int64_t rows, int64_t cols, float eps, float* out) {
+void rmsnorm(sycl::queue& q, const float* x, const float* w_or_null, int64_t rows, int64_t cols, float eps, float* out) {
+  // SYCL's native_cpu device refuses a null pointer as a kernel argument: a flag, and x in its place
+  const bool has_w = w_or_null != nullptr;
+  const float* w = has_w ? w_or_null : x;
   q.parallel_for(sycl::range<1>(size_t(rows)), [=](sycl::id<1> id) {
      const int64_t r = int64_t(id[0]);
      const float* xr = x + r * cols;
      float ss = 0;
      for (int64_t i = 0; i < cols; ++i) ss += xr[i] * xr[i];
      const float inv = 1.0f / sycl::sqrt(ss / float(cols) + eps);
-     for (int64_t i = 0; i < cols; ++i) out[r * cols + i] = xr[i] * inv * (w ? w[i] : 1.0f);
+     for (int64_t i = 0; i < cols; ++i) out[r * cols + i] = xr[i] * inv * (has_w ? w[i] : 1.0f);
    });
 }
 
@@ -277,6 +319,7 @@ void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, flo
        if (ww.type == gguf::Type::Q4_0) acc = dot_q4_0(row, xm, ww.k);
        else if (ww.type == gguf::Type::Q8_0) acc = dot_q8_0(row, xm, ww.k);
        else if (ww.type == gguf::Type::Q6_K) acc = dot_q6_k(row, xm, ww.k);
+       else if (ww.type == gguf::Type::NVFP4) acc = dot_nvfp4(row, xm, ww.k);
        else if (ww.type == gguf::Type::Q4_K || ww.type == gguf::Type::Q5_K || ww.type == gguf::Type::IQ4_XS)
          acc = dot_kblocks(ww.type, row, xm, ww.k);
        else {
@@ -284,6 +327,35 @@ void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, flo
          for (int64_t i = 0; i < ww.k; ++i) acc += weight_at(ww.type, row, i) * xm[i];
        }
        out[m * ww.n + n] = acc;
+     });
+  }
+}
+
+void matmul_experts(sycl::queue& q, const Weight& w, uint64_t expert_bytes, const float* x, bool x_per_slot,
+                    const int32_t* ids, int64_t n_tok, int64_t n_used, const float* scales_or_null, float* out) {
+  check_type(w);
+  const bool has_scales = scales_or_null != nullptr;  // no null kernel arguments (native_cpu)
+  const float* scales = has_scales ? scales_or_null : x;
+  const double budget = w.type == gguf::Type::Q8_0 ? 2e10 : 2e9;
+  const int64_t per = std::max<int64_t>(1, int64_t(budget / double(w.n * w.k * n_used)));
+  for (int64_t t0 = 0; t0 < n_tok; t0 += per) {
+    const int64_t tc = std::min(per, n_tok - t0);
+    const Weight ww = w;
+    q.parallel_for(sycl::range<3>(size_t(tc), size_t(n_used), size_t(w.n)), [=](sycl::id<3> id) {
+       const int64_t t = t0 + int64_t(id[0]), s = int64_t(id[1]), n = int64_t(id[2]);
+       const int32_t e = ids[t * n_used + s];
+       const uint8_t* row = ww.data + uint64_t(e) * expert_bytes + uint64_t(n) * ww.row_bytes;
+       const float* xm = x + (x_per_slot ? (t * n_used + s) * ww.k : t * ww.k);
+       float acc;
+       if (ww.type == gguf::Type::Q8_0) acc = dot_q8_0(row, xm, ww.k);
+       else if (ww.type == gguf::Type::NVFP4) acc = dot_nvfp4(row, xm, ww.k);
+       else if (ww.type == gguf::Type::Q4_K || ww.type == gguf::Type::Q5_K || ww.type == gguf::Type::IQ4_XS)
+         acc = dot_kblocks(ww.type, row, xm, ww.k);
+       else {
+         acc = 0;
+         for (int64_t i = 0; i < ww.k; ++i) acc += weight_at(ww.type, row, i) * xm[i];
+       }
+       out[(t * n_used + s) * ww.n + n] = acc * (has_scales ? scales[e] : 1.0f);
      });
   }
 }

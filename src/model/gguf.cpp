@@ -130,6 +130,7 @@ std::optional<TypeTraits> traits(Type t) {
     case Type::IQ4_NL: return TypeTraits{"IQ4_NL", 32, 18};
     case Type::IQ4_XS: return TypeTraits{"IQ4_XS", 256, 136};
     case Type::MXFP4: return TypeTraits{"MXFP4", 32, 17};
+    case Type::NVFP4: return TypeTraits{"NVFP4", 64, 36};
     default: return std::nullopt;
   }
 }

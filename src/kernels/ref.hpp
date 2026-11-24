@@ -37,6 +37,11 @@ void rmsnorm(sycl::queue& q, const float* x, const float* w, int64_t rows, int64
 // out[m][n] = sum_k x[m][k] * W[n][k] for rows m in [0, m_rows).
 void matmul(sycl::queue& q, const Weight& w, const float* x, int64_t m_rows, float* out);
 
+// A mixture of experts' projection: out[t][s][n] = scale[e] * sum_k W_e[n][k] * x[k] for e = ids[t][s], where W_e starts
+// at w.data + e * expert_bytes and x is x[t][s][:] when x_per_slot, else x[t][:] for every slot s; scales null means 1.
+void matmul_experts(sycl::queue& q, const Weight& w, uint64_t expert_bytes, const float* x, bool x_per_slot,
+                    const int32_t* ids, int64_t n_tok, int64_t n_used, const float* scales, float* out);
+
 // cos and sin of the NeoX RoPE angles pos * base^(-2i/n_rot) / freq_factors[i] for positions
 // 0..n_tok-1 and i < n_rot/2, computed on the host in double (the A770M has no fp64), [pos][i].
 struct RopeTables {

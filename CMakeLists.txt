@@ -80,6 +80,7 @@ add_library(eklow_model STATIC
   src/kernels/gemma_fast.cpp
   src/kernels/qwen_fast.cpp
   src/kernels/ref.cpp
+  src/kernels/ref_inkling.cpp
   src/kernels/xmx.cpp
   src/kernels/xmx_fmt.cpp
   src/kernels/xmx_gemv_iq4xs.cpp
@@ -92,6 +93,7 @@ add_library(eklow_model STATIC
   src/model/vision_gemma4v_fast.cpp
   src/kernels/vision_attn.cpp
   src/model/gemma4.cpp
+  src/model/inkling2.cpp
 )
 target_link_libraries(eklow_model PUBLIC eklow_host eklow_image eklow_rt)
 eklow_sycl(eklow_model)

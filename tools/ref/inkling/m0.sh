@@ -18,7 +18,8 @@ cd "$out"
 "$bin/eklow-chat-oracle" --model "$gguf" --tokenize strings.json --out tokens.json
 
 # every slot's stream and router; the detailed tensors on the slots named in $detail
-every="l_out-,ffn_inp-,ffn_out-,attn_out-,ffn_moe_topk-,ffn_moe_weights_scaled-,result_norm,result_output"
+# (the router picks as ffn_moe_argsort: ffn_moe_topk is a view of it that is not contiguous; its first 8 are the picks)
+every="l_out-,ffn_inp-,ffn_out-,attn_out-,ffn_moe_argsort-,ffn_moe_weights_scaled-,result_norm,result_output"
 detail_slots="0 1 5 6 11 17 18 23 24 29 30 35 41 47"
 detail=""
 for s in $detail_slots; do
