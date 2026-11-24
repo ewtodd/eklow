@@ -98,6 +98,10 @@ struct Scratch {
   sycl::half* p = nullptr;
   float* stat = nullptr;
   size_t p_halves = 0, stat_floats = 0;
+  // Inkling's bias (the Bias overload of attend): R as fp16 A-operand tiles, and the table in the layout the kernels
+  // read when the caller did not prepare it (bias_table).
+  sycl::half *rt = nullptr, *tv = nullptr;
+  size_t rt_halves = 0, tv_halves = 0;
 };
 
 // out[t][h][:] = softmax(Q[t][h] . K^T * scale) V over the keys token t sees: positions up to its
@@ -116,15 +120,28 @@ struct Bias {
   const float* table = nullptr;  // [extent][n_rel] fp32, the layer's attn_rel_bias
   int64_t n_rel = 0, extent = 0;
   const float* sink = nullptr;   // [n_tok][n_head] fp32
+  // The table as bias_table prepared it (device, bias_table_halves(extent) halves): the engine does that once per layer at
+  // load; without it attend converts the table into the scratch on every call (one more launch).
+  const sycl::half* table_tiles = nullptr;
 };
+// The Bias overload is written for head 128 with 3 query heads per K/V head, fp16 caches, n_rel 16 and an extent that is a
+// multiple of 8, and for causal tokens (no Tokens::lo, hi): the tokens of a chunk must be consecutive positions of one slot, as
+// the TileList's chunks are (a thread's four rows span two tokens, whose windows of distances the bias reads as three tiles).
+// R, table and sink are the layer's, after the clips and the full layers' log-position scale; R is rounded to fp16 for the matrix
+// units, as Q x scale is.
 void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* packed, const Cache& c,
             int64_t n_head, float scale, const Bias& bias, float* out, Scratch& scratch);
+// The table [extent][n_rel = 16] fp32 as the bias kernels read it (fp16, reversed in distance, in tiles for the matrix
+// units, zero padded): `out` holds bias_table_halves(extent) halves. extent a multiple of 8.
+size_t bias_table_halves(int64_t extent);
+void bias_table(sycl::queue& q, const float* table, int64_t extent, sycl::half* out);
 
 // Allocates the scratch attend needs for up to max_tiles query tiles a step and chunks of up to max_chunk_rows
-// rows per K/V head, for one kind of layer: the long prefill's buffers on the global layers take ~100 MB (the
+// rows per K/V head, for one kind of layer (bias_extent > 0: for the Bias overload, whose R tiles and, without a prepared table, the
+// converted table go in the scratch too): the long prefill's buffers on the global layers take ~100 MB (the
 // 26B's 2,048-token chunks), which an engine should count before it spends the card's free memory on experts.
 void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim, int64_t group = 0,
-             int64_t max_keys = 0);
+             int64_t max_keys = 0, int64_t bias_extent = 0);
 
 // Writes K, V fp32 [n_tok][n_head_kv][head_dim] at each token's slot and position.
 void write(sycl::queue& q, const float* K, const float* V, const Tokens& tok, const Cache& c);

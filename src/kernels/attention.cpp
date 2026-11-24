@@ -113,12 +113,98 @@ inline esimd::simd<sycl::half, 128> v_tile(const void* base, const sycl::half* s
 template <bool Q8>
 constexpr int kElem = Q8 ? 1 : 2;
 
+// Inkling's relative-position bias (DECISIONS 2026-11-24, M2): a score of row r (position p) against key j gains
+// R[r] . table[p - j] for p - j < extent. The 16 products of a score are one dpas (K = 16) of the row's R (A operand,
+// fp16) against 8 distances of the table (B operand), so a thread's rows get the bias of every distance their block of
+// 16 keys spans from 3 dpas of repeat count RPT, instead of 16 MACs a score on the vector units. The table is kept
+// reversed, in u = extent + 31 - d, in VNNI tiles of 8 consecutive u with 4 tiles of zeros on each side: a row's 16
+// keys then are 16 consecutive u (ascending with the key), distances past the extent read zeros, and clamping the tile
+// index into the table needs no branch. A thread's rows are RPT consecutive rows (at most 2 tokens, whose positions
+// differ by at most 1, as consecutive tokens of a chunk do): their windows start at most 1 apart, and 3 tiles (24
+// values) cover every 16-key window.
+constexpr int kBiasPad = 32;
+constexpr int kBiasRows = 4;
+struct BiasArgs {
+  const sycl::half* rt = nullptr;   // R tiles [tile][8 rows][16] fp16, the A operands
+  const sycl::half* tv = nullptr;   // the table's tiles
+  const float* sink = nullptr;      // [n_tok][n_head]
+  int32_t n_tiles = 0, extent = 0;  // tiles of tv, the table's extent
+};
+
+// out[i][k]: the bias of the thread's row i against key key0 + k. pr: the rows' positions (padding rows carry pmin),
+// pmin and pmax over the valid rows.
+template <int RPT>
+inline void row_bias(esimd::simd<float, 16>* out, const esimd::simd<sycl::half, 16 * RPT>& A, const BiasArgs& ba, const int32_t* pr,
+                     int32_t pmin, int32_t pmax, int32_t key0) SYCL_ESIMD_FUNCTION {
+  const int32_t u0 = ba.extent + kBiasPad - 1;
+  const int32_t ustart = u0 - pmax + key0, uend = u0 - pmin + key0 + 15;
+  if (uend < kBiasPad) {  // every distance is past the extent
+#pragma unroll
+    for (int i = 0; i < RPT; ++i) out[i] = 0;
+    return;
+  }
+  const int32_t tb = ustart >> 3;
+  esimd::simd<float, 8 * RPT> C[3];
+#pragma unroll
+  for (int q = 0; q < 3; ++q) {
+    const int32_t t = std::min(std::max(tb + q, 0), ba.n_tiles - 1);
+    const esimd::simd<sycl::half, 128> B = esimd::block_load<sycl::half, 128>(ba.tv + t * 128);
+    C[q] = xmxd::dpas<8, RPT, float>(esimd::simd<float, 8 * RPT>(0), B, A);
+  }
+#pragma unroll
+  for (int i = 0; i < RPT; ++i) {
+    esimd::simd<float, 24> w;
+    w.select<8, 1>(0) = C[0].template select<8, 1>(i * 8);
+    w.select<8, 1>(8) = C[1].template select<8, 1>(i * 8);
+    w.select<8, 1>(16) = C[2].template select<8, 1>(i * 8);
+    out[i] = w.select<16, 1>(u0 - pr[i] + key0 - tb * 8);
+  }
+}
+
+// The thread's softmax state for Inkling's layers (B): per row the running maximum and sum start at the sink (the sink
+// is a key of that logit and a zero value), the positions the bias needs, and the row's R as the A operand.
+template <int RPT>
+struct BiasRows {
+  const sycl::half* a_src = nullptr;  // the rows' R, loaded as the bias needs it (from the cache) rather than kept in registers
+  int32_t pr[RPT], pmin = std::numeric_limits<int32_t>::max(), pmax = -1;
+  // hi: the rows' last keys (-1 for padding rows); sink_at(i): the row's sink; first: this thread's work holds the
+  // sink (the first split).
+  template <class SinkAt>
+  void init(const int32_t* hi, const BiasArgs& ba, const sycl::half* a_src, bool first, float* m, float* l, SinkAt sink_at) SYCL_ESIMD_FUNCTION {
+#pragma unroll
+    for (int i = 0; i < RPT; ++i) {
+      pr[i] = hi[i];
+      if (hi[i] >= 0) {
+        pmin = std::min(pmin, hi[i]), pmax = std::max(pmax, hi[i]);
+        if (first) m[i] = sink_at(i), l[i] = 1;
+      }
+    }
+    if (pmax < 0) return;
+#pragma unroll
+    for (int i = 0; i < RPT; ++i)
+      if (pr[i] < 0) pr[i] = pmin;
+    this->a_src = a_src;
+    (void)ba;
+  }
+  // The bias of rows i0 .. i0 + NR - 1 against the 16 keys from key0 (zero for a thread without rows).
+  template <int NR>
+  void group(const BiasArgs& ba, int32_t key0, int i0, esimd::simd<float, 16>* out) SYCL_ESIMD_FUNCTION {
+    if (pmax < 0) {
+#pragma unroll
+      for (int i = 0; i < NR; ++i) out[i] = 0;
+      return;
+    }
+    const esimd::simd<sycl::half, 16 * NR> a = esimd::block_load<sycl::half, 16 * NR>(a_src + 16 * i0);
+    row_bias<NR>(out, a, ba, pr + i0, pmin, pmax, key0);
+  }
+};
+
 // Index arithmetic below is in 32 bits with the query group size a template parameter: DG2 has no
 // integer division, and 64-bit divisions by runtime values were library calls that cost more than
 // a decode step's whole attention.
 // R: the tokens carry their own first keys (Tokens::lo). Without, the kernel is the one decode runs, which reading
 // them cost registers (int8 global decode +6%, 2026-10-27).
-template <int D, int G, bool Q8, int S, bool R = false>
+template <int D, int G, bool Q8, int S, bool R = false, bool BI = false>
 struct Flash {
   static constexpr int P = D / S;          // threads per tile
   static constexpr int RPT = kRows / P;    // rows each thread runs the softmax for
@@ -140,6 +226,7 @@ struct Flash {
   float* out;
   float* part;
   const int32_t* lo_of = nullptr;  // Tokens::lo
+  BiasArgs ba = {};  // BI: Inkling's bias and sink
 
   // The physical page (this K/V head's part of it) holding position `key`, as a page index.
   int32_t head_page(int32_t slot, int32_t kvh, int32_t key) const SYCL_ESIMD_FUNCTION {
@@ -203,6 +290,12 @@ struct Flash {
       m[i] = kNegBig;
       l[i] = 0;
     }
+    BiasRows<RPT> br;
+    if constexpr (BI)
+      br.init(hi, ba, ba.rt + tile * 128 + j * 16 * RPT, s == 0, m, l, [&](int i) SYCL_ESIMD_FUNCTION {
+        const int32_t r = r0 + j * RPT + i;
+        return ba.sink[(base + r / G) * n_head + kvh * G + r % G];
+      });
     esimd::simd<float, 64> O[DG];
 #pragma unroll
     for (int g = 0; g < DG; ++g) O[g] = 0;
@@ -232,11 +325,15 @@ struct Flash {
           s1 += esimd::slm_block_load<float, 8 * RPT>(kScores + t * 512 + 256 + j * RPT * 32);
         }
         const esimd::simd<int, 16> key(key0, 1);
+        esimd::simd<float, 16> bg[kBiasRows];
 #pragma unroll
         for (int i = 0; i < RPT; ++i) {
           esimd::simd<float, 16> sc;
+          if constexpr (BI)
+            if (i % kBiasRows == 0) br.template group<kBiasRows>(ba, key0, i, bg);
           sc.select<8, 1>(0) = s0.template select<8, 1>(i * 8);
           sc.select<8, 1>(8) = s1.template select<8, 1>(i * 8);
+          if constexpr (BI) sc += bg[i % kBiasRows];
           sc.merge(sc, esimd::simd<float, 16>(-std::numeric_limits<float>::infinity()), (key <= hi[i]) & (key > wlo[i]));
           const float mx = std::max(m[i], esimd::hmax<float>(sc));
           const esimd::simd<float, 16> p = esimd::exp(sc - mx);
@@ -296,7 +393,7 @@ struct Flash {
 // pieces in their registers and store them while the compute threads are past the point of
 // reading the old ones. Per block, between the two barriers of the score exchange: K of block b+1
 // (block b's Q.K^T is done) and V of block b (block b-1's P.V is done).
-template <int D, int G, int QT, bool Q8>
+template <int D, int G, int QT, bool Q8, bool BI = false>
 struct FlashGroup {
   static constexpr int P = D / kSlice, NC = QT * P, L = 16, NT = NC + L;
   static constexpr int RPT = kRows / P, DC = kSlice / 16, DG = kSlice / 8;
@@ -317,6 +414,7 @@ struct FlashGroup {
   int32_t pages, window, n_head_kv, n_head;
   float* out;
   const int32_t* lo_of = nullptr;
+  BiasArgs ba = {};
 
   int32_t head_page(int32_t slot, int32_t kvh, int32_t key) const SYCL_ESIMD_FUNCTION {
     const int32_t logical = key / int32_t(kPage);
@@ -433,6 +531,12 @@ struct FlashGroup {
       m[i] = kNegBig;
       l_[i] = 0;
     }
+    BiasRows<RPT> br;
+    if constexpr (BI)
+      br.init(hi, ba, ba.rt + tile * 128 + j * 16 * RPT, true, m, l_, [&](int i) SYCL_ESIMD_FUNCTION {
+        const int32_t r = r0 + j * RPT + i;
+        return ba.sink[(base + r / G) * n_head + kvh * G + r % G];
+      });
     esimd::simd<float, 64> O[DG];
 #pragma unroll
     for (int g = 0; g < DG; ++g) O[g] = 0;
@@ -462,11 +566,15 @@ struct FlashGroup {
           s1 += esimd::slm_block_load<float, 8 * RPT>(kScores + (qi * P + t) * 512 + 256 + j * RPT * 32);
         }
         const esimd::simd<int, 16> key(b * kKeys, 1);
+        esimd::simd<float, 16> bg[kBiasRows];
 #pragma unroll
         for (int i = 0; i < RPT; ++i) {
           esimd::simd<float, 16> sc;
+          if constexpr (BI)
+            if (i % kBiasRows == 0) br.template group<kBiasRows>(ba, b * kKeys, i, bg);
           sc.select<8, 1>(0) = s0.template select<8, 1>(i * 8);
           sc.select<8, 1>(8) = s1.template select<8, 1>(i * 8);
+          if constexpr (BI) sc += bg[i % kBiasRows];
           sc.merge(sc, esimd::simd<float, 16>(-std::numeric_limits<float>::infinity()), (key <= hi[i]) & (key > wlo[i]));
           const float mx = std::max(m[i], esimd::hmax<float>(sc));
           const esimd::simd<float, 16> p = esimd::exp(sc - mx);
@@ -878,9 +986,9 @@ void run_segments(sycl::queue& q, const sycl::half* qt, const Tokens& tok, const
   }
 }
 
-template <int D, int G, bool Q8>
+template <int D, int G, bool Q8, bool BI = false>
 void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* tiles, const Cache& c,
-         int64_t n_head, float scale, float* out, Scratch& scratch) {
+         int64_t n_head, float scale, float* out, Scratch& scratch, const Bias* bias = nullptr) {
   // The 256-dim decode slices 32 dims per thread: at 64, Flash's P.V output (8 x 64 floats)
   // spilled 928 B; at 32 it fits the 128-register budget and the tile gets twice the threads.
   constexpr int S = D == 256 ? 32 : kSlice;
@@ -898,6 +1006,24 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
     if (r < rows) v = Q[((base + r / G) * H + kvh * G + r % G) * D + d] * scale;
     qt[tile * kRows * D + (d / 16) * 128 + i * 16 + d % 16] = sycl::half(v);
   });
+  BiasArgs ba = {};
+  if constexpr (BI) {
+    if (tok.lo || tok.hi) throw std::runtime_error("attention: the bias takes causal tokens only");
+    // R as the A operands of the bias dpas: [tile][8 rows][16] fp16.
+    sycl::half* rt = grow(q, scratch.rt, scratch.rt_halves, size_t(n_tiles * kRows * 16), "attention R tiles");
+    const float* R = bias->R;
+    q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, 16), [=](sycl::id<3> id) {
+      const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), k = int32_t(id[2]);
+      const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];
+      rt[(tile * kRows + i) * 16 + k] = sycl::half(r < rows ? R[((base + r / G) * H + kvh * G + r % G) * 16 + k] : 0.0f);
+    });
+    const sycl::half* tv = bias->table_tiles;
+    if (!tv) {
+      tv = grow(q, scratch.tv, scratch.tv_halves, bias_table_halves(bias->extent), "attention bias table");
+      bias_table(q, bias->table, bias->extent, scratch.tv);
+    }
+    ba = BiasArgs{rt, tv, bias->sink, int32_t((bias->extent + 2 * kBiasPad) / 8), int32_t(bias->extent)};
+  }
   // Enough threads to fill the card: when there are few tiles (decode), split each tile's keys.
   // Each block costs a thread several microseconds of load latency, so short splits win, but every
   // split adds partials to merge. Up to 4k keys the splits are as measured on 2026-10-24 (at least
@@ -909,7 +1035,12 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
     float* part = splits > 1 ? grow(q, scratch.part, scratch.part_floats, size_t(n_tiles * splits * part_stride(D)), "attention split partials") : nullptr;
     float* const part_in = part;
     const sycl::nd_range<2> nd(sycl::range<2>(size_t(splits), size_t(n_tiles * P)), sycl::range<2>(1, P));
-    if (tok.lo) {
+    if constexpr (BI) {
+      Flash<D, G, Q8, S, false, true> k{qt, tiles, tok.slot, last, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
+                                        int32_t(c.n_head_kv), H, sp, out, part};
+      k.ba = ba;
+      q.parallel_for(nd, k);
+    } else if (tok.lo) {
       Flash<D, G, Q8, S, true> k{qt, tiles, tok.slot, last, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
                                  int32_t(c.n_head_kv), H, sp, out, part};
       k.lo_of = tok.lo;
@@ -986,11 +1117,12 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
     }
   }
   // Enough groups to fill the card (a prefill chunk): the group kernel, one pass over the keys.
-  if (list.n_groups() * FlashGroup<D, G, QT, Q8>::NT >= 8192) {
-    FlashGroup<D, G, QT, Q8> k{qt,   tiles, tiles + 4 * n_tiles, tok.slot, last, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages),
-                               int32_t(c.window), int32_t(c.n_head_kv), H, out};
+  if (list.n_groups() * FlashGroup<D, G, QT, Q8, BI>::NT >= 8192) {
+    FlashGroup<D, G, QT, Q8, BI> k{qt,   tiles, tiles + 4 * n_tiles, tok.slot, last, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages),
+                                   int32_t(c.window), int32_t(c.n_head_kv), H, out};
     k.lo_of = tok.lo;
-    constexpr int NT = FlashGroup<D, G, QT, Q8>::NT;
+    k.ba = ba;
+    constexpr int NT = FlashGroup<D, G, QT, Q8, BI>::NT;
     q.parallel_for(sycl::nd_range<1>(size_t(list.n_groups() * NT), NT), k);
     return;
   }
@@ -1012,6 +1144,9 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
     // layers) or, for the full layer of a plain DFlash draft, in int8.
     if (c.int8()) run<128, 4, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
     else run<128, 4, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
+  } else if (c.head_dim == 128 && group == 3 && !c.int8()) {
+    // Inkling 2 Mini's layers without the bias (the speed reference of the Bias overload): 24 query heads over 8 K/V heads of 128.
+    run<128, 3, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
   } else if (c.head_dim == 128 && group == 2 && !c.int8()) {
     // Qwen3-Reranker-0.6B's (src/model/rerank_qwen3.hpp): 16 query heads over 8 K/V heads of 128, an fp16 cache of one pass.
     run<128, 2, false>(q, Q, tok, list, packed, c, n_head, scale, out, scratch);
@@ -1034,14 +1169,41 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
   } else throw std::runtime_error("attention: no kernel for head_dim " + std::to_string(c.head_dim) + ", group " + std::to_string(group));
 }
 
+size_t bias_table_halves(int64_t extent) { return size_t((extent + 2 * kBiasPad) * 16); }
+
+void bias_table(sycl::queue& q, const float* table, int64_t extent, sycl::half* out) {
+  if (extent % 8) throw std::runtime_error("attention: the bias table's extent is not a multiple of 8");
+  const int32_t ext = int32_t(extent);
+  // Tile t holds u = 8 t + n, d = extent + 31 - u; element (k, n) at (k / 2) * 16 + n * 2 + k % 2.
+  q.parallel_for(sycl::range<1>(bias_table_halves(extent)), [=](sycl::id<1> id) {
+    const int32_t e = int32_t(id[0]), t = e / 128, w = e % 128, k = (w / 16) * 2 + w % 2, n = (w % 16) / 2, u = t * 8 + n;
+    const int32_t d = ext + kBiasPad - 1 - u;
+    out[e] = sycl::half(d >= 0 && d < ext ? table[d * 16 + k] : 0.0f);
+  });
+}
+
+void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* packed, const Cache& c,
+            int64_t n_head, float scale, const Bias& bias, float* out, Scratch& scratch) {
+  if (list.size() == 0) return;
+  if (c.head_dim != 128 || n_head != 3 * c.n_head_kv || c.int8() || bias.n_rel != 16)
+    throw std::runtime_error("attention: the bias is written for head 128, group 3, fp16 caches, 16 values a head");
+  run<128, 3, false, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch, &bias);
+}
+
 void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim, int64_t group,
-             int64_t max_keys) {
+             int64_t max_keys, int64_t bias_extent) {
   // Every buffer is written once (zeroed) so that the driver has committed it before anyone reads the card's free memory.
   auto fill = [&](auto* p, size_t n) {
     if (p && n) q.memset(p, 0, n * sizeof(*p));
   };
   grow(q, s.q, s.q_halves, size_t(max_tiles * kRows * head_dim));
   fill(s.q, s.q_halves);
+  if (bias_extent > 0) {
+    grow(q, s.rt, s.rt_halves, size_t(max_tiles * kRows * 16));
+    grow(q, s.tv, s.tv_halves, bias_table_halves(bias_extent));
+    fill(s.rt, s.rt_halves);
+    fill(s.tv, s.tv_halves);
+  }
   if (max_keys > 0) {
     // The split launch's partials at the largest shape it can see: any tile count up to max_tiles, keys up to max_keys. P is the
     // threads a tile takes (head 256: 8, else D / 64); the first fold level goes to part2, later ones back to part.

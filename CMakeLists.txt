@@ -114,7 +114,7 @@ add_executable(eklow-vision tools/vision/main.cpp)
 target_link_libraries(eklow-vision PRIVATE eklow_model)
 eklow_sycl(eklow-vision)
 
-add_executable(eklow-attn-test tools/attn_test/main.cpp)
+add_executable(eklow-attn-test tools/attn_test/main.cpp tools/attn_test/inkling.cpp)
 target_link_libraries(eklow-attn-test PRIVATE eklow_model)
 eklow_sycl(eklow-attn-test)
 
