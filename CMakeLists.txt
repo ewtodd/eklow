@@ -184,6 +184,13 @@ target_link_libraries(eklow_grammar_gemma4 PUBLIC eklow_text)
 add_executable(eklow-grammar-test-gemma4 tools/grammar_test_gemma4/main.cpp)
 target_link_libraries(eklow-grammar-test-gemma4 PRIVATE eklow_grammar_gemma4)
 
+# Inkling 2 Mini's tool-call grammar: llama.cpp's grammar sampler on the grammar its Inkling parser builds, token by token.
+add_library(eklow_grammar_inkling STATIC src/serve/tool_grammar_inkling.cpp)
+target_link_libraries(eklow_grammar_inkling PUBLIC eklow_text)
+
+add_executable(eklow-grammar-test-inkling tools/grammar_test_inkling/main.cpp)
+target_link_libraries(eklow-grammar-test-inkling PRIVATE eklow_grammar_inkling)
+
 add_executable(eklow-chat-inkling tools/chat_inkling/main.cpp)
 target_link_libraries(eklow-chat-inkling PRIVATE eklow_text)
 
