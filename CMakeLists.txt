@@ -277,3 +277,14 @@ eklow_sycl(eklow-metrics-test)
 add_executable(eklow-prefix-engine-test tools/server/prefix_engine_test.cpp)
 target_link_libraries(eklow-prefix-engine-test PRIVATE eklow_engine_gemma4 eklow_prefix eklow_text)
 eklow_sycl(eklow-prefix-engine-test)
+
+# Inkling 2 Mini's cold experts on the host CPU (M3): the pool, the Q8_0 / Q5_K / NVFP4 AVX-VNNI GEMVs and one expert's
+# FFN (src/cpu). Plain host code, so the flags are per source file and there is no -fsycl.
+add_library(eklow_cpu STATIC src/cpu/pool.cpp src/cpu/qgemv.cpp src/cpu/nvfp4.cpp src/cpu/expert.cpp)
+target_include_directories(eklow_cpu PUBLIC src)
+target_compile_options(eklow_cpu PRIVATE -O3 -mavx2 -mfma -mf16c -mavxvnni)
+target_link_libraries(eklow_cpu PUBLIC Threads::Threads)
+
+add_executable(eklow-cpu-expert-test tools/cpu_expert_test/main.cpp)
+target_compile_options(eklow-cpu-expert-test PRIVATE -O2 -mavx2 -mfma -mf16c)
+target_link_libraries(eklow-cpu-expert-test PRIVATE eklow_cpu eklow_host)

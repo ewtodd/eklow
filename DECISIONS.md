@@ -4126,3 +4126,75 @@ CUDA):
 
 The card session: eklow-bolt was stopped from 14:39 to 16:23 CST for the two kernel workers and these runs, and restarted
 (healthy).
+
+## 2026-11-24 — Inkling M3: the cold experts' FFN on the host CPU (`src/cpu/`, `eklow-cpu-expert-test`)
+
+Experts that do not stay on the card are computed on fiona's i7-12700H (6 P + 8 E cores, AVX2 + AVX-VNNI, two DDR4
+channels), as the Gemma 4 26B's and Qwen3.6's were. The pool and the int8 activations came back from 32152a6
+(`pool.*`: `Pool` with its spin-before-sleep, `Q8Blocks`; `qgemv.*`: only Q8_0 and Q5_K, the formats of layers 20-23;
+the Q4_0, Q4_K, Q6_K and IQ4_XS GEMVs stayed in history), with two new files: `nvfp4.*` and `expert.*`.
+
+**NVFP4 GEMV** (`gemv_nvfp4_multi`, `gemv_nvfp4`), from the GGUF's bytes as stored (36 bytes for 64 weights).
+- Weights: the 32 code bytes' nibbles go through one `pshufb` each (a table of doubled E2M1 value + 12: unsigned bytes
+  0..24, so `_mm256_dpbusd_avx_epi32`'s unsigned x signed operands take them as they are, no abs/sign). The low nibbles
+  of the 32 bytes are the 4 sub-blocks' weights 0..7 and the high nibbles their weights 8..15, so two dpbusd (low half,
+  high half) against activations stored in that order give 8 int32 lanes, lane pair 2s, 2s+1 being sub-block s. The
+  offset 12 comes off through the accumulator's start value (-12 x the lane's activation sum, precomputed with the
+  activations), and each lane is scaled by (UE4M3 scale / 2, a 256-entry table, 0 and 0x7f read as 0) x the activation
+  scale in fp32 before the fma: no shuffle of the weights, no per-weight float work.
+- Activations (`NvBlocks`, not `Q8Blocks`): int8 with one scale per 16 (the weights' sub-block), laid out in that lane
+  order, lane scales and lane sums beside them. Finer than the 32-blocks of the Q8_0 / Q5_K path.
+- The multi-input form takes inputs in groups of four (then 3, 2, 1) so a weight row is decoded once per group; a group of
+  eight spilled and ran 10% slower at 64-256 inputs (not kept). Rows are software-prefetched three ahead as before.
+
+**One expert's FFN** (`expert_ffn`; `experts_ffn` for several experts of a layer on the same inputs): y = dn_scale *
+down(situ(gu_scale * gate_up(x))) with situ and the scales as `ref::inkling::situ` and `ref::matmul_experts`. A task is 16
+gate rows with their 16 up rows against all inputs, situ applied in the task (libm tanh/exp: the same function as the
+reference, no approximation), so there is one barrier after gate_up (plus a short one for quantizing situ's output when
+there are 16 or more rows to do) and one after down. `experts_ffn` runs all the experts' tasks in the same two passes.
+Every combination of NVFP4, Q5_K and Q8_0 for gate_up and down works; sizes need n_embd a multiple of 256 and n_ff of 64.
+
+**Gates** (`eklow-cpu-expert-test`; experts 3, 77, 100 of layers 0, 6, 19 (NVFP4 / NVFP4) and 20, 23 (Q5_K / Q8_0); inputs
+random rows, RMS-normed, times the layer's `ffn_norm.weight`; the reference is written in the test: the reference's
+dequantization, double accumulation, fp32 situ). Relative L2 of the output row, 1 and 8 inputs:
+- against the fp32 reference: NVFP4 layers 9.3e-3 to 1.07e-2 (max over rows), Q5_K / Q8_0 layers 1.12e-2 to 1.37e-2. That is the
+  floor the int8 activations set (x and situ's output, each rounded to 127 levels per 16 or 32 values); the card's fp16
+  activations give 3.4e-4 to 4.1e-4 (NVFP4) and 1.1e-3 (Q5_K / Q8_0) on the same experts' layers. A cold expert is about 30x
+  less exact than a hot one; at 8 experts per token and weights summing in the layer's output it is lower, not measured here.
+- against the same reference with activations rounded to int8 the way the kernels round them: 1.7e-7 to 2.7e-7 (NVFP4),
+  4.8e-7 to 6.2e-7 (Q5_K / Q8_0): what is left is the order of the float sums.
+- NVFP4 on random bytes (every code, every scale byte, outlier activations; nx 1, 3, 4, 5): 1.6e-7.
+- `experts_ffn` of 3 experts is bit-identical to three `expert_ffn` calls.
+
+**Speed** (fiona, `eklow-bolt` idle, 14 pool threads, medians of 100 reps; the experts rotate over the layer's 128 so their
+bytes come from RAM, not cache; the CPU's read bandwidth is ~41 GB/s):
+
+| layer, format | what | time | weights read |
+|---|---|---|---|
+| 6, NVFP4 (4.48 MB an expert) | 1 expert, 1 token | 113 us | 39.7 GB/s |
+| | 8 experts one after another | 903 us | 39.7 GB/s |
+| | 8 experts in one `experts_ffn` pass | 837-850 us | 42.2-42.8 GB/s |
+| | 1 expert, 16 / 64 / 256 tokens | 0.40 / 1.43 / 5.47 ms | 25 / 22 / 21.4 us a token |
+| 20, 23 (Q5_K + Q8_0, 6.47 MB) | 1 expert, 1 token | 164-169 us | 38-39.5 GB/s |
+| | 8 experts one after another / one pass | 1.31-1.35 ms / 1.24-1.25 ms | 38.4-39.5 / 41.4-41.8 GB/s |
+| | 1 expert, 16 / 64 / 256 tokens | 0.68-0.69 / 2.49 / 9.8 ms | 43 / 39 / 38.4 us a token |
+
+Layers 0, 6 and 19 are within 2% of each other. Decode is at the DRAM floor; one pass over 8 experts saves 6-8% of the one-by-one
+time (the barriers and the quantize between the two matrices). Threads, layer 6, 1 token / 8 experts in one pass: 1: 273 us
+(one thread is 16 GB/s), 2: 208, 3: 173, 4: 126, 6: 122 / 865, 8: 114 / 855, 12: 112 / 834, 14: 116 / 854, 20: 114 / 858: four
+threads reach the floor, so a decode pool of 6-8 leaves the host thread that drives the card its core. The multi-input
+GEMV is compute-bound (21 us a token; one token costs 113 us because the read dominates): ~14 MAC per cycle per thread, 5 vector
+uops on ports 0 and 1 per input and 64 weights (two dpbusd, a conversion, the lane-scale product, an fma) against 2 ports; 6
+threads take 7.0 ms for 256 tokens, 20 threads 5.4 (the E cores and the power limit do not add much). So a cold expert is
+worth its read (112 us) only for up to ~5 tokens in decode, and in prefill a layer's cold experts cost ~21 us a token per
+NVFP4 expert (38 for Q5_K / Q8_0): at 1,024 tokens x 8 slots over 128 experts (64 tokens each), 1.4 ms per NVFP4 expert, so
+a layer with 40 cold experts costs ~55 ms of CPU against the card's layer time of ~13 ms at 1,024 tokens (M2: 9.7 ms at 512, 22 ms at 2,048): prefill should not use
+the CPU path for more than a handful of experts a layer (stage the layer, as M2 does, or keep prefill's experts on the card).
+
+**Not done / open.**
+- An int8 x int8 floor of 1e-2 against the card's fp16: at decode the GEMVs have ~2x ALU headroom over the DRAM floor (4
+  threads reach it, 14 are used), so a two-term activation (int8 q1 plus a residual q2 at 1/256 of the scale, two dpbusd chains,
+  `(dp1 << 8) + dp2`) would be expected to give ~1e-4 at no cost at one token (an estimate, not built or measured); not built: a decision for the lead, and the Q5_K / Q8_0 kernels
+  would need the same.
+- The pool must be built once and the calls come from one thread (`Pool::for_each` is one call at a time); the scratch is
+  `thread_local` to that caller, so a second calling thread gets its own.
