@@ -3627,3 +3627,66 @@ and without the cache:
 
 main's run also failed "two at once" (a near-tie). These failures are older than this branch: they come from the draft's
 verify shapes against plain decode (int8 rounding depends on the step's shape). The other 22-23 checks pass.
+
+## 2026-11-24 — Inkling 2 Mini as fiona's chat model: the decision, its architecture, the plan
+
+**Decision (owner, 2026-11-24).** Inkling 2 Mini (thinkingmachines/Inkling-2-Mini) replaces Bolt as the chat model eklow
+serves on fiona. Bolt keeps serving until Inkling wins on quality and speed through eklow.
+
+**Why.** Bolt's mistakes in real chats were mostly harness-shaped (answering from recalled fragments instead of reading the
+file, overwriting a day's row, a wrong time zone), and prompt and tool fixes did not remove them. A sandboxed replay of 21
+real chat moments (private; each played to its end with son-of-anton's own file tools on copies of the files as they stood,
+graded on the files, calls and reply) gave, at 6 runs a moment, on the 4090 with llama.cpp c74c71a6:
+
+| model | quant | pass |
+|---|---|---|
+| son-of-anton's production model (reference, not eklow-sized) | | 73/74 |
+| Qwen3.8-27B | UD-IQ3_S | 119/126 |
+| **Inkling 2 Mini** | **UD-Q4_K_M** | **110/126** |
+| Qwen3.6-35B-A3B | UD-Q4_K_M | 87/126 |
+| Gemma 4 12B / 26B A4B (first 8 moments) | QAT Q4_0 / Q4_0 | 31/48, 29/48 |
+| Bolt, through eklow (first 8 moments) | Q4_K_M | 16/48 |
+
+The owner chose Inkling over the denser Qwen3.8-27B for its speed headroom: about 4B active parameters a token, an MTP
+head, and MoE weights whose cold experts can sit on the CPU, as the Gemma 4 26B's did.
+
+**The model** (config.json; llama.cpp `src/models/inkling2.cpp`, `inkling2-loop.cpp` at c74c71a6 are the reference to port).
+- Text: 24 physical layers, hidden 2304, 24 query heads and 8 K/V heads of 128, vocabulary 201,024 (200,058 unpadded;
+  logits beyond it dropped), final logit soft-cap 30. Token embeddings are RMS-normed (not raw image embeddings).
+- **No RoPE.** A relative-position bias: per layer, R = W_rel·x (16 per head, clipped), projected on a learned table of the
+  layer's extent (1,024 for the sliding layers, 1,024 for the full ones too: `rel_extent`) and gathered by distance.
+- Attention: sliding window 1,024 on 20 layers, full on 4 (5, 11, 17, 23). Q, K and R are L2-clipped (Q and R after a
+  per-channel scale); V is RMS-normed without a gain. The full layers multiply Q and R by 1 + 0.1·log(max(1, (pos+1)/8192)),
+  and take separate Q, K and V input norms. A per-query sink logit from W_sink·x (softmax with an extra exp(t) term). The
+  output is gated by sigmoid(W_gate·x).
+- Short causal convolutions (kernel 4, with a residual and a 1/sqrt(n+1) scale) on K, V, the attention output and the FFN
+  output; on the full layers K and V add input-dependent taps per head. Their last 3 inputs are recurrent state.
+- "Attention residuals": every 6 layers a block closes; each layer's attention input (one for sliding layers, Q/K/V each for
+  full ones) and FFN input are a softmax over the RMS-normed earlier block outputs and the current stream, with learned
+  queries; the output is mixed the same way before the final norm.
+- MoE: 128 routed experts, top-8, no shared expert, sigmoid gating with a bias, fused gate+up (width 1,152), the SITU
+  activation (gate soft-cap 4, up soft-cap 25), route scale 8.
+- **The loop:** layers 6-17 run 3 times. Pass 1 is plain; passes 2 and 3 restart from the prelude's output and take a
+  "message" from the previous pass (a mix of its block outputs and output with a learned query per Q/K/V/FFN), applied by
+  rank-64 controllers: (1 - tanh(forget))·x + tanh(gain)·message. Every pass keeps its own K/V and conv state: 48 cache
+  slots, 8 of them full attention (5, 11, 17, 23, and 11 and 17 twice more), so a 64k context costs about 2 GiB of fp16
+  K/V; the 40 sliding slots hold 1,024 positions each.
+- MTP: 3 layers (2 sliding), drafting blocks of 8 with a Markov head (rank 256), reading target layers 5, 23, 41 and 48.
+- Vision: a 23-layer encoder (hidden 1,024), 20-pixel patches, 2x2 merge, projected to 2,304.
+- The released weights are NVFP4; the GGUFs are made from them. unsloth's UD-Q4_K_M (16.6 GB, rev 8078d149) is the one
+  the replay ran; it does not fit the card beside the utility models, so cold experts go to the CPU (the looped core's
+  experts are read three times a token: they stay on the card first).
+
+**The plan** (each step checked against the one before, as the earlier ports were):
+- M0: ground truth from llama.cpp CUDA on the 4090 (c74c71a6): per-layer activations and logits on fixed prompts (short,
+  chat, long, past the sliding window and the log-scale floor), tokenizer vectors, rendered chat-template turns, parsed
+  tool calls.
+- M1: eklow's host reference forward (fp32) of `inkling2_loop` from the GGUF, the tokenizer, the chat template (ported, not
+  Jinja) and the tool-call parser; in the band against M0.
+- M2: the forward on the A770M (prefill and decode), against M1.
+- M3: memory: hot and cold experts, the 48 K/V and conv slots, 64k, two slots, the prefix cache with conv-state snapshots.
+- M4: eklow-server for Inkling (template, parser, grammar, sampling, metrics); the private replay through eklow must match
+  the 4090's score.
+- M5: vision (the owner: images before speed).
+- M6: speed: the MTP block-8 draft, against Bolt's 90.8 / 44.8 tok/s at 8k (draft / plain).
+- Then the NixOS instance and the switch; the owner deploys.
