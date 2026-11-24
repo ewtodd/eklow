@@ -106,6 +106,20 @@ struct Scratch {
 void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* packed, const Cache& c,
             int64_t n_head, float scale, float* out, Scratch& scratch);
 
+// Inkling 2 Mini's attention (DECISIONS 2026-11-24, M2), as ref::inkling::attention computes it: the scores gain a
+// relative-position bias, s(t, j) = scale * q.k_j + R[t][h] . table[pos_t - pos_j] for distances below `extent` (0 past
+// it), and the softmax's denominator gains exp(sink[t][h]) (the sink is a key of that logit and a zero value):
+//   out = sum_j exp(s_j) v_j / (exp(sink) + sum_j exp(s_j))
+// over the keys token t sees (as attend: its own position back to the layer's window, or 0).
+struct Bias {
+  const float* R = nullptr;      // [n_tok][n_head][n_rel] fp32, the step's tokens in batch order
+  const float* table = nullptr;  // [extent][n_rel] fp32, the layer's attn_rel_bias
+  int64_t n_rel = 0, extent = 0;
+  const float* sink = nullptr;   // [n_tok][n_head] fp32
+};
+void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* packed, const Cache& c,
+            int64_t n_head, float scale, const Bias& bias, float* out, Scratch& scratch);
+
 // Allocates the scratch attend needs for up to max_tiles query tiles a step and chunks of up to max_chunk_rows
 // rows per K/V head, for one kind of layer: the long prefill's buffers on the global layers take ~100 MB (the
 // 26B's 2,048-token chunks), which an engine should count before it spends the card's free memory on experts.
