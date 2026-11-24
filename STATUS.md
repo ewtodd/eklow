@@ -88,7 +88,7 @@ with its measurements); what eklow is and its numbers: `README.md`.
   no server or GPU test may run on the card while any `eklow*` unit is active. `gpu.lock` does not cover the service. A
   test server beside it on 2026-11-11 slowed a real chat turn to 0.9 tok/s for six minutes.
 - The private replay set (real chats, graded points, the checker's 29 turns) stays on e-workstation and fiona, never in
-  the repository. Inkling's replay harness is `~/Software/fiona-replay-test` (private, never pushed).
+  the repository. Inkling's replay runs from it too.
 - Inkling's ground truth and tools live on e-workstation in `~/eklow-qwen-data/inkling-port`: `m0/` (the dumps, cases and
   prompts), `m1/` (eklow's reference dumps), `oracle-inkling` (`nix-build --impure nix/oracle-inkling.nix`), the llama.cpp
   c74c71a6 sources, Hugging Face's tokenizer and config (c9d02830), and `py` (a Python with numpy, jinja2, tokenizers).
