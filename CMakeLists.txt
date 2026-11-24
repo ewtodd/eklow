@@ -83,6 +83,7 @@ add_library(eklow_model STATIC
   src/kernels/gemma_fast.cpp
   src/kernels/qwen_fast.cpp
   src/kernels/ref.cpp
+  src/kernels/moe.cpp
   src/kernels/ref_inkling.cpp
   src/kernels/xmx.cpp
   src/kernels/xmx_fmt.cpp
@@ -228,6 +229,11 @@ eklow_sycl(eklow-xmx-bench)
 
 install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-embed eklow-vision eklow-image-prep eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-prompt-gemma4 eklow-server eklow-vega eklow-rerank RUNTIME DESTINATION bin)
 install(TARGETS eklow-grammar-test-gemma4 eklow-chat-gemma4 eklow-parse-gemma4 RUNTIME DESTINATION bin)
+
+# Inkling 2 Mini's experts on the card against the reference ops.
+add_executable(eklow-moe-test tools/moe_test/main.cpp)
+target_link_libraries(eklow-moe-test PRIVATE eklow_model)
+eklow_sycl(eklow-moe-test)
 
 # DFlash drafting and speculative decoding: the draft's kernels and model, the acceptance of a drafted block, and their
 # checks.
