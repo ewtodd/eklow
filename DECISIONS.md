@@ -3965,10 +3965,9 @@ its layer three times.
 **What was tried and what did not help.**
 - K splits of the GEMVs (gate_up 3, 4, 6, 9, 12 threads; down 2, 3, 6, 9): within 3% of each other at 1-2 tokens, 4 / 3 kept.
 - The scale-before GEMV: as fast at 1-2 tokens, 20% slower at 3-4 (ALU-bound).
-- The GEMM: whole records dequantized by half the threads (16 of 32) 17 TFLOPS -> pieces spread over all threads (the
-  measured form); a second accumulator set (8 chains -> 16) and loads three steps ahead both spilled (3-5 KB) and ran
-  1.5-2x slower. The dpas chain is still the limit: 15-16 TFLOPS of 98 at 2,048 tokens; the old Q4_0 kernel's 48-52 needed
-  its 1-2 bytes a weight to stay out of ALU. The GEMM is also latency-bound per K step at few rows (5 ms at 16 tokens
+- The GEMM: whole records dequantized by half the threads (16 of 32): 20.8 ms at 2,048 tokens in 2,048-token slabs; pieces
+  spread over all threads (the kept form): 17.4 ms; a second accumulator set (8 chains -> 16) and loads three steps ahead both spilled (3-5 KB) and ran
+  1.5-2x slower. The dpas chain is still the limit: 15-16 TFLOPS of 98 at 2,048 tokens (the old Qwen Q4_0 GEMM reached 48-52). The GEMM is also latency-bound per K step at few rows (5 ms at 16 tokens
   however few rows), which is why the GEMVs serve up to ~450 tokens.
 - Tiles of 8 rows in the GEMV (repeat count 8): spills (the A tiles and 16 accumulator registers beside the double buffer);
   4 rows are enough up to the 3-4 tokens decode runs and cost nothing at 8 (an expert with more than 4 rows is read twice).
