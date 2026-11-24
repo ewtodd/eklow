@@ -2,6 +2,7 @@
 //
 //   eklow-oracle --model GGUF --out DIR (--prompt TEXT | --prompt-file FILE | --tokens 2,818,...)
 //                [--tensors PREFIX,...] [--list] [--threads N] [--ngl N] [--logits-last N]
+//                [--ubatch N] [--dump-last N] [--generate N]
 //                [--mmproj GGUF --image FILE ... [--clip-tensors PREFIX,...] [--clip-list]]
 //
 // Runs one forward pass over the whole prompt (one ubatch, fp32 KV cache, no flash attention) and
@@ -11,6 +12,12 @@
 //   index.json      one entry per dumped tensor: name, ggml shape (ne[0] fastest), file
 //   NAME.f32        the tensor as float32, in ggml order
 //   logits.f32      n_vocab logits for every position (or the last --logits-last), row by row
+// --ubatch N prefills in chunks of N positions (one ubatch each) instead of one; --dump-last N makes the last chunk the
+// final N positions and dumps tensors and logits of that chunk only, so a long prompt's activations stay small (the
+// earlier chunks run through llama.cpp's caches, K/V and recurrent state, as a server's chunked prefill does).
+// --generate N then decodes N tokens greedily, one at a time: gen.json holds their ids and pieces, logits_gen.f32 the
+// logits each step saw (row i is the distribution token i was taken from). I32 tensors (the routers' choices) are
+// dumped as NAME.i32. Host tensor ops are never offloaded (op_offload off).
 // --tensors takes name prefixes (a trailing $ makes it an exact name) matched against llama.cpp's graph tensor names (default: l_out-,
 // result_norm, result_output); --list prints every graph tensor name and shape once. --ngl offloads
 // layers to a GPU backend when the linked llama.cpp has one (default 0: CPU only).
@@ -27,6 +34,7 @@
 // --image-tokens N sets the token budget per image (mtmd's image_max_tokens; unset, the projector's own
 // maximum, 1120 for gemma4v). --encode-only (with --mmproj and --image, no prompt) skips the text model's forward pass
 // and only encodes the images: image_K.f32, images.json (tokens and grid per image), the clip tensors.
+#include <algorithm>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -54,12 +62,16 @@ struct Dump {
   std::set<std::string> listed;
   std::ostringstream index;
   bool first = true;
+  bool active = true;  // dump only while set (the last chunk of a chunked prefill)
   std::vector<uint8_t> buf;
 };
 
-// A prefix ending in '$' must match the whole name (attn_norm-3$ is layer 3 and not 30..39).
+// A prefix ending in '$' must match the whole name (attn_norm-3$ is layer 3 and not 30..39). Views and reshapes of a
+// named tensor ("l_out-3 (reshaped)") hold the same data and are skipped unless a prefix names them.
 bool wanted(const Dump& d, const char* name) {
+  const bool view = std::strchr(name, ' ') != nullptr;
   for (const auto& p : d.prefixes) {
+    if (view && p.find(' ') == std::string::npos) continue;
     if (!p.empty() && p.back() == '$') {
       if (p.compare(0, p.size() - 1, name) == 0) return true;
     } else if (std::strncmp(name, p.c_str(), p.size()) == 0) {
@@ -87,11 +99,22 @@ std::string json_str(const std::string& s) {
 bool eval_cb(ggml_tensor* t, bool ask, void* user) {
   auto& d = *static_cast<Dump*>(user);
   const char* name = ggml_get_name(t);
+  if (!d.active) return ask ? false : true;
   if (ask) {
     if (d.list && d.listed.insert(name).second)
       std::printf("  %-40s %-6s [%lld, %lld, %lld, %lld]\n", name, ggml_type_name(t->type), (long long)t->ne[0],
                   (long long)t->ne[1], (long long)t->ne[2], (long long)t->ne[3]);
     return wanted(d, name);
+  }
+  if (ggml_is_contiguous(t) && t->type == GGML_TYPE_I32) {
+    d.buf.resize(ggml_nbytes(t));
+    ggml_backend_tensor_get(t, d.buf.data(), 0, d.buf.size());
+    const std::string file = d.tag + name + ".i32";
+    std::ofstream(d.dir + "/" + file, std::ios::binary).write(reinterpret_cast<const char*>(d.buf.data()), d.buf.size());
+    d.index << (d.first ? "\n" : ",\n") << "  {\"name\": " << json_str(name) << ", \"type\": \"i32\", \"ne\": [" << t->ne[0]
+            << ", " << t->ne[1] << ", " << t->ne[2] << ", " << t->ne[3] << "], \"file\": " << json_str(file) << "}";
+    d.first = false;
+    return true;
   }
   if (!ggml_is_contiguous(t) || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16)) {
     std::fprintf(stderr, "oracle: skipping %s (%s, %s)\n", name, ggml_type_name(t->type),
@@ -131,14 +154,17 @@ int usage() {
   std::fprintf(stderr,
                "usage: eklow-oracle --model GGUF --out DIR (--prompt TEXT | --prompt-file FILE | --tokens IDS)\n"
                "                    [--tensors PREFIX,...] [--list] [--threads N] [--ngl N] [--logits-last N]\n"
+               "                    [--ubatch N] [--dump-last N] [--generate N]\n"
                "                    [--mmproj GGUF --image FILE ... [--clip-tensors PREFIX,...] [--clip-list] [--image-tokens N] [--encode-only]]\n");
   return 2;
 }
 
-llama_context* make_context(llama_model* model, int n_tok, int threads, Dump* d) {
+llama_context* make_context(llama_model* model, int n_tok, int threads, Dump* d, int n_ubatch = 0) {
   auto cp = llama_context_default_params();
   cp.n_ctx = uint32_t((n_tok + 255) / 256 * 256);
-  cp.n_batch = cp.n_ubatch = uint32_t(n_tok);
+  cp.n_batch = cp.n_ubatch = uint32_t(n_ubatch > 0 ? n_ubatch : n_tok);
+  cp.op_offload = false;
+  cp.swa_full = false;  // sliding layers keep their window (and a ubatch), not the whole context
   cp.type_k = cp.type_v = GGML_TYPE_F32;
   cp.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_DISABLED;
   if (threads > 0) cp.n_threads = cp.n_threads_batch = threads;
@@ -372,7 +398,7 @@ int main(int argc, char** argv) {
   std::vector<std::string> images;
   bool have_prompt = false;
   bool encode_only = false;
-  int threads = 0, ngl = 0, logits_last = 0;
+  int threads = 0, ngl = 0, logits_last = 0, ubatch = 0, dump_last = 0, generate = 0;
   Dump d, clip;
   d.prefixes = {"l_out-", "result_norm", "result_output"};
   clip.tag = "clip.";
@@ -392,6 +418,9 @@ int main(int argc, char** argv) {
     else if (a == "--threads") threads = std::atoi(next().c_str());
     else if (a == "--ngl") ngl = std::atoi(next().c_str());
     else if (a == "--logits-last") logits_last = std::atoi(next().c_str());
+    else if (a == "--ubatch") ubatch = std::atoi(next().c_str());
+    else if (a == "--dump-last") dump_last = std::atoi(next().c_str());
+    else if (a == "--generate") generate = std::atoi(next().c_str());
     else if (a == "--mmproj") mmproj = next();
     else if (a == "--image") images.push_back(next());
     else if (a == "--clip-tensors") clip.prefixes = split(next(), ',');
@@ -451,36 +480,82 @@ int main(int argc, char** argv) {
     }
   }
 
-  llama_context* ctx = make_context(model, n_tok, threads, &d);
+  // The last chunk is the final `last` positions; the ones before go in chunks of `ub`.
+  const int last = dump_last > 0 && dump_last < n_tok ? dump_last : n_tok;
+  const int ub = ubatch > 0 ? ubatch : n_tok - last;
+  llama_context* ctx = make_context(model, n_tok + generate, threads, &d, std::max(ub, last));
   if (!ctx) {
     std::fprintf(stderr, "oracle: cannot create a context\n");
     return 1;
   }
 
-  llama_batch batch = llama_batch_init(n_tok, 0, 1);
-  for (int i = 0; i < n_tok; ++i) {
-    batch.token[i] = toks[i];
-    batch.pos[i] = i;
-    batch.n_seq_id[i] = 1;
-    batch.seq_id[i][0] = 0;
-    batch.logits[i] = logits_last <= 0 || i >= n_tok - logits_last;
+  llama_batch batch = llama_batch_init(std::max(ub, last), 0, 1);
+  auto decode = [&](int from, int to, bool out) {
+    for (int i = from; i < to; ++i) {
+      const int j = i - from;
+      batch.token[j] = toks[i];
+      batch.pos[j] = i;
+      batch.n_seq_id[j] = 1;
+      batch.seq_id[j][0] = 0;
+      batch.logits[j] = out && (logits_last <= 0 || i >= n_tok - logits_last);
+    }
+    batch.n_tokens = to - from;
+    return llama_decode(ctx, batch) == 0;
+  };
+  d.active = false;
+  for (int p = 0; p < n_tok - last; p += ub) {
+    if (!decode(p, std::min(p + ub, n_tok - last), false)) {
+      std::fprintf(stderr, "oracle: llama_decode failed at %d\n", p);
+      return 1;
+    }
   }
-  batch.n_tokens = n_tok;
+  d.active = true;
   if (d.list) std::printf("graph tensors:\n");
-  if (llama_decode(ctx, batch) != 0) {
+  if (!decode(n_tok - last, n_tok, true)) {
     std::fprintf(stderr, "oracle: llama_decode failed\n");
     return 1;
   }
+  d.active = false;
 
   const int n_vocab = llama_vocab_n_tokens(vocab);
-  const int first = logits_last > 0 && logits_last < n_tok ? n_tok - logits_last : 0;
-  std::ofstream lf(d.dir + "/logits.f32", std::ios::binary);
-  for (int i = first; i < n_tok; ++i)
-    lf.write(reinterpret_cast<const char*>(llama_get_logits_ith(ctx, i)), size_t(n_vocab) * sizeof(float));
+  const int first = std::max(n_tok - last, logits_last > 0 && logits_last < n_tok ? n_tok - logits_last : 0);
+  {
+    std::ofstream lf(d.dir + "/logits.f32", std::ios::binary);
+    for (int i = first; i < n_tok; ++i)
+      lf.write(reinterpret_cast<const char*>(llama_get_logits_ith(ctx, i - (n_tok - last))), size_t(n_vocab) * sizeof(float));
+  }
   std::ofstream(d.dir + "/index.json") << "{\"n_tokens\": " << n_tok << ", \"n_vocab\": " << n_vocab
-                                       << ", \"logits_rows\": " << n_tok - first << ", \"tensors\": [" << d.index.str()
-                                       << "\n]}\n";
-  std::printf("oracle: %d tokens, %d vocab, wrote %s\n", n_tok, n_vocab, d.dir.c_str());
+                                       << ", \"first_position\": " << n_tok - last << ", \"logits_rows\": " << n_tok - first
+                                       << ", \"logits_first\": " << first << ", \"tensors\": [" << d.index.str() << "\n]}\n";
+  std::printf("oracle: %d tokens (last chunk %d), %d vocab, wrote %s\n", n_tok, last, n_vocab, d.dir.c_str());
+
+  if (generate > 0) {
+    std::ofstream gl(d.dir + "/logits_gen.f32", std::ios::binary);
+    std::ostringstream gids, gpieces;
+    const float* lg = llama_get_logits_ith(ctx, -1);
+    for (int g = 0; g < generate; ++g) {
+      gl.write(reinterpret_cast<const char*>(lg), size_t(n_vocab) * sizeof(float));
+      int best = 0;
+      for (int v = 1; v < n_vocab; ++v)
+        if (lg[v] > lg[best]) best = v;
+      gids << (g ? ", " : "") << best;
+      gpieces << (g ? ", " : "") << json_str(piece(vocab, best));
+      if (g + 1 == generate) break;
+      batch.token[0] = best;
+      batch.pos[0] = n_tok + g;
+      batch.n_seq_id[0] = 1;
+      batch.seq_id[0][0] = 0;
+      batch.logits[0] = true;
+      batch.n_tokens = 1;
+      if (llama_decode(ctx, batch) != 0) {
+        std::fprintf(stderr, "oracle: llama_decode failed generating\n");
+        return 1;
+      }
+      lg = llama_get_logits_ith(ctx, -1);
+    }
+    std::ofstream(d.dir + "/gen.json") << "{\"ids\": [" << gids.str() << "], \"pieces\": [" << gpieces.str() << "]}\n";
+    std::printf("oracle: generated %d tokens\n", generate);
+  }
 
   llama_batch_free(batch);
   llama_free(ctx);

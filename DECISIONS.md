@@ -3690,3 +3690,55 @@ head, and MoE weights whose cold experts can sit on the CPU, as the Gemma 4 26B'
 - M5: vision (the owner: images before speed).
 - M6: speed: the MTP block-8 draft, against Bolt's 90.8 / 44.8 tok/s at 8k (draft / plain).
 - Then the NixOS instance and the switch; the owner deploys.
+
+## 2026-11-24 — Inkling M0: the ground truth from llama.cpp c74c71a6
+
+The reference every later step is checked against, from the llama.cpp the private replay ran (master c74c71a6, CUDA, on
+e-workstation's 4090). `nix/oracle-inkling.nix` builds two tools against that build:
+- `eklow-oracle` (tools/ref/oracle), extended: `--ubatch N` prefills in chunks through llama.cpp's own K/V and conv state,
+  `--dump-last N` makes the final N positions the last chunk and dumps only it, `--generate N` decodes greedily and keeps
+  each step's logits, router picks (I32) are dumped, and views of a dumped tensor are skipped. fp32 K/V, no flash attention,
+  everything on the card, host ops never offloaded.
+- `eklow-chat-oracle` (new): a chat request goes through llama-server's own `oaicompat_chat_params_parse` (linked from
+  `libllama-server-impl`, `--jinja`, the server's defaults); it writes the rendered prompt and its tokens, the generation
+  prompt, the tool grammar, and for each given model output the message after `finish()` and the deltas a stream would carry,
+  fed one token at a time as the server feeds them. `--tokenize` writes llama.cpp's tokens of a list of strings.
+
+`tools/ref/inkling/m0.py` writes the cases and renders the forward prompts; `m0.sh` runs both tools. Everything in them is
+synthetic or eklow's own public files (DECISIONS.md and `src/core/json.hpp` at cc9e886). The forward prompts, rendered by
+the server's path:
+
+| prompt | tokens | what it reaches | dumped positions | greedy tokens |
+|---|---|---|---|---|
+| short: one question | 67 | | all | 64 |
+| tools: a read-file loop, the file as its result | 1,339 | past the 1,024-position window | last 512 | 64 |
+| long: a question on the log | 11,996 | past the 8,192 floor (log scale 1.038 at the end) | last 256 | 32 |
+| deep: the same, longer | 32,950 | log scale 1.139 | last 128 | 32 |
+
+Every one of the 48 slots (24 layers, layers 6-17's two extra passes as slots 24-47) dumps its stream (`l_out`, `ffn_inp`,
+`ffn_out`, `attn_out`) and its router's picks and weights; 14 slots add Q, K, V, R, the attention output, the router logits
+and the experts' activations; the short prompt adds every slot's bias, attention probabilities and expert gate/up. With the
+logits of the dumped positions it is 4.4 GB, kept on e-workstation (`~/eklow-qwen-data/inkling-port/m0`). On a block's
+first layer llama.cpp names the attention output `ffn_inp` (it is not added to the stream there), so 40 slots have an
+`attn_out`. The greedy continuations read as sensible answers to each prompt.
+
+The text layer's cases: 41 chat requests (roles, history with reasoning, content parts, Unicode, special-token text in a
+user turn, every reasoning effort, tools with odd schemas, parallel and required calls, `tool_choice` none, tool results
+named and matched by id, odd argument values and key orders, continuation of a final assistant message, a response format)
+and 48 model outputs to parse, and 62 tokenizer strings.
+
+What they show:
+- **llama.cpp's tokenizer equals Hugging Face's** (`tokenizer.json` at c9d02830) on the 62 strings and on all four prompts.
+  The pre-tokenizer is GPT-4o's regex with `ignore_merges` (a pre-token in the vocabulary is one token). No BOS.
+- **The GGUF's template is Hugging Face's** `chat_template.jinja` byte for byte. It adds no generation prompt: the model
+  opens its own `<|message_model|>` block. Before the first non-system message it writes a system block "Thinking effort
+  level: X", 0.9 by default; `reasoning_effort` maps none/minimal/low/medium/high/xhigh/max to 0/0.1/0.2/0.7/0.9/0.99/0.99
+  and an unknown one raises. `enable_thinking` changes nothing. Tools are declared as one JSON array (keys sorted, compact
+  separators); a call in the history is written with its arguments' keys sorted, values compact.
+- **The parser** (common/parsers/inkling.cpp) reads blocks `<|message_model|>` + thinking or text or a call, each closed
+  by `<|end_message|>`. Several thinking blocks join into one reasoning text. Output that does not open with a header
+  parses to nothing, and with `tool_choice` none a call parses to empty content. `<|content_model_end_sampling|>` (200006)
+  ends the turn and is not part of the text.
+- Running it: without flash attention llama.cpp reserves the attention scores for the whole context at the ubatch size, so
+  a 1,024 ubatch does not fit beside the 16.6 GB of weights at 12k (256 does; 128 at 33k). Its default keeps the sliding
+  layers' caches at full length too (10.3 GB at 33k); the oracle turns that off. All of M0 runs in about a minute.
