@@ -47,6 +47,7 @@ add_library(eklow_text STATIC
   src/text/pyfmt.cpp
   src/text/tokenizer.cpp
   src/text/output_parser_gemma4.cpp
+  src/text/output_parser_inkling.cpp
   src/text/tokenizer_inkling.cpp
   src/text/tokenizer_qwen.cpp
   src/text/unicode.cpp
@@ -176,6 +177,9 @@ target_link_libraries(eklow-chat-inkling PRIVATE eklow_text)
 
 add_executable(eklow-chat-gemma4 tools/chat_gemma4/main.cpp)
 target_link_libraries(eklow-chat-gemma4 PRIVATE eklow_text)
+
+add_executable(eklow-parse-inkling tools/parse_inkling/main.cpp)
+target_link_libraries(eklow-parse-inkling PRIVATE eklow_text)
 
 add_executable(eklow-parse-gemma4 tools/parse_gemma4/main.cpp)
 target_link_libraries(eklow-parse-gemma4 PRIVATE eklow_text)

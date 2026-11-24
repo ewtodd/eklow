@@ -15,9 +15,6 @@ struct InklingMode {
   bool parallel_tool_calls = true;                     // more than one call in a turn (llama.cpp's default for this template)
   bool response_format = false;                        // a JSON schema constrains the answer: its text is read as content
   bool extract_reasoning = true;                       // reasoning_format is not "none"
-  // What the prompt already opened (continuing a final assistant message): the parser reads it first, as llama.cpp does,
-  // so that it is not delivered again.
-  std::string prefill;
 
   // Tool calls are read: tools were given and tool_choice is not "none".
   bool use_tools() const { return !tool_names.empty() && tool_choice != InklingToolChoice::None; }

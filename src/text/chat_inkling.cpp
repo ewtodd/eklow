@@ -714,12 +714,12 @@ InklingChat render_inkling_request(const Value& raw) {
       g.lit("<|message_model|><|content_text|>");
       g.in(last->render_content());
     }
+    chat.generation_parts = g.parts;
     for (const auto& p : g.parts) {
       chat.generation_prompt += p.text;
       if (!chat.parts.empty() && chat.parts.back().input == p.input) chat.parts.back().text += p.text;
       else chat.parts.push_back(p);
     }
-    mode.prefill = chat.generation_prompt;
   }
   return chat;
 }

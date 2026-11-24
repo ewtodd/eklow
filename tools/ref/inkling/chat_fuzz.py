@@ -405,3 +405,156 @@ def edge_requests():
                 r["tools"] = [{"type": "function", "function": {"name": "f"}}]
             reqs.append(r)
     return reqs
+
+
+# ---- model outputs for the parser ------------------------------------------------------------------------------------
+
+H, K, X, J, E = "<|message_model|>", "<|content_thinking|>", "<|content_text|>", "<|content_invoke_tool_json|>", "<|end_message|>"
+OTHER_SPECIALS = ["<|message_user|>", "<|message_system|>", "<|message_tool|>", "<|content_xml|>", "<|unused_200007|>", "<|content_image|>",
+                  "<|begin_of_text|>", "<|content_tool_error|>", "<|content_invoke_tool_text|>"]
+
+
+def words(rng, n=None):
+    n = rng.choice([0, 1, 1, 2, 3, 6, 15, 40]) if n is None else n
+    out = []
+    for _ in range(n):
+        r = rng.random()
+        out.append(rng.choice(UNICODE) if r < 0.12 else rng.choice(ESCAPES) if r < 0.2 else rng.choice(["{", "}", "\"", "<", "|>", "<|", "[", "]"]) if r < 0.25
+                   else rng.choice(OTHER_SPECIALS) if r < 0.28 else rng.choice(WORDS))
+        out.append(rng.choice([" ", " ", " ", "", "\n", "\t", "  "]))
+    return "".join(out)
+
+
+def json_text(rng, depth=0):
+    """A JSON value as the model might write it: usually valid, sometimes not."""
+    r = rng.random()
+    if r < 0.12:
+        return rng.choice(["0", "-0", "7", "-12", "3.5", "1e5", "1E+2", "2.5e-3", "0.1", "100", "-0.0", "123456789012345678901234567890"])
+    if r < 0.17:
+        return rng.choice(["01", "1.", ".5", "+1", "1e", "1e+", "--1", "0x1", "1.5.2", "NaN", "Infinity", "-", "1_0", "00", "-01"])
+    if r < 0.3:
+        return json.dumps(text(rng, 0.02), ensure_ascii=rng.random() < 0.3)
+    if r < 0.35:
+        return rng.choice(['"a\\x41"', '"tab\there"', '"line\nbreak"', '"\\u12"', '"\\u12G4"', '"\\ud83d\\ude00"', '"\\/"', '"unterminated', '"\\'])
+    if r < 0.42:
+        return rng.choice(["true", "false", "null", "True", "None", "tru", "nul", "[]", "{}", "[ ]", "{ }"])
+    if r < 0.7 or depth > 3:
+        n = rng.choice([0, 1, 2, 3])
+        parts = []
+        for _ in range(n):
+            ws = rng.choice(["", " ", "\n", "  "])
+            parts.append(ws + json.dumps(key(rng), ensure_ascii=rng.random() < 0.3) + rng.choice([":", " : ", ": ", ":\n"]) + json_text(rng, depth + 1))
+        return "{" + rng.choice(["", " "]) + ",".join(parts) + rng.choice(["", " ", "\n"]) + "}"
+    n = rng.choice([0, 1, 2, 4])
+    return "[" + rng.choice(["", " "]) + rng.choice([",", ", ", " ,"]).join(json_text(rng, depth + 1) for _ in range(n)) + "]"
+
+
+def call_text(rng, names):
+    name = rng.choice(names + [rng.choice(WORDS), "", "é", "a\\\"b", "x y ", "with\\nescape", "a b"]) if rng.random() < 0.97 else ""
+    r = rng.random()
+    if r < 0.6:
+        args = json.dumps(obj(rng, n=rng.choice([0, 1, 2, 3])), ensure_ascii=rng.random() < 0.3, separators=rng.choice([(",", ":"), (", ", ": ")]))
+    elif r < 0.8:
+        args = json_text(rng)
+    elif r < 0.85:
+        args = "{" * rng.randint(1, 70) + "}" * rng.randint(0, 70) if rng.random() < 0.5 else "[" * rng.randint(60, 70) + "1" + "]" * rng.randint(60, 70)
+    else:
+        args = rng.choice(["{}", "[]", "null", "5", '"s"', "true", '{"a":', '{"a":1', '{"a":1,', '{"a":[1,2', "{", ""])
+    sp = lambda: rng.choice(["", "", "", " ", "\n", "  "])  # noqa: E731
+    name_json = json.dumps(name, ensure_ascii=False)[1:-1] if rng.random() < 0.9 and "\\" not in name else name
+    shape = rng.random()
+    if shape < 0.75:
+        body = '{' + sp() + '"name"' + sp() + ':' + sp() + '"' + name_json + '"' + sp() + ',' + sp() + '"args"' + sp() + ':' + sp() + args + sp() + '}'
+    elif shape < 0.82:
+        body = '{"args":' + args + ',"name":"' + name_json + '"}'
+    elif shape < 0.86:
+        body = '{"name":"' + name_json + '"}'
+    elif shape < 0.9:
+        body = '{"name":"' + name_json + '","args":' + args + ',"extra":1}'
+    elif shape < 0.93:
+        body = '{"name":"' + name_json + '","arguments":' + args + '}'
+    elif shape < 0.96:
+        body = '{"name":"' + name_json + '","args":' + args
+    else:
+        body = '{"name":' + name_json + ',"args":' + args + '}'
+    head = rng.choice([name, name, "", "", rng.choice(WORDS), name + " ", " " + name, rng.choice(names + [""]) + "x", rng.choice(OTHER_SPECIALS), E + name])
+    return head, body
+
+
+def clean_call(rng, names):
+    """A call as the model writes it when it is right, for some tool of the request."""
+    name = rng.choice(names)
+    esc = json.dumps(name, ensure_ascii=False)[1:-1]
+    args = json.dumps(obj(rng, n=rng.choice([0, 1, 2, 3])), ensure_ascii=rng.random() < 0.3, separators=rng.choice([(",", ":"), (", ", ": ")]))
+    return H + rng.choice([name, name, ""]) + J + '{"name":"' + esc + '","args":' + args + '}' + E
+
+
+def clean_output(rng, names, rf):
+    parts = []
+    if rng.random() < 0.5:
+        parts += [H + K + words(rng) + E] * rng.choice([1, 1, 2])
+    if rf:
+        parts.append(H + X + json_text(rng) + E)
+    else:
+        if rng.random() < 0.4:
+            parts.append(H + X + words(rng) + E)
+        if names and rng.random() < 0.8:
+            parts += [clean_call(rng, names) for _ in range(rng.choice([1, 1, 2, 3, 4]))]
+    return "".join(parts)
+
+
+def output(rng, names, rf=False):
+    if rng.random() < 0.45:
+        s = clean_output(rng, names, rf)
+        for _ in range(rng.choice([0, 0, 1, 2])):
+            r = rng.random()
+            if r < 0.4 and s:
+                s = s[:rng.randrange(len(s) + 1)]
+            elif r < 0.7:
+                toks = [t for t in (H, K, X, J, E) if t in s]
+                if toks:
+                    t = rng.choice(toks)
+                    i = rng.choice([m for m in range(len(s)) if s.startswith(t, m)])
+                    s = s[:i] + s[i + len(t):]
+            else:
+                i = rng.randrange(len(s) + 1)
+                s = s[:i] + rng.choice([" ", "\n", "x", H, E, "}", "{"]) + s[i:]
+        return s
+    parts = []
+    for _ in range(rng.choice([1, 1, 1, 2, 2, 3, 4])):
+        r = rng.random()
+        if r < 0.3:
+            parts.append(H + K + words(rng) + E)
+        elif r < 0.6:
+            parts.append(H + X + words(rng) + E)
+        elif r < 0.9 or not names:
+            head, body = call_text(rng, names or ["f"])
+            parts.append(H + head + J + body + rng.choice([E, E, E, E, "", E + " ", " " + E, "}" + E, E + "x"]))
+        else:
+            parts.append(rng.choice([H, K, X, E, J, "", words(rng, 2), H + H, H + E, E + E, H + K, H + X]))
+    s = "".join(parts)
+    # mutations: cut it, insert a token, drop a token, append junk
+    for _ in range(rng.choice([0, 0, 0, 1, 1, 2])):
+        r = rng.random()
+        if r < 0.4 and s:
+            s = s[:rng.randrange(len(s) + 1)]
+        elif r < 0.6:
+            i = rng.randrange(len(s) + 1)
+            s = s[:i] + rng.choice([H, K, X, J, E] + OTHER_SPECIALS + [words(rng, 2)]) + s[i:]
+        elif r < 0.8:
+            toks = [t for t in (H, K, X, J, E) if t in s]
+            if toks:
+                t = rng.choice(toks)
+                i = s.index(t)
+                s = s[:i] + s[i + len(t):]
+        else:
+            s += rng.choice(["", " ", "\n", "x", words(rng, 3), H, E])
+    return s
+
+
+def outputs(n, seed, names, rf=False):
+    """n model outputs. The two tokens that end a turn are left out of the middle of them: eklow stops at one (the server
+    never feeds one to the parser), llama.cpp's test harness would read it as text."""
+    rng = random.Random(seed)
+    return [output(rng, names, rf).replace("<|endoftext|>", "<|content_xml|>").replace("<|content_model_end_sampling|>", "<|content_xml|>")
+            for _ in range(n)]

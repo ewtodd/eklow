@@ -39,8 +39,10 @@ std::vector<ChatPart> render_inkling(const json::Value& messages, const json::Va
 struct InklingChat {
   std::vector<ChatPart> parts;  // the prompt, without a trailing generation prompt
   // Continuing the final assistant message (the request ends with one, or says continue_final_message): the block that
-  // message opened, which the prompt ends with and the output parser reads first; empty otherwise.
+  // message opened, which the prompt ends with and the output parser reads first (its token ids, tokenized as part of the
+  // prompt, are the parser's prefill); empty otherwise.
   std::string generation_prompt;
+  std::vector<ChatPart> generation_parts;
   InklingMode mode;  // for the output parser
 };
 

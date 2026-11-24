@@ -12,6 +12,11 @@ namespace eklow::text {
 struct ToolCall {
   std::string name;
   json::Value arguments;  // an object
+  // Inkling 2's parser keeps what llama.cpp's does: the arguments exactly as the model wrote them (`arguments` is
+  // that text read as JSON, an empty object when it is not a whole object), and whether the call was cut off (the
+  // output ended, or went wrong, before its `<|end_message|>`).
+  std::string arguments_text;
+  bool truncated = false;
 };
 
 struct OutputDelta {

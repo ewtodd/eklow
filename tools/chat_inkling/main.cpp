@@ -98,6 +98,12 @@ int main(int argc, char** argv) {
           const std::vector<int32_t> ids = tok->encode(pieces);
           for (int32_t id : ids) w.value(int64_t(id));
           w.end_array().kv("roundtrip", tok->decode(ids) == text::join(chat.parts));
+          // the ids of the continued block, as the prompt tokenizes it (the output parser's prefill)
+          std::vector<text::InklingTokenizer::Piece> gp;
+          for (const auto& p : chat.generation_parts) gp.push_back({p.text, !p.input});
+          w.key("generation_ids").begin_array();
+          for (int32_t id : tok->encode(gp)) w.value(int64_t(id));
+          w.end_array();
         }
         w.end_object();
       } catch (const std::exception& e) {
