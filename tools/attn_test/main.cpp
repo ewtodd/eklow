@@ -182,7 +182,11 @@ double gpu_seconds(sycl::queue& q, F&& f) {
 
 }  // namespace
 
+int inkling_main(int argc, char** argv);
+
 int main(int argc, char** argv) {
+  for (int i = 1; i < argc; ++i)
+    if (std::string(argv[i]) == "--inkling") return inkling_main(argc, argv);
   int64_t len = 3000, chunk = 512, decode = 40;
   std::vector<int64_t> time_ctx = {4096, 16384};
   int64_t pf_len = 1024, pf_slots = 1;
