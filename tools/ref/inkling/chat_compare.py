@@ -308,6 +308,9 @@ def main():
         tmpl = make_python_template(a.template)
         same, diff, skipped = 0, [], 0
         for i, (req, r) in enumerate(zip(reqs, ll)):
+            if deliberate(req):
+                skipped += 1
+                continue
             if "error" in r and template_error(r["error"]) is None and "Unknown (built-in) filter" not in r["error"]:
                 skipped += 1
                 continue
@@ -334,7 +337,7 @@ def main():
         by_kind = collections.defaultdict(list)
         for i, why in diff:
             kind = re.sub(r"\(.*\)", "", why) if why.startswith("the effort") else why[:150]
-            if "raised 'Unknown reasoning_effort: high" in why:
+            if why.startswith("llama.cpp raised 'Unknown reasoning_effort"):
                 kind = "Unknown reasoning_effort where Python's trim strips more than ASCII white space (U+00A0)"
             if "Unknown (built-in) filter 'float'" in why:
                 kind = "reasoning_effort is a list or object: llama.cpp has no float filter for it, Python's returns 0.0"
