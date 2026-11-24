@@ -1,12 +1,13 @@
 // eklow-tok: eklow's tokenizers from the command line, for comparison against Hugging Face's. The GGUF decides which:
-// a Qwen3.6 tokenizer (gpt2 model, qwen35 pre-tokenizer) or the Gemma tokenizer (EmbeddingGemma 2's).
+// a Qwen3.6 tokenizer (gpt2 model, qwen35 pre-tokenizer), Inkling 2 Mini's (gpt2 model, inkling2 pre-tokenizer) or the
+// Gemma tokenizer (EmbeddingGemma 2's).
 //
 //   eklow-tok GGUF encode [--no-special] < STRINGS > IDS   STRINGS: NUL-separated; IDS: one line per
 //                                                          string, ids separated by spaces
 //   eklow-tok GGUF decode [--skip-special] < IDS > STRINGS
 //   eklow-tok GGUF bench FILE                              encode FILE, report tokens per second
-//   eklow-tok GGUF pretok < STRINGS > SPLITS               (Qwen) NFC and the pre-tokenizer's split: one line per
-//                                                          string, the lengths in bytes of its pieces
+//   eklow-tok GGUF pretok < STRINGS > SPLITS               (Qwen, Inkling) NFC (Qwen) and the pre-tokenizer's split: one
+//                                                          line per string, the lengths in bytes of its pieces
 //   eklow-tok GGUF nfc < STRINGS > STRINGS                 (Qwen) NFC-normalized, NUL-separated
 #include <chrono>
 #include <cstdio>
@@ -22,6 +23,7 @@
 
 #include "model/gguf.hpp"
 #include "text/tokenizer.hpp"
+#include "text/tokenizer_inkling.hpp"
 #include "text/tokenizer_qwen.hpp"
 #include "text/unicode.hpp"
 
@@ -35,15 +37,23 @@ int main(int argc, char** argv) {
   try {
     auto f = gguf::File::open(argv[1]);
     const auto* model = f.find("tokenizer.ggml.model");
-    const bool qwen = model && model->as_string() == "gpt2";
+    const auto* pre = f.find("tokenizer.ggml.pre");
+    const bool inkling = model && model->as_string() == "gpt2" && pre && pre->as_string() == "inkling2";
+    const bool qwen = model && model->as_string() == "gpt2" && !inkling;
     auto t0 = std::chrono::steady_clock::now();
     std::optional<text::Tokenizer> gemma;
     std::optional<text::QwenTokenizer> q;
-    if (qwen) q.emplace(text::QwenTokenizer::from_gguf(f));
+    std::optional<text::InklingTokenizer> ink;
+    if (inkling) ink.emplace(text::InklingTokenizer::from_gguf(f));
+    else if (qwen) q.emplace(text::QwenTokenizer::from_gguf(f));
     else gemma.emplace(text::Tokenizer::from_gguf(f));
     double load = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    auto encode = [&](std::string_view s, bool special) { return qwen ? q->encode(s, special) : gemma->encode(s, special); };
-    auto decode = [&](const std::vector<int32_t>& ids, bool skip) { return qwen ? q->decode(ids, skip) : gemma->decode(ids, skip); };
+    auto encode = [&](std::string_view s, bool special) {
+      return inkling ? ink->encode(s, special) : qwen ? q->encode(s, special) : gemma->encode(s, special);
+    };
+    auto decode = [&](const std::vector<int32_t>& ids, bool skip) {
+      return inkling ? ink->decode(ids, skip) : qwen ? q->decode(ids, skip) : gemma->decode(ids, skip);
+    };
     std::string mode = argv[2];
     bool flag = argc > 3 && (!std::strcmp(argv[3], "--no-special") || !std::strcmp(argv[3], "--skip-special"));
     std::ios::sync_with_stdio(false);
@@ -81,6 +91,12 @@ int main(int argc, char** argv) {
       double secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - t1).count();
       std::printf("load %.2f s; %zu bytes -> %zu tokens in %.3f s (%.0f tokens/s)\n", load, s.size(), ids.size(), secs,
                   ids.size() / secs);
+    } else if (inkling && mode == "pretok") {
+      strings([&](std::string_view s) {
+        std::string line;
+        for (auto [b, e] : text::InklingTokenizer::pretokenize(s)) line += (line.empty() ? "" : " ") + std::to_string(e - b);
+        std::cout << line << '\n';
+      });
     } else if (qwen && mode == "pretok") {
       strings([&](std::string_view s) {
         std::string line;
