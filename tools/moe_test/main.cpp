@@ -207,6 +207,7 @@ int main(int argc, char** argv) {
         if (timing) {
           moe::ffn(q, layer, x, n, ids, wts, c.NU, c.beta, c.lb, *scratch, out);
           q.wait();
+          moe::profile_print(false);
           const auto s0 = std::chrono::steady_clock::now();
           const int r = n >= 512 ? std::max(2, reps / 4) : reps;
           for (int i = 0; i < r; ++i) moe::ffn(q, layer, x, n, ids, wts, c.NU, c.beta, c.lb, *scratch, out);
@@ -218,6 +219,7 @@ int main(int argc, char** argv) {
           const double bytes = double(distinct) * double(layer.gate_up.expert_bytes + layer.down.expert_bytes);
           std::printf("  time  %5lld tokens: %8.3f ms  %5lld experts %7.1f MB read, %6.1f GB/s  %9.0f tokens/s\n", (long long)n, ms,
                       (long long)distinct, bytes / 1e6, bytes / (ms * 1e-3) / 1e9, double(n) / (ms * 1e-3));
+          if (std::getenv("EKLOW_MOE_PROFILE")) moe::profile_print();
         }
       }
       for (const void* p : {(const void*)rg, (const void*)rd, (const void*)rr, (const void*)norm, (const void*)bias, (const void*)gs, (const void*)ds})

@@ -11,14 +11,17 @@
 //          nibbles (16 dwords [K octet][column], K low nibble first), then the 5th bits, a u16 per column per piece.
 //   Q8_0   (544 B, 8.5 bits)  meta: fp16 scale [32-K block][column]; piece: int8 in the fp16 B operand's order, word
 //          (K pair, column).
-// NVFP4 dequantizes without a table: a code's magnitude bits placed at fp16 bits 9..11 and the sign at 15, read as
-// fp16, are the e2m1 value / 2^14 (the denormal 0.5 included), so one exact multiply by 2^7 and one by the group's scale
-// (ue4m3 * 2^7, at most 57,344) give the value exactly in fp16.
+// NVFP4 dequantizes without a table: a code's magnitude bits placed at fp16 bits 9..11 and the sign at 15, read as fp16, are
+// the e2m1 value / 2^14 (the denormal 0.5 included; the dpas takes denormal inputs). The GEMVs feed those bits to the dpas
+// as they are and multiply each K16 result by its group's scale * 2^14 in fp32 ("scale-after"); the GEMM, whose B tile
+// serves many rows, multiplies the fp16 values by 2^7 and by the scale * 2^7 (at most 57,344) first: both exact in fp16.
 #include "kernels/moe.hpp"
 
 #include <sycl/ext/intel/esimd.hpp>
 
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
@@ -32,8 +35,10 @@ namespace xmxd = sycl::ext::intel::esimd::xmx;
 namespace {
 
 constexpr int kStepK = 64;        // K a record covers
-constexpr int kSlabTokens = 512;  // ffn runs longer steps in slabs of this many tokens (scratch size)
+constexpr int kSlabTokens = 1024; // ffn runs longer steps in slabs of this many tokens (scratch size)
 constexpr int kExperts = 128;     // the group kernel's work-group
+constexpr int kGemvRows = 4;      // rows of a GEMV tile (at most: the dpas repeat count 1, 2 or 4)
+constexpr int kGemmWM = 8;        // the GEMM tile: 16 * kGemmWM rows
 
 inline int64_t env_int(const char* name, int64_t def) {
   const char* v = std::getenv(name);
@@ -87,17 +92,18 @@ SYCL_ESIMD_FUNCTION inline esimd::simd<uint32_t, 64> nibbles_to_pairs(esimd::sim
   return W;
 }
 
-// Piece H (8 columns x 16 K, the dpas B operand in VNNI order: element (k, n) at (k / 2) * 16 + n * 2 + k % 2) of a record.
+// Piece H (8 columns x 16 K, the dpas B operand in VNNI order: element (k, n) at (k / 2) * 16 + n * 2 + k % 2) of a record:
+// `core` turns the piece's own bytes into it, `piece<H>` takes them from a whole record in registers, `Pc` + `load` +
+// `dequant` from the record in memory (a thread dequantizing one piece of a work-group's step).
 template <Format F>
 struct Dec;
 
 template <>
 struct Dec<Format::NVFP4> {
-  template <int H>
-  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> piece(esimd::simd<uint8_t, 288>& r) {
+  // sb: the piece's 8 scale bytes (ue4m3), cb: its 64 code bytes
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> core(esimd::simd<uint8_t, 8> sb, esimd::simd<uint8_t, 64> cb) {
     // The scales: ue4m3 (e, m) = (8 [e > 0] + m) 2^(max(e, 1) - 10), times 2^7.
-    esimd::simd<uint8_t, 8> xb = r.template select<8, 1>(8 * H);
-    esimd::simd<uint32_t, 8> x = xb;
+    esimd::simd<uint32_t, 8> x = sb;
     esimd::simd<uint32_t, 8> e = (x >> 3) & 15, m = x & 7, ex = e, mant = m;
     ex.merge(esimd::simd<uint32_t, 8>(1), e == 0);
     mant.merge(m + 8, e != 0);
@@ -106,7 +112,6 @@ struct Dec<Format::NVFP4> {
     esimd::simd<float, 8> mf = mant;
     esimd::simd<float, 8> scf = mf * p2 * 128.0f;
     esimd::simd<sycl::half, 8> sc = scf;
-    esimd::simd<uint8_t, 64> cb = r.template select<64, 1>(32 + 64 * H);
     esimd::simd<uint32_t, 16> D = cb.template bit_cast_view<uint32_t>();
     esimd::simd<uint32_t, 64> W;
 #pragma unroll
@@ -124,18 +129,57 @@ struct Dec<Format::NVFP4> {
     w = w * sycl::half(128.0f);
     return w * vnni_cols(sc);
   }
+  template <int H>
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> piece(esimd::simd<uint8_t, 288>& r) {
+    return core(r.template select<8, 1>(8 * H), r.template select<64, 1>(32 + 64 * H));
+  }
+  struct Pc {
+    esimd::simd<uint8_t, 8> m;
+    esimd::simd<uint8_t, 64> c;
+  };
+  SYCL_ESIMD_FUNCTION static void load(Pc& p, const uint8_t* rec, int h) {
+    p.m = esimd::block_load<uint8_t, 8>(rec + 8 * h);
+    p.c = esimd::block_load<uint8_t, 64>(rec + 32 + 64 * h);
+  }
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> dequant(Pc& p) { return core(p.m, p.c); }
+  // The scale-after form for the GEMVs: the code bits as fp16 are the e2m1 value / 2^14 (denormals the dpas takes as they
+  // are), the scales of a record's 4 pieces x 8 columns (32 bytes) as fp32 ue4m3 * 2^14, applied to the dpas result.
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> bits(esimd::simd<uint8_t, 64> cb) {
+    esimd::simd<uint32_t, 16> D = cb.template bit_cast_view<uint32_t>();
+    esimd::simd<uint32_t, 64> W;
+#pragma unroll
+    for (int kg = 0; kg < 2; ++kg) {
+      const esimd::simd<uint32_t, 8> d = D.template select<8, 1>(kg * 8);
+#pragma unroll
+      for (int q = 0; q < 4; ++q) {
+        const esimd::simd<uint32_t, 8> m_ = shift_by(d, 4 * q - 9) & 0x0E000E00u;
+        const esimd::simd<uint32_t, 8> s_ = shift_by(d, 4 * q - 12) & 0x80008000u;
+        W.template select<8, 1>((kg * 4 + q) * 8) = m_ | s_;
+      }
+    }
+    return W.template bit_cast_view<sycl::half>();
+  }
+  SYCL_ESIMD_FUNCTION static esimd::simd<float, 32> scales(esimd::simd<uint8_t, 32> sb) {
+    esimd::simd<uint32_t, 32> x = sb;
+    esimd::simd<uint32_t, 32> e = (x >> 3) & 15, m = x & 7, ex = e, mant = m;
+    ex.merge(esimd::simd<uint32_t, 32>(1), e == 0);
+    mant.merge(m + 8, e != 0);
+    esimd::simd<uint32_t, 32> pb = (ex + 131) << 23;  // 2^(ex - 10 + 14)
+    esimd::simd<float, 32> p2 = pb.template bit_cast_view<float>();
+    esimd::simd<float, 32> mf = mant;
+    return mf * p2;
+  }
 };
 
 template <>
 struct Dec<Format::Q5_K> {
-  template <int H>
-  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> piece(esimd::simd<uint8_t, 384>& r) {
-    esimd::simd<uint8_t, 16> dsb = r.template select<16, 1>((H / 2) * 32), dmb = r.template select<16, 1>((H / 2) * 32 + 16);
-    esimd::simd<sycl::half, 8> ds = dsb.template bit_cast_view<sycl::half>(), dm = dmb.template bit_cast_view<sycl::half>();
-    esimd::simd<uint8_t, 64> cb = r.template select<64, 1>(64 + 64 * H);
-    esimd::simd<uint32_t, 16> D = cb.template bit_cast_view<uint32_t>();
+  // dd: the sub-block's fp16 d*sc [8] and dmin*m [8], nb: the piece's nibbles, hb: its 5th bits
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> core(esimd::simd<uint8_t, 32> dd, esimd::simd<uint8_t, 64> nb,
+                                                               esimd::simd<uint8_t, 16> hb) {
+    esimd::simd<sycl::half, 16> dh = dd.template bit_cast_view<sycl::half>();
+    esimd::simd<sycl::half, 8> ds = dh.template select<8, 1>(0), dm = dh.template select<8, 1>(8);
+    esimd::simd<uint32_t, 16> D = nb.template bit_cast_view<uint32_t>();
     esimd::simd<uint32_t, 64> W = nibbles_to_pairs(D);
-    esimd::simd<uint8_t, 16> hb = r.template select<16, 1>(64 + 256 + 16 * H);
     esimd::simd<uint16_t, 8> h16 = hb.template bit_cast_view<uint16_t>();
     const esimd::simd<uint32_t, 8> hm = h16;
 #pragma unroll
@@ -147,19 +191,44 @@ struct Dec<Format::Q5_K> {
     x = x - vnni_cols(dm);
     return x;
   }
+  template <int H>
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> piece(esimd::simd<uint8_t, 384>& r) {
+    return core(r.template select<32, 1>((H / 2) * 32), r.template select<64, 1>(64 + 64 * H), r.template select<16, 1>(64 + 256 + 16 * H));
+  }
+  struct Pc {
+    esimd::simd<uint8_t, 32> d;
+    esimd::simd<uint8_t, 64> n;
+    esimd::simd<uint8_t, 16> h;
+  };
+  SYCL_ESIMD_FUNCTION static void load(Pc& p, const uint8_t* rec, int h) {
+    p.d = esimd::block_load<uint8_t, 32>(rec + (h / 2) * 32);
+    p.n = esimd::block_load<uint8_t, 64>(rec + 64 + 64 * h);
+    p.h = esimd::block_load<uint8_t, 16>(rec + 64 + 256 + 16 * h);
+  }
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> dequant(Pc& p) { return core(p.d, p.n, p.h); }
 };
 
 template <>
 struct Dec<Format::Q8_0> {
-  template <int H>
-  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> piece(esimd::simd<uint8_t, 544>& r) {
-    esimd::simd<uint8_t, 16> sb = r.template select<16, 1>((H / 2) * 16);
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> core(esimd::simd<uint8_t, 16> sb, esimd::simd<uint8_t, 128> qb) {
     esimd::simd<sycl::half, 8> sc = sb.template bit_cast_view<sycl::half>();
-    esimd::simd<uint8_t, 128> qb = r.template select<128, 1>(32 + 128 * H);
     esimd::simd<int8_t, 128> q8 = qb.template bit_cast_view<int8_t>();
     esimd::simd<sycl::half, 128> w = q8;
     return w * vnni_cols(sc);
   }
+  template <int H>
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> piece(esimd::simd<uint8_t, 544>& r) {
+    return core(r.template select<16, 1>((H / 2) * 16), r.template select<128, 1>(32 + 128 * H));
+  }
+  struct Pc {
+    esimd::simd<uint8_t, 16> s;
+    esimd::simd<uint8_t, 128> q;
+  };
+  SYCL_ESIMD_FUNCTION static void load(Pc& p, const uint8_t* rec, int h) {
+    p.s = esimd::block_load<uint8_t, 16>(rec + (h / 2) * 16);
+    p.q = esimd::block_load<uint8_t, 128>(rec + 32 + 128 * h);
+  }
+  SYCL_ESIMD_FUNCTION static esimd::simd<sycl::half, 128> dequant(Pc& p) { return core(p.s, p.q); }
 };
 
 // act16 layout (xmx's): row tiles of 8 rows x K16, 256 bytes each, row-major in the tile.
@@ -183,15 +252,27 @@ SYCL_ESIMD_FUNCTION inline esimd::simd<float, 8> situ8(esimd::simd<float, 8> g, 
 //   first row, rows holding pairs. An expert's pairs fill its segment in token order (stable, so results do not depend on
 //   scheduling); a segment is cut into tiles of T rows. rop[p] = pair p's row.
 void group(sycl::queue& q, const int32_t* ids, int64_t P, int64_t E, int T, int32_t* tl, int32_t* rop) {
+  // 128 items: item i counts the pairs of its contiguous chunk per expert (hist[i][e], 16 bits), item e then turns column
+  // e of the table into the chunks' starts within expert e and the expert's count, one item lays out the segments and
+  // tiles, and item i places its chunk's pairs: stable, deterministic, no atomics.
   q.submit([&](sycl::handler& h) {
-    sycl::local_accessor<int32_t, 1> cnt(sycl::range<1>(256), h), start(sycl::range<1>(256), h);
-    const int32_t p_n = int32_t(P), e_n = int32_t(E);
+    sycl::local_accessor<uint16_t, 1> hist(sycl::range<1>(kExperts * kExperts), h);
+    sycl::local_accessor<int32_t, 1> cnt(sycl::range<1>(kExperts), h), start(sycl::range<1>(kExperts), h);
+    const int32_t p_n = int32_t(P), e_n = int32_t(E), chunk = int32_t((P + kExperts - 1) / kExperts);
     h.parallel_for(sycl::nd_range<1>(kExperts, kExperts), [=](sycl::nd_item<1> it) {
       const int lid = int(it.get_local_id(0));
-      for (int e = lid; e < e_n; e += kExperts) {
-        int c = 0;
-        for (int p = 0; p < p_n; ++p) c += ids[p] == e;
-        cnt[e] = c;
+      for (int e = 0; e < e_n; ++e) hist[lid * kExperts + e] = 0;
+      const int p0 = lid * chunk, p1 = sycl::min(p0 + chunk, p_n);
+      for (int p = p0; p < p1; ++p) hist[lid * kExperts + ids[p]] += 1;
+      sycl::group_barrier(it.get_group());
+      if (lid < e_n) {
+        int run = 0;
+        for (int i = 0; i < kExperts; ++i) {
+          const int c = hist[i * kExperts + lid];
+          hist[i * kExperts + lid] = uint16_t(run);
+          run += c;
+        }
+        cnt[lid] = run;
       }
       sycl::group_barrier(it.get_group());
       if (lid == 0) {
@@ -211,10 +292,10 @@ void group(sycl::queue& q, const int32_t* ids, int64_t P, int64_t E, int T, int3
         tl[1] = row;
       }
       sycl::group_barrier(it.get_group());
-      for (int e = lid; e < e_n; e += kExperts) {
-        int pos = start[e];
-        for (int p = 0; p < p_n; ++p)
-          if (ids[p] == e) rop[p] = pos++;
+      for (int p = p0; p < p1; ++p) {
+        const int e = ids[p];
+        rop[p] = start[e] + int(hist[lid * kExperts + e]);
+        hist[lid * kExperts + e] += 1;
       }
     });
   });
@@ -261,7 +342,7 @@ struct Combine {
 // reduce through shared local memory. GU: the unit is a gate group and its up group, the epilogue SITU into fp16 rows of
 // `out_h` (width n_ff); down: fp32 rows of `out_y`. Each thread streams its slice's records double-buffered in registers
 // (the next step's loads go out before this step's dpas); the row count of the tile picks the dpas repeat count.
-template <Format F, bool GU, int S, int CG>
+template <Format F, bool GU, int S, int CG, bool SA>
 struct Gemv {
   static constexpr int REC = Fd<F>::REC;
   const sycl::half* a;
@@ -279,7 +360,7 @@ struct Gemv {
   SYCL_ESIMD_FUNCTION void run(int u, int sl, int e, int row0, int valid) const {
     const int ns = kst / S, s0 = sl * ns;
     const uint8_t* eb = data + uint64_t(e) * expert_bytes;
-    const sycl::half* ap = a + int64_t(row0 / 8) * (4 * int64_t(kst)) * 128;
+    const sycl::half* ap = a + int64_t(row0 / 8) * (4 * int64_t(kst)) * 128 + (row0 % 8) * 16;
     esimd::simd<uint8_t, REC> bufA[CG], bufB[CG];
     esimd::simd<float, 8 * RC> acc[CG][4];
 #pragma unroll
@@ -292,15 +373,45 @@ struct Gemv {
       for (int c = 0; c < CG; ++c) buf[c] = esimd::block_load<uint8_t, REC>(p + c * REC);
     };
     auto compute = [&](esimd::simd<uint8_t, REC>(&buf)[CG], int s) SYCL_ESIMD_FUNCTION {
-      esimd::simd<sycl::half, 16 * RC> A[4];
+      const sycl::half* as = ap + 4 * int64_t(s) * 128;
+      if constexpr (SA) {
 #pragma unroll
-      for (int h = 0; h < 4; ++h) A[h] = esimd::block_load<sycl::half, 16 * RC>(ap + (4 * int64_t(s) + h) * 128);
+        for (int c = 0; c < CG; ++c) {
+          esimd::simd<uint8_t, 32> sb = buf[c].template select<32, 1>(0);
+          esimd::simd<float, 32> sc = Dec<F>::scales(sb);
+          const esimd::simd<sycl::half, 16 * RC> A0 = esimd::block_load<sycl::half, 16 * RC>(as), A1 = esimd::block_load<sycl::half, 16 * RC>(as + 128),
+                                                 A2 = esimd::block_load<sycl::half, 16 * RC>(as + 256), A3 = esimd::block_load<sycl::half, 16 * RC>(as + 384);
+          esimd::simd<float, 8 * RC> r0 = xmxd::dpas<8, RC, float>(Dec<F>::bits(buf[c].template select<64, 1>(32)), A0);
+          esimd::simd<float, 8 * RC> r1 = xmxd::dpas<8, RC, float>(Dec<F>::bits(buf[c].template select<64, 1>(96)), A1);
+          esimd::simd<float, 8 * RC> r2 = xmxd::dpas<8, RC, float>(Dec<F>::bits(buf[c].template select<64, 1>(160)), A2);
+          esimd::simd<float, 8 * RC> r3 = xmxd::dpas<8, RC, float>(Dec<F>::bits(buf[c].template select<64, 1>(224)), A3);
+          { esimd::simd<float, 8> sv0 = sc.template select<8, 1>(0); acc[c][0] += r0 * sv0.template replicate<RC>(); }
+          { esimd::simd<float, 8> sv1 = sc.template select<8, 1>(8); acc[c][1] += r1 * sv1.template replicate<RC>(); }
+          { esimd::simd<float, 8> sv2 = sc.template select<8, 1>(16); acc[c][2] += r2 * sv2.template replicate<RC>(); }
+          { esimd::simd<float, 8> sv3 = sc.template select<8, 1>(24); acc[c][3] += r3 * sv3.template replicate<RC>(); }
+        }
+        return;
+      }
+      // one K16 piece at a time: its activation tile once for the unit's column groups
+      {
+        const esimd::simd<sycl::half, 16 * RC> A = esimd::block_load<sycl::half, 16 * RC>(as);
 #pragma unroll
-      for (int c = 0; c < CG; ++c) {
-        acc[c][0] = xmxd::dpas<8, RC, float>(acc[c][0], Dec<F>::template piece<0>(buf[c]), A[0]);
-        acc[c][1] = xmxd::dpas<8, RC, float>(acc[c][1], Dec<F>::template piece<1>(buf[c]), A[1]);
-        acc[c][2] = xmxd::dpas<8, RC, float>(acc[c][2], Dec<F>::template piece<2>(buf[c]), A[2]);
-        acc[c][3] = xmxd::dpas<8, RC, float>(acc[c][3], Dec<F>::template piece<3>(buf[c]), A[3]);
+        for (int c = 0; c < CG; ++c) acc[c][0] = xmxd::dpas<8, RC, float>(acc[c][0], Dec<F>::template piece<0>(buf[c]), A);
+      }
+      {
+        const esimd::simd<sycl::half, 16 * RC> A = esimd::block_load<sycl::half, 16 * RC>(as + 128);
+#pragma unroll
+        for (int c = 0; c < CG; ++c) acc[c][1] = xmxd::dpas<8, RC, float>(acc[c][1], Dec<F>::template piece<1>(buf[c]), A);
+      }
+      {
+        const esimd::simd<sycl::half, 16 * RC> A = esimd::block_load<sycl::half, 16 * RC>(as + 256);
+#pragma unroll
+        for (int c = 0; c < CG; ++c) acc[c][2] = xmxd::dpas<8, RC, float>(acc[c][2], Dec<F>::template piece<2>(buf[c]), A);
+      }
+      {
+        const esimd::simd<sycl::half, 16 * RC> A = esimd::block_load<sycl::half, 16 * RC>(as + 384);
+#pragma unroll
+        for (int c = 0; c < CG; ++c) acc[c][3] = xmxd::dpas<8, RC, float>(acc[c][3], Dec<F>::template piece<3>(buf[c]), A);
       }
     };
     ld(bufA, s0);
@@ -349,22 +460,23 @@ struct Gemv {
     const int e = tl[4 + 4 * tm], row0 = tl[5 + 4 * tm], valid = tl[6 + 4 * tm];
     if (valid <= 1) run<1>(u, sl, e, row0, valid);
     else if (valid <= 2) run<2>(u, sl, e, row0, valid);
-    else if (valid <= 4) run<4>(u, sl, e, row0, valid);
-    else run<8>(u, sl, e, row0, valid);
+    else run<4>(u, sl, e, row0, valid);
   }
 };
 
 // ---------------------------------------------------------------------------------------------------------------------
 // Prefill: a grouped fp16 GEMM. A work-group of WM x WN threads takes one tile of 16 WM rows of one expert and 32 WN
 // output columns (4 WN column groups); a thread computes 16 x 32. Per K step the threads dequantize the group's records
-// to fp16 B operands and copy the activation pieces into shared local memory (two buffers: the next step's global loads
-// go out before this step's dpas), then every thread reads its operands from there.
-template <Format F, bool GU, int WM, int WN, int CG>
+// to fp16 B operands (a thread a piece: 8 columns x 16 K) and copy the activation pieces into shared local memory (two buffers:
+// the next step's global loads go out before this step's dpas), then every thread reads its operands from there. D > 1
+// (loads D steps ahead) and NA > 1 (more accumulators) were measured slower: the registers spill.
+template <Format F, bool GU, int WM, int WN, int CG, int NA, int D>
 struct Gemm {
   static constexpr int NT = WM * WN, BT = WN * 4, AT = WM * 2, REC = Fd<F>::REC;
   static constexpr int kBPieces = BT * 4, kAPieces = AT * 4;
-  static constexpr int BP = (BT + NT - 1) / NT, AP = (kAPieces + NT - 1) / NT;
+  static constexpr int BP = kBPieces / NT, AP = (kAPieces + NT - 1) / NT;  // pieces a thread dequantizes / copies a step
   static constexpr uint32_t kBBuf = kBPieces * 256, kBuf = kBBuf + kAPieces * 256;
+  static_assert(kBPieces % NT == 0, "the pieces of a step split evenly over the threads");
   const sycl::half* a;
   const uint8_t* data;
   uint64_t expert_bytes;
@@ -383,15 +495,17 @@ struct Gemm {
     const int e = live ? tl[4 + 4 * tm] : 0, row0 = live ? tl[5 + 4 * tm] : 0, valid = live ? tl[6 + 4 * tm] : 0;
     const int kbl = live ? int(kst) : 0, kh = 4 * kst;
     const uint8_t* eb = data + uint64_t(e) * expert_bytes;
-    esimd::simd<uint8_t, REC> R[BP];
+    typename Dec<F>::Pc R[D][BP];
     esimd::simd<sycl::half, 128> Araw[AP];
-    auto load = [&](int b) SYCL_ESIMD_FUNCTION {
+    // thread t dequantizes pieces t + i NT of the step: column group p / 4 of the work-group, K16 piece p % 4
+    auto load = [&](int slot, int b) SYCL_ESIMD_FUNCTION {
 #pragma unroll
       for (int i = 0; i < BP; ++i) {
-        const int g = tn * BT + tid + i * NT;
-        if (tid + i * NT >= BT) break;
-        R[i] = esimd::block_load<uint8_t, REC>(eb + ((int64_t(g / CG) * kst + b) * CG + g % CG) * REC);
+        const int p = tid + i * NT, g = tn * BT + p / 4;
+        Dec<F>::load(R[slot][i], eb + ((int64_t(g / CG) * kst + b) * CG + g % CG) * REC, p % 4);
       }
+    };
+    auto load_a = [&](int b) SYCL_ESIMD_FUNCTION {
 #pragma unroll
       for (int i = 0; i < AP; ++i) {
         const int p = tid + i * NT;
@@ -399,51 +513,63 @@ struct Gemm {
         Araw[i] = esimd::block_load<sycl::half, 128>(a + (int64_t(row0 / 8 + p / 4) * kh + 4 * b + p % 4) * 128);
       }
     };
-    auto store = [&](uint32_t buf) SYCL_ESIMD_FUNCTION {
+    auto store = [&](int slot, uint32_t buf) SYCL_ESIMD_FUNCTION {
 #pragma unroll
-      for (int i = 0; i < BP; ++i) {
-        const int g = tid + i * NT;
-        if (g >= BT) break;
-        esimd::slm_block_store<sycl::half, 128>(buf + (g * 4 + 0) * 256, Dec<F>::template piece<0>(R[i]));
-        esimd::slm_block_store<sycl::half, 128>(buf + (g * 4 + 1) * 256, Dec<F>::template piece<1>(R[i]));
-        esimd::slm_block_store<sycl::half, 128>(buf + (g * 4 + 2) * 256, Dec<F>::template piece<2>(R[i]));
-        esimd::slm_block_store<sycl::half, 128>(buf + (g * 4 + 3) * 256, Dec<F>::template piece<3>(R[i]));
-      }
+      for (int i = 0; i < BP; ++i) esimd::slm_block_store<sycl::half, 128>(buf + (tid + i * NT) * 256, Dec<F>::dequant(R[slot][i]));
 #pragma unroll
       for (int i = 0; i < AP; ++i)
         if (tid + i * NT < kAPieces) esimd::slm_block_store<sycl::half, 128>(buf + kBBuf + (tid + i * NT) * 256, Araw[i]);
     };
-    esimd::simd<float, 64> acc[2][4];
+    esimd::simd<float, 64> acc[NA][2][4];
 #pragma unroll
-    for (int r = 0; r < 2; ++r)
+    for (int n = 0; n < NA; ++n)
 #pragma unroll
-      for (int c = 0; c < 4; ++c) acc[r][c] = 0;
+      for (int r = 0; r < 2; ++r)
+#pragma unroll
+        for (int c = 0; c < 4; ++c) acc[n][r][c] = 0;
     if (kbl > 0) {
-      load(0);
-      store(0);
+#pragma unroll
+      for (int j = 0; j < D; ++j)
+        if (j < kbl) load(j, j);
+      load_a(0);
+      store(0, 0);
     }
     esimd::barrier();
-    for (int b = 0; b < kbl; ++b) {
-      const uint32_t cur = (b & 1) * kBuf, nxt = kBuf - cur;
-      if (b + 1 < kst) load(b + 1);
+    // step b computes from the shared buffer b % 2 while the registers of slot b % D hold step b's pieces, already stored;
+    // loads for step b + D go into that slot, and step b + 1's pieces (slot (b + 1) % D) are dequantized into the other buffer
+    for (int b0 = 0; b0 < kbl; b0 += D) {
 #pragma unroll
-      for (int h = 0; h < 4; ++h) {
-        esimd::simd<sycl::half, 128> A[2];
+      for (int j = 0; j < D; ++j) {
+        const int b = b0 + j;
+        if (b >= kbl) break;
+        const uint32_t cur = (b & 1) * kBuf, nxt = kBuf - cur;
+        if (b + D < kst) load(j, b + D);
+        if (b + 1 < kst) load_a(b + 1);
 #pragma unroll
-        for (int r = 0; r < 2; ++r) A[r] = esimd::slm_block_load<sycl::half, 128>(cur + kBBuf + ((wi * 2 + r) * 4 + h) * 256);
+        for (int h = 0; h < 4; ++h) {
+          esimd::simd<sycl::half, 128> A[2];
 #pragma unroll
-        for (int c = 0; c < 4; ++c) {
-          const esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4 + c) * 4 + h) * 256);
+          for (int r = 0; r < 2; ++r) A[r] = esimd::slm_block_load<sycl::half, 128>(cur + kBBuf + ((wi * 2 + r) * 4 + h) * 256);
 #pragma unroll
-          for (int r = 0; r < 2; ++r)
-            if ((wi * 2 + r) * 8 < valid) acc[r][c] = xmxd::dpas<8, 8, float>(acc[r][c], B, A[r]);
+          for (int c = 0; c < 4; ++c) {
+            const esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4 + c) * 4 + h) * 256);
+#pragma unroll
+            for (int r = 0; r < 2; ++r)
+              if ((wi * 2 + r) * 8 < valid) acc[h % NA][r][c] = xmxd::dpas<8, 8, float>(acc[h % NA][r][c], B, A[r]);
+          }
         }
+        if (b + 1 < kst) store((j + 1) % D, nxt);
+        esimd::barrier();
       }
-      if (b + 1 < kst) store(nxt);
-      esimd::barrier();
     }
     if (!live) return;
     const float sc = scale ? scale[e] : 1.0f;
+#pragma unroll
+    for (int r = 0; r < 2; ++r)
+#pragma unroll
+      for (int c = 0; c < 4; ++c)
+#pragma unroll
+        for (int n = 1; n < NA; ++n) acc[0][r][c] += acc[n][r][c];
 #pragma unroll
     for (int r = 0; r < 2; ++r)
 #pragma unroll
@@ -454,8 +580,8 @@ struct Gemm {
         if constexpr (GU) {
 #pragma unroll
           for (int c = 0; c < 4; c += 2) {
-            const esimd::simd<float, 8> g = acc[r][c].template select<8, 1>(i * 8) * sc,
-                                        up = acc[r][c + 1].template select<8, 1>(i * 8) * sc;
+            const esimd::simd<float, 8> g = acc[0][r][c].template select<8, 1>(i * 8) * sc,
+                                        up = acc[0][r][c + 1].template select<8, 1>(i * 8) * sc;
             esimd::simd<sycl::half, 8> h = situ8(g, up, beta, lb);
             const int pu = (tn * BT + wj * 4 + c) / 2;
             esimd::block_store<sycl::half, 8>(out_h + act16_index(row, pu * 8, n_ff / 16), h);
@@ -464,7 +590,7 @@ struct Gemm {
 #pragma unroll
           for (int c = 0; c < 4; ++c)
             esimd::block_store<float, 8>(out_y + int64_t(row) * n_out + (tn * BT + wj * 4 + c) * 8,
-                                         acc[r][c].template select<8, 1>(i * 8) * sc);
+                                         acc[0][r][c].template select<8, 1>(i * 8) * sc);
         }
       }
   }
@@ -677,7 +803,7 @@ Scratch* reserve(sycl::queue& q, int64_t max_tokens, int64_t n_used, int64_t n_e
   s->n_ff = n_ff;
   const int64_t P = s->slab * n_used;
   s->rows = P + 8 * std::min<int64_t>(kExperts * 2, P) + 128;  // segments padded to 8 rows, and the last tile's slack
-  s->max_tiles = P / 8 + kExperts * 2 + 1;
+  s->max_tiles = P / kGemvRows + kExperts * 2 + 1;
   auto dev = [&](size_t bytes) {
     void* p = sycl::malloc_device(bytes, q);
     if (!p) throw std::runtime_error("moe: out of device memory for the scratch");
@@ -707,67 +833,127 @@ uint64_t scratch_bytes(const Scratch& s) { return s.bytes; }
 
 namespace {
 
+template <Format F, int CG, int S, bool SA>
+void gemv_gu_s(sycl::queue& q, const Layer& L, Scratch& s, int64_t max_tiles, float beta, float lb) {
+  const Table& t = L.gate_up;
+  const int64_t units = t.n / 8 / CG;
+  Gemv<F, true, S, CG, SA> k{s.a, L.base + t.offset, t.expert_bytes, s.tl, L.gate_up_scale, s.h, nullptr, int32_t(t.k / kStepK), int32_t(t.n), int32_t(L.n_ff), beta, lb};
+  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(max_tiles) * S, size_t(units)), sycl::range<2>(S, 1)), k);
+}
+
+template <Format F, int CG, int S, bool SA>
+void gemv_down_s(sycl::queue& q, const Layer& L, Scratch& s, int64_t max_tiles) {
+  const Table& t = L.down;
+  const int64_t units = t.n / 8 / CG;
+  Gemv<F, false, S, CG, SA> k{s.h, L.base + t.offset, t.expert_bytes, s.tl, L.down_scale, nullptr, s.y, int32_t(t.k / kStepK), int32_t(t.n), 0, 0, 0};
+  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(max_tiles) * S, size_t(units)), sycl::range<2>(S, 1)), k);
+}
+
+// K splits of the GEMVs (threads a work-group): gate_up's K is 36 steps, down's 18 (Q8_0's records are bigger: 3 threads and
+// one column group each). NVFP4 runs scale-after (Gemv::compute); the others dequantize with their scales first.
 template <Format F, int CG>
 void gemv_gu(sycl::queue& q, const Layer& L, Scratch& s, int64_t max_tiles, float beta, float lb) {
-  const Table& t = L.gate_up;
-  constexpr int S = 4;
-  const int64_t units = t.n / 8 / CG;
-  Gemv<F, true, S, CG> k{s.a, L.base + t.offset, t.expert_bytes, s.tl, L.gate_up_scale, s.h, nullptr, int32_t(t.k / kStepK), int32_t(t.n), int32_t(L.n_ff), beta, lb};
-  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(max_tiles) * S, size_t(units)), sycl::range<2>(S, 1)), k);
+  gemv_gu_s<F, CG, 4, F == Format::NVFP4>(q, L, s, max_tiles, beta, lb);
 }
 
 template <Format F, int CG>
 void gemv_down(sycl::queue& q, const Layer& L, Scratch& s, int64_t max_tiles) {
-  const Table& t = L.down;
-  constexpr int S = CG == 2 ? 2 : 3;
-  const int64_t units = t.n / 8 / CG;
-  Gemv<F, false, S, CG> k{s.h, L.base + t.offset, t.expert_bytes, s.tl, L.down_scale, nullptr, s.y, int32_t(t.k / kStepK), int32_t(t.n), 0, 0, 0};
-  q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(max_tiles) * S, size_t(units)), sycl::range<2>(S, 1)), k);
+  gemv_down_s<F, CG, 3, F == Format::NVFP4>(q, L, s, max_tiles);
 }
 
-template <Format F, int CG, int WM>
+template <Format F, int CG, int WM, int NA, int D>
 void gemm_gu(sycl::queue& q, const Layer& L, Scratch& s, int64_t max_tiles, float beta, float lb) {
   const Table& t = L.gate_up;
   constexpr int WN = 4;
-  Gemm<F, true, WM, WN, CG> k{s.a, L.base + t.offset, t.expert_bytes, s.tl, L.gate_up_scale, s.h, nullptr, int32_t(t.k / kStepK), int32_t(t.n), int32_t(L.n_ff), beta, lb};
+  Gemm<F, true, WM, WN, CG, NA, D> k{s.a, L.base + t.offset, t.expert_bytes, s.tl, L.gate_up_scale, s.h, nullptr, int32_t(t.k / kStepK), int32_t(t.n), int32_t(L.n_ff), beta, lb};
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(max_tiles) * WM, size_t(t.n / 8 / 4 / WN) * WN), sycl::range<2>(WM, WN)), k);
 }
 
-template <Format F, int CG, int WM>
+template <Format F, int CG, int WM, int NA, int D>
 void gemm_down(sycl::queue& q, const Layer& L, Scratch& s, int64_t max_tiles) {
   const Table& t = L.down;
   constexpr int WN = 4;
-  Gemm<F, false, WM, WN, CG> k{s.h, L.base + t.offset, t.expert_bytes, s.tl, L.down_scale, nullptr, s.y, int32_t(t.k / kStepK), int32_t(t.n), 0, 0, 0};
+  Gemm<F, false, WM, WN, CG, NA, D> k{s.h, L.base + t.offset, t.expert_bytes, s.tl, L.down_scale, nullptr, s.y, int32_t(t.k / kStepK), int32_t(t.n), 0, 0, 0};
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(max_tiles) * WM, size_t(t.n / 8 / 4 / WN) * WN), sycl::range<2>(WM, WN)), k);
 }
 
 }  // namespace
 
+namespace {
+
+// EKLOW_MOE_PROFILE=1: every stage of ffn waits and is timed; profile_print() reports the sums.
+double g_prof[6] = {};
+const char* const kProfNames[6] = {"group", "gather", "gate_up", "down", "combine", "calls"};
+
+template <int WM, int NA, int D>
+void gemms(sycl::queue& q, const Layer& L, Scratch& s, int64_t tiles, float beta, float lb, bool prof) {
+  auto stage = [&](int i, auto&& f) {
+    if (!prof) return f();
+    q.wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    f();
+    q.wait();
+    g_prof[i] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  };
+  stage(2, [&] {
+    if (L.gate_up.format == Format::NVFP4) gemm_gu<Format::NVFP4, 2, WM, NA, D>(q, L, s, tiles, beta, lb);
+    else gemm_gu<Format::Q5_K, 2, WM, NA, D>(q, L, s, tiles, beta, lb);
+  });
+  stage(3, [&] {
+    if (L.down.format == Format::NVFP4) gemm_down<Format::NVFP4, 2, WM, NA, D>(q, L, s, tiles);
+    else gemm_down<Format::Q8_0, 1, WM, NA, D>(q, L, s, tiles);
+  });
+}
+
+}  // namespace
+
+void profile_print(bool print) {
+  for (int i = 0; print && i < 6; ++i) std::printf("    %-8s %9.3f ms\n", kProfNames[i], i == 5 ? g_prof[i] : g_prof[i] / std::max(1.0, g_prof[5]));
+  for (double& v : g_prof) v = 0;
+}
+
 void ffn(sycl::queue& q, const Layer& L, const float* x, int64_t n_tok, const int32_t* ids, const float* w, int64_t n_used,
          float situ_beta, float situ_linear_beta, Scratch& s, float* out) {
   if (n_used != s.n_used || L.n_embd != s.n_embd || L.n_ff != s.n_ff) throw std::runtime_error("moe: scratch shape differs from the layer's");
-  const int64_t gemm_min = env_int("EKLOW_MOE_GEMM_MIN", 24);  // tokens above which the GEMM runs
+  // Tokens above which the GEMM beats the GEMVs (measured on layers 6 and 20, DECISIONS 2026-11-24, "Inkling M2: the experts")
+  const int64_t gemm_min = env_int("EKLOW_MOE_GEMM_MIN", L.gate_up.format == Format::NVFP4 ? 448 : 256);
+  const int wm = kGemmWM;
+  const bool prof = env_int("EKLOW_MOE_PROFILE", 0) != 0;
+  auto stage = [&](int i, auto&& f) {
+    if (!prof) return f();
+    q.wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    f();
+    q.wait();
+    g_prof[i] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+  };
   for (int64_t t0 = 0; t0 < n_tok; t0 += s.slab) {
     const int64_t tc = std::min(s.slab, n_tok - t0), P = tc * n_used;
     const bool use_gemm = tc > gemm_min;
-    const int T = use_gemm ? 64 : 8;
+    const int T = use_gemm ? 16 * wm : kGemvRows;
     const int64_t tiles = std::min<int64_t>(P, (P + T - 1) / T + L.n_expert);
-    group(q, ids + t0 * n_used, P, L.n_expert, T, s.tl, s.rop);
-    q.parallel_for(sycl::range<2>(size_t(P), size_t(L.n_embd / 64)), Gather{x + t0 * L.n_embd, s.rop, s.a, int32_t(n_used), int32_t(L.n_embd)});
+    stage(0, [&] { group(q, ids + t0 * n_used, P, L.n_expert, T, s.tl, s.rop); });
+    stage(1, [&] {
+      q.parallel_for(sycl::range<2>(size_t(P), size_t(L.n_embd / 64)), Gather{x + t0 * L.n_embd, s.rop, s.a, int32_t(n_used), int32_t(L.n_embd)});
+    });
     const Format fg = L.gate_up.format, fd = L.down.format;
     if (!use_gemm) {
-      if (fg == Format::NVFP4) gemv_gu<Format::NVFP4, 2>(q, L, s, tiles, situ_beta, situ_linear_beta);
-      else gemv_gu<Format::Q5_K, 2>(q, L, s, tiles, situ_beta, situ_linear_beta);
-      if (fd == Format::NVFP4) gemv_down<Format::NVFP4, 2>(q, L, s, tiles);
-      else gemv_down<Format::Q8_0, 1>(q, L, s, tiles);
+      stage(2, [&] {
+        if (fg == Format::NVFP4) gemv_gu<Format::NVFP4, 2>(q, L, s, tiles, situ_beta, situ_linear_beta);
+        else gemv_gu<Format::Q5_K, 2>(q, L, s, tiles, situ_beta, situ_linear_beta);
+      });
+      stage(3, [&] {
+        if (fd == Format::NVFP4) gemv_down<Format::NVFP4, 2>(q, L, s, tiles);
+        else gemv_down<Format::Q8_0, 1>(q, L, s, tiles);
+      });
     } else {
-      if (fg == Format::NVFP4) gemm_gu<Format::NVFP4, 2, 4>(q, L, s, tiles, situ_beta, situ_linear_beta);
-      else gemm_gu<Format::Q5_K, 2, 4>(q, L, s, tiles, situ_beta, situ_linear_beta);
-      if (fd == Format::NVFP4) gemm_down<Format::NVFP4, 2, 4>(q, L, s, tiles);
-      else gemm_down<Format::Q8_0, 1, 4>(q, L, s, tiles);
+      gemms<kGemmWM, 1, 1>(q, L, s, tiles, situ_beta, situ_linear_beta, prof);
     }
-    q.parallel_for(sycl::range<2>(size_t(tc), size_t(L.n_embd / 128)), Combine{s.y, w + t0 * n_used, s.rop, out + t0 * L.n_embd, int32_t(n_used), int32_t(L.n_embd)});
+    stage(4, [&] {
+      q.parallel_for(sycl::range<2>(size_t(tc), size_t(L.n_embd / 128)), Combine{s.y, w + t0 * n_used, s.rop, out + t0 * L.n_embd, int32_t(n_used), int32_t(L.n_embd)});
+    });
   }
+  g_prof[5] += 1;
 }
 
 }  // namespace eklow::moe

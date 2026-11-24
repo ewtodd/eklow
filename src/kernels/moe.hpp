@@ -61,6 +61,8 @@ Scratch* reserve(sycl::queue& q, int64_t max_tokens, int64_t n_used, int64_t n_e
 void free_scratch(sycl::queue& q, Scratch* s);
 uint64_t scratch_bytes(const Scratch& s);
 int64_t scratch_slab();
+// With EKLOW_MOE_PROFILE=1 in the environment, ffn times its stages (waiting after each); prints the means per call and resets.
+void profile_print(bool print = true);
 
 // out[t][:] for t < n_tok, fp32 [n_tok][n_embd]; x fp32 [n_tok][n_embd]; ids int32 and w fp32 [n_tok][n_used] on the
 // device. Enqueues only (in-order queue).

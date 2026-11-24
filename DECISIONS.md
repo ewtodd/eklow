@@ -3900,3 +3900,86 @@ What follows for the next milestones:
 - The replay's llama.cpp ran with flash attention (the bias cast to fp16) and fp16 K/V; that is inside the same spread.
 - Under noise the chosen experts change at 1-7% of (position, slot): the hot and cold placement of M3 must not lean on a
   token's route being stable.
+
+## 2026-11-24 — Inkling M2: the experts on the card (`src/kernels/moe.*`, `eklow-moe-test`)
+
+One layer's MoE FFN on the A770M: NVFP4 (layers 0-19) kept at ggml's 4.5 bits and run on the matrix units with fp16
+activations; Q5_K gate_up and Q8_0 down (layers 20-23); the per-expert scales and SITU fused into the kernels' epilogues.
+Checked on the card against the reference ops (`ref::matmul_experts`, `situ`, `moe_combine`, fp32) on the real GGUF's layers
+0, 6, 17, 19, 20, 23 (inputs: random rows, RMS-normed and times `ffn_norm`, routed by the layer's own router). The experts'
+formats and the kernels live in `moe.cpp`, not in `xmx.*` (the interface in `moe.hpp` had to change: see below).
+
+**Layouts.** A matrix is records of 8 output columns x 64 K, `[column unit][K step][column group of the unit]`, a record
+meta bytes then four K16 pieces (each the 8 x 16 dpas B operand), loaded contiguously. Gate_up's two halves are interleaved by
+8-column group (unit = a gate group and its up group, so one thread holds both for SITU); down's unit is 2 groups (1 for Q8_0).
+- NVFP4, 288 B per 512 weights (4.5 bits): the 4 ue4m3 scale bytes per column, then per piece 16 dwords `[K octet][column]`
+  of 8 codes, a K pair's two codes in nibbles q and 4+q so that they sit in the two fp16 lanes of one dword. Decoding
+  needs no table: a code's three magnitude bits at fp16 bits 9..11 and the sign at 15 read as fp16 are the e2m1 value /
+  2^14 (0.5 is a denormal, which the dpas takes: checked), then two exact multiplies (2^7, and the scale * 2^7, at most
+  57,344) give the value in fp16 (e2m1 x ue4m3 is exact), or, in the GEMVs, the bits go to the dpas as they are and each
+  K16 result is multiplied by its scale * 2^14 in fp32 ("scale-after": the vector units spend about 0.3 instruction per
+  weight less and the decode GEMV, ALU-bound on the dequantization, gains 20% at 3-4 tokens).
+- Q5_K, 384 B per 512 (6 bits; ggml's 5.5): fp16 `d*sc` and `dmin*m` per 32-K sub-block (rounded to fp16 as the Qwen path
+  did), the nibbles and the 5th bits apart. Q8_0, 544 B per 512 (8.5 bits): the fp16 scales and the int8 in the B operand's
+  order. Both dequantize with their scales before the dpas.
+- One layer is one device allocation (`Layer::base`, `bytes`: both matrices and the scales, 546.8 MiB for NVFP4 layers,
+  830.2 MiB for Q5_K/Q8_0), expert e at `offset + e * expert_bytes` (no pointer tables), so `moe::rebase(L, new_base)` is
+  host-side only and the engine can keep layers in pinned host memory and copy them back. The check copies a layer through
+  host memory, rebases and runs: the output is bit-identical at 1, 8 and 2,048 tokens on all six layers.
+
+**Kernels.**
+- `group`: the (token, slot) pairs counted per expert and placed stably (deterministic, no atomics) into segments padded
+  to 8 rows, cut into tiles; then `Gather` writes x as fp16 into the sorted rows (xmx's act16 layout).
+- Decode, up to ~450 tokens: grouped GEMVs over tiles of at most 4 rows of one expert (dpas repeat count 1, 2 or 4 by the
+  tile's rows; tokens sharing an expert read its weights once). A work-group is a tile and a column unit, 4 threads split K
+  (down: 3) and reduce through shared local memory; each thread streams its slice double-buffered in registers. gate_up
+  ends in SITU into fp16 rows, down in fp32 rows x the expert's scale, `Combine` sums a token's 8 rows in the reference's order.
+- Prefill: a grouped GEMM, a work-group of 8 x 4 threads = 128 rows of one expert x 128 columns, each thread dequantizing
+  2 pieces of a K step into shared local memory (two buffers; the next step's loads go out before the dpas), 2 x 4
+  accumulators of 8 x 8 a thread; row tiles past an expert's rows skip their dpas.
+- Slabs: `ffn` runs more than `scratch_slab()` = 1,024 tokens (8,192 pairs) in slabs; the scratch is then 159.5 MiB
+  (2,048-token slabs: 285.6 MiB, +25% prefill speed, below). The switch to the GEMM is above 448 tokens (NVFP4), 256 (Q5_K).
+
+**Gates** (relative L2 per token against the fp32 reference; gate: median <= 2e-3, max <= 1e-2): NVFP4 layers 3.4e-4 to
+3.8e-4 median and <= 4.1e-4 max at 1, 2, 3, 8, 32, 64, 512 and 2,048 tokens (fp16 activations and fp16 B operands are all
+of it); Q5_K / Q8_0 layers 1.1e-3 to 1.2e-3 median, 1.4e-3 max (the fp16 `d*sc` and `dmin*m` of Q5_K's sub-blocks, and
+fp16 activations). There are no int8 paths. Rebased copies identical.
+
+**Speed** (layer 6, an NVFP4 layer; the A770M with `eklow-bolt` stopped; `eklow-moe-test`, ffn only, back to back):
+
+| tokens | ms | experts read | GB/s | tokens/s |
+|---|---|---|---|---|
+| 1 | 0.193 | 8 (35.8 MB) | 186 | 5,184 |
+| 2 | 0.294 | 16 (71.7 MB) | 244 | 6,802 |
+| 3 | 0.389 | 23 | 265 | 7,702 |
+| 8 | 0.758 | 50 | 295 | 10,547 |
+| 64 | 2.08 | 112 | 241 | 30,771 |
+| 512 | 9.7 | 125 | 58 | 52,651 |
+| 2,048 | 22.0 (17.4 with 2,048-token slabs) | 125 | 25 | 93,260 (118,000) |
+
+Layers 0, 17, 19 within 5% of these; the Q5_K / Q8_0 layers (54 MB an expert pair): 0.27 ms at 1 token, 0.40 at 2, 10.7 at
+512, 23.4 at 2,048 (18.9 with 2,048-token slabs). The 1-token step is 8 experts x 4.5 MB: the GEMVs run at 250-260 GB/s of
+the card's 399, with about 0.04 ms of group, gather and combine around them. A decode step of the looped core costs
+its layer three times.
+
+**What was tried and what did not help.**
+- K splits of the GEMVs (gate_up 3, 4, 6, 9, 12 threads; down 2, 3, 6, 9): within 3% of each other at 1-2 tokens, 4 / 3 kept.
+- The scale-before GEMV: as fast at 1-2 tokens, 20% slower at 3-4 (ALU-bound).
+- The GEMM: whole records dequantized by half the threads (16 of 32) 17 TFLOPS -> pieces spread over all threads (the
+  measured form); a second accumulator set (8 chains -> 16) and loads three steps ahead both spilled (3-5 KB) and ran
+  1.5-2x slower. The dpas chain is still the limit: 15-16 TFLOPS of 98 at 2,048 tokens; the old Q4_0 kernel's 48-52 needed
+  its 1-2 bytes a weight to stay out of ALU. The GEMM is also latency-bound per K step at few rows (5 ms at 16 tokens
+  however few rows), which is why the GEMVs serve up to ~450 tokens.
+- Tiles of 8 rows in the GEMV (repeat count 8): spills (the A tiles and 16 accumulator registers beside the double buffer);
+  4 rows are enough up to the 3-4 tokens decode runs and cost nothing at 8 (an expert with more than 4 rows is read twice).
+
+**Interface change** (`moe.hpp`): `Layer` no longer holds `xmx::ExpertTable`s (the grouped kernels of the Qwen path are not
+in `xmx.*` any more and these do not need pointer tables): it holds `Table` (format, k, n, cg, offset, expert_bytes) for
+gate_up and down, `base` / `bytes`, the scale offsets and pointers; `rebase` and `scratch_bytes` / `scratch_slab` /
+`profile_print` are new. Environment knobs for tuning: `EKLOW_MOE_SLAB`, `EKLOW_MOE_GEMM_MIN`, `EKLOW_MOE_PROFILE`.
+
+**For the engine.** `reserve(q, max_tokens, n_used, n_embd, n_ff)` allocates for min(max_tokens, 1,024) tokens: 10.8 MiB at 1
+token, 41 MiB at 128, 159.5 MiB at 1,024 and more (the tile list, the sorted fp16 inputs, the SITU output, and 4.6 bytes
+x 2,304 of fp32 output a padded row). `ffn` only enqueues, takes x, ids and w on the device, and handles any `n_tok`; one
+Scratch serves one layer at a time on an in-order queue. NVFP4's ggml 0x7f scale byte (NaN in e4m3) is stored as 0, as the
+reference decodes it.
