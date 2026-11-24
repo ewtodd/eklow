@@ -1191,13 +1191,19 @@ void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& l
 }
 
 void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim, int64_t group,
-             int64_t max_keys) {
+             int64_t max_keys, int64_t bias_extent) {
   // Every buffer is written once (zeroed) so that the driver has committed it before anyone reads the card's free memory.
   auto fill = [&](auto* p, size_t n) {
     if (p && n) q.memset(p, 0, n * sizeof(*p));
   };
   grow(q, s.q, s.q_halves, size_t(max_tiles * kRows * head_dim));
   fill(s.q, s.q_halves);
+  if (bias_extent > 0) {
+    grow(q, s.rt, s.rt_halves, size_t(max_tiles * kRows * 16));
+    grow(q, s.tv, s.tv_halves, bias_table_halves(bias_extent));
+    fill(s.rt, s.rt_halves);
+    fill(s.tv, s.tv_halves);
+  }
   if (max_keys > 0) {
     // The split launch's partials at the largest shape it can see: any tile count up to max_tiles, keys up to max_keys. P is the
     // threads a tile takes (head 256: 8, else D / 64); the first fold level goes to part2, later ones back to part.

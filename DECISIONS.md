@@ -3900,3 +3900,95 @@ What follows for the next milestones:
 - The replay's llama.cpp ran with flash attention (the bias cast to fp16) and fp16 K/V; that is inside the same spread.
 - Under noise the chosen experts change at 1-7% of (position, slot): the hot and cold placement of M3 must not lean on a
   token's route being stable.
+
+## 2026-11-24 — Inkling M2: the biased attention on the card
+
+`attn::attend` with a `Bias` (src/kernels/attention.*): Inkling 2 Mini's attention for head 128, 24 query heads over 8 K/V
+heads (group 3), fp16 sliding rings and global pages, both paths: the prefill kernel (FlashGroup, K/V staged in shared
+local memory) and the decode split and merge (Flash), the existing kernels with a compile-time switch, so the plain
+`attend`'s kernels (Gemma's, Bolt's, the drafts') are the same code. The plain `attend` also gained a head-128, group-3
+dispatch (the speed reference below).
+
+**The design.**
+- The score is `scale q.k + R[t][h] . table[t - j]` and the sink starts the softmax: `m = sink, l = 1` where the plain
+  kernels start at `m = -1e30, l = 0` (with split decode only the first split holds the sink, the merge treats the rest as
+  before). Tokens carry no keys of their own (`Tokens::lo, hi` refused).
+- The bias is matrix work, not 16 MACs a score: R's 16 values are one dpas depth (K = 16). A thread's rows (4: two tokens,
+  positions at most 1 apart) take every distance their block of 16 keys spans (at most 17 distinct, 3 tiles of 8) from 3
+  dpas of repeat count 4, R as the A operand and the table as B. The table is stored reversed in `u = extent + 31 - d`,
+  fp16, VNNI tiles of 8 consecutive u, with 4 tiles of zeros on each side (`bias_table`, 34 KB for extent 1,024): a row's
+  16 keys are then 16 consecutive u, ascending with the key, so the row's values come out of the dpas result as one select
+  at a runtime offset, no gather; distances at or past the extent read the zero tiles, so clamping the tile index into the
+  table replaces every branch, and a block whose nearest distance is past the extent (most blocks of a full layer) skips
+  the dpas.
+- `Bias::table_tiles` takes the prepared table (the engine converts each layer's once at load); without it `attend`
+  converts the table into `Scratch::tv` every call (one more tiny launch, +5 us in decode). R goes to fp16 A tiles
+  `Scratch::rt` by a launch beside the Q tiles'. `reserve(..., bias_extent)` allocates both.
+- Where the bias is computed matters more than what it costs: computed a block ahead (to overlap the P.V dpas) or before
+  the scores were added, the kernels spilled 1.1-2.5 KB of registers and the prefill chunk took 5.3-6.9 ms; computed in the
+  softmax step where it is added, with the rows' R reloaded from cache each block instead of kept in registers, they spill
+  512 B (the plain kernel 192): 4.13 ms. Computing it 2 rows (4.63 ms) or 1 row (6.41) at a time was slower.
+- FlashGroup's work-group is unchanged (24 compute threads + 16 loaders, shared local memory the same), decode's split
+  count and merge too.
+
+**Gates** (`eklow-attn-test --inkling`, fiona's A770M, DG2). Two slots of 33,000 positions each, K/V through `attn::write`,
+steps of 2,048, 2,048, 1, 7 and 300 tokens (cycled), then 16 decode steps of one token and 8 of two a slot; sliding rings
+(window 1,024, a ring of 12 pages, 3,072 positions) wrapped 10 times, the full layer's page table interleaved between the slots. Q and K are
+drawn from 16 shared directions with noise and clipped to norms of 19-22.6 (so that half the rows reach a score of 40; the
+largest seen is 55), R to 9.1, V RMS-normed, sinks N(3, 4), the table the GGUF's `blk.0.attn_rel_bias` (sliding; max 1.13)
+and `blk.5` (full; max 1.73). The reference is a copy of `ref::inkling::attention`'s loop that takes a list of tokens (the
+full thing at 33,000 tokens is hours; the copy matches `ref::inkling::attention` to 0 on 2,600 tokens, both layers), run on
+the card over each slot's contiguous fp16-rounded K/V and the unrounded Q, R and table; per step every token of a short
+step, else the first, the last and 62 random ones, per slot. Relative L2 per (token, head) row, |g - r| / (|r| + 1e-3):
+
+| layer | rows | median | p99 | max |
+|---|---|---|---|---|
+| sliding | 74,880 | 1.9e-4 | 6.2e-4 | 1.7e-3 |
+| full | 74,880 | 2.2e-4 | 7.2e-4 | 2.9e-3 |
+
+By step kind the medians are 1.6-2.2e-4 (decode of one and two tokens, chunks of 1, 7, 300, 2,048); the gate was 2e-3
+median and 1e-2 max. The floor in the metric is for rows the sink swallows: a row whose largest weight is e^-17 or less
+below the sink has an output of 1e-8, where fp16 P (below) is off by 2x, and by the plain L2 that row is "100% wrong".
+- **What the error is** (`--attribute`, sliding): against the reference run on the kernel's own fp16 Q x scale the median
+  falls from 1.6-1.9e-4 to 1.3-1.6e-4, and with R and the table rounded to fp16 as well to 0.5-1.0e-4 (max 2-4e-4). In
+  quadrature (prefill) Q's rounding is 1.0e-4 (a score of 45 is wrong by up to ~0.02, a 2% weight on that key), R and the
+  table 1.3e-4, and what is left 1.0e-4: fp16 P, and the fp32 sums in a different order. The operands' fp16 is the larger
+  part; the R and table term is what an fp32 bias (two fp16 halves of each, twice the dpas) would remove, not needed at this level.
+- **fp16 P at scores near 45.** P is `exp(s - m)` with m the running maximum (the sink included), so it is at most 1 and
+  never overflows however large the scores; the denominator is summed from the fp32 probabilities and P.V uses their fp16
+  roundings (relative 5e-4 a weight, unbiased). What fp16 loses is the tail: a weight below 6e-8 of the maximum (17 nats
+  down) underflows, 6e-8 to 6e-5 keeps fewer than 11 bits. A thousand keys at that level are 1e-4 of an output whose
+  largest weight is 1, so nothing a sharp row shows; only a row where the sink is the maximum and every key is 17 nats
+  below it is off by a factor, with an output of 1e-8.
+- The existing `eklow-attn-test` gates for Gemma give the same results as on `inkling/port`'s build (1637c72, built beside):
+  sliding, global, sliding8, global8, each plain and +img, identical to the printed digits (sliding 1.03e-4, global 3.64e-4,
+  the int8 kinds 9.0e-3). The speed of Gemma's kernels is within run-to-run noise (decode 71-96 us, 1,024-token chunk
+  1.72-2.6 ms for sliding in both builds, the card's clock moving between runs; global and global8 4096 ctx: 147 / 169 us
+  decode and 4.4 / 4.1 ms prefill against 151 / 170 and 4.5 / 4.2).
+
+**Speed** (per layer, 24 heads, one slot, best of 3 runs of 100 decodes or 5 chunks; the table prepared):
+
+| layer, depth | decode 1 token, biased / plain | prefill 2,048-token chunk, biased / plain |
+|---|---|---|
+| sliding, 8k | 104 / 90 us | 4.13 / 2.84 ms (6.2 / 9.1 TFLOPS) |
+| sliding, 32k | 103 / 90 us | 4.14 / 2.84 ms |
+| full, 8k | 169 / 149 us | 22.6 / 17.4 ms (8.0 / 10.4 TFLOPS) |
+| full, 32k | 538 / 506 us | 97.1 / 76.7 ms (8.2 / 10.4 TFLOPS) |
+
+Two tokens a slot cost the same as one (104-105 us sliding). The biased prefill costs +45% on the sliding layers and +25-27%
+on the full ones, where most blocks skip the dpas: that remainder is the kernel's extra state (512 B of spill against 192),
+not the bias arithmetic. The plain head-128 group-3 kernel itself runs at 9-10 TFLOPS, below the Gemma shapes (a tile of 8 rows holds 2.67
+tokens of 3 rows; not investigated). A 2,048-token chunk through
+the 20 sliding layers costs 83 ms of attention and through the 4 full ones 90-390 ms at 8-32k of depth, per pass (the
+looped layers' slots run three passes).
+
+**For the engine.** `attend(q, Q, tok, list, packed, cache, n_head=24, scale, bias, out, scratch)` with `Bias{R, table, 16,
+extent, sink, table_tiles}`: Q fp32 [n_tok][24][128] (the kernel scales it by `scale` and rounds to fp16), R fp32
+[n_tok][24][16] and sink fp32 [n_tok][24] in the step's token order, after the clips and the full layers' scale. Tile lists
+as for any layer: `TileList(128)` (12 tiles a group), `add_chunk(base, n_tok, last_pos, group = 3, n_head_kv = 8, window)`
+per chunk, chunks one slot's consecutive positions; Cache as for Gemma (`window` 1,024 or 0 with a page table, ring pages
+for the window plus the largest chunk). Scratch grows on first use; `reserve(q, s, max_tiles, max_chunk_rows, 8, 128, 3,
+max_keys, 1024)` allocates it up front: Q tiles `max_tiles * 8 * 128` halves, R tiles `max_tiles * 128` halves, the table
+`(extent + 64) * 16` halves, decode's split partials as for any head-128 layer. A prepared table is `attn::bias_table_halves(extent)`
+halves from `attn::bias_table(q, table_fp32, extent, out)`: do it once per layer. n_rel must be 16, extent a multiple of 8
+(1,024 both kinds), no int8 caches (the plain dispatch has none for group 3 either).
