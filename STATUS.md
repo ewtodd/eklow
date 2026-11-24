@@ -14,7 +14,11 @@ with its measurements); what eklow is and its numbers: `README.md`.
     the chat template and the output parser (DECISIONS "Inkling M1"). The forward matches llama.cpp to 1e-7 per tensor
     when given llama.cpp's own streams and activation rounding, and free-running sits inside llama.cpp's own CPU-against-CUDA
     spread, which is wide for this model (mean KL 5e-2 to 0.46). The text layer has 0 differences on every gate.
-  - Next: M2, the forward on the A770M (it needs pauses of `eklow-bolt`); the deep prompt's reference runs there.
+  - **M2 is done** (DECISIONS "Inkling M2: the forward on the A770M" and its two kernel entries): `engine_inkling` with
+    NVFP4 experts on the matrix units and the biased attention, inside llama.cpp's spread at 67 to 32,950 tokens, decode
+    steps matching llama.cpp's greedy tokens. 637 tok/s prefill at 12k; decode 12.0 tok/s with every expert on the card
+    (which fits only beside a short context and without Bolt's side models).
+  - Next: M3, memory (where the experts live beside the side models and 2 x 64k of K/V); then M4, the server and the replay.
 
 - **fiona runs eklow's milestone in production** (`eklow-bolt.service` since 2026-11-10 22:48): Nemotron-3.5-Bolt-E4B with
   NVIDIA's DFlash draft and Gemma 4's projector, EmbeddingGemma 2 with its projector, vega's end-of-turn checker (the
@@ -55,9 +59,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 ## Open, in order
 
-0. **Inkling M2**: the forward on the A770M, prefill and decode, against M1's reference (the same SYCL reference runs on
-   the card, which is also how the 32,950-token prompt gets its reference); NVFP4 experts on the matrix units (e2m1 x e4m3
-   dequantizes exactly to fp16), the biased attention with a sink, the 48 slots' K/V and convolution state.
+0. **Inkling M3**: memory. The weights are 15.16 GiB (experts 13.8); the side models take ~2.3 GiB and 2 x 64k of K/V
+   ~4.4 GiB (fp16; 8 full applications x 2 slots). Experts must split between the card and the host by use (the looped
+   layers 6-17 run three times a token), as llama.cpp's --n-cpu-moe or the old Qwen path's streaming did; then the prefix
+   cache with the convolution states. M2's whole-layer staging is a stopgap (2.6 tok/s).
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):
    - the kernel tests;
    - the draft's lattices and the embeddings, against main's build;
@@ -108,6 +113,7 @@ with its measurements); what eklow is and its numbers: `README.md`.
   - `tools/server/serve_test.py basic`;
   - the template and parser against Hugging Face (`tools/ref/gemma4_chat_compare.py`, `gemma4_parse_compare.py`);
   - the side models' own gates: `eklow-vega check`, `tools/rerank/rerank_compare.py gate`, `tools/bench/embed_bench.py`;
-  - Inkling's: `tools/ref/inkling/text_gates.sh build` (tokenizer, template, parser against llama.cpp and Hugging Face), and
+  - Inkling's: `tools/ref/inkling/m2_card.sh` on fiona (the engine against M0 and M1, with compare.py on e-workstation),
+    `eklow-moe-test` and `eklow-attn-test --inkling` (the kernels against the reference ops), `tools/ref/inkling/text_gates.sh build` (tokenizer, template, parser against llama.cpp and Hugging Face), and
     the reference forward (`tools/ref/inkling/host-build.sh`, then `eklow-ref-run` with `--teacher` and
     `--emulate-ggml-cpu` against llama.cpp's CPU dumps, and free-running against M0, `tools/ref/inkling/compare.py`).

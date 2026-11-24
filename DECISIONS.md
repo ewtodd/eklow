@@ -4074,3 +4074,55 @@ token, 41 MiB at 128, 159.5 MiB at 1,024 and more (the tile list, the sorted fp1
 x 2,304 of fp32 output a padded row). `ffn` only enqueues, takes x, ids and w on the device, and handles any `n_tok`; one
 Scratch serves one layer at a time on an in-order queue. NVFP4's ggml 0x7f scale byte (NaN in e4m3) is stored as 0, as the
 reference decodes it.
+
+## 2026-11-24 — Inkling M2: the forward on the A770M
+
+`src/engine/engine_inkling.*` (with `src/kernels/inkling_fast.*`) runs the reference forward's computation on the card,
+over steps of chunks from several sequences as Bolt's engine does: prefill chunks and decode tokens, K/V and convolution
+state per sequence slot. `eklow-engine-run-inkling` drives it over a prompt (chunked prefill, dumps of the last chunk, an
+oracle's greedy tokens decoded one a step, `--teacher`), and `tools/ref/inkling/m2_card.sh` runs the checks below on
+fiona.
+- Every one of the 48 layer applications keeps its own K/V and its own convolution state (the last three inputs of its
+  four short convolutions, [slot][application][3][6,656] fp32). The 40 sliding applications have a ring of window +
+  max_chunk positions each, the 8 full ones pages from a pool.
+- The dense matrices on the matrix units in their Q8_0 bits (int8 activations up to 32 rows, fp16 above), Q, R and the
+  gate stacked. The router, the full layers' conv taps and the controllers' down projections stay fp32 (routing is
+  sensitive): a sub-group an output for steps of up to 16 tokens, the shared tiled kernel above. The controllers' gain and
+  forget (rank 64) take the fp16 GEMM in prefill. The depth mixes (attention residuals) run a 256-lane group a row for
+  few rows and a sub-group a row for many.
+- The experts through `moe::ffn` and the attention through the biased `attn::attend` (the two entries above), each layer's
+  bias table prepared once at load.
+- Experts that do not fit stay in pinned host memory, whole layers, copied onto the card before their layer runs. That is
+  M2's stopgap: with layers 20-23 staged (3.24 GiB) the 33k prompt's K/V fits; M3 places experts properly.
+
+**Checks** (M0's prompts, layers 20-23 staged; the reference is M1's fp32 forward, the band llama.cpp's own CPU against
+CUDA):
+- Each layer continued from the reference's stream (`--teacher`, the short prompt): Q, K, V, R, attention output, router
+  logits and FFN output within 1e-4..6e-4 of the reference on every slot (fp16 activations); the same 8 experts on every
+  slot but two tokens (single near-tie flips, layers 20 and 23); the output path at 6e-7, logits KL 8.7e-5. On the tools
+  prompt, chunked across 1,024, the same experts at 99.4-100% of positions on every slot and logits 512/512 at KL 5.6e-5.
+- Free-running (top-1 and mean KL over the dumped positions):
+
+| prompt | against the reference | against llama.cpp CUDA | llama.cpp CPU against CUDA |
+|---|---|---|---|
+| short (67) | 65/67, 4.8e-3 | 61/67, 4.7e-2 | 60/67, 5.1e-2 |
+| tools (1,339) | 468/512, 0.23 | 439/512, 0.43 | 433/512, 0.46 |
+| long (11,996) | 244/256, 2.2e-2 | 239/256, 9.1e-2 | 242/256, 7.0e-2 |
+| deep (32,950) | 119/128, 4.3e-2 | 115/128, 0.13 | (the reference against CUDA: 115/128, 9.9e-2) |
+
+- Decode, llama.cpp CUDA's greedy tokens fed one a step: the engine's top-1 is CUDA's at 64/64, 63/64, 32/32 and 32/32
+  steps (KL 1.3e-3 to 3.1e-3), and the reference's at 64/64, 62/64, 32/32, 32/32.
+- The deep prompt's reference (fp32, the host's 32 threads: 89 minutes) and the engine agree as closely there as at 12k,
+  so the log-position scale past 8,192 holds in both.
+
+**Speed** (fiona, one sequence):
+- Prefill, layers 20-23 staged: 456 / 637 / 616 tok/s for 1.3k / 12k / 33k (2.9 / 18.8 / 53.5 s). Staging costs ~3.9 s of
+  the 12k prompt's 18.8.
+- Decode with every expert on the card (it fits beside a short context: 15.16 GiB of weights and 0.21 GiB of caches, chunks
+  of 128): 12.0 tok/s. With four layers staged, 2.6: each token copies 3.2 GB over PCIe.
+- Where a decode token's 83 ms go: the per-layer small kernels (depth mixes, norms, controllers, router and routing: 41 ms,
+  launch-bound over 48 applications), the dense projections 13, the experts 12 (their GEMVs run at 250-295 GB/s), attention
+  7. Fusing the small kernels is the first speed work (M6), before the draft.
+
+The card session: eklow-bolt was stopped from 14:39 to 16:23 CST for the two kernel workers and these runs, and restarted
+(healthy).

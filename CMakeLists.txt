@@ -85,6 +85,7 @@ add_library(eklow_model STATIC
   src/kernels/ref.cpp
   src/kernels/moe.cpp
   src/kernels/ref_inkling.cpp
+  src/kernels/inkling_fast.cpp
   src/kernels/xmx.cpp
   src/kernels/xmx_fmt.cpp
   src/kernels/xmx_gemv_iq4xs.cpp
@@ -122,6 +123,14 @@ eklow_sycl(eklow-attn-test)
 add_executable(eklow-dequant-test tools/dequant_test/main.cpp)
 target_link_libraries(eklow-dequant-test PRIVATE eklow_model)
 eklow_sycl(eklow-dequant-test)
+
+# Inkling 2 Mini's serving engine (M2, DECISIONS 2026-11-24) and its driver over M0's prompts.
+add_library(eklow_inkling STATIC src/engine/engine_inkling.cpp)
+target_link_libraries(eklow_inkling PUBLIC eklow_model)
+eklow_sycl(eklow_inkling)
+add_executable(eklow-engine-run-inkling tools/engine_run_inkling/main.cpp)
+target_link_libraries(eklow-engine-run-inkling PRIVATE eklow_inkling)
+eklow_sycl(eklow-engine-run-inkling)
 
 add_executable(eklow-ref-run tools/ref_run/main.cpp)
 target_link_libraries(eklow-ref-run PRIVATE eklow_model)

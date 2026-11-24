@@ -73,7 +73,7 @@ def main():
         if any_:
             print(f"{s:4d} " + " ".join(row) + "  " + router)
     for n in ("result_norm",):
-        if n in rt and n in tt:
+        if n in rt and n in tt and rt[n]["ne"] == tt[n]["ne"]:
             r = load(a.ref, rt[n]).astype(np.float64)
             x = load(a.test, tt[n]).astype(np.float64)
             print(f"{n}: rel L2 {np.linalg.norm(x - r) / np.linalg.norm(r):.2e}")
