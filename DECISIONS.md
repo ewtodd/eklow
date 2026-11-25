@@ -4753,3 +4753,18 @@ ms and the card takes 40.5: decode is bound by the card's own timeline, not by t
 What is left is the count of dependent small kernels each costing ~11-20 us on the card; merging two dependent ones
 does not shorten the chain. Next for decode: launching independent ones together (the controllers and norms of a full
 layer's three inputs), or fewer stages per layer.
+
+## 2026-11-25 — Inkling's prefill attention with EU fusion on: slower, dropped
+
+FlashGroup runs with EU fusion off (its loader threads, its loop between loaded bounds and its `active` tiles put dpas
+under control flow the compiler cannot prove uniform). FlashGroupU, its fusion-safe form for Inkling (every thread
+loading and computing, a block loop of a count from the host, padding tiles computing a duplicate and storing nothing,
+the bias helpers without their early exits), compiled with fusion on and ran correct, but slower, per 2,048-token
+chunk: sliding 5.4 ms against 4.2, full at 12k 54 against 34 (it computed the bias of every block, where FlashGroup
+skips the blocks past the extent). Aligning the loop to each group's last block, so that the bias's blocks are the last
+of every group's loop (two loops, without and with it), and storing the next block at the end behind a third barrier:
+3.5 KB of spills, 7.3 and 62 ms, and wrong sliding rows near the start (keys before position 0 inside the window).
+FlashGroup's dedicated loaders cover the loads' latency that the compute threads cannot; the fusion it lacks does not
+make up for them in a loop of two barriers a 16-key block. For long prompts the better way is the segmented attention of
+the 26B's global layers (two GEMM-shaped kernels a segment, ~31 TFLOPS against ~10), the bias taken for the last
+`extent` keys of each row apart.
