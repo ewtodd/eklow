@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
@@ -584,6 +585,9 @@ void Engine::cold(const Layer& L, int64_t T, sycl::event packed) {
 }
 
 std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::DumpSink* dump, const model::Teacher* teacher) {
+  // EKLOW_STEP_TIMING: per step, the host's time until everything is submitted and the step's whole time (speed work).
+  static const bool step_timing = std::getenv("EKLOW_STEP_TIMING") != nullptr;
+  const auto t_step0 = std::chrono::steady_clock::now();
   const int64_t E = cfg_.n_embd, H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim, NR = cfg_.n_rel;
   const int64_t HD = H * D, KD = HK * D, QRG = HD + H * NR + HD, CC = cfg_.conv_channels(), NA = cfg_.n_slot();
   const int64_t NU = cfg_.n_expert_used, V = cfg_.n_vocab, VO = cfg_.n_vocab_out;
@@ -633,6 +637,16 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     (*profile_)[name] += std::chrono::duration<double>(now - t_mark).count();
     t_mark = now;
   };
+  // EKLOW_PROFILE_FINE (with a profile): a mark after every kernel group, and "_sync", what one mark costs by itself, to
+  // subtract from each (speed work).
+  static const bool fine_profile = std::getenv("EKLOW_PROFILE_FINE") != nullptr;
+  auto fine = [&](const char* name) {
+    if (fine_profile) mark(name);
+  };
+  if (profile_ && fine_profile) {
+    mark("_before");
+    for (int i = 0; i < 20; ++i) mark("_sync");
+  }
   auto emit = [&](const std::string& name, const float* p, std::vector<int64_t> ne) {
     if (!dump || !dump->wants(name)) return;
     int64_t n = 1;
@@ -688,6 +702,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       states(x);
       ik::depth_mix(q_, st, L.attn_res_query, swa ? 1 : 3, T, E, 1e-6f, mixq_);
       for (int j = 0; j < 3; ++j) in[j] = mixq_ + (swa ? 0 : j) * T * E;
+      fine("in.mix");
     }
     auto control = [&](const float* cur, int k, float* dst) {
       ik::control_input(q_, cur, msgs + int64_t(k) * T * E, T, E, 1e-6f, ci_);
@@ -707,6 +722,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     if (msgs) {
       for (int j = 0; j < 3; ++j) {
         control(in[j], j, h_[j]);
+        fine("in.ctl");
         fast::rmsnorm(q_, h_[j], swa ? L.attn_norm : (j == 0 ? L.q_norm : j == 1 ? L.k_norm : L.v_norm), T, E, cfg_.eps, h_[j]);
         hin[j] = h_[j];
       }
@@ -722,9 +738,13 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     mark("inputs");
     // Projections; K and V through their convolutions (full layers: with taps from their inputs), then the heads.
     mm(L.qrg, hin[0], E, qrg_);
+    fine("proj.qrg");
     mm(L.k, hin[1], E, kr_);
+    fine("proj.k");
     mm(L.v, hin[2], E, vr_);
+    fine("proj.v");
     mm32(L.sink, H, E, hin[0], sk_);
+    fine("proj.sink");
     if (!swa) {
       mm32(L.k_dyn, 4 * HK, E, hin[1], kd_);
       mm32(L.v_dyn, 4 * HK, E, hin[2], vd_);
@@ -733,7 +753,9 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     float* hist = conv_ + int64_t(app) * 3 * CC;
     const int64_t sstride = NA * 3 * CC;
     ik::short_conv(q_, kr_, KD, T, KD, ch, slot_, base_, hist, sstride, CC, L.k_conv, swa ? nullptr : kd_, HK, kb_);
+    fine("conv.k");
     ik::short_conv(q_, vr_, KD, T, KD, ch, slot_, base_, hist + KD, sstride, CC, L.v_conv, swa ? nullptr : vd_, HK, vb_);
+    fine("conv.v");
     ik::heads(q_, qrg_, QRG, kb_, vb_, pos_, T, H, HK, D, NR, L.q_clip, L.rel_clip, cfg_.qk_clip, cfg_.rel_clip, !swa, cfg_.log_alpha,
               float(cfg_.log_floor), cfg_.eps, qb_, rb_, kb_, vb_);
     emit("Qcur" + sl, qb_, {D, H, T});
@@ -748,17 +770,21 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       const int r = ring_of_[size_t(app)];
       const attn::Cache cache{ring_k_ + r * ring_layer_stride_, ring_v_ + r * ring_layer_stride_, nullptr, ring_pages_, cfg_.window, HK, D};
       attn::write(q_, kb_, vb_, toks, cache);
+      fine("attn.write");
       attn::attend(q_, qb_, toks, tiles_s, tiles_sliding_, cache, H, scale, bias, att_, attn_scratch_);
     } else {
       const auto& kv = pages_kv_[size_t(page_of_[size_t(app)])];
       const attn::Cache cache{kv.first, kv.second, page_table_, max_pages_, 0, HK, D};
       attn::write(q_, kb_, vb_, toks, cache);
+      fine("attn.write");
       attn::attend(q_, qb_, toks, tiles_f, tiles_full_, cache, H, scale, bias, att_, attn_scratch_);
     }
     emit("kqv_out" + sl, att_, {HD, T});
     mark(swa ? "attn_sliding" : "attn_full");
     ik::gate(q_, att_, qrg_ + HD + H * NR, QRG, T, HD);
+    fine("o.gate");
     mm(L.o, att_, HD, o_);
+    fine("o.mm");
     ik::short_conv(q_, o_, E, T, E, ch, slot_, base_, hist + 2 * KD, sstride, CC, L.attn_post_conv, nullptr, 0, oc_);
     mark("o");
     // A block's first layer starts a new stream; the others add to theirs. The stream goes to `out`.
@@ -770,19 +796,24 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       emit("attn_out" + sl, oc_, {E, T});
       ref::add(q_, x, oc_, T * E, out);
       cur = out;
+      fine("ffn.add");
     }
     emit("ffn_inp" + sl, cur, {E, T});
     // The MoE.
     states(cur);
     ik::depth_mix(q_, st, L.ffn_res_query, 1, T, E, 1e-6f, mixq_);
+    fine("ffn.mix");
     if (msgs) {
       control(mixq_, 3, h_[0]);
+      fine("ffn.ctl");
       fast::rmsnorm(q_, h_[0], L.ffn_norm, T, E, cfg_.eps, h_[0]);
     } else {
       fast::rmsnorm(q_, mixq_, L.ffn_norm, T, E, cfg_.eps, h_[0]);
     }
+    fine("ffn.norm");
     mm32(L.router, cfg_.n_expert, E, h_[0], lg_);
-    ref::inkling::route(q_, lg_, L.probs_bias, T, cfg_.n_expert, NU, cfg_.w_scale, ids_, wts_);
+    fine("router.mm");
+    ik::route(q_, lg_, L.probs_bias, T, cfg_.n_expert, NU, cfg_.w_scale, ids_, wts_);
     emit("ffn_moe_logits" + sl, lg_, {cfg_.n_expert, T});
     if (dump && dump->wants("ffn_moe_topk" + sl)) {
       std::vector<int32_t> h(size_t(T * NU));
@@ -797,6 +828,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     const bool cold_cpu = !L.cold_ref.empty() && T <= c_.cpu_max_tokens;
     const bool cold_card = !L.cold_ref.empty() && !cold_cpu;
     if (cold_cpu) packed = ik::pack_host(q_, ids_, wts_, h_[0], T, NU, E, hids_, hw_, hx_);
+    if (cold_cpu) fine("pack");
     if (cold_card) {
       if (staged_layer_ != ip) {
         q_.memcpy(staging_, L.cold_host, L.cold_set.bytes);
@@ -814,6 +846,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     }
     emit("ffn_moe_out" + sl, f_, {E, T});
     ik::short_conv(q_, f_, E, T, E, ch, slot_, base_, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_);
+    fine("ffn.conv");
     emit("ffn_out" + sl, o_, {E, T});
     ref::add(q_, cur, o_, T * E, out);
     if (teacher) {
@@ -901,11 +934,18 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   }
   if (cfg_.softcap > 0) fast::softcap(q_, logits_, cfg_.softcap, R * V);
   mark("head");
+  const auto t_submitted = std::chrono::steady_clock::now();
   std::vector<float> full(size_t(R * V));
   q_.memcpy(full.data(), logits_, full.size() * sizeof(float)).wait();
   std::vector<float> out(size_t(R * VO));
   for (int64_t r = 0; r < R; ++r) std::memcpy(out.data() + r * VO, full.data() + r * V, size_t(VO) * sizeof(float));
   if (dump && dump->wants("result_output")) dump->put("result_output", out, {VO, R});
+  if (step_timing) {
+    const auto now = std::chrono::steady_clock::now();
+    std::fprintf(stderr, "step: %lld tokens, submitted after %.2f ms, done after %.2f ms\n", (long long)T,
+                 std::chrono::duration<double, std::milli>(t_submitted - t_step0).count(),
+                 std::chrono::duration<double, std::milli>(now - t_step0).count());
+  }
   return out;
 }
 

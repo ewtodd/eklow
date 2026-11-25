@@ -120,6 +120,11 @@ add_executable(eklow-attn-test tools/attn_test/main.cpp tools/attn_test/inkling.
 target_link_libraries(eklow-attn-test PRIVATE eklow_model)
 eklow_sycl(eklow-attn-test)
 
+# The engine's Inkling kernels against the reference ones (route, depth_mix, matmul_f32).
+add_executable(eklow-inkling-fast-test tools/inkling_fast_test/main.cpp)
+target_link_libraries(eklow-inkling-fast-test PRIVATE eklow_model)
+eklow_sycl(eklow-inkling-fast-test)
+
 add_executable(eklow-dequant-test tools/dequant_test/main.cpp)
 target_link_libraries(eklow-dequant-test PRIVATE eklow_model)
 eklow_sycl(eklow-dequant-test)

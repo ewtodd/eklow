@@ -54,6 +54,12 @@ void control_input(sycl::queue& q, const float* cur, const float* msg, int64_t T
 // out[r][:] = x[idx[r]][:] for r < rows, n columns.
 void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t rows, int64_t n, float* out);
 
+// The router's choice, as ref::inkling::route: per token the n_used experts of the highest sigmoid(logit) + bias (ties to the
+// lower id), weighted by their sigmoid(logit), normalized and scaled. A sub-group a token (n_expert a multiple of 16, at
+// most 256; n_used at most 16).
+void route(sycl::queue& q, const float* logits, const float* bias, int64_t T, int64_t n_expert, int64_t n_used, float w_scale,
+           int32_t* ids, float* weights);
+
 // LoopCD's hidden-state contrast (arXiv 2610.02185): y <- y + w (y - first), over n values.
 void contrast(sycl::queue& q, float* y, const float* first, float w, int64_t n);
 

@@ -11,10 +11,18 @@ namespace {
 // Few rows (decode): one 256-lane work-group a row.
 void depth_mix_wide(sycl::queue& q, const States& st, const float* query, int n_query, int64_t rows, int64_t n_embd, float eps,
                     float* out) {
-  constexpr int kWg = 256, kS = 8, kQ = 4;
-  q.parallel_for(sycl::nd_range<1>(size_t(rows * kWg), kWg), [=](sycl::nd_item<1> it) {
+  // A work-group a row. Its sums (each state's squares, each state against each query: up to 40) were 40 group reductions
+  // one after another, each with its barriers (0.11-0.15 ms a call at one token); they reduce over each sub-group by
+  // shuffles, meet in local memory once, and every thread reads the totals.
+  constexpr int kWg = 256, kS = 8, kQ = 4, kSg = 16, kNsg = kWg / kSg, kV = kS + kQ * kS;
+  q.submit([&](sycl::handler& h) {
+  sycl::local_accessor<float, 1> part(sycl::range<1>(kNsg * kV), h);
+  sycl::local_accessor<float, 1> tot(sycl::range<1>(kV), h);
+  h.parallel_for(sycl::nd_range<1>(size_t(rows * kWg), kWg), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSg)]] {
     const int64_t r = int64_t(it.get_group(0));
     const int lid = int(it.get_local_id(0));
+    const auto sg = it.get_sub_group();
+    const int lane = int(sg.get_local_id()[0]), sgid = int(sg.get_group_id()[0]);
     float ss[kS], dq[kQ][kS];
     for (int j = 0; j < kS; ++j) {
       ss[j] = 0;
@@ -30,13 +38,30 @@ void depth_mix_wide(sycl::queue& q, const States& st, const float* query, int n_
         for (int i = 0; i < kQ; ++i) dq[i][j] += x * qv[i];
       }
     }
+    for (int j = 0; j < kS; ++j) {
+      if (j >= st.n) break;
+      const float a = sycl::reduce_over_group(sg, ss[j], sycl::plus<float>());
+      if (lane == 0) part[sgid * kV + j] = a;
+      for (int i = 0; i < kQ; ++i) {
+        if (i >= n_query) break;
+        const float b = sycl::reduce_over_group(sg, dq[i][j], sycl::plus<float>());
+        if (lane == 0) part[sgid * kV + kS + i * kS + j] = b;
+      }
+    }
+    sycl::group_barrier(it.get_group());
+    if (lid < kV) {
+      float a = 0;
+      for (int g = 0; g < kNsg; ++g) a += part[g * kV + lid];
+      tot[lid] = a;
+    }
+    sycl::group_barrier(it.get_group());
     float inv[kS], w[kQ][kS];
     for (int j = 0; j < kS; ++j) {
       if (j >= st.n) break;
-      inv[j] = 1.0f / sycl::sqrt(sycl::reduce_over_group(it.get_group(), ss[j], sycl::plus<float>()) / float(n_embd) + eps);
+      inv[j] = 1.0f / sycl::sqrt(tot[j] / float(n_embd) + eps);
       for (int i = 0; i < kQ; ++i) {
         if (i >= n_query) break;
-        w[i][j] = sycl::reduce_over_group(it.get_group(), dq[i][j], sycl::plus<float>());
+        w[i][j] = tot[kS + i * kS + j];
       }
     }
     const float sc = 1.0f / sycl::sqrt(float(n_embd));
@@ -70,6 +95,7 @@ void depth_mix_wide(sycl::queue& q, const States& st, const float* query, int n_
         out[(int64_t(i) * rows + r) * n_embd + e] = acc;
       }
     }
+  });
   });
 }
 
@@ -240,6 +266,23 @@ void gate(sycl::queue& q, float* att, const float* g, int64_t ld_g, int64_t T, i
 
 void matmul_f32(sycl::queue& q, const float* w, int64_t n, int64_t k, const float* x, int64_t ld_x, int64_t T, float* out,
                 int64_t ld_out) {
+  // Few outputs over long rows (the controllers' 4,608-wide down projection, the router, the sinks, the dynamic taps at a
+  // decode step): a sub-group an output left the card nearly idle while each walked its row 16 floats at a time (80-180 us
+  // a call). A work-group an output splits the row 256 ways and reduces once.
+  if (k >= 1024 && T * n <= 8192) {
+    constexpr int kWgRow = 256;
+    q.parallel_for(sycl::nd_range<1>(size_t(T * n * kWgRow), kWgRow), [=](sycl::nd_item<1> it) {
+      const int64_t o = int64_t(it.get_group(0)), t = o / n, j = o % n;
+      const int lid = int(it.get_local_id(0));
+      const float* wr = w + j * k;
+      const float* xr = x + t * ld_x;
+      float acc = 0;
+      for (int64_t i = lid; i < k; i += kWgRow) acc += wr[i] * xr[i];
+      acc = sycl::reduce_over_group(it.get_group(), acc, sycl::plus<float>());
+      if (lid == 0) out[t * ld_out + j] = acc;
+    });
+    return;
+  }
   constexpr int kSg = 16, kWg = 128;
   const int64_t outs = T * n, groups = (outs * kSg + kWg - 1) / kWg;
   q.parallel_for(sycl::nd_range<1>(size_t(groups * kWg), kWg), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSg)]] {
@@ -272,6 +315,48 @@ void control_input(sycl::queue& q, const float* cur, const float* msg, int64_t T
 void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t rows, int64_t n, float* out) {
   q.parallel_for(sycl::range<2>(size_t(rows), size_t(n)), [=](sycl::id<2> id) {
     out[int64_t(id[0]) * n + int64_t(id[1])] = x[int64_t(idx[id[0]]) * n + int64_t(id[1])];
+  });
+}
+
+void route(sycl::queue& q, const float* logits, const float* bias, int64_t T, int64_t n_expert, int64_t n_used, float w_scale,
+           int32_t* ids, float* weights) {
+  constexpr int kSg = 16, kMax = 16;
+  if (n_expert % kSg || n_expert / kSg > kMax || n_used > kSg) throw std::runtime_error("inkling::route: unsupported expert counts");
+  const int per = int(n_expert / kSg);
+  q.parallel_for(sycl::nd_range<1>(size_t(T * kSg), kSg), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(kSg)]] {
+    const auto sg = it.get_sub_group();
+    const int64_t t = int64_t(it.get_group(0));
+    const int lane = int(sg.get_local_id()[0]);
+    const float* l = logits + t * n_expert;
+    float v[kMax];
+    for (int i = 0; i < kMax; ++i) {
+      if (i >= per) break;
+      const int64_t e = int64_t(i) * kSg + lane;
+      v[i] = 1.0f / (1.0f + sycl::exp(-l[e])) + (bias ? bias[e] : 0.0f);
+    }
+    int32_t mine = -1;  // lane s keeps the s-th pick
+    for (int s = 0; s < int(n_used); ++s) {
+      float bv = -INFINITY;
+      int32_t be = INT32_MAX;
+      for (int i = 0; i < kMax; ++i) {
+        if (i >= per) break;
+        const int32_t e = int32_t(i * kSg + lane);
+        if (v[i] > bv || (v[i] == bv && e < be)) bv = v[i], be = e;
+      }
+      const float m = sycl::reduce_over_group(sg, bv, sycl::maximum<float>());
+      const int32_t win = sycl::reduce_over_group(sg, bv == m ? be : INT32_MAX, sycl::minimum<int32_t>());
+      for (int i = 0; i < kMax; ++i) {
+        if (i >= per) break;
+        if (i * kSg + lane == win) v[i] = -INFINITY;
+      }
+      if (lane == s) mine = win;
+    }
+    const float g = lane < int(n_used) ? 1.0f / (1.0f + sycl::exp(-l[mine])) : 0.0f;
+    const float sum = sycl::reduce_over_group(sg, g, sycl::plus<float>());
+    if (lane < int(n_used)) {
+      ids[t * n_used + lane] = mine;
+      weights[t * n_used + lane] = g / (sum + 1e-20f) * w_scale;
+    }
   });
 }
 
