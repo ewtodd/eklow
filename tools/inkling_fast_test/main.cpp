@@ -86,7 +86,7 @@ void test_route(sycl::queue& q, std::mt19937& rng) {
 void test_depth_mix(sycl::queue& q, std::mt19937& rng) {
   const int64_t E = 2304;
   std::normal_distribution<float> nd(0, 1);
-  for (int64_t rows : {int64_t(1), int64_t(7), int64_t(64), int64_t(200)})
+  for (int64_t rows : {int64_t(1), int64_t(7), int64_t(64), int64_t(200), int64_t(1024)})
     for (int n_states : {1, 3, 6})
       for (int n_query : {1, 3}) {
         std::vector<float*> sp;
@@ -106,9 +106,8 @@ void test_depth_mix(sycl::queue& q, std::mt19937& rng) {
         ref::inkling::depth_mix(q, table, n_states, dq, n_query, rows, E, 1e-6f, oa);
         ik::States st;
         for (float* p : sp) st.p[st.n++] = p;
-        float* scratch = sycl::malloc_device<float>(size_t(ik::kMixFewRows * ik::kMixScratch), q);
+        float* scratch = sycl::malloc_device<float>(size_t(rows * ik::kMixScratch), q);
         for (bool few : {false, true}) {
-          if (few && rows > ik::kMixFewRows) continue;
           ik::depth_mix(q, st, dq, n_query, rows, E, 1e-6f, ob, few ? scratch : nullptr);
           q.wait();
           const double e = max_rel(host(q, ob, size_t(n_query * rows * E)), host(q, oa, size_t(n_query * rows * E)));

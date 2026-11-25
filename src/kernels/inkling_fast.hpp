@@ -16,8 +16,8 @@ struct States {
   int n = 0;
 };
 
-// ref::inkling::depth_mix: out [n_query][rows][n_embd]. Up to kMixFewRows rows with `scratch` (kMixScratch floats a row),
-// each row split across work-groups; up to 64 a work-group a row; above, a sub-group a row.
+// ref::inkling::depth_mix: out [n_query][rows][n_embd]. With `scratch` (kMixScratch floats a row of `rows`), each row split
+// across work-groups; without, up to 64 rows a work-group a row, above a sub-group a row.
 constexpr int64_t kMixFewRows = 16;
 constexpr int64_t kMixScratch = 40 * 16;  // a row's slices' sums: 40 values for each of up to 16 slices of 256 (n_embd <= 4096)
 void depth_mix(sycl::queue& q, const States& s, const float* query, int n_query, int64_t rows, int64_t n_embd, float eps, float* out,
@@ -57,6 +57,8 @@ void control_input(sycl::queue& q, const float* cur, const float* msg, int64_t T
 
 // out[r][:] = x[idx[r]][:] for r < rows, n columns.
 void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t rows, int64_t n, float* out);
+// out[r][j] = x[r * ld + j] for j < n: the first n columns of rows of ld.
+void gather_cols(sycl::queue& q, const float* x, int64_t ld, int64_t rows, int64_t n, float* out);
 
 // The router's choice, as ref::inkling::route: per token the n_used experts of the highest sigmoid(logit) + bias (ties to the
 // lower id), weighted by their sigmoid(logit), normalized and scaled. A sub-group a token (n_expert a multiple of 16, at

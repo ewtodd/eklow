@@ -139,6 +139,11 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     L.v = matrix({&need(b + "attn_v.weight")});
     L.o = matrix({&need(b + "attn_output.weight")});
     L.sink = vec(b + "attn_sink_proj.weight");
+    if (cfg_.n_head <= 32) {
+      L.sink32 = dev(32 * E);
+      q_.memset(L.sink32, 0, size_t(32 * E) * sizeof(float));
+      q_.memcpy(L.sink32, L.sink, size_t(cfg_.n_head * E) * sizeof(float));
+    }
     L.router = vec(b + "ffn_gate_inp.weight");
     L.q_clip = vec(b + "attn_q_clip.weight");
     L.rel_bias = vec(b + "attn_rel_bias.weight");
@@ -249,20 +254,22 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   att_ = dev(B * HD);
   o_ = dev(B * E);
   oc_ = dev(B * E);
-  f_ = dev(B * E);
+  f_ = dev(S * E);
+  hs_ = S > B ? dev(S * E) : nullptr;
   ci_ = dev(B * 2 * E);
   cd_ = dev(B * cfg_.gate_rank);
-  mixp_ = dev(ik::kMixFewRows * ik::kMixScratch);
+  mixp_ = dev(B * ik::kMixScratch);
+  skp_ = dev(B * 32);
   cg_ = dev(B * E);
   cf_ = dev(B * E);
   lg_ = dev(B * cfg_.n_expert);
-  wts_ = dev(B * cfg_.n_expert_used);
+  wts_ = dev(S * cfg_.n_expert_used);
   rows_ = dev(int64_t(c_.max_logits) * E * 6);
   logits_ = dev(int64_t(c_.max_logits) * cfg_.n_vocab);
   max_tiles_sliding_ = HK * ((B * (H / HK) + 7) / 8 + c_.n_slots);
   max_tiles_full_ = max_tiles_sliding_;
   tile_stride_s_ = 6 * max_tiles_sliding_, tile_stride_f_ = 6 * max_tiles_full_;
-  for (auto [p, n] : {std::pair{&ids_, B * cfg_.n_expert_used}, {&tok_, S}, {&slot_, S}, {&pos_, S}, {&base_, S},
+  for (auto [p, n] : {std::pair{&ids_, S * cfg_.n_expert_used}, {&tok_, S}, {&slot_, S}, {&pos_, S}, {&base_, S},
                       {&lrows_, int64_t(c_.max_logits)}, {&tiles_sliding_, subs * tile_stride_s_}, {&tiles_full_, subs * tile_stride_f_}}) {
     *p = sycl::malloc_device<int32_t>(size_t(n), q_);
     if (!*p) throw std::runtime_error("inkling engine: out of device memory");
@@ -272,7 +279,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   attn::reserve(q_, attn_scratch_, max_tiles_sliding_, c_.max_chunk * (H / HK), HK, D, H / HK, cfg_.window + c_.max_chunk, bias_extent);
   attn::reserve(q_, attn_scratch_, max_tiles_full_, c_.max_chunk * (H / HK), HK, D, H / HK, c_.max_ctx + attn::kPage, bias_extent);
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, HD));
-  moe_scratch_ = moe::reserve(q_, B, cfg_.n_expert_used, E, cfg_.n_ff_exp);
+  moe_scratch_ = moe::reserve(q_, S, cfg_.n_expert_used, E, cfg_.n_ff_exp);
   place_experts(f);
   // The cold path's buffers: the step's routing and expert inputs on the host (the card writes them there), the cold
   // experts' weighted rows back.
@@ -285,7 +292,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     if (!hx_ || !hrows_ || !hids_ || !hw_) throw std::runtime_error("inkling engine: out of pinned host memory");
     for (void* p : {static_cast<void*>(hx_), static_cast<void*>(hrows_), static_cast<void*>(hids_), static_cast<void*>(hw_)})
       owned_.push_back(p);
-    cr_ = dev(B * E);
+    cr_ = dev(max_step_ * E);
     pool_ = std::make_unique<cpu::Pool>(c_.cpu_threads);
   }
 }
@@ -708,6 +715,9 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     tl_s_dev = tiles_sliding_ + int64_t(g) * tile_stride_s_, tl_f_dev = tiles_full_ + int64_t(g) * tile_stride_f_;
     slot_d = slot_ + sb.row0, base_d = base_ + sb.row0, pos_d = pos_ + sb.row0;
   };
+  // Several sub-batches: each runs a layer application up to its routing, the experts run once over the whole step (their
+  // GEMMs on ~4x the rows an expert, and a cold set copied once), then each sub-batch's FFN convolution and residual, in order.
+  const bool multi = subs.size() > 1;
 
   auto t_mark = std::chrono::steady_clock::now();
   // With a queue that keeps timestamps (EKLOW_PROFILE_DEVICE in the driver), a mark is an empty kernel whose times are read
@@ -847,7 +857,13 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     fine("proj.k");
     mm(L.v, hin[2], E, vr_);
     fine("proj.v");
-    mm32(L.sink, H, E, hin[0], sk_);
+    if (T > kFewTokens && L.sink32) {
+      // 24 outputs miss the tiled fp32 GEMM (a multiple of 32): 32 of them, the padding dropped after
+      fast::matmul_f32(q_, L.sink32, 32, E, hin[0], T, skp_);
+      ik::gather_cols(q_, skp_, 32, T, H, sk_);
+    } else {
+      mm32(L.sink, H, E, hin[0], sk_);
+    }
     fine("proj.sink");
     if (!swa) {
       mm32(L.k_dyn, 4 * HK, E, hin[1], kd_);
@@ -896,6 +912,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     if (ip % cfg_.block == 0) {
       blocks.push_back(x);
       cur = oc_;
+      // a step of several sub-batches finishes the FFN after all of them: the new stream waits in `out`
+      if (multi) {
+        q_.memcpy(out, oc_, size_t(T * E) * sizeof(float));
+        cur = out;
+      }
     } else {
       emit("attn_out" + sl, oc_, {E, T});
       ref::add(q_, x, oc_, T * E, out);
@@ -917,7 +938,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     fine("ffn.norm");
     mm32(L.router, cfg_.n_expert, E, h_[0], lg_);
     fine("router.mm");
-    ik::route(q_, lg_, L.probs_bias, T, cfg_.n_expert, NU, cfg_.w_scale, ids_, wts_);
+    ik::route(q_, lg_, L.probs_bias, T, cfg_.n_expert, NU, cfg_.w_scale, ids_ + row_off * NU, wts_ + row_off * NU);
     emit("ffn_moe_logits" + sl, lg_, {cfg_.n_expert, T});
     if (dump && dump->wants("ffn_moe_topk" + sl)) {
       std::vector<int32_t> h(size_t(T * NU));
@@ -925,6 +946,10 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       dump->put("ffn_moe_topk" + sl, std::vector<float>(h.begin(), h.end()), {NU, T});
     }
     mark("router");
+    if (multi) {
+      q_.memcpy(hs_ + row_off * E, h_[0], size_t(T * E) * sizeof(float));
+      return;  // the experts, the FFN's convolution and its residual run over the whole step (apply)
+    }
     // Cold experts: the routing and the inputs go to pinned host memory ahead of the hot experts' kernels; the host waits
     // for them alone, computes the cold pairs while the card runs the hot ones, and adds their rows after.
     // Longer steps copy the layer's cold set onto the card and run it there, its rows going into the hot experts' sum.
@@ -984,6 +1009,33 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         msgs = msg_;
       }
       layer(app, ip, x + off, bg, msgs, lp, out + off);
+    }
+    if (multi) {
+      const Layer& L = layers_[size_t(ip)];
+      const bool cold = !L.cold_ref.empty();
+      T = TA;
+      if (cold) {
+        const int b = stage(ip, -1);
+        q_.ext_oneapi_submit_barrier({copied_[b]});
+        moe::rebase(q_, layers_[size_t(ip)].cold_set, staging_[b]);
+        moe::ffn(q_, L.cold_set, hs_, TA, ids_, wts_, cfg_.n_expert_used, cfg_.situ_beta, cfg_.situ_linear_beta, *moe_scratch_, cr_);
+        used_[b] = q_.ext_oneapi_submit_barrier();
+        last_staged_use_ = b;
+        if (size_t(exec_i) < exec_layers_.size()) stage(exec_layers_[size_t(exec_i)], b);
+        mark("cold");
+      }
+      moe::ffn(q_, L.experts, hs_, TA, ids_, wts_, cfg_.n_expert_used, cfg_.situ_beta, cfg_.situ_linear_beta, *moe_scratch_, f_,
+               cold ? cr_ : nullptr);
+      mark("moe");
+      const int64_t KD = cfg_.n_head_kv * cfg_.head_dim, CC = cfg_.conv_channels(), sstride = int64_t(cfg_.n_slot()) * 3 * CC;
+      float* hist = conv_ + int64_t(app) * 3 * CC;
+      for (size_t g = 0; g < subs.size(); ++g) {
+        use_sub(g);
+        const int64_t off = row_off * E;
+        ik::short_conv(q_, f_ + off, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_);
+        ref::add(q_, out + off, o_, T * E, out + off);
+      }
+      mark("ffn_out");
     }
     if (ip % cfg_.block == 0) blocks.push_back(x);
   };

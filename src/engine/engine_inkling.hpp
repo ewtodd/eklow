@@ -115,6 +115,7 @@ class Engine {
   struct Layer {
     xmx::Weight qrg, k, v, o;  // Q|R|gate stacked (they read the same input), K, V, the output projection
     const float* sink = nullptr;       // [n_head][n_embd] fp32 (from BF16)
+    float* sink32 = nullptr;           // the same padded to 32 rows of zeros, for the tiled fp32 GEMM of long steps
     const float* k_dyn = nullptr;      // [4 n_head_kv][n_embd] fp32, full layers
     const float* v_dyn = nullptr;
     const float* router = nullptr;     // [n_expert][n_embd] fp32
@@ -208,7 +209,9 @@ class Engine {
   // Workspace, sized for max_batch tokens.
   std::vector<float*> blk_;  // block and stream buffers [B][E]
   float *mixq_, *h_[3], *qrg_, *kr_, *vr_, *kd_, *vd_, *qb_, *kb_, *vb_, *rb_, *sk_, *att_, *o_, *oc_, *f_, *ci_, *cd_, *cg_, *cf_;
-  float* mixp_ = nullptr;  // depth_mix's per-slice sums at a few rows (ik::kMixScratch a row)
+  float* mixp_ = nullptr;
+  float* skp_ = nullptr;  // a long step's sinks on 32 columns (Layer::sink32), [max_batch][32]
+  float* hs_ = nullptr;   // a step of several sub-batches: the experts' inputs of all of them, [max_step][n_embd]  // depth_mix's per-slice sums at a few rows (ik::kMixScratch a row)
   float *lg_, *wts_, *rows_, *logits_, *msg_;
   int32_t *ids_, *tok_, *slot_, *pos_, *base_, *lrows_, *tiles_sliding_, *tiles_full_;
   int64_t max_tiles_sliding_ = 0, max_tiles_full_ = 0;

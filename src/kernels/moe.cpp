@@ -35,7 +35,7 @@ namespace xmxd = sycl::ext::intel::esimd::xmx;
 namespace {
 
 constexpr int kStepK = 64;        // K a record covers
-constexpr int kSlabTokens = 1024; // ffn runs longer steps in slabs of this many tokens (scratch size)
+constexpr int kSlabTokens = 4096; // ffn runs longer steps in slabs of this many tokens (scratch size)
 constexpr int kExperts = 128;     // the group kernel's work-group
 constexpr int kGemvRows = 4;      // rows of a GEMV tile (at most: the dpas repeat count 1, 2 or 4)
 constexpr int kGemmWM = 8;        // the GEMM tile: 16 * kGemmWM rows
@@ -328,7 +328,7 @@ struct Gather {
 
 // out[t][:] = sum_i w[t][i] y[rop[t n_used + i]][:], in the order i = 0 .. n_used - 1 (the reference's).
 struct Combine {
-  const float* y;
+  const sycl::half* y;
   const float* w;
   const int32_t* rop;
   float* out;
@@ -341,7 +341,7 @@ struct Combine {
       const float wt = w[t * n_used + i];
       const int row = rop[t * n_used + i];
       if (row < 0) continue;
-      acc += wt * esimd::block_load<float, 128>(y + int64_t(row) * n + j * 128);
+      acc += wt * esimd::simd<float, 128>(esimd::block_load<sycl::half, 128>(y + int64_t(row) * n + j * 128));
     }
     if (cold) acc += esimd::block_load<float, 128>(cold + int64_t(t) * n + j * 128);
     esimd::block_store<float, 128>(out + int64_t(t) * n + j * 128, acc);
@@ -362,7 +362,7 @@ struct Gemv {
   const int32_t* tl;
   const float* scale;  // per expert, or null
   sycl::half* out_h;
-  float* out_y;
+  sycl::half* out_y;
   int32_t kst, n_out;  // K / 64; down's N
   int32_t n_ff;        // GU: the output width
   float beta, lb;
@@ -459,7 +459,8 @@ struct Gemv {
       } else {
 #pragma unroll
         for (int c = 0; c < CG; ++c)
-          esimd::block_store<float, 8>(out_y + int64_t(row) * n_out + (u * CG + c) * 8, tot[c].template select<8, 1>(i * 8) * sc);
+          esimd::block_store<sycl::half, 8>(out_y + int64_t(row) * n_out + (u * CG + c) * 8,
+                                            esimd::simd<sycl::half, 8>(tot[c].template select<8, 1>(i * 8) * sc));
       }
     }
   }
@@ -494,7 +495,7 @@ struct Gemm {
   const int32_t* tl;
   const float* scale;
   sycl::half* out_h;
-  float* out_y;
+  sycl::half* out_y;
   int32_t kst, n_out, n_ff;
   float beta, lb;
 
@@ -600,8 +601,8 @@ struct Gemm {
         } else {
 #pragma unroll
           for (int c = 0; c < 4; ++c)
-            esimd::block_store<float, 8>(out_y + int64_t(row) * n_out + (tn * BT + wj * 4 + c) * 8,
-                                         acc[0][r][c].template select<8, 1>(i * 8) * sc);
+            esimd::block_store<sycl::half, 8>(out_y + int64_t(row) * n_out + (tn * BT + wj * 4 + c) * 8,
+                                              esimd::simd<sycl::half, 8>(acc[0][r][c].template select<8, 1>(i * 8) * sc));
         }
       }
   }
@@ -725,7 +726,7 @@ struct Scratch {
   int32_t* rop = nullptr;
   sycl::half* a = nullptr;  // sorted activations, width n_embd, act16 layout
   sycl::half* h = nullptr;  // SITU output, width n_ff
-  float* y = nullptr;       // down's outputs [row][n_embd]
+  sycl::half* y = nullptr;  // down's outputs [row][n_embd], fp16: the same memory as `a`, dead once gate_up has read it
   uint64_t bytes = 0;
 };
 
@@ -846,7 +847,7 @@ Scratch* reserve(sycl::queue& q, int64_t max_tokens, int64_t n_used, int64_t n_e
   s->rop = static_cast<int32_t*>(dev(size_t(P) * 4));
   s->a = static_cast<sycl::half*>(dev(size_t(s->rows * n_embd) * 2));
   s->h = static_cast<sycl::half*>(dev(size_t(s->rows * n_ff) * 2));
-  s->y = static_cast<float*>(dev(size_t(s->rows * n_embd) * 4));
+  s->y = s->a;  // (DECISIONS 2026-11-24, "Inkling speed, second round")
   return s;
 }
 
@@ -857,7 +858,6 @@ void free_scratch(sycl::queue& q, Scratch* s) {
   sycl::free(s->rop, q);
   sycl::free(s->a, q);
   sycl::free(s->h, q);
-  sycl::free(s->y, q);
   delete s;
 }
 

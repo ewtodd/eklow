@@ -191,7 +191,9 @@ void depth_mix_few(sycl::queue& q, const States& st, const float* query, int n_q
 void depth_mix(sycl::queue& q, const States& s, const float* query, int n_query, int64_t rows, int64_t n_embd, float eps, float* out,
                float* scratch) {
   if (s.n < 1 || s.n > 8 || n_query < 1 || n_query > 4) throw std::runtime_error("inkling::depth_mix: bad state or query count");
-  if (scratch && rows <= kMixFewRows) return depth_mix_few(q, s, query, n_query, rows, n_embd, eps, out, scratch);
+  // With scratch, every row count: rows split across work-groups. At a prefill sub-batch of 1,024 rows it beats a sub-group
+  // a row (whose 16 lanes walked 6 states x 2,304 twice: in.mix + ffn.mix 245 ms of a 1,024-token prefill).
+  if (scratch) return depth_mix_few(q, s, query, n_query, rows, n_embd, eps, out, scratch);
   if (rows <= 64) return depth_mix_wide(q, s, query, n_query, rows, n_embd, eps, out);
   // Many rows (prefill): one sub-group of 16 a row, 8 rows a work-group: the sums of squares and the products with each query reduce over the
   // sub-group (shuffles, no barriers).
@@ -525,6 +527,12 @@ void control(sycl::queue& q, const float* cur, const float* msg, const float* do
       }
     });
   }
+}
+
+void gather_cols(sycl::queue& q, const float* x, int64_t ld, int64_t rows, int64_t n, float* out) {
+  q.parallel_for(sycl::range<2>(size_t(rows), size_t(n)), [=](sycl::id<2> id) {
+    out[int64_t(id[0]) * n + int64_t(id[1])] = x[int64_t(id[0]) * ld + int64_t(id[1])];
+  });
 }
 
 void contrast(sycl::queue& q, float* y, const float* first, float w, int64_t n) {
