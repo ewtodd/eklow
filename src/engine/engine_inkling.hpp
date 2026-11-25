@@ -47,6 +47,9 @@ struct Config {
   int64_t cpu_max_tokens = 128;                    // steps up to this many tokens run cold experts on the CPU; longer
                                                    // ones copy the layer's cold set onto the card and run it there
   int checkpoints = 2;                             // per slot: saved states a sequence can be rewound to (rewind)
+  // LoopCD's hidden-state form (arXiv 2610.02185; DECISIONS 2026-11-24): what the coda reads of the core, its two blocks'
+  // outputs, becomes h + w (h - h_1), h_1 the same after the first pass. 0: the model as trained.
+  float loopcd = 0.0f;
 };
 
 struct Chunk {
@@ -81,6 +84,9 @@ class Engine {
   bool rewind(int slot, int64_t pos);  // false when the slot has no checkpoint at pos (or pos is past its length)
   std::vector<int64_t> checkpoint_positions(int slot) const;
   int64_t length(int slot) const { return slots_[size_t(slot)].length; }
+  // The full applications' page pool: pages in all and free now (a page is attn::kPage positions).
+  int64_t pool_pages() const { return n_pages_; }
+  int64_t free_pages() const { return int64_t(free_pages_.size()); }
 
   void set_profile(std::map<std::string, double>* p) { profile_ = p; }
   const model::Inkling2Config& model() const { return cfg_; }

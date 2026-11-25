@@ -60,6 +60,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
@@ -70,6 +71,7 @@
 #include "core/json.hpp"
 #include "core/json_value.hpp"
 #include "engine/engine_gemma4.hpp"
+#include "engine/engine_inkling.hpp"
 #include "image/gemma4_image.hpp"
 #include "model/dflash2.hpp"
 #include "model/embed_gemma2.hpp"
@@ -77,9 +79,13 @@
 #include "model/vision_gemma4v.hpp"
 #include "rt/device.hpp"
 #include "serve/openai_gemma4.hpp"
+#include "serve/openai_inkling.hpp"
 #include "serve/scheduler_gemma4.hpp"
+#include "serve/scheduler_inkling.hpp"
 #include "text/chat_gemma4.hpp"
+#include "text/chat_inkling.hpp"
 #include "text/tokenizer.hpp"
+#include "text/tokenizer_inkling.hpp"
 
 
 using namespace eklow;
@@ -205,7 +211,7 @@ void reply_error(httplib::Response& res, const serve::gemma4::ApiError& e) {
 class ImageService {
  public:
   ImageService(sycl::queue& q, model::VisionGemma4V& v, int tokens) : q_(q), v_(v), tokens_(tokens) {}
-  void bind(serve::gemma4::Scheduler* s) { sched_ = s; }
+  void bind(std::function<std::shared_ptr<void>()> hold) { hold_ = std::move(hold); }
   int64_t n_embd() const { return v_.n_embd(); }
 
   serve::gemma4::EncodedImage operator()(std::span<const uint8_t> bytes) {
@@ -227,8 +233,8 @@ class ImageService {
     }
     const auto t0 = std::chrono::steady_clock::now();
     std::lock_guard lk(enc_mu_);
-    std::unique_ptr<serve::gemma4::Scheduler::Hold> hold;
-    if (sched_) hold = std::make_unique<serve::gemma4::Scheduler::Hold>(*sched_);
+    std::shared_ptr<void> hold;
+    if (hold_) hold = hold_();
     const auto t1 = std::chrono::steady_clock::now();
     model::DeviceRows rows;
     try {
@@ -260,7 +266,7 @@ class ImageService {
   sycl::queue& q_;
   model::VisionGemma4V& v_;
   int tokens_;
-  serve::gemma4::Scheduler* sched_ = nullptr;
+  std::function<std::shared_ptr<void>()> hold_;
   std::mutex enc_mu_, cache_mu_;
   std::list<Entry> cache_;
 };
@@ -270,10 +276,10 @@ class ImageService {
 // step starts until they are done. Each request is logged (its wait for the model, behind another request,
 // and its time) and counted in `stats`.
 void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::Tokenizer& tok, std::mutex& mu,
-                      serve::gemma4::Scheduler& sched, const std::string& alias, int64_t max_tokens, EmbedStats& stats, ImageService* images) {
+                      std::function<std::shared_ptr<void>()> hold, const std::string& alias, int64_t max_tokens, EmbedStats& stats, ImageService* images) {
   http.Get("/health", [](const httplib::Request&, httplib::Response& res) { res.set_content("{\"status\":\"ok\"}", "application/json"); });
   serve::serve_models(http, alias, max_tokens, 1);
-  http.Post("/v1/embeddings", [&m, &tok, &mu, &sched, &stats, alias, max_tokens, images](const httplib::Request& req, httplib::Response& res) {
+  http.Post("/v1/embeddings", [&m, &tok, &mu, hold, &stats, alias, max_tokens, images](const httplib::Request& req, httplib::Response& res) {
     try {
       json::Value body;
       try {
@@ -380,7 +386,7 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
       std::chrono::steady_clock::time_point t1;
       {
         std::lock_guard lk(mu);
-        const serve::gemma4::Scheduler::Hold hold(sched);
+        const std::shared_ptr<void> held = hold();
         t1 = std::chrono::steady_clock::now();
         embs = image_rows > 0 ? m.embed(seqs, &spans) : m.embed(seqs);
       }
@@ -416,7 +422,14 @@ int main(int argc, char** argv) {
   int64_t draft_full_context = 0;  // a plain draft's full-attention layer: positions per slot it keeps (0: the draft code's 32,768)
   int draft_sliding_causal = -1;   // -1 the draft's own, 0 or 1: to measure the difference (Dflash2::Options::sliding_causal)
   int port = 8081, slots = 2, embed_port = 8082;
-  int64_t ctx = 65536, batch = 2048, chunk = 2048;
+  int64_t ctx = 65536, batch = 0, chunk = 0;  // 0: the model's default (Bolt 2,048, Inkling 1,024)
+  // Inkling's experts (engine/engine_inkling.hpp): the routing profile that ranks them for the card, the card memory left
+  // free after them, and the CPU pool that runs the cold ones.
+  std::string expert_profile;
+  int64_t card_margin_mib = 1024;
+  int cpu_threads = 8, checkpoints = 2;
+  int64_t cpu_max_tokens = 128;
+  double loopcd = 0;  // Inkling: LoopCD's contrast strength (0: off)
   bool kv_int8 = false, preserve_thinking = false;
   double log_interval = 10;  // seconds between the engine's log lines while there is traffic; 0: none
   double keepalive_s = 15;  // a stream silent this long gets an SSE comment (keepalive.hpp); 0: never
@@ -475,9 +488,15 @@ int main(int argc, char** argv) {
     else if (a == "--prefix-cache-key") prefix_key = next();
     else if (a == "--prefix-cache-gib") prefix_gib = std::atoll(next().c_str());
     else if (a == "--prefix-cache-buffers") prefix_buffers = std::atoll(next().c_str());
+    else if (a == "--expert-profile") expert_profile = next();
+    else if (a == "--card-margin-mib") card_margin_mib = std::atoll(next().c_str());
+    else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
+    else if (a == "--cpu-max-tokens") cpu_max_tokens = std::atoll(next().c_str());
+    else if (a == "--checkpoints") checkpoints = std::atoi(next().c_str());
+    else if (a == "--loopcd") loopcd = std::atof(next().c_str());
     else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" || a == "--kv-pool" ||
-               a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib" || a == "--expert-profile" ||
-               a == "--experts-on-card" || a == "--card-margin-mib" || a == "--verification" || a == "--draft-reserve-mib") {
+               a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib" ||
+               a == "--experts-on-card" || a == "--verification" || a == "--draft-reserve-mib") {
       std::fprintf(stderr, "eklow-server: %s was the Qwen3.6-35B-A3B server's, which eklow no longer has (2026-11-11)\n", a.c_str());
       return 2;
     } else {
@@ -486,7 +505,8 @@ int main(int argc, char** argv) {
                            "[--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] "
                            "[--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]] "
                            "[--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S] "
-                           "[--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N] [--prefix-cache-buffers N]]\n");
+                           "[--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N] [--prefix-cache-buffers N]] "
+                           "[--expert-profile JSON] [--card-margin-mib N] [--cpu-threads N] [--cpu-max-tokens N] [--checkpoints N] [--loopcd W]\n");
       return 2;
     }
   }
@@ -519,29 +539,51 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "eklow-server: --image-tokens must be 70 to 1120\n");
     return 2;
   }
-  if (!mmproj_path.empty() && (chunk < image_tokens || batch < image_tokens + slots)) {
-    // An image's rows go in one chunk (its sliding layers see all of it at once), and a step holds the decode tokens too.
-    std::fprintf(stderr, "eklow-server: --image-tokens %d needs --chunk >= %d and --batch >= %d\n", image_tokens, image_tokens, image_tokens + slots);
-    return 2;
-  }
   try {
     auto t0 = std::chrono::steady_clock::now();
     auto file = gguf::File::open(model_path);
-    if (const gguf::Value* a = file.find("general.architecture"); !a || a->as_string() != "gemma4")
-      throw std::runtime_error(model_path + ": architecture " + (a ? a->as_string() : std::string("(none)")) +
-                               "; eklow serves gemma4 (Gemma 4 E4B: Nemotron-3.5-Bolt-E4B), and no longer qwen35moe (2026-11-11)");
+    const gguf::Value* arch_v = file.find("general.architecture");
+    const std::string arch = arch_v ? arch_v->as_string() : std::string("(none)");
+    const bool inkling = arch == "inkling2_loop";
+    if (arch != "gemma4" && !inkling)
+      throw std::runtime_error(model_path + ": architecture " + arch +
+                               "; eklow serves gemma4 (Gemma 4 E4B: Nemotron-3.5-Bolt-E4B) and inkling2_loop (Inkling 2 Mini), and no longer qwen35moe (2026-11-11)");
+    if (batch <= 0) batch = inkling ? 1024 : 2048;
+    if (chunk <= 0) chunk = inkling ? 1024 : 2048;
+    const int64_t max_ctx = (ctx + attn::kPage - 1) / attn::kPage * attn::kPage;
     // The template is ported, not interpreted: a file carrying another one is refused rather than rendered wrong.
     const gguf::Value* tmpl = file.find("tokenizer.chat_template");
-    const std::optional<text::Gemma4Template> which = tmpl ? text::gemma4_template_of(tmpl->as_string()) : std::nullopt;
-    if (!which) throw std::runtime_error(model_path + ": its chat template is neither Bolt's nor Google's Gemma 4 template, which eklow ports");
-    // Bolt was trained to 65,536 positions; beyond them its RoPE is untested, so a larger --ctx is refused, not served.
-    if (const gguf::Value* n = file.find("gemma4.context_length"); n && ctx > n->as_int())
-      throw std::runtime_error("--ctx " + std::to_string(ctx) + " is beyond the model's context of " + std::to_string(n->as_int()));
-    const text::Tokenizer tok = text::Tokenizer::from_gguf(file);
+    std::optional<text::Gemma4Template> which;
+    std::unique_ptr<text::Tokenizer> gtok;
+    std::unique_ptr<text::InklingTokenizer> itok;
+    if (inkling) {
+      // M4 of the port (DECISIONS 2026-11-24): text and tools. Its vision is M5 and its MTP draft M6; it keeps no disk prefix
+      // cache (its sliding rings and convolution states are rewound from checkpoints, engine_inkling.hpp).
+      if (!draft_path.empty() || !mmproj_path.empty() || !prefix_dir.empty() || kv_int8 || preserve_thinking)
+        throw std::runtime_error("Inkling 2 Mini is served without --draft, --mmproj, --prefix-cache, --kv-int8 and --preserve-thinking");
+      if (!tmpl || !text::is_inkling_template(tmpl->as_string()))
+        throw std::runtime_error(model_path + ": its chat template is not Inkling 2 Mini's, which eklow ports");
+      if (const gguf::Value* n = file.find("inkling2_loop.context_length"); n && ctx > n->as_int())
+        throw std::runtime_error("--ctx " + std::to_string(ctx) + " is beyond the model's context of " + std::to_string(n->as_int()));
+      if (expert_profile.empty())
+        throw std::runtime_error("Inkling 2 Mini needs --expert-profile (data/inkling-2-mini-experts.json): its experts do not all fit the card");
+      itok = std::make_unique<text::InklingTokenizer>(text::InklingTokenizer::from_gguf(file));
+    } else {
+      which = tmpl ? text::gemma4_template_of(tmpl->as_string()) : std::nullopt;
+      if (!which) throw std::runtime_error(model_path + ": its chat template is neither Bolt's nor Google's Gemma 4 template, which eklow ports");
+      // Bolt was trained to 65,536 positions; beyond them its RoPE is untested, so a larger --ctx is refused, not served.
+      if (const gguf::Value* n = file.find("gemma4.context_length"); n && ctx > n->as_int())
+        throw std::runtime_error("--ctx " + std::to_string(ctx) + " is beyond the model's context of " + std::to_string(n->as_int()));
+      if (!mmproj_path.empty() && (chunk < image_tokens || batch < image_tokens + slots))
+        // An image's rows go in one chunk (its sliding layers see all of it at once), and a step holds the decode tokens too.
+        throw std::runtime_error("--image-tokens " + std::to_string(image_tokens) + " needs --chunk >= " + std::to_string(image_tokens) + " and --batch >= " +
+                                 std::to_string(image_tokens + slots));
+      gtok = std::make_unique<text::Tokenizer>(text::Tokenizer::from_gguf(file));
+    }
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     engine::gemma4::Config ec;
     ec.n_slots = slots;
-    ec.max_ctx = (ctx + attn::kPage - 1) / attn::kPage * attn::kPage;
+    ec.max_ctx = max_ctx;
     ec.max_batch = batch;
     ec.max_chunk = chunk;
     ec.max_logits = slots;
@@ -640,72 +682,111 @@ int main(int argc, char** argv) {
                    rerank_alias.c_str(), rerank_path.c_str(), (free0 - double(rt::free_memory(q.get_device()).value_or(0))) / 1048576.0,
                    (long long)rerank_max_tokens, std::chrono::duration<double>(std::chrono::steady_clock::now() - t_rr).count());
     }
-    engine::gemma4::Engine eng(q, file, ec);
-    if (vision && vision->n_embd() != eng.model().n_embd)
-      throw std::runtime_error(mmproj_path + ": projects to " + std::to_string(vision->n_embd()) + " but the model's width is " +
-                               std::to_string(eng.model().n_embd));
     const double GiB = 1073741824.0;
-    std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights, %.2f GiB of KV cache (%d slots of %lld), %.1f s\n",
-                 alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / GiB,
-                 eng.cache_bytes() / GiB, slots, (long long)ec.max_ctx,
-                 std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-
-    // The draft goes on after the engine.
+    // What the rest of the server sees of the chat model: its scheduler's counters, a hold that keeps it from starting steps
+    // while a side model has the card, and its engine thread.
+    std::function<serve::gemma4::Scheduler::Stats()> chat_stats;
+    std::function<std::shared_ptr<void>()> hold;
+    std::function<void()> run_engine;
+    std::unique_ptr<engine::gemma4::Engine> geng;
     std::unique_ptr<model::Dflash2> draft;
-    if (draft_file) {
-      // The token table stays in the mapped file (a pass copies the rows it embeds); the head is the engine's own.
-      const model::Dflash2Target target{eng.embedding_table(), eng.head_weight(), true};
-      model::Dflash2::Options opt;
-      opt.slots = slots;
-      opt.max_block = int(engine::gemma4::kMaxVerify);  // a request may ask for a larger block than the default
-      opt.full_context = draft_full_context;
-      opt.sliding_causal = draft_sliding_causal;
-      draft = std::make_unique<model::Dflash2>(q, *draft_file, target, opt);
-      std::fprintf(stderr, "eklow-server: DFlash draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card (its token table stays on the host, its head is the engine's); free card memory now %.2f GiB\n",
-                   draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0,
-                   rt::free_memory(q.get_device()).value_or(0) / GiB);
-    }
-    serve::gemma4::SchedulerConfig sc{batch, chunk, ec.max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }};
-    sc.draft = draft.get();
-    if (draft) sc.draft_block = draft_block;
-    // The disk prefix cache, before the scheduler, which writes into it until it stops.
     std::unique_ptr<serve::PrefixStore> store;
-    if (!prefix_dir.empty()) {
-      sc.store_buffers = size_t(prefix_buffers);
-      serve::PrefixStore::Options so;
-      so.dir = prefix_dir;
-      so.max_bytes = uint64_t(prefix_gib) << 30;
-      so.key = serve::read_key_file(prefix_key);
-      so.max_queued = sc.store_buffers + size_t(2 * eng.window_pages() * slots) + 8;  // the scheduler's buffers, so a put never finds the queue full
-      store = std::make_unique<serve::PrefixStore>(so);
-      // The keys' root: what the K/V depends on besides the tokens (the image rows' too, when the prompt has images).
-      std::string fp = "model " + file_identity(model_path) + " | " + eng.kv_fingerprint();
-      if (!mmproj_path.empty()) fp += " | mmproj " + file_identity(mmproj_path) + " image-tokens " + std::to_string(image_tokens);
-      sc.store = store.get();
-      sc.store_root = serve::chain_root(fp);
-      const auto pb = eng.page_bytes();
-      std::fprintf(stderr, "eklow-server: prefix cache %s, up to %lld GiB, AES-256-GCM: a page (%lld positions) is %.1f MiB of global K/V, %.1f MiB of sliding K/V at a restore point\n",
-                   prefix_dir.c_str(), (long long)prefix_gib, (long long)attn::kPage, double(pb.global) / 1048576.0, double(pb.sliding) / 1048576.0);
+    std::unique_ptr<serve::gemma4::Scheduler> gsched;
+    std::unique_ptr<engine::inkling::Engine> ieng;
+    std::unique_ptr<serve::inkling::Scheduler> isched;
+    if (inkling) {
+      // The side models are on the card already, so the experts' placement sees what they left (DECISIONS 2026-11-24, M4).
+      engine::inkling::Config ic;
+      ic.n_slots = slots;
+      ic.max_ctx = max_ctx;
+      ic.max_batch = batch;
+      ic.max_chunk = chunk;
+      ic.max_logits = slots;
+      ic.expert_profile = expert_profile;
+      ic.card_margin_bytes = uint64_t(std::max<int64_t>(0, card_margin_mib)) << 20;
+      ic.cpu_threads = cpu_threads;
+      ic.cpu_max_tokens = cpu_max_tokens;
+      ic.checkpoints = checkpoints;
+      ic.loopcd = float(loopcd);
+      ieng = std::make_unique<engine::inkling::Engine>(q, file, ic);
+      std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights on the card, %lld cold experts (%.2f GiB) on the CPU with %d threads, %.2f GiB of caches (%d slots of %lld), %.1f s\n",
+                   alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), ieng->weight_bytes() / GiB, (long long)ieng->cold_experts(),
+                   ieng->host_expert_bytes() / GiB, cpu_threads, ieng->cache_bytes() / GiB, slots, (long long)max_ctx,
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+      serve::inkling::SchedulerConfig sc{batch, chunk, max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }};
+      isched = std::make_unique<serve::inkling::Scheduler>(*ieng, *itok, sc);
+      chat_stats = [&] { return isched->stats(); };
+      hold = [&] { return std::static_pointer_cast<void>(std::make_shared<serve::inkling::Scheduler::Hold>(*isched)); };
+      run_engine = [&] { isched->run(g_stop); };
+    } else {
+      geng = std::make_unique<engine::gemma4::Engine>(q, file, ec);
+      auto& eng = *geng;
+      if (vision && vision->n_embd() != eng.model().n_embd)
+        throw std::runtime_error(mmproj_path + ": projects to " + std::to_string(vision->n_embd()) + " but the model's width is " +
+                                 std::to_string(eng.model().n_embd));
+      std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights, %.2f GiB of KV cache (%d slots of %lld), %.1f s\n",
+                   alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), eng.weight_bytes() / GiB,
+                   eng.cache_bytes() / GiB, slots, (long long)ec.max_ctx,
+                   std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+
+      // The draft goes on after the engine.
+      if (draft_file) {
+        // The token table stays in the mapped file (a pass copies the rows it embeds); the head is the engine's own.
+        const model::Dflash2Target target{eng.embedding_table(), eng.head_weight(), true};
+        model::Dflash2::Options opt;
+        opt.slots = slots;
+        opt.max_block = int(engine::gemma4::kMaxVerify);  // a request may ask for a larger block than the default
+        opt.full_context = draft_full_context;
+        opt.sliding_causal = draft_sliding_causal;
+        draft = std::make_unique<model::Dflash2>(q, *draft_file, target, opt);
+        std::fprintf(stderr, "eklow-server: DFlash draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card (its token table stays on the host, its head is the engine's); free card memory now %.2f GiB\n",
+                     draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0,
+                     rt::free_memory(q.get_device()).value_or(0) / GiB);
+      }
+      serve::gemma4::SchedulerConfig sc{batch, chunk, ec.max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }};
+      sc.draft = draft.get();
+      if (draft) sc.draft_block = draft_block;
+      // The disk prefix cache, before the scheduler, which writes into it until it stops.
+      if (!prefix_dir.empty()) {
+        sc.store_buffers = size_t(prefix_buffers);
+        serve::PrefixStore::Options so;
+        so.dir = prefix_dir;
+        so.max_bytes = uint64_t(prefix_gib) << 30;
+        so.key = serve::read_key_file(prefix_key);
+        so.max_queued = sc.store_buffers + size_t(2 * eng.window_pages() * slots) + 8;  // the scheduler's buffers, so a put never finds the queue full
+        store = std::make_unique<serve::PrefixStore>(so);
+        // The keys' root: what the K/V depends on besides the tokens (the image rows' too, when the prompt has images).
+        std::string fp = "model " + file_identity(model_path) + " | " + eng.kv_fingerprint();
+        if (!mmproj_path.empty()) fp += " | mmproj " + file_identity(mmproj_path) + " image-tokens " + std::to_string(image_tokens);
+        sc.store = store.get();
+        sc.store_root = serve::chain_root(fp);
+        const auto pb = eng.page_bytes();
+        std::fprintf(stderr, "eklow-server: prefix cache %s, up to %lld GiB, AES-256-GCM: a page (%lld positions) is %.1f MiB of global K/V, %.1f MiB of sliding K/V at a restore point\n",
+                     prefix_dir.c_str(), (long long)prefix_gib, (long long)attn::kPage, double(pb.global) / 1048576.0, double(pb.sliding) / 1048576.0);
+      }
+      gsched = std::make_unique<serve::gemma4::Scheduler>(eng, *gtok, sc);
+      chat_stats = [&] { return gsched->stats(); };
+      hold = [&] { return std::static_pointer_cast<void>(std::make_shared<serve::gemma4::Scheduler::Hold>(*gsched)); };
+      run_engine = [&] { gsched->run(g_stop); };
     }
-    serve::gemma4::Scheduler sched(eng, tok, sc);
-    if (images) images->bind(&sched);
-    if (embed_images) embed_images->bind(&sched);
-    std::thread engine_thread([&] { sched.run(g_stop); });
+    if (images) images->bind(hold);
+    if (embed_images) embed_images->bind(hold);
+    std::thread engine_thread(run_engine);
     EmbedStats embed_stats;
     // The engine's line every log_interval seconds while there is traffic, and once more after it ends (rates
     // back to zero).
     std::thread stats_thread;
     if (log_interval > 0)
-      stats_thread = std::thread([&, capacity = int64_t(slots) * ec.max_ctx] {
+      stats_thread = std::thread([&, capacity = int64_t(slots) * max_ctx] {
         const auto every = std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::duration<double>(log_interval));
-        auto prev = sched.stats();
+        auto prev = chat_stats();
         auto eprev = embed_stats.snapshot();
         auto t_prev = std::chrono::steady_clock::now();
         bool was_active = false;
         while (!g_stop.load()) {
           while (!g_stop.load() && std::chrono::steady_clock::now() < t_prev + every) std::this_thread::sleep_for(std::chrono::milliseconds(200));
           if (g_stop.load()) break;
-          const auto cur = sched.stats();
+          const auto cur = chat_stats();
           const auto ecur = embed_stats.snapshot();
           const auto now = std::chrono::steady_clock::now();
           const bool active = cur.steps != prev.steps || cur.active > 0 || cur.waiting > 0 || ecur.requests != eprev.requests;
@@ -730,12 +811,14 @@ int main(int argc, char** argv) {
     // The sampling defaults: llama.cpp's, under the GGUF's general.sampling.* (as llama-server takes them).
     serve::SamplingParams sampling;
     serve::apply_gguf_sampling(file, sampling);
-    serve::gemma4::ChatDefaults defaults{sampling, ec.max_ctx, *which, preserve_thinking};
+    serve::gemma4::ChatDefaults defaults{sampling, max_ctx, which.value_or(text::Gemma4Template::Bolt), preserve_thinking};
+    const serve::inkling::ChatDefaults idefaults{sampling};
     std::fprintf(stderr, "eklow-server: sampling defaults: temperature %.2f, top_k %d, top_p %.2f, min_p %.2f, penalty_last_n %d, repeat %.2f\n",
                  double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p), int(sampling.penalty_last_n),
                  double(sampling.repeat_penalty));
-    std::fprintf(stderr, "eklow-server: %s's chat template; earlier turns' reasoning %s by default\n", text::gemma4_template_name(*which),
-                 preserve_thinking ? "kept (--preserve-thinking on)" : "as the template drops it");
+    if (which)
+      std::fprintf(stderr, "eklow-server: %s's chat template; earlier turns' reasoning %s by default\n", text::gemma4_template_name(*which),
+                   preserve_thinking ? "kept (--preserve-thinking on)" : "as the template drops it");
     if (images) defaults.encode_image = [&](std::span<const uint8_t> bytes) { return (*images)(bytes); };
 
     httplib::Server http;
@@ -746,48 +829,16 @@ int main(int argc, char** argv) {
     });
     http.Get("/metrics", [&](const httplib::Request&, httplib::Response& res) {
       const EmbedCounts ec_ = embed_stats.snapshot();
-      res.set_content(serve::render_metrics(sched.stats(), {ec_.requests, ec_.inputs, ec_.tokens}, {http_requests.load(), http_errors.load()}, {alias, slots, ec.max_ctx}),
+      res.set_content(serve::render_metrics(chat_stats(), {ec_.requests, ec_.inputs, ec_.tokens}, {http_requests.load(), http_errors.load()}, {alias, slots, max_ctx}),
                       "text/plain; version=0.0.4; charset=utf-8");
     });
     http.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-      res.set_content(serve::models_json(alias, ec.max_ctx, slots), "application/json");
+      res.set_content(serve::models_json(alias, max_ctx, slots), "application/json");
     });
-    http.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
-      ++http_requests;
-      const auto fail = [&](const serve::gemma4::ApiError& e) {
-        ++http_errors;
-        reply_error(res, e);
-      };
-      serve::gemma4::ChatRequest cr;
-      try {
-        json::Value body;
-        try {
-          body = json::parse(req.body);
-        } catch (const std::exception& e) {
-          throw serve::gemma4::ApiError(400, "invalid_request_error", "", std::string("the body is not JSON: ") + e.what());
-        }
-        cr = serve::gemma4::parse_chat(body, tok, defaults);
-      } catch (const serve::gemma4::ApiError& e) {
-        return fail(e);
-      }
-      auto r = std::make_shared<serve::gemma4::Request>();
-      r->prompt = std::move(cr.prompt);
-      r->images = std::move(cr.images);
-      r->sampling = cr.sampling;
-      r->max_tokens = cr.max_tokens;
-      r->prefill_only = cr.prefill_only;
-      r->stop = cr.stop;
-      r->in_thinking = cr.in_thinking;
-      r->tools = cr.tool_names;
-      r->draft_block = cr.draft_block;
-      r->tag = serve::gemma4::new_completion_id();
-      try {
-        sched.submit(r);
-      } catch (const std::invalid_argument&) {
-        return fail(serve::gemma4::context_exceeded(int64_t(r->prompt.size()), ec.max_ctx));
-      }
-      auto out = std::make_shared<serve::gemma4::ChatResponse>(r->tag, cr.model.empty() ? alias : cr.model, now_s());
-      if (!cr.stream) {
+    // A submitted request's answer, whole or streamed: its events through ChatResponse (either model's Request).
+    auto respond = [keepalive_s](auto r, httplib::Response& res, std::shared_ptr<serve::gemma4::ChatResponse> out, bool stream, bool usage,
+                                 const std::function<void(const serve::gemma4::ApiError&)>& fail) {
+      if (!stream) {
         serve::gemma4::Event e;
         try {
           do {
@@ -800,7 +851,6 @@ int main(int argc, char** argv) {
         }
         return res.set_content(out->body(), "application/json");
       }
-      const bool usage = cr.include_usage;
       res.set_header("Cache-Control", "no-cache");
       auto ka = std::make_shared<serve::KeepAlive>(std::chrono::milliseconds(int64_t(keepalive_s * 1000)));
       res.set_chunked_content_provider(
@@ -827,13 +877,86 @@ int main(int argc, char** argv) {
             return true;
           },
           [r](bool) { r->cancel(); });
+    };
+    http.Post("/v1/chat/completions", [&](const httplib::Request& req, httplib::Response& res) {
+      ++http_requests;
+      const std::function<void(const serve::gemma4::ApiError&)> fail = [&](const serve::gemma4::ApiError& e) {
+        ++http_errors;
+        reply_error(res, e);
+      };
+      if (inkling) {
+        serve::inkling::ChatRequest cr;
+        try {
+          json::Value body;
+          try {
+            body = text::parse_llama_json(req.body);  // as llama-server reads it (nlohmann's numbers and refusals)
+          } catch (const std::exception& e) {
+            throw serve::gemma4::ApiError(400, "invalid_request_error", "", std::string("the body is not JSON: ") + e.what());
+          }
+          cr = serve::inkling::parse_chat(body, *itok, idefaults);
+        } catch (const serve::gemma4::ApiError& e) {
+          return fail(e);
+        }
+        auto r = std::make_shared<serve::inkling::Request>();
+        r->prompt = std::move(cr.prompt);
+        r->prefill = std::move(cr.prefill);
+        r->sampling = cr.sampling;
+        r->max_tokens = cr.max_tokens;
+        r->prefill_only = cr.prefill_only;
+        r->stop = cr.stop;
+        // llama-server samples a request with tools (tool_choice not none) under Inkling's tool grammar from its first token.
+        r->grammar = cr.mode.use_tools();
+        r->choice = cr.mode.tool_choice == text::InklingToolChoice::Required ? serve::InklingToolGrammar::Choice::Required
+                                                                             : serve::InklingToolGrammar::Choice::Auto;
+        r->tools = cr.mode.tool_names;
+        r->parallel = cr.mode.parallel_tool_calls;
+        r->mode = std::move(cr.mode);
+        r->tag = serve::gemma4::new_completion_id();
+        try {
+          isched->submit(r);
+        } catch (const std::invalid_argument&) {
+          return fail(serve::gemma4::context_exceeded(int64_t(r->prompt.size()), max_ctx));
+        }
+        return respond(r, res, std::make_shared<serve::gemma4::ChatResponse>(r->tag, cr.model.empty() ? alias : cr.model, now_s()), cr.stream,
+                       cr.include_usage, fail);
+      }
+      serve::gemma4::ChatRequest cr;
+      try {
+        json::Value body;
+        try {
+          body = json::parse(req.body);
+        } catch (const std::exception& e) {
+          throw serve::gemma4::ApiError(400, "invalid_request_error", "", std::string("the body is not JSON: ") + e.what());
+        }
+        cr = serve::gemma4::parse_chat(body, *gtok, defaults);
+      } catch (const serve::gemma4::ApiError& e) {
+        return fail(e);
+      }
+      auto r = std::make_shared<serve::gemma4::Request>();
+      r->prompt = std::move(cr.prompt);
+      r->images = std::move(cr.images);
+      r->sampling = cr.sampling;
+      r->max_tokens = cr.max_tokens;
+      r->prefill_only = cr.prefill_only;
+      r->stop = cr.stop;
+      r->in_thinking = cr.in_thinking;
+      r->tools = cr.tool_names;
+      r->draft_block = cr.draft_block;
+      r->tag = serve::gemma4::new_completion_id();
+      try {
+        gsched->submit(r);
+      } catch (const std::invalid_argument&) {
+        return fail(serve::gemma4::context_exceeded(int64_t(r->prompt.size()), max_ctx));
+      }
+      respond(r, res, std::make_shared<serve::gemma4::ChatResponse>(r->tag, cr.model.empty() ? alias : cr.model, now_s()), cr.stream, cr.include_usage,
+              fail);
     });
 
     httplib::Server embed_http;
     std::thread embed_thread;
     if (embed_model) {
       embed_http.new_task_queue = [] { return new httplib::ThreadPool(4); };
-      serve_embeddings(embed_http, *embed_model, *embed_tok, embed_mu, sched, embed_alias, 8192, embed_stats, embed_images.get());
+      serve_embeddings(embed_http, *embed_model, *embed_tok, embed_mu, hold, embed_alias, 8192, embed_stats, embed_images.get());
       std::fprintf(stderr, "eklow-server: %s, %.2f GiB, listening on %s:%d\n", embed_alias.c_str(), embed_model->bytes() / 1073741824.0,
                    host.c_str(), embed_port);
       embed_thread = std::thread([&] {
@@ -844,7 +967,6 @@ int main(int argc, char** argv) {
       });
     }
 
-    auto hold = [&sched] { return std::static_pointer_cast<void>(std::make_shared<serve::gemma4::Scheduler::Hold>(sched)); };
     httplib::Server checker_http;
     std::thread checker_thread;
     if (checker) {

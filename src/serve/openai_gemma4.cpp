@@ -317,7 +317,9 @@ std::string call_json(const text::ToolCall& c, const std::string& id, int index,
   json::Writer w(false);
   w.begin_object();
   if (with_index) w.kv("index", index);
-  w.kv("id", id).kv("type", "function").key("function").begin_object().kv("name", c.name).kv("arguments", json::dump(c.arguments));
+  w.kv("id", id).kv("type", "function").key("function").begin_object().kv("name", c.name);
+  // Inkling's parser keeps the arguments as the model wrote them, which llama-server passes on; Gemma's leaves it empty.
+  w.kv("arguments", c.arguments_text.empty() ? json::dump(c.arguments) : c.arguments_text);
   w.end_object().end_object();
   return w.str();
 }

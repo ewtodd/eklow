@@ -217,13 +217,18 @@ add_library(eklow_serve_gemma4 STATIC src/serve/openai_gemma4.cpp src/serve/sche
 target_link_libraries(eklow_serve_gemma4 PUBLIC eklow_spec eklow_grammar_gemma4 eklow_text eklow_engine_gemma4 eklow_prefix)
 eklow_sycl(eklow_serve_gemma4)
 
+# Inkling 2 Mini's request layer and scheduler (M4); its responses are written by Bolt's ChatResponse.
+add_library(eklow_serve_inkling STATIC src/serve/openai_inkling.cpp src/serve/scheduler_inkling.cpp)
+target_link_libraries(eklow_serve_inkling PUBLIC eklow_serve_gemma4 eklow_grammar_inkling eklow_inkling)
+eklow_sycl(eklow_serve_inkling)
+
 add_executable(eklow-prompt-gemma4 tools/prompt_gemma4/main.cpp)
 target_link_libraries(eklow-prompt-gemma4 PRIVATE eklow_serve_gemma4)
 eklow_sycl(eklow-prompt-gemma4)
 
 add_executable(eklow-server tools/server/main.cpp)
 target_include_directories(eklow-server PRIVATE ${HTTPLIB_INCLUDE_DIR})
-target_link_libraries(eklow-server PRIVATE eklow_serve_gemma4 eklow_vega eklow_rerank Threads::Threads)
+target_link_libraries(eklow-server PRIVATE eklow_serve_gemma4 eklow_serve_inkling eklow_vega eklow_rerank Threads::Threads)
 eklow_sycl(eklow-server)
 # The streams' keep-alive (tools/server/keepalive.hpp), host only.
 add_executable(eklow-keepalive-test tools/server/keepalive_test.cpp)

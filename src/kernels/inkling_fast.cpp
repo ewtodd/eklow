@@ -275,6 +275,10 @@ void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t row
   });
 }
 
+void contrast(sycl::queue& q, float* y, const float* first, float w, int64_t n) {
+  q.parallel_for(sycl::range<1>(size_t(n)), [=](sycl::id<1> i) { y[i] += w * (y[i] - first[i]); });
+}
+
 sycl::event pack_host(sycl::queue& q, const int32_t* ids, const float* w, const float* x, int64_t T, int64_t n_used, int64_t n_embd,
                       int32_t* hids, float* hw, float* hx) {
   return q.parallel_for(sycl::range<2>(size_t(T), size_t(n_embd)), [=](sycl::id<2> id) {

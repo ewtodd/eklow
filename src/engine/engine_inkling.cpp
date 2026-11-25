@@ -224,7 +224,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
 
   // Workspace.
   const int64_t B = c_.max_batch, QRG = HD + H * NR + HD;
-  for (int i = 0; i < 8; ++i) blk_.push_back(dev(B * E));
+  for (int i = 0; i < (c_.loopcd != 0.0f ? 10 : 8); ++i) blk_.push_back(dev(B * E));
   mixq_ = dev(3 * B * E);
   msg_ = dev(4 * B * E);
   for (auto& h : h_) h = dev(B * E);
@@ -857,6 +857,17 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         layer(app, l, x, blocks, msg_, &lp, out);
       }
       x = out;
+    }
+    // LoopCD: the first pass's blocks are kept (a later pass of the same parity writes over them), and the last pass's
+    // become h + w (h - h_1) in place, before the coda and the output mix read them.
+    if (c_.loopcd != 0.0f && cfg_.n_passes > 1) {
+      if (pass == 0) {
+        q_.memcpy(blk_[8], o11[0], size_t(T * E) * sizeof(float));
+        q_.memcpy(blk_[9], o17[0], size_t(T * E) * sizeof(float));
+      } else if (pass == cfg_.n_passes - 1) {
+        ik::contrast(q_, o11[pass % 2], blk_[8], c_.loopcd, T * E);
+        ik::contrast(q_, o17[pass % 2], blk_[9], c_.loopcd, T * E);
+      }
     }
   }
   for (int l = cfg_.core_end; l < cfg_.n_layer; ++l) {
