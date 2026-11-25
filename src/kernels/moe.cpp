@@ -1042,8 +1042,9 @@ void ffn(sycl::queue& q, const Layer& L, const float* x, int64_t n_tok, const in
       if (P <= kExperts) group_few(q, ids + t0 * n_used, L.slot_of, P, T, s.tl, s.rop);
       else group(q, ids + t0 * n_used, L.slot_of, P, L.n_hot, T, s.tl, s.rop);
     });
-    // The GEMM's grid is the exact tile count, read back (a wait on the queue a call, ~50 us against milliseconds of GEMM):
-    // work-groups past the list would have to repeat a tile (Gemm), 20% of the work at 4,096 tokens.
+    // The GEMM's grid is the exact tile count, read back (a wait on the queue a call): work-groups past the list would
+    // repeat a tile (Gemm), 20% of the hot experts' work at 4,096 tokens and more of the cold set's, whose bound counts
+    // every pair (prefill 1,035 -> 902 tok/s without the read).
     if (use_gemm) {
       int32_t nt = 0;
       q.memcpy(&nt, s.tl, 4).wait();

@@ -299,21 +299,38 @@ void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t
     });
     return;
   }
-  q.parallel_for(sycl::range<2>(size_t(T), size_t(channels)), [=](sycl::id<2> id) {
-    const int64_t t = int64_t(id[0]), c = int64_t(id[1]);
-    const int64_t b = base[t];
-    const float* hist = conv + int64_t(slot[t]) * state_stride;
-    auto at = [&](int64_t back) {
-      const int64_t p = t - back;
-      return p >= b ? x[p * ld_x + c] : hist[(3 + (p - b)) * hist_stride + c];
-    };
-    float acc = 0;
-    for (int k = 0; k < 4; ++k) acc += w[c * 4 + k] * at(3 - k);
-    if (has_dyn) {
-      const float* d = dyn + (t * heads + c / per_head) * 4;
-      for (int lag = 0; lag < 4; ++lag) acc += d[lag] * at(lag);
+  // A work-item a channel over a run of kSeg tokens, the last three inputs in registers: each input is read once (a
+  // work-item a (token, channel) read four, with a branch each, at ~35 GB/s). A token that starts a chunk takes them
+  // from its slot's state instead.
+  constexpr int64_t kSeg = 64;
+  const int64_t n_seg = (T + kSeg - 1) / kSeg;
+  q.parallel_for(sycl::range<2>(size_t(n_seg), size_t(channels)), [=](sycl::id<2> id) {
+    const int64_t t0 = int64_t(id[0]) * kSeg, t1 = sycl::min(t0 + kSeg, T), c = int64_t(id[1]);
+    const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+    int64_t b = base[t0];
+    // x[t0 - 3], x[t0 - 2], x[t0 - 1]: from the run's chunk's inputs where they are in it, else its slot's state
+    float h0, h1, h2;
+    {
+      const float* hist = conv + int64_t(slot[t0]) * state_stride;
+      auto at = [&](int64_t p) { return p >= b ? x[p * ld_x + c] : hist[(3 + (p - b)) * hist_stride + c]; };
+      h0 = at(t0 - 3), h1 = at(t0 - 2), h2 = at(t0 - 1);
     }
-    out[t * channels + c] = (x[t * ld_x + c] + acc) * s + (resid ? resid[t * channels + c] : 0.0f);
+    for (int64_t t = t0; t < t1; ++t) {
+      const int64_t bt = base[t];
+      if (bt != b) {  // a chunk starts here
+        b = bt;
+        const float* hist = conv + int64_t(slot[t]) * state_stride;
+        h0 = hist[c], h1 = hist[hist_stride + c], h2 = hist[2 * hist_stride + c];
+      }
+      const float xt = x[t * ld_x + c];
+      float acc = w0 * h0 + w1 * h1 + w2 * h2 + w3 * xt;
+      if (has_dyn) {
+        const float* d = dyn + (t * heads + c / per_head) * 4;
+        acc += d[0] * xt + d[1] * h2 + d[2] * h1 + d[3] * h0;
+      }
+      out[t * channels + c] = (xt + acc) * s + (resid ? resid[t * channels + c] : 0.0f);
+      h0 = h1, h1 = h2, h2 = xt;
+    }
   });
   // the new state: each chunk's last three inputs, older state where the chunk has fewer
   const Chunks cc = ch;
