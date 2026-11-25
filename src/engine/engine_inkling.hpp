@@ -158,8 +158,16 @@ class Engine {
   std::vector<Layer> layers_;  // physical
   std::vector<Loop> loops_;
   int64_t n_cold_ = 0;
-  uint8_t* staging_ = nullptr;  // a layer's cold set on the card while a long step runs it
-  int staged_layer_ = -1;       // whose cold set staging_ holds
+  // Two staging regions, each the largest cold set: while a long step runs one layer application's cold set from one, the
+  // copy queue fills the other with the next application's (DECISIONS 2026-11-24, M6). staged_: whose set each holds;
+  // copied_: its copy; used_: the step's last use of it, which the next copy into it waits for.
+  uint8_t* staging_[2] = {nullptr, nullptr};
+  int staged_[2] = {-1, -1};
+  sycl::event copied_[2], used_[2];
+  std::unique_ptr<sycl::queue> copy_q_;
+  std::vector<int> exec_layers_;  // the physical layer of each layer application, in the order a step runs them
+  int stage(int layer, int avoid);  // the region holding `layer`'s cold set, its copy issued if needed (never into `avoid`)
+  int last_staged_use_ = 0;         // the region the latest cold set ran from
   uint64_t free_at_placement_ = 0;
   // The cold path: the step's routing and expert inputs on the host, the cold rows, their device copy, the pool.
   int32_t* hids_ = nullptr;

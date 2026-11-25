@@ -51,6 +51,10 @@ std::vector<float> as_f32(const gguf::Tensor& t) {
 }  // namespace
 
 Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), c_(cfg), cfg_(model::Inkling2Config::from_gguf(f)) {
+  for (int l = 0; l < cfg_.core_start; ++l) exec_layers_.push_back(l);
+  for (int p = 0; p < cfg_.n_passes; ++p)
+    for (int l = cfg_.core_start; l < cfg_.core_end; ++l) exec_layers_.push_back(l);
+  for (int l = cfg_.core_end; l < cfg_.n_layer; ++l) exec_layers_.push_back(l);
   if (c_.max_ctx % attn::kPage) throw std::runtime_error("inkling engine: max_ctx must be a multiple of the page size");
   if (c_.max_chunk > c_.max_batch) throw std::runtime_error("inkling engine: max_chunk above max_batch");
   if (c_.n_slots < 1 || c_.n_slots > 8) throw std::runtime_error("inkling engine: 1 to 8 slots");
@@ -338,7 +342,7 @@ void Engine::place_experts(const gguf::File& f) {
     };
     uint64_t stage = 0;
     for (int round = 0; round < 8; ++round) {
-      uint64_t budget = *fm > keep + stage ? *fm - keep - stage : 0;
+      uint64_t budget = *fm > keep + 2 * stage ? *fm - keep - 2 * stage : 0;  // two staging regions
       for (auto& row : hot) std::fill(row.begin(), row.end(), false);
       for (const Cand& c : cand) {
         if (per(c.layer) > budget) continue;  // a smaller expert of another layer may still fit
@@ -375,11 +379,14 @@ void Engine::place_experts(const gguf::File& f) {
   for (const auto& L : layers_)
     if (L.cold_host) stage_bytes = std::max(stage_bytes, L.cold_set.bytes);
   if (stage_bytes > 0) {
-    staging_ = sycl::malloc_device<uint8_t>(stage_bytes, q_);
-    if (!staging_) throw std::runtime_error("inkling engine: out of device memory for the cold experts' staging region");
-    owned_.push_back(staging_);
+    for (auto& s : staging_) {
+      s = sycl::malloc_device<uint8_t>(stage_bytes, q_);
+      if (!s) throw std::runtime_error("inkling engine: out of device memory for the cold experts' staging regions");
+      owned_.push_back(s);
+    }
     for (auto& L : layers_)
-      if (L.cold_host) moe::rebase(q_, L.cold_set, staging_);
+      if (L.cold_host) moe::rebase(q_, L.cold_set, staging_[0]);
+    copy_q_ = std::make_unique<sycl::queue>(q_.get_context(), q_.get_device(), sycl::property::queue::in_order());
   }
   for (int l = 0; l < NL; ++l) {
     Layer& L = layers_[size_t(l)];
@@ -416,6 +423,7 @@ void Engine::place_experts(const gguf::File& f) {
 
 Engine::~Engine() {
   q_.wait();
+  if (copy_q_) copy_q_->wait();
   xmx::free_activations(q_, act_);
   xmx::free_activations(q_, act_head_);
   for (void* p : {static_cast<void*>(attn_scratch_.q), static_cast<void*>(attn_scratch_.part), static_cast<void*>(attn_scratch_.part2),
@@ -535,6 +543,18 @@ namespace {
 double g_cold_wait_ms = 0, g_cold_cpu_ms = 0;
 int64_t g_cold_pairs = 0;
 }  // namespace
+
+int Engine::stage(int layer, int avoid) {
+  for (int b = 0; b < 2; ++b)
+    if (staged_[b] == layer) return b;
+  const Layer& L = layers_[size_t(layer)];
+  if (!L.cold_host) return -1;
+  // into the region `avoid` is not, or (a use that found its set in neither) the one the latest set did not run from
+  const int b = avoid >= 0 ? 1 - avoid : 1 - last_staged_use_;
+  copied_[b] = copy_q_->memcpy(staging_[b], L.cold_host, L.cold_set.bytes, used_[b]);
+  staged_[b] = layer;
+  return b;
+}
 
 void Engine::cold(const Layer& L, int64_t T, sycl::event packed) {
   const int64_t E = cfg_.n_embd, NU = cfg_.n_expert_used, F = cfg_.n_ff_exp;
@@ -721,7 +741,9 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   auto next_of = [&](const float* x) { return x == xs[0] ? xs[1] : xs[0]; };
 
   // One layer application, as the reference's Forward::layer.
+  int exec_i = 0;  // layer applications started in this step (the next one's physical layer: exec_layers_[exec_i])
   auto layer = [&](int app, int ip, const float* x, std::vector<const float*>& blocks, const float* msgs, const Loop* lp, float* out) {
+    ++exec_i;
     const Layer& L = layers_[size_t(ip)];
     const bool swa = cfg_.sliding[size_t(ip)];
     const std::string sl = "-" + std::to_string(app);
@@ -869,11 +891,14 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     if (cold_cpu) packed = ik::pack_host(q_, ids_, wts_, h_[0], T, NU, E, hids_, hw_, hx_);
     if (cold_cpu) fine("pack");
     if (cold_card) {
-      if (staged_layer_ != ip) {
-        q_.memcpy(staging_, L.cold_host, L.cold_set.bytes);
-        staged_layer_ = ip;
-      }
+      const int b = stage(ip, -1);
+      q_.ext_oneapi_submit_barrier({copied_[b]});
+      moe::rebase(q_, layers_[size_t(ip)].cold_set, staging_[b]);
       moe::ffn(q_, L.cold_set, h_[0], T, ids_, wts_, NU, cfg_.situ_beta, cfg_.situ_linear_beta, *moe_scratch_, cr_);
+      used_[b] = q_.ext_oneapi_submit_barrier();
+      last_staged_use_ = b;
+      // the next layer application's cold set into the other region, while this one's experts run
+      if (size_t(exec_i) < exec_layers_.size()) stage(exec_layers_[size_t(exec_i)], b);
       mark("cold");
     }
     moe::ffn(q_, L.experts, h_[0], T, ids_, wts_, NU, cfg_.situ_beta, cfg_.situ_linear_beta, *moe_scratch_, f_,
