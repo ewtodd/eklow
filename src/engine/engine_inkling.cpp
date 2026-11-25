@@ -872,18 +872,28 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     }
     mark("inputs");
     // Projections; K and V through their convolutions (full layers: with taps from their inputs), then the heads.
-    mm(L.qrg, hin[0], E, qrg_);
+    // One or two tokens: Q|R|gate, K and V quantized and multiplied in one launch (xmx::matmul_fused; DECISIONS 2026-11-25)
+    const bool fused = T <= 2;
+    if (fused) {
+      const xmx::FusedJob jobs[3] = {{&L.qrg, hin[0], qrg_}, {&L.k, hin[1], kr_}, {&L.v, hin[2], vr_}};
+      xmx::matmul_fused(q_, jobs, 3, T);
+      fine("proj.qrgkv");
+    } else {
+      mm(L.qrg, hin[0], E, qrg_);
+    }
     // the sinks from the same activations, on the fp16 GEMM, when they are fp16 (steps of more than kFp16Rows)
     const bool sink_done = T > xmx::kFp16Rows && L.sink16.tiles;
     if (sink_done) {
       xmx::matmul(q_, act_, L.sink16, skp_);
       ik::gather_cols(q_, skp_, L.sink16.n, T, H, sk_);
     }
-    fine("proj.qrg");
-    mm(L.k, hin[1], E, kr_);
-    fine("proj.k");
-    mm(L.v, hin[2], E, vr_);
-    fine("proj.v");
+    if (!fused) {
+      fine("proj.qrg");
+      mm(L.k, hin[1], E, kr_);
+      fine("proj.k");
+      mm(L.v, hin[2], E, vr_);
+      fine("proj.v");
+    }
     if (sink_done) {
     } else if (T > kFewTokens && L.sink32) {
       // 24 outputs miss the tiled fp32 GEMM (a multiple of 32): 32 of them, the padding dropped after
@@ -937,7 +947,12 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     mark(swa ? "attn_sliding" : "attn_full");
     ik::gate(q_, att_, qrg_ + HD + H * NR, QRG, T, HD);
     fine("o.gate");
-    mm(L.o, att_, HD, o_);
+    if (T <= 2) {
+      const xmx::FusedJob job{&L.o, att_, o_};
+      xmx::matmul_fused(q_, &job, 1, T);
+    } else {
+      mm(L.o, att_, HD, o_);
+    }
     fine("o.mm");
     // the stream's residual added in the convolution, where nothing reads the attention's output alone
     const bool fuse_res = ip % cfg_.block != 0 && !dump;
