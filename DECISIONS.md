@@ -4457,3 +4457,36 @@ generating sequence that still finds no page restarts a request still reading it
 the most recently admitted other request with "the K/V pool is full". One request alone always fits. Checked through
 eklow-server on fiona: two 37k-token conversations at once, the second waits for the first (its first token after 116 s),
 then takes its idle cache, so the first prefills again when it returns; the smoke checks pass.
+
+## 2026-11-24 — Inkling speed, second round: prefill ~600 -> ~890 tok/s, no checker
+
+**The checker leaves** (the owner: unused in production for a while): its 1.19 GiB on the card hold ~300 more experts.
+Measured with the side models' reserve at 1.33 GiB instead of 2.5: 1,833 -> 1,535 cold experts, cold pairs per decode step
+67 -> 46, decode at 12k 17.9 -> 18.4 tok/s, prefill 627 -> 653. Moving the embeddings and the reranker to the Iris Xe as well
+(the rest of that option) was not done: ~1-2% more, for porting their kernels off the matrix units, and the reranker runs
+before every turn (~100 ms on the A770M, ~1 s on the Iris Xe when it ran there).
+
+**Prefill**, the owner's measure being the Gemma 4 26B's (1,578 tok/s at 8k in production on this card, 3,130 all on the
+card): Inkling's work a token is about the 26B's, the loop included (48 layer applications of ~68M active parameters
+against 30 of ~125M). Per 1,000 tokens of a 12k prompt, from 1.53 s:
+- depth_mix splits rows across work-groups at every row count (the sub-group-a-row path walked 6 states twice: the mixes
+  245 -> 60 ms);
+- the sink projection (24 outputs) and the loop controllers' down projection (64 outputs, 4,608 wide) run on the fp16 GEMM
+  when the activations are fp16, padded to its 128-column tile (they were fp32 GEMMs at 0.3-1 TFLOPS);
+- the experts run once over a whole step: each sub-batch runs a layer application up to its routing, the experts (hot,
+  then the cold set from staging) over all of the step's rows, then each sub-batch's FFN convolution and residual in order.
+  The grouped GEMMs get ~256 rows an expert instead of ~64 (half of a 128-row tile was padding): 43.8 -> 30.2 ms for 4,096
+  tokens of layer 6. moe's down rows became fp16 over the fp16 inputs' memory (dead once gate_up has read them), so the
+  4,096-token scratch is 231 MiB, not 538 (eklow-moe-test: rel L2 ~4e-4 against the reference, as before).
+
+Prefill at 12k / 33k: 13.5 s / 37.9 s (887 / 869 tok/s), from 18.4 s / 56 s; through eklow-server a new 15.4k prompt to its
+first token in 16.7 s (924 tok/s; the checker still loaded there). Decode against llama.cpp CUDA's continuations: top-1
+32/32 at both, mean KL 1.5e-3 and 6.8e-4.
+
+What a 1,000-token prefill spends now (~1.15 s): the hot experts' GEMMs 395 ms (~9-12 TFLOPS), the cold sets 138 (their
+GEMMs; skipping the copies altogether gained 5%), attention 178 (sliding 96 at ~5.5 TFLOPS with the bias, full 82), the
+controllers 77, Q/R/gate 58, the mixes 60, O 32. The expert GEMM is the gap to the 26B's 21-26 TFLOPS: per K step its
+threads read shared memory 24 times for 32 dpas (shared-memory bound at about a third of the matrix units), and a larger
+tile than 128 x 128 does not fit the 64 KB of shared memory a work-group may have with double buffering (128 x 256 and 256
+x 128 failed to build). The next step there is a different kernel: activation tiles loaded into registers with the
+card's 2D block loads instead of through shared memory.
