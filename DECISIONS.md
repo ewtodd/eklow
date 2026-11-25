@@ -4275,3 +4275,49 @@ time copying cold sets, once for each pass of a looped layer. What would buy it 
   kernels it overlaps).
 
 The card sessions for M3: eklow-bolt stopped 16:46-17:08 CST (with the experts worker's runs), restarted healthy.
+
+## 2026-11-24 — Inkling M4: the tool-call grammar (`src/serve/tool_grammar_inkling.*`, `eklow-grammar-test-inkling`)
+
+With tools in a request llama-server samples all of Inkling's output under the grammar `common/parsers/inkling.cpp` builds
+(`grammar_lazy` false, from the first token). `InklingToolGrammar` is that grammar's sampler as a token-level state machine
+(`Choice::Auto` or `Required`, parallel or not, the request's tool names; `allowed()`, `unconstrained()`, `accept()`, plus
+`can_end()` and `ended()`), built from llama.cpp's source, not from a description of it:
+- **Auto**: any token until `<|content_invoke_tool_json|>` (200049), then `{"name": STRING, "args": VALUE}` (`space` between
+  the tokens, no space before the `{`, any JSON value; the `space` rule is `| " " | "\n"{1,2} [ \t]{0,20}`), then 200010; with
+  parallel calls 200001, any tokens, 200049 and another call. **Required**: blocks, then 200001 and a call of a tool: its name
+  as optional text, 200049, the call with that name.
+- The end-of-generation tokens (200006, 199999) are allowed only where the grammar may end (auto before a call and after a
+  complete one; required after a complete one).
+- **What llama.cpp does that the grammar text does not say**, all reproduced and checked: a token the grammar names by id
+  (opaque: 200001 only if the grammar has a rule for it, which auto without parallel calls does not; 200004 and 200008 only in
+  required; 200010; 200049) matches only a rule that names it, every other token is matched by its text, special tokens as
+  their `<|...|>` text, so 200004 or 200008 may sit inside a JSON string in auto mode. A token's text is read as a C string
+  (cut at a NUL; empty or NUL-first is never allowed). The sampler carries a partial UTF-8 character across every token, even
+  where tokens are matched by id, so after a token that ends inside a character only a token that continues it is allowed, and
+  a token that begins with a stray continuation byte, or an invalid lead, is never allowed (332 of the 200,058 tokens, from
+  a clean state: `InklingToolVocab::never`). The escape class holds a space (`\ ` is a valid escape).
+- **Unconstrained**: auto before a call with no character pending allows everything but `never`; the sampler may skip the
+  mask if it bans `never`.
+- **Speed**: an allowed set is cached by state (mode, position in the call, nesting, the names still possible, the pending
+  character), shared across requests with the same grammar; a set is computed once with a first-character prefilter. See the
+  numbers below.
+
+**The gate** (`tools/ref/inkling/grammar_gate.sh`): `eklow-grammar-oracle` (new, beside the chat oracle in `nix/oracle-inkling.nix`)
+builds `llama_sampler_init_grammar` from the grammar string `eklow-chat-oracle` gives for a request, replays a token sequence
+and writes the allowed ids at every step. 412 grammars: M0's 12 tool requests and 400 fuzzed ones (1 to 30 tools; names with
+Unicode, quotes, backslashes, newlines, control bytes, special-token text, names that start with another; auto and required,
+parallel on and off). Sequences: model-like outputs tokenized by eklow (blocks, calls with every spacing, escapes, number
+forms, nesting to 40, invalid values, some with multi-byte characters split into byte tokens), mutations (token replaced,
+inserted, deleted, swapped, cut), random walks through eklow's allowed sets, M0's 48 model outputs, and single tokens.
+The vocabulary's every token text and end flag also equal llama.cpp's (`check-vocab`, 200,058 of 200,058).
+
+**Result.** The full run (76,256 sequences) was stopped at about 44% to spare the owner's desktop; every sequence the 28
+oracle shards finished was compared: **39,619 sequences over 232 grammars, 1,047,690 steps, 1.02 M tokens accepted, 81 G
+(id, step) pairs compared: 0 allowed-set differences, 0 accept() disagreements, 0 end-of-generation or unconstrained()
+errors** (15,635 sequences stop at a token llama.cpp refuses, 11,435 at an accepted end token; by kind: 16,400 single tokens,
+10,940 walks, 6,688 valid outputs, 4,405 mutated, 1,186 M0 outputs). Two bugs the gate found early, both in what llama.cpp
+treats as a named token (above). **Speed** (replaying all 1.97 M steps, one thread): `allowed()` on a cached state 0.06 us
+(p50) and `accept()` 0.05 us; a state's first set costs up to 13 ms (p99.9 2.6 ms; string interiors, whose sets hold
+~200k ids), so a request pays a few ms once per distinct state it reaches, and a tool set already seen pays nothing. The
+bench's own mean (73 us) is its 412 grammars thrashing the cache (cleared past 64 M ids); one production grammar fits.
+`eklow-grammar-test-inkling check` compares a stopped run's finished sequences only.

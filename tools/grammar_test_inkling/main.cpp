@@ -236,9 +236,12 @@ struct Gen {
   Gen(uint64_t seed, const text::InklingTokenizer& t, const serve::InklingToolVocab& v) : r(seed), tok(t), byte_tok(256, -1) {
     static const std::string js = "{}[]:,\" \n\t0123456789.-+eE\\/ntrufalsb";
     for (size_t id = 0; id < v.n; ++id) {
+      if (!tok.is_special(int32_t(id))) {
+        const std::string raw = tok.bytes(int32_t(id));
+        if (raw.size() == 1) byte_tok[uint8_t(raw[0])] = int32_t(id);
+      }
       const std::string& p = v.piece[id];
       if (p.empty()) continue;
-      if (p.size() == 1) byte_tok[uint8_t(p[0])] = int32_t(id);
       if (!tok.is_special(int32_t(id))) {
         bool all_js = true;
         for (char c : p) all_js = all_js && js.find(c) != std::string::npos;
@@ -669,8 +672,10 @@ int cmd_check(const std::string& model, const std::string& dir, int shard) {
   auto vocab = std::make_shared<const serve::InklingToolVocab>(tok);
   std::map<std::string, Meta> metas;
   for (auto& m : read_meta(dir + "/meta.json")) metas[m.id] = m;
-  const auto cases = read_cases(dir + "/cases-" + std::to_string(shard) + ".txt");
+  auto cases = read_cases(dir + "/cases-" + std::to_string(shard) + ".txt");
   const auto results = read_results(dir + "/results-" + std::to_string(shard) + ".txt");
+  // A run that was stopped leaves the sequences it finished (each ends in a Z line): those are compared, the rest ignored.
+  if (results.size() < cases.size()) cases.resize(results.size());
   if (cases.size() != results.size()) {
     std::fprintf(stderr, "shard %d: %zu sequences, %zu results\n", shard, cases.size(), results.size());
     return 1;
