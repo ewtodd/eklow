@@ -73,6 +73,7 @@ int main(int argc, char** argv) {
   std::string experts;
   double reserve_gib = 0;
   int64_t cpu_max_tokens = -1;
+  int cpu_threads = 0;  // 0: the engine's default (8)
   double loopcd = 0;  // LoopCD's contrast strength (Config::loopcd)
   bool profile = false, rewind = false, twin = false;
   for (int i = 1; i < argc; ++i) {
@@ -96,6 +97,7 @@ int main(int argc, char** argv) {
     else if (a == "--twin-tokens") twin_tokens = next(), twin = true;
     else if (a == "--cpu-max-tokens") cpu_max_tokens = std::atoll(next().c_str());
     else if (a == "--loopcd") loopcd = std::atof(next().c_str());
+    else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-run-inkling --model GGUF --out DIR --tokens-json FILE [--tensors P,...] [--dump-last N]\n"
                            "       [--chunk N] [--max-ctx N] [--slots N] [--experts PROFILE] [--reserve-gib G] [--teacher DIR]\n"
@@ -113,7 +115,11 @@ int main(int argc, char** argv) {
 
     auto t0 = std::chrono::steady_clock::now();
     auto f = gguf::File::open(model);
-    sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
+    // EKLOW_PROFILE_DEVICE (with --profile): the queue keeps kernel timestamps, and the profile is the device's time between
+    // marks instead of the host's.
+    sycl::queue q = std::getenv("EKLOW_PROFILE_DEVICE")
+                        ? sycl::queue(rt::pick_device(), {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()})
+                        : sycl::queue(rt::pick_device(), sycl::property::queue::in_order());
     engine::inkling::Config cfg;
     cfg.n_slots = int(slots);
     cfg.max_ctx = max_ctx;
@@ -123,6 +129,7 @@ int main(int argc, char** argv) {
     cfg.card_reserve_bytes = uint64_t(reserve_gib * 1073741824.0);
     if (cpu_max_tokens >= 0) cfg.cpu_max_tokens = cpu_max_tokens;
     cfg.loopcd = float(loopcd);
+    if (cpu_threads > 0) cfg.cpu_threads = cpu_threads;
     engine::inkling::Engine eng(q, f, cfg);
     std::printf("engine: %.2f GiB of weights on %s, %lld cold experts (%.2f GiB) on the CPU, %.2f GiB of caches, %.2f GiB free "
                 "before the experts, %.1f s\n",

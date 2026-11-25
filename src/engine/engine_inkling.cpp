@@ -245,6 +245,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   f_ = dev(B * E);
   ci_ = dev(B * 2 * E);
   cd_ = dev(B * cfg_.gate_rank);
+  mixp_ = dev(ik::kMixFewRows * ik::kMixScratch);
   cg_ = dev(B * E);
   cf_ = dev(B * E);
   lg_ = dev(B * cfg_.n_expert);
@@ -529,9 +530,22 @@ cpu::QType Engine::cpu_type(gguf::Type t) {
   }
 }
 
+namespace {
+// EKLOW_STEP_TIMING's split of the cold path in a step: the host waiting for the routing, the CPU computing the cold pairs.
+double g_cold_wait_ms = 0, g_cold_cpu_ms = 0;
+int64_t g_cold_pairs = 0;
+}  // namespace
+
 void Engine::cold(const Layer& L, int64_t T, sycl::event packed) {
   const int64_t E = cfg_.n_embd, NU = cfg_.n_expert_used, F = cfg_.n_ff_exp;
+  const auto t_w0 = std::chrono::steady_clock::now();
   packed.wait();
+  const auto t_w1 = std::chrono::steady_clock::now();
+  g_cold_wait_ms += std::chrono::duration<double, std::milli>(t_w1 - t_w0).count();
+  struct CpuTime {
+    std::chrono::steady_clock::time_point t0;
+    ~CpuTime() { g_cold_cpu_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count(); }
+  } cpu_time{t_w1};
   // the step's cold pairs by expert, so that each cold expert's weights are read once for all its tokens
   std::vector<std::vector<std::pair<int32_t, int32_t>>> by(L.cold_ref.size());
   std::vector<uint8_t> touched(size_t(T), 0);
@@ -541,6 +555,7 @@ void Engine::cold(const Layer& L, int64_t T, sycl::event packed) {
       const int32_t c = L.cold_slot[size_t(hids_[t * NU + s])];
       if (c < 0) continue;
       by[size_t(c)].push_back({int32_t(t), int32_t(s)});
+      ++g_cold_pairs;
       touched[size_t(t)] = 1;
       any = true;
     }
@@ -588,6 +603,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   // EKLOW_STEP_TIMING: per step, the host's time until everything is submitted and the step's whole time (speed work).
   static const bool step_timing = std::getenv("EKLOW_STEP_TIMING") != nullptr;
   const auto t_step0 = std::chrono::steady_clock::now();
+  g_cold_wait_ms = g_cold_cpu_ms = 0, g_cold_pairs = 0;
   const int64_t E = cfg_.n_embd, H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim, NR = cfg_.n_rel;
   const int64_t HD = H * D, KD = HK * D, QRG = HD + H * NR + HD, CC = cfg_.conv_channels(), NA = cfg_.n_slot();
   const int64_t NU = cfg_.n_expert_used, V = cfg_.n_vocab, VO = cfg_.n_vocab_out;
@@ -630,12 +646,31 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   const attn::Tokens toks{slot_, pos_, T};
 
   auto t_mark = std::chrono::steady_clock::now();
+  // With a queue that keeps timestamps (EKLOW_PROFILE_DEVICE in the driver), a mark is an empty kernel whose times are read
+  // after the step: each name gets the device's time since the mark before (idle time included where the card waited for
+  // the host). Otherwise the host waits at every mark.
+  const bool device_marks = profile_ && q_.has_property<sycl::property::queue::enable_profiling>();
+  std::vector<std::pair<const char*, sycl::event>> marks;
+  if (device_marks) marks.push_back({"_start", q_.single_task([] {})});
   auto mark = [&](const char* name) {
     if (!profile_) return;
+    if (device_marks) {
+      marks.push_back({name, q_.single_task([] {})});
+      return;
+    }
     q_.wait();
     const auto now = std::chrono::steady_clock::now();
     (*profile_)[name] += std::chrono::duration<double>(now - t_mark).count();
     t_mark = now;
+  };
+  auto settle_marks = [&] {
+    if (!device_marks || marks.size() < 2) return;
+    q_.wait();
+    using namespace sycl::info;
+    for (size_t i = 1; i < marks.size(); ++i)
+      (*profile_)[marks[i].first] += double(marks[i].second.get_profiling_info<event_profiling::command_start>() -
+                                            marks[i - 1].second.get_profiling_info<event_profiling::command_end>()) * 1e-9;
+    marks.clear();
   };
   // EKLOW_PROFILE_FINE (with a profile): a mark after every kernel group, and "_sync", what one mark costs by itself, to
   // subtract from each (speed work).
@@ -643,7 +678,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   auto fine = [&](const char* name) {
     if (fine_profile) mark(name);
   };
-  if (profile_ && fine_profile) {
+  if (profile_ && fine_profile && !device_marks) {
     mark("_before");
     for (int i = 0; i < 20; ++i) mark("_sync");
   }
@@ -700,11 +735,15 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     const float* in[3] = {x, x, x};
     if (L.attn_res_query) {
       states(x);
-      ik::depth_mix(q_, st, L.attn_res_query, swa ? 1 : 3, T, E, 1e-6f, mixq_);
+      ik::depth_mix(q_, st, L.attn_res_query, swa ? 1 : 3, T, E, 1e-6f, mixq_, mixp_);
       for (int j = 0; j < 3; ++j) in[j] = mixq_ + (swa ? 0 : j) * T * E;
       fine("in.mix");
     }
     auto control = [&](const float* cur, int k, float* dst) {
+      if (T <= kFewTokens) {
+        ik::control(q_, cur, msgs + int64_t(k) * T * E, lp->down[k], lp->gain32[k], lp->forget32[k], T, E, cfg_.gate_rank, 1e-6f, cd_, dst);
+        return;
+      }
       ik::control_input(q_, cur, msgs + int64_t(k) * T * E, T, E, 1e-6f, ci_);
       mm32(lp->down[k], cfg_.gate_rank, 2 * E, ci_, cd_);
       if (T <= kFewTokens) {
@@ -801,7 +840,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     emit("ffn_inp" + sl, cur, {E, T});
     // The MoE.
     states(cur);
-    ik::depth_mix(q_, st, L.ffn_res_query, 1, T, E, 1e-6f, mixq_);
+    ik::depth_mix(q_, st, L.ffn_res_query, 1, T, E, 1e-6f, mixq_, mixp_);
     fine("ffn.mix");
     if (msgs) {
       control(mixq_, 3, h_[0]);
@@ -886,7 +925,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         ik::States st;
         for (const float* b : bank) st.p[st.n++] = b;
         st.p[st.n++] = bank_out;
-        ik::depth_mix(q_, st, lp.msg_query, 4, T, E, 1e-6f, msg_);
+        ik::depth_mix(q_, st, lp.msg_query, 4, T, E, 1e-6f, msg_, mixp_);
         layer(app, l, x, blocks, msg_, &lp, out);
       }
       x = out;
@@ -911,6 +950,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   for (const auto& c : chunks) slots_[size_t(c.slot)].length += int64_t(c.tokens.size());
   if (R == 0) {
     q_.wait();
+    settle_marks();
     return {};
   }
 
@@ -940,11 +980,12 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   std::vector<float> out(size_t(R * VO));
   for (int64_t r = 0; r < R; ++r) std::memcpy(out.data() + r * VO, full.data() + r * V, size_t(VO) * sizeof(float));
   if (dump && dump->wants("result_output")) dump->put("result_output", out, {VO, R});
+  settle_marks();
   if (step_timing) {
     const auto now = std::chrono::steady_clock::now();
-    std::fprintf(stderr, "step: %lld tokens, submitted after %.2f ms, done after %.2f ms\n", (long long)T,
-                 std::chrono::duration<double, std::milli>(t_submitted - t_step0).count(),
-                 std::chrono::duration<double, std::milli>(now - t_step0).count());
+    std::fprintf(stderr, "step: %lld tokens, submitted after %.2f ms, done after %.2f ms; cold: %lld pairs, %.2f ms waiting for the routing, %.2f ms on the CPU\n",
+                 (long long)T, std::chrono::duration<double, std::milli>(t_submitted - t_step0).count(),
+                 std::chrono::duration<double, std::milli>(now - t_step0).count(), (long long)g_cold_pairs, g_cold_wait_ms, g_cold_cpu_ms);
   }
   return out;
 }

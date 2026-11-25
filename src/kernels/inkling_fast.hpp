@@ -16,8 +16,12 @@ struct States {
   int n = 0;
 };
 
-// ref::inkling::depth_mix: out [n_query][rows][n_embd]. One work-group a row.
-void depth_mix(sycl::queue& q, const States& s, const float* query, int n_query, int64_t rows, int64_t n_embd, float eps, float* out);
+// ref::inkling::depth_mix: out [n_query][rows][n_embd]. Up to kMixFewRows rows with `scratch` (kMixScratch floats a row),
+// each row split across work-groups; up to 64 a work-group a row; above, a sub-group a row.
+constexpr int64_t kMixFewRows = 16;
+constexpr int64_t kMixScratch = 40 * 16;  // a row's slices' sums: 40 values for each of up to 16 slices of 256 (n_embd <= 4096)
+void depth_mix(sycl::queue& q, const States& s, const float* query, int n_query, int64_t rows, int64_t n_embd, float eps, float* out,
+               float* scratch = nullptr);
 
 // The chunks of a step, by value: where each starts in the batch, its length and its sequence slot.
 struct Chunks {
@@ -59,6 +63,12 @@ void gather_rows(sycl::queue& q, const float* x, const int32_t* idx, int64_t row
 // most 256; n_used at most 16).
 void route(sycl::queue& q, const float* logits, const float* bias, int64_t T, int64_t n_expert, int64_t n_used, float w_scale,
            int32_t* ids, float* weights);
+
+// A loop controller at a few tokens, as ref control_input, the down projection, gain and forget and ref control_mix, in two
+// kernels: cd [T][rank] (scratch) = down . [cur/rms(cur), msg/rms(msg)]; out = cur - tanh(forget . cd) cur + tanh(gain . cd)
+// msg. down [rank][2 n_embd], gain and forget [n_embd][rank], fp32.
+void control(sycl::queue& q, const float* cur, const float* msg, const float* down, const float* gain, const float* forget, int64_t T,
+             int64_t n_embd, int64_t rank, float eps, float* cd, float* out);
 
 // LoopCD's hidden-state contrast (arXiv 2610.02185): y <- y + w (y - first), over n values.
 void contrast(sycl::queue& q, float* y, const float* first, float w, int64_t n);

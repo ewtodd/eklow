@@ -1,5 +1,11 @@
 #include "cpu/pool.hpp"
 
+#include <pthread.h>
+#include <sched.h>
+
+#include <cstdlib>
+#include <vector>
+
 #include <immintrin.h>
 
 #include <algorithm>
@@ -41,7 +47,27 @@ using SpinClock = std::chrono::steady_clock;
 }
 
 Pool::Pool(int threads, int spin_us) : spin_us_(spin_us) {
-  for (int i = 1; i < std::max(threads, 1); ++i) workers_.emplace_back([this, i] { run(i); });
+  // EKLOW_CPU_PIN: a comma-separated list of CPUs; worker i (1 on: the caller is 0 and stays where it is) runs on entry
+  // i - 1, cycling (speed work: P-cores against E-cores).
+  std::vector<int> pin;
+  if (const char* e = std::getenv("EKLOW_CPU_PIN"))
+    for (const char* c = e; *c;) {
+      char* end = nullptr;
+      const long v = std::strtol(c, &end, 10);
+      if (end == c) break;
+      pin.push_back(int(v));
+      c = *end == ',' ? end + 1 : end;
+    }
+  for (int i = 1; i < std::max(threads, 1); ++i)
+    workers_.emplace_back([this, i, pin] {
+      if (!pin.empty()) {
+        cpu_set_t set;
+        CPU_ZERO(&set);
+        CPU_SET(pin[size_t(i - 1) % pin.size()], &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+      }
+      run(i);
+    });
 }
 
 Pool::~Pool() {

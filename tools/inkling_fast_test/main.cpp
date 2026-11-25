@@ -106,12 +106,18 @@ void test_depth_mix(sycl::queue& q, std::mt19937& rng) {
         ref::inkling::depth_mix(q, table, n_states, dq, n_query, rows, E, 1e-6f, oa);
         ik::States st;
         for (float* p : sp) st.p[st.n++] = p;
-        ik::depth_mix(q, st, dq, n_query, rows, E, 1e-6f, ob);
-        q.wait();
-        const double e = max_rel(host(q, ob, size_t(n_query * rows * E)), host(q, oa, size_t(n_query * rows * E)));
-        char d[120];
-        std::snprintf(d, sizeof d, "%lld rows, %d states, %d queries: max rel %.2e", (long long)rows, n_states, n_query, e);
-        report("depth_mix", e < 1e-5, d);
+        float* scratch = sycl::malloc_device<float>(size_t(ik::kMixFewRows * ik::kMixScratch), q);
+        for (bool few : {false, true}) {
+          if (few && rows > ik::kMixFewRows) continue;
+          ik::depth_mix(q, st, dq, n_query, rows, E, 1e-6f, ob, few ? scratch : nullptr);
+          q.wait();
+          const double e = max_rel(host(q, ob, size_t(n_query * rows * E)), host(q, oa, size_t(n_query * rows * E)));
+          char d[120];
+          std::snprintf(d, sizeof d, "%lld rows, %d states, %d queries%s: max rel %.2e", (long long)rows, n_states, n_query,
+                        few ? ", split rows" : "", e);
+          report("depth_mix", e < 1e-5, d);
+        }
+        sycl::free(scratch, q);
         for (float* p : sp) sycl::free(p, q);
         for (void* p : {(void*)dq, (void*)table, (void*)oa, (void*)ob}) sycl::free(p, q);
       }
@@ -148,6 +154,53 @@ void test_matmul(sycl::queue& q, std::mt19937& rng) {
   }
 }
 
+void test_control(sycl::queue& q, std::mt19937& rng) {
+  const int64_t E = 2304, R = 64;
+  std::normal_distribution<float> nd(0, 1);
+  for (int64_t T : {int64_t(1), int64_t(3), int64_t(16)}) {
+    std::vector<float> cur(static_cast<size_t>(T * E)), msg(cur.size()), down(static_cast<size_t>(R * 2 * E)), gain(static_cast<size_t>(E * R)),
+        forget(gain.size());
+    for (auto& v : cur) v = nd(rng) * 3.0f;
+    for (auto& v : msg) v = nd(rng) * 0.5f;
+    for (auto& v : down) v = nd(rng) * 0.02f;
+    for (auto& v : gain) v = nd(rng) * 0.1f;
+    for (auto& v : forget) v = nd(rng) * 0.1f;
+    float *dc = dev(q, cur), *dm = dev(q, msg), *dd = dev(q, down), *dg = dev(q, gain), *df = dev(q, forget);
+    float* ci = sycl::malloc_device<float>(size_t(T * 2 * E), q);
+    float* cd = sycl::malloc_device<float>(size_t(T * R), q);
+    float* out = sycl::malloc_device<float>(size_t(T * E), q);
+    // the reference: ref control_input, the projections on the host in fp64, ref control_mix
+    ref::inkling::control_input(q, dc, dm, T, E, 1e-6f, ci);
+    q.wait();
+    const auto hci = host(q, ci, size_t(T * 2 * E));
+    std::vector<float> hcd(static_cast<size_t>(T * R)), hg(static_cast<size_t>(T * E)), hf(hg.size());
+    for (int64_t t = 0; t < T; ++t) {
+      for (int64_t r = 0; r < R; ++r) {
+        double a = 0;
+        for (int64_t i = 0; i < 2 * E; ++i) a += double(down[size_t(r * 2 * E + i)]) * double(hci[size_t(t * 2 * E + i)]);
+        hcd[size_t(t * R + r)] = float(a);
+      }
+      for (int64_t e = 0; e < E; ++e) {
+        double g = 0, f = 0;
+        for (int64_t r = 0; r < R; ++r)
+          g += double(gain[size_t(e * R + r)]) * hcd[size_t(t * R + r)], f += double(forget[size_t(e * R + r)]) * hcd[size_t(t * R + r)];
+        hg[size_t(t * E + e)] = float(g), hf[size_t(t * E + e)] = float(f);
+      }
+    }
+    float *dhg = dev(q, hg), *dhf = dev(q, hf);
+    float* want = sycl::malloc_device<float>(size_t(T * E), q);
+    ref::inkling::control_mix(q, dc, dm, dhg, dhf, T * E, want);
+    ik::control(q, dc, dm, dd, dg, df, T, E, R, 1e-6f, cd, out);
+    q.wait();
+    const double ecd = max_rel(host(q, cd, size_t(T * R)), hcd), e = max_rel(host(q, out, size_t(T * E)), host(q, want, size_t(T * E)));
+    char d[120];
+    std::snprintf(d, sizeof d, "%lld tokens: down max rel %.2e, out max rel %.2e", (long long)T, ecd, e);
+    report("control", ecd < 1e-5 && e < 1e-5, d);
+    for (void* p : {(void*)dc, (void*)dm, (void*)dd, (void*)dg, (void*)df, (void*)ci, (void*)cd, (void*)out, (void*)dhg, (void*)dhf, (void*)want})
+      sycl::free(p, q);
+  }
+}
+
 }  // namespace
 
 int main() {
@@ -158,6 +211,7 @@ int main() {
     test_route(q, rng);
     test_depth_mix(q, rng);
     test_matmul(q, rng);
+    test_control(q, rng);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-inkling-fast-test: %s\n", e.what());
     return 1;
