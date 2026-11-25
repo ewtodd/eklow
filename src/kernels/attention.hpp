@@ -37,6 +37,9 @@
 
 namespace eklow::attn {
 
+// A measuring hook: when set, attend appends each of its kernels' events here.
+extern std::vector<sycl::event>* g_event_log;
+
 constexpr int64_t kPage = 256;
 
 struct Cache {

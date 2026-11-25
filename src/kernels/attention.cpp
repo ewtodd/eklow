@@ -12,6 +12,16 @@
 
 namespace eklow::attn {
 
+// EKLOW speed work: when set, attend appends each of its kernels' events here (eklow-attn-test, eklow-engine-run-inkling).
+std::vector<sycl::event>* g_event_log = nullptr;
+
+namespace {
+inline void log_ev(sycl::event e) {
+  if (g_event_log) g_event_log->push_back(e);
+}
+}  // namespace
+
+
 namespace esimd = sycl::ext::intel::esimd;
 namespace xmxd = sycl::ext::intel::esimd::xmx;
 
@@ -1002,24 +1012,24 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
   const int32_t* last = tok.hi ? tok.hi : tok.pos;  // the last key each token sees
   // Query tiles in fp16, the A operands of Q.K^T: [tile][D/16][8 rows][16].
   sycl::half* qt = grow(q, scratch.q, scratch.q_halves, size_t(n_tiles * kRows * D), "attention query tiles");
-  q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
+  log_ev(q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
     const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), d = int32_t(id[2]);
     const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];
     float v = 0;
     if (r < rows) v = Q[((base + r / G) * H + kvh * G + r % G) * D + d] * scale;
     qt[tile * kRows * D + (d / 16) * 128 + i * 16 + d % 16] = sycl::half(v);
-  });
+  }));
   BiasArgs ba = {};
   if constexpr (BI) {
     if (tok.lo || tok.hi) throw std::runtime_error("attention: the bias takes causal tokens only");
     // R as the A operands of the bias dpas: [tile][8 rows][16] fp16.
     sycl::half* rt = grow(q, scratch.rt, scratch.rt_halves, size_t(n_tiles * kRows * 16), "attention R tiles");
     const float* R = bias->R;
-    q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, 16), [=](sycl::id<3> id) {
+    log_ev(q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, 16), [=](sycl::id<3> id) {
       const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), k = int32_t(id[2]);
       const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];
       rt[(tile * kRows + i) * 16 + k] = sycl::half(r < rows ? R[((base + r / G) * H + kvh * G + r % G) * 16 + k] : 0.0f);
-    });
+    }));
     const sycl::half* tv = bias->table_tiles;
     if (!tv) {
       tv = grow(q, scratch.tv, scratch.tv_halves, bias_table_halves(bias->extent), "attention bias table");
@@ -1042,15 +1052,15 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
       Flash<D, G, Q8, S, false, true> k{qt, tiles, tok.slot, last, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
                                         int32_t(c.n_head_kv), H, sp, out, part};
       k.ba = ba;
-      q.parallel_for(nd, k);
+      log_ev(q.parallel_for(nd, k));
     } else if (tok.lo) {
       Flash<D, G, Q8, S, true> k{qt, tiles, tok.slot, last, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
                                  int32_t(c.n_head_kv), H, sp, out, part};
       k.lo_of = tok.lo;
-      q.parallel_for(nd, k);
+      log_ev(q.parallel_for(nd, k));
     } else {
-      q.parallel_for(nd, Flash<D, G, Q8, S>{qt, tiles, tok.slot, last, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
-                                            int32_t(c.n_head_kv), H, sp, out, part});
+      log_ev(q.parallel_for(nd, Flash<D, G, Q8, S>{qt, tiles, tok.slot, last, c.k, c.v, c.ks, c.vs, c.table, int32_t(c.pages), int32_t(c.window),
+                                            int32_t(c.n_head_kv), H, sp, out, part}));
     }
     if (splits == 1) return;
     // Each work-item of the merge below loops over every split, which at 128 splits was half of
@@ -1062,7 +1072,7 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
       const int32_t sp2 = (sp + 7) / 8;
       float* dst = to2 ? grow(q, scratch.part2, scratch.part2_floats, size_t(n_tiles) * sp2 * part_stride(D), "attention folded partials") : part_in;
       const float* src = part;
-      q.parallel_for(sycl::range<3>(size_t(n_tiles) * kRows, size_t(sp2), D), [=](sycl::id<3> id) {
+      log_ev(q.parallel_for(sycl::range<3>(size_t(n_tiles) * kRows, size_t(sp2), D), [=](sycl::id<3> id) {
         const int32_t tile = int32_t(id[0]) / kRows, i = int32_t(id[0]) % kRows, g = int32_t(id[1]), d = int32_t(id[2]);
         const int32_t rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i;
         if (r >= rows) return;
@@ -1081,11 +1091,11 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
         }
         o2[i * D + d] = o;
         if (d == 0) o2[kRows * D + i] = mg, o2[kRows * D + kRows + i] = lg;
-      });
+      }));
       sp = sp2;
       part = dst;
     }
-    q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
+    log_ev(q.parallel_for(sycl::range<3>(size_t(n_tiles), kRows, D), [=](sycl::id<3> id) {
       const int32_t tile = int32_t(id[0]), i = int32_t(id[1]), d = int32_t(id[2]);
       const int32_t base = tiles[tile * 4], rows = tiles[tile * 4 + 1], r = tiles[tile * 4 + 2] + i, kvh = tiles[tile * 4 + 3];
       if (r >= rows) return;
@@ -1103,7 +1113,7 @@ void run(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list
         o += ps[i * D + d] * w;
       }
       out[((base + r / G) * H + kvh * G + r % G) * D + d] = o / lsum;
-    });
+    }));
   };
   // The global layers' long chunks: attention in segments, each chunk on its own; the step's other chunks
   // (decode tokens beside a prefill) each through the split kernel, their tiles being a contiguous run.

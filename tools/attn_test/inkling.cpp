@@ -473,16 +473,49 @@ int inkling_main(int argc, char** argv) {
           q.wait();
           attn::Bias bias;
           bias.R = dr, bias.table = dtable, bias.n_rel = kRel, bias.extent = extent, bias.sink = dsink, bias.table_tiles = dtiles_table;
+          // EKLOW_ATTN_ROTATE=N: N copies of the cache, the calls going round them, so that each reads its keys from memory
+          // rather than L2 (the engine's 40 sliding layer applications), for the decode timings
+          const int n_rot = std::getenv("EKLOW_ATTN_ROTATE") ? std::atoi(std::getenv("EKLOW_ATTN_ROTATE")) : 1;
+          std::vector<attn::Cache> caches(1, cache);
+          for (int i = 1; i < n_rot; ++i) {
+            attn::Cache c2 = cache;
+            c2.k = sycl::malloc_device(elems * 2, q), c2.v = sycl::malloc_device(elems * 2, q);
+            q.memcpy(c2.k, cache.k, elems * 2);
+            q.memcpy(c2.v, cache.v, elems * 2);
+            caches.push_back(c2);
+          }
+          q.wait();
+          int turn = 0;
           auto timed = [&](int64_t a, int64_t b, int reps, bool biased, bool prepared = true) {
             const attn::Tokens tok = prepare(a, b);
             attn::Bias bi = bias;
             if (!prepared) bi.table_tiles = nullptr;
             auto go = [&] {
-              if (biased) attn::attend(q, dq, tok, tl, dtl, cache, kH, kScale, bi, dout, scratch);
-              else attn::attend(q, dq, tok, tl, dtl, cache, kH, kScale, dout, scratch);
+              const attn::Cache& cc = caches[size_t((b - a) <= 2 ? turn++ % n_rot : 0)];
+              if (biased) attn::attend(q, dq, tok, tl, dtl, cc, kH, kScale, bi, dout, scratch);
+              else attn::attend(q, dq, tok, tl, dtl, cc, kH, kScale, dout, scratch);
             };
             go();
             q.wait();
+            if (std::getenv("EKLOW_ATTN_KERNELS") && reps > 10) {  // each kernel of one call: device time, and the gap before it
+              std::vector<sycl::event> log;
+              attn::g_event_log = &log;
+              for (int i = 0; i < 2; ++i) {
+                log.clear();
+                go();
+                q.wait();
+              }
+              attn::g_event_log = nullptr;
+              using namespace sycl::info;
+              std::printf("    %s %lld..%lld:", biased ? "biased" : "plain", (long long)a, (long long)b);
+              uint64_t prev = 0;
+              for (auto& e : log) {
+                const uint64_t st = e.get_profiling_info<event_profiling::command_start>(), en = e.get_profiling_info<event_profiling::command_end>();
+                std::printf(" [%.1f us%s%.1f]", double(en - st) * 1e-3, prev ? ", gap " : "", prev ? double(st - prev) * 1e-3 : 0.0);
+                prev = en;
+              }
+              std::printf("\n");
+            }
             double best = 1e30;  // the best of three runs
             for (int rep3 = 0; rep3 < 3; ++rep3) {
               sycl::event e0 = q.single_task([] {});
@@ -502,6 +535,7 @@ int inkling_main(int argc, char** argv) {
           std::printf("%-7s ctx %6lld: decode 1 token biased %7.1f us, plain %7.1f us (table converted per call %7.1f us); 2 tokens %7.1f / %7.1f us; prefill %lld biased %7.2f ms (%5.2f TFLOPS), plain %7.2f ms (%5.2f TFLOPS)\n",
                       ly.name, (long long)ctx, d_b * 1e6, d_p * 1e6, d_u * 1e6, d2_b * 1e6, d2_p * 1e6, (long long)nt, p_b * 1e3, flops / p_b / 1e12, p_p * 1e3,
                       flops / p_p / 1e12);
+          for (size_t i = 1; i < caches.size(); ++i) sycl::free(caches[i].k, q), sycl::free(caches[i].v, q);
           for (void* p : {static_cast<void*>(dq), static_cast<void*>(dk), static_cast<void*>(dv), static_cast<void*>(dr), static_cast<void*>(dsink),
                           static_cast<void*>(dout), static_cast<void*>(dslot), static_cast<void*>(dpos), static_cast<void*>(dtl), cache.k, cache.v,
                           static_cast<void*>(td), static_cast<void*>(scratch.q), static_cast<void*>(scratch.part), static_cast<void*>(scratch.part2),

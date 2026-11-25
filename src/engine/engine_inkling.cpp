@@ -1020,8 +1020,10 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     // for them alone, computes the cold pairs while the card runs the hot ones, and adds their rows after.
     // Longer steps copy the layer's cold set onto the card and run it there, its rows going into the hot experts' sum.
     sycl::event packed;
-    const bool cold_cpu = !L.cold_ref.empty() && T <= c_.cpu_max_tokens;
-    const bool cold_card = !L.cold_ref.empty() && !cold_cpu;
+    // EKLOW_SKIP_COLD=1, timing only: the CPU's cold experts left out (wrong output), to see what the round trip costs
+    static const bool skip_cold = std::getenv("EKLOW_SKIP_COLD") != nullptr;
+    const bool cold_cpu = !L.cold_ref.empty() && T <= c_.cpu_max_tokens && !skip_cold;
+    const bool cold_card = !L.cold_ref.empty() && T > c_.cpu_max_tokens;
     if (cold_cpu) packed = ik::pack_host(q_, ids_, wts_, h_[0], T, NU, E, hids_, hw_, hx_);
     if (cold_cpu) fine("pack");
     if (cold_card) {

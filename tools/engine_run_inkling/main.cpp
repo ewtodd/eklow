@@ -33,13 +33,91 @@
 
 #include "core/json.hpp"
 #include "core/json_value.hpp"
+#include <level_zero/ze_api.h>
+#include <level_zero/layers/zel_tracing_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
+#include <map>
 #include "engine/engine_inkling.hpp"
+#include "kernels/attention.hpp"
 #include "model/gguf.hpp"
 #include "rt/device.hpp"
 
 using namespace eklow;
 
 namespace {
+
+// EKLOW_TRACE=1: a step's kernels on the card, by the Level Zero loader's tracing layer: each kernel (and copy) appended
+// to a command list gets a global timestamp written after it, so that the time from one to the next is that kernel and
+// the gap before it. Printed per kernel name for the 10th decode step (speed work).
+struct Tracer {
+  zel_tracer_handle_t h = nullptr;
+  uint64_t* ts = nullptr;  // host memory the card writes
+  static constexpr size_t kMax = 16384;
+  std::vector<std::string> names;
+  bool on = false;
+  double ns_per_tick = 1;
+  void stamp(ze_command_list_handle_t cl, std::string name) {
+    if (!on || names.size() >= kMax) return;
+    on = false;  // our own append below is not traced
+    zeCommandListAppendWriteGlobalTimestamp(cl, ts + names.size(), nullptr, 0, nullptr);
+    on = true;
+    names.push_back(std::move(name));
+  }
+};
+Tracer g_tr;
+
+void tracer_start(sycl::queue& q) {
+  ze_context_handle_t zc = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_context());
+  ze_device_handle_t zd = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device());
+  ze_host_mem_alloc_desc_t hd{ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC};
+  void* p = nullptr;
+  if (zeMemAllocHost(zc, &hd, Tracer::kMax * 8, 64, &p) != ZE_RESULT_SUCCESS) throw std::runtime_error("trace: host memory");
+  g_tr.ts = static_cast<uint64_t*>(p);
+  ze_device_properties_t dp{ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES};
+  zeDeviceGetProperties(zd, &dp);
+  g_tr.ns_per_tick = double(dp.timerResolution);  // with ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES: nanoseconds a tick
+  zel_tracer_desc_t td{ZEL_STRUCTURE_TYPE_TRACER_EXP_DESC, nullptr, &g_tr};
+  if (zelTracerCreate(&td, &g_tr.h) != ZE_RESULT_SUCCESS) throw std::runtime_error("trace: zelTracerCreate (ZE_ENABLE_TRACING_LAYER=1?)");
+  zel_core_callbacks_t ep{};
+  ep.CommandList.pfnAppendLaunchKernelCb = [](ze_command_list_append_launch_kernel_params_t* pr, ze_result_t, void* ud, void**) {
+    auto* t = static_cast<Tracer*>(ud);
+    if (!t->on) return;
+    size_t n = 0;
+    zeKernelGetName(*pr->phKernel, &n, nullptr);
+    std::string name(n, '\0');
+    zeKernelGetName(*pr->phKernel, &n, name.data());
+    t->stamp(*pr->phCommandList, name.c_str());
+  };
+  ep.CommandList.pfnAppendMemoryCopyCb = [](ze_command_list_append_memory_copy_params_t* pr, ze_result_t, void* ud, void**) {
+    static_cast<Tracer*>(ud)->stamp(*pr->phCommandList, "(copy)");
+  };
+  ep.CommandList.pfnAppendBarrierCb = [](ze_command_list_append_barrier_params_t* pr, ze_result_t, void* ud, void**) {
+    static_cast<Tracer*>(ud)->stamp(*pr->phCommandList, "(barrier)");
+  };
+  zelTracerSetEpilogues(g_tr.h, &ep);
+  zelTracerSetEnabled(g_tr.h, true);
+}
+
+void tracer_print() {
+  // a kernel's time: from the previous stamp to its own (its run and the gap before it); the first has none
+  struct Agg {
+    int n = 0;
+    double us = 0;
+  };
+  std::map<std::string, Agg> agg;
+  double total = 0;
+  for (size_t i = 1; i < g_tr.names.size(); ++i) {
+    std::string nm = g_tr.names[i];
+    // shorten the mangled names: drop the template arguments past the first 60 characters
+    if (nm.size() > 70) nm = nm.substr(0, 70);
+    const double us = double(g_tr.ts[i] - g_tr.ts[i - 1]) * g_tr.ns_per_tick * 1e-3;
+    agg[nm].n++, agg[nm].us += us, total += us;
+  }
+  std::vector<std::pair<std::string, Agg>> v(agg.begin(), agg.end());
+  std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.us > b.second.us; });
+  std::printf("trace: %zu commands, %.1f us from the first to the last\n", g_tr.names.size(), total);
+  for (const auto& [nm, a] : v) std::printf("  %8.1f us %5d x %6.1f us  %s\n", a.us, a.n, a.us / a.n, nm.c_str());
+}
 
 std::vector<std::string> split(const std::string& s, char sep) {
   std::vector<std::string> out;
@@ -67,6 +145,7 @@ std::vector<int32_t> ids_of(const std::string& path) {
 }  // namespace
 
 int main(int argc, char** argv) {
+  if (std::getenv("EKLOW_TRACE")) setenv("ZE_ENABLE_TRACING_LAYER", "1", 1);
   std::string model, out, tokens_json, teacher_dir, gen_json, twin_tokens;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   int64_t chunk = 1024, max_ctx = 0, dump_last = 0, slots = 1, step_tokens = 0, kv_pool = 0;
@@ -122,6 +201,7 @@ int main(int argc, char** argv) {
     sycl::queue q = std::getenv("EKLOW_PROFILE_DEVICE")
                         ? sycl::queue(rt::pick_device(), {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()})
                         : sycl::queue(rt::pick_device(), sycl::property::queue::in_order());
+    if (std::getenv("EKLOW_TRACE")) tracer_start(q);
     engine::inkling::Config cfg;
     cfg.n_slots = int(slots);
     cfg.max_ctx = max_ctx;
@@ -290,7 +370,33 @@ int main(int argc, char** argv) {
       t0 = std::chrono::steady_clock::now();
       for (size_t i = 0; i + 1 < gen.size(); ++i) {
         engine::inkling::Chunk c{0, n + int64_t(i), {gen[i]}, 1};
+        if (std::getenv("EKLOW_TRACE") && i == 10) {
+          q.wait();
+          g_tr.names.clear();
+          g_tr.on = true;
+        }
+        // EKLOW_ATTN_KERNELS (with EKLOW_PROFILE_DEVICE): the attention kernels' device times in the 10th decode step
+        std::vector<sycl::event> alog;
+        const bool alog_on = std::getenv("EKLOW_ATTN_KERNELS") && std::getenv("EKLOW_PROFILE_DEVICE") && i == 10;
+        if (alog_on) attn::g_event_log = &alog;
         const std::vector<float> l = eng.step({c});
+        if (std::getenv("EKLOW_TRACE") && i == 10) {
+          q.wait();
+          g_tr.on = false;
+          tracer_print();
+        }
+        if (alog_on) {
+          attn::g_event_log = nullptr;
+          using namespace sycl::info;
+          double sum = 0;
+          std::printf("attention kernels (us):");
+          for (auto& e : alog) {
+            const double d = double(e.get_profiling_info<event_profiling::command_end>() - e.get_profiling_info<event_profiling::command_start>()) * 1e-3;
+            sum += d;
+            std::printf(" %.0f", d);
+          }
+          std::printf("\nattention kernels: %zu, %.1f us in all\n", alog.size(), sum);
+        }
         gl.write(reinterpret_cast<const char*>(l.data()), std::streamsize(VO * sizeof(float)));
         if (rewind) first.push_back(l);
       }
