@@ -70,8 +70,11 @@ constexpr int64_t kPerSplitMax = 8;
 // How many splits a decode-style launch cuts its keys into: enough threads to fill the card (a tile has P threads), short splits
 // (kPerSplitMax blocks at most past 4k keys), at least 1. Shared by the launch and by reserve(), which sizes the partials by it.
 inline int64_t split_count(int64_t n_tiles, int64_t max_keys, int64_t P) {
+  // At least 4 blocks a split for Bolt's 256- and 512-wide heads (as measured 2026-10-24); 2 for Inkling's 128-wide ones
+  // (P 2), whose one-token step over a 1,024-key window otherwise ran 256 threads: 105 -> 77 us a call (1 block: 76).
+  const int64_t min_per = P <= 2 ? 2 : 4;
   const int64_t max_blocks = max_keys / kKeys + 2;
-  const int64_t per_split = std::clamp<int64_t>(max_blocks / 32, 4, kPerSplitMax);
+  const int64_t per_split = std::clamp<int64_t>(max_blocks / 32, min_per, std::max(min_per, kPerSplitMax));
   return std::clamp<int64_t>((8192 + n_tiles * P - 1) / (n_tiles * P), 1, std::max<int64_t>(1, max_blocks / per_split));
 }
 
