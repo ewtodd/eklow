@@ -2,7 +2,7 @@
 // llama.cpp build), as the reference for eklow's ported chat template, tokenizer and output parser.
 //
 //   eklow-chat-oracle --model GGUF --cases CASES.json --out RESULTS.json
-//                     [--reasoning-format NAME] [--no-prefill-assistant] [--template-kwargs JSON]
+//                     [--reasoning-format NAME] [--no-prefill-assistant] [--template-kwargs JSON] [--allow-image]
 //   eklow-chat-oracle --model GGUF --tokenize STRINGS.json --out TOKENS.json
 //
 // --tokenize takes an array of strings and writes, for each, llama.cpp's tokens with special tokens as plain text
@@ -70,7 +70,7 @@ json diff_json(const common_chat_msg_diff& d) {
 int usage() {
   std::fprintf(stderr,
                "usage: eklow-chat-oracle --model GGUF --cases CASES.json --out RESULTS.json\n"
-               "                         [--reasoning-format NAME] [--no-prefill-assistant] [--template-kwargs JSON]\n");
+               "                         [--reasoning-format NAME] [--no-prefill-assistant] [--template-kwargs JSON] [--allow-image]\n");
   return 2;
 }
 
@@ -79,6 +79,7 @@ int usage() {
 int main(int argc, char** argv) {
   std::string model_path, cases_path, out_path, reasoning = "deepseek", kwargs, tok_path;
   bool prefill_assistant = true;
+  bool allow_image = false;  // image parts accepted, as when the server has an mmproj: each becomes the media marker
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -87,6 +88,7 @@ int main(int argc, char** argv) {
     else if (a == "--out") out_path = next();
     else if (a == "--reasoning-format") reasoning = next();
     else if (a == "--no-prefill-assistant") prefill_assistant = false;
+    else if (a == "--allow-image") allow_image = true;
     else if (a == "--template-kwargs") kwargs = next();
     else if (a == "--tokenize") tok_path = next();
     else return usage();
@@ -141,7 +143,8 @@ int main(int argc, char** argv) {
     for (const auto& item : kw.items()) opt.chat_template_kwargs[item.key()] = item.value().dump();
   }
   opt.tmpls = common_chat_templates_init(model, "");
-  opt.allow_image = opt.allow_audio = opt.allow_video = false;
+  opt.allow_image = allow_image;
+  opt.allow_audio = opt.allow_video = false;
   opt.enable_thinking = common_chat_templates_support_enable_thinking(opt.tmpls.get());
 
   std::ifstream cf(cases_path, std::ios::binary);

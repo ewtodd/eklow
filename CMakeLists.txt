@@ -54,9 +54,11 @@ add_library(eklow_text STATIC
 )
 target_link_libraries(eklow_text PUBLIC eklow_host)
 
-# Images for the Gemma vision towers (Bolt's and EmbeddingGemma 2's): decoding (stb_image, vendored) and preparation. No device code.
+# Images for the vision towers (Gemma 4's, Bolt's and EmbeddingGemma 2's; Inkling 2's): decoding (stb_image, vendored) and
+# preparation. No device code.
 add_library(eklow_image STATIC
   src/image/gemma4_image.cpp
+  src/image/inkling_image.cpp
   src/image/stb_image.cpp
 )
 target_include_directories(eklow_image PUBLIC src third_party)
@@ -97,6 +99,7 @@ add_library(eklow_model STATIC
   src/model/embed_gemma2.cpp
   src/model/vision_gemma4v.cpp
   src/model/vision_gemma4v_fast.cpp
+  src/model/vision_inkling2v.cpp
   src/kernels/vision_attn.cpp
   src/model/gemma4.cpp
   src/model/inkling2.cpp
@@ -122,6 +125,10 @@ target_link_libraries(eklow-attn-test PRIVATE eklow_model)
 eklow_sycl(eklow-attn-test)
 
 # The engine's Inkling kernels against the reference ones (route, depth_mix, matmul_f32).
+add_executable(eklow-inkling-vision-test tools/inkling_vision_test/main.cpp)
+target_link_libraries(eklow-inkling-vision-test PRIVATE eklow_model)
+eklow_sycl(eklow-inkling-vision-test)
+
 add_executable(eklow-inkling-fast-test tools/inkling_fast_test/main.cpp)
 target_link_libraries(eklow-inkling-fast-test PRIVATE eklow_model)
 eklow_sycl(eklow-inkling-fast-test)
