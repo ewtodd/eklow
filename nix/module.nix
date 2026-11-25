@@ -69,10 +69,21 @@ let
         mmproj = lib.mkOption {
           type = lib.types.nullOr lib.types.path;
           default = null;
-          example = lib.literalExpression "inputs.eklow.packages.x86_64-linux.bolt-e4b-mmproj";
+          example = lib.literalExpression "inputs.eklow.packages.x86_64-linux.inkling-2-mini-mmproj";
           description = ''
-            The chat model's vision projector (llama.cpp's mmproj GGUF: Google's Gemma 4 E4B tower, which Bolt carries
-            unchanged; the flake's `bolt-e4b-mmproj`), for image_url parts in /v1/chat/completions; null refuses them.
+            The chat model's vision projector (llama.cpp's mmproj GGUF: Inkling 2 Mini's, the flake's
+            `inkling-2-mini-mmproj`, whose weights stay in host memory; or Google's Gemma 4 E4B tower, which Bolt
+            carries unchanged, `bolt-e4b-mmproj`), for image_url parts in /v1/chat/completions; null refuses them.
+          '';
+        };
+
+        imageMaxTokens = lib.mkOption {
+          type = lib.types.nullOr (lib.types.ints.between 1 4096);
+          default = null;
+          description = ''
+            Inkling 2's image budget with `mmproj` (`--image-max-tokens`, llama.cpp's image_max_tokens): a larger picture
+            is resized down to it. null: the server's default, 1,024 tokens (~1,280 x 1,280 pixels), about the most whose
+            encoder activations fit the engine's step buffers at 8,192-token steps.
           '';
         };
 
@@ -263,7 +274,7 @@ in
       default = 280;
       description = ''
         Rows an image becomes at most in EmbeddingGemma 2's input (Google's default is 280, the projector's maximum
-        1120); the chat model's projector takes the same budget.
+        1120); a Gemma 4 chat model's projector takes the same budget (Inkling's has its own, imageMaxTokens).
       '';
     };
 
@@ -525,6 +536,10 @@ in
             ++ lib.optionals (inst.mmproj != null) [
               "--mmproj"
               inst.mmproj
+            ]
+            ++ lib.optionals (inst.imageMaxTokens != null) [
+              "--image-max-tokens"
+              (toString inst.imageMaxTokens)
             ]
             ++ lib.optionals (inst.expertProfile != null) [
               "--expert-profile"

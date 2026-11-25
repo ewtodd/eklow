@@ -75,6 +75,12 @@ in
       "Inkling-2-Mini-UD-Q4_K_M.gguf"
       "78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae";
 
+  # Its vision tower (llama.cpp's inkling2v projector, F16), from the same revision: eklow keeps its weights in host memory
+  # and runs it in the engine's step buffers (DECISIONS 2026-11-25, "Inkling M5"). 635 MB; seed the store as above.
+  inkling-2-mini-mmproj =
+    hf "unsloth/Inkling-2-Mini-GGUF" "8078d149286eec7193795413b9e0643da6d11fa1" "mmproj-F16.gguf"
+      "3bff75ffeb2d6e0371ba7bd42e30d26a7d98aea681fa44b03b5a20891cfa2c5f";
+
   bolt-e4b =
     hf "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB" "1db54d5b12533ff1bcaa8e42cf4c667988a1f1be"
       "Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf"

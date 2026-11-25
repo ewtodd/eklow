@@ -4768,3 +4768,41 @@ FlashGroup's dedicated loaders cover the loads' latency that the compute threads
 make up for them in a loop of two barriers a 16-key block. For long prompts the better way is the segmented attention of
 the 26B's global layers (two GEMM-shaped kernels a segment, ~31 TFLOPS against ~10), the bias taken for the last
 `extent` keys of each row apart.
+
+## 2026-11-25 — Inkling M5: vision, its tower off the card between images
+
+**Ground truth.** llama.cpp c74c71a6's mtmd (the M0 build, `eklow-oracle --mmproj --image`, `--clip-tensors` for each
+stage) on Unsloth's `mmproj-F16.gguf` (the model's revision, 635 MB), five synthetic pictures: 60 x 44 (4 tokens),
+800 x 480 gray text (240), 640 x 640 shapes (256), 517 x 333 (117, padded), and a 3,200 x 2,400 JPEG resized to 972
+tokens under a 1,024-token budget. Each case keeps the tower's stages, the image's rows and the prompt's last logits.
+
+**The tower** (`image/inkling_image`, `model/vision_inkling2v`): mtmd's inkling2v. The picture at its own size, each side
+padded to a multiple of 40 with -1 before the normalization ((x - 127.5) / 127.5), or past max_tokens x 1,600 pixels
+resized (bicubic) to calc_size_preserved_ratio's size first; 20 x 20 patches, a CLS token, the 32 x 32 learned position
+grid resized bilinearly (ggml's half-pixel centers), 23 ViT layers (LayerNorm with biases, Q|K|V stacked with biases, 2D
+RoPE: a head's first 32 dims by the patch's column, the last 32 by its row, theta 10,000, CLS at 0 and patches from 1;
+layer scales; GELU-erf), the CLS dropped, 2 x 2 patches merged (top left, top right, bottom left, bottom right) and two
+linears to 2,304. The linears on the fp16 GEMM, attention on `vision_attn`. Against llama.cpp: the embeddings before the
+first layer within 1e-6, the image's rows ~1e-3 median relative L2 (2e-2 at most, in the 972-token picture).
+
+**The text side.** llama-server with Inkling's projector makes an image_url part a media part, its own block in any role
+(`common/parsers/inkling.cpp`'s `inkling_split_media` takes the marker out of its text block), and mtmd opens it with
+`<|content_image|>`: `<header><|content_image|>`, the rows, `<|end_message|>`. The rows are not normalized (llama.cpp
+norms only token batches), so the engine puts them in after the token norm; they decode causally, so a chunk may hold
+part of an image. The template port renders a placeholder that the parser expands; five image requests render
+byte for byte as llama-server's, the 41 M0 cases still do. Through the engine the last logits match llama.cpp's on the
+five pictures (KL at most 4e-10, top-5 equal), and the greedy answers read them (the invoice's total, the shapes and
+colors, the JPEG's text).
+
+**Card memory.** Resident, the tower took 999 MiB beside the engine at a 1,024-token budget (635 MB of weights, the rest
+activations): 248 more experts went to the CPU and decode fell from 21.6 to 20.1 tok/s. Images are encoded with the
+scheduler held, when the engine's eight step buffers (75.5 MB each at 8,192-token steps) hold nothing, so the encoder
+borrows them for its activations, and its weights live in pinned host memory, copied in a layer at a time on a queue of
+their own (two slots, layer l + 2 copied when layer l is done; the projector after the last layer). The tower then holds
+1 MiB of the card: 1,663 cold experts with `--mmproj` and 1,661 without, decode 21.9 and 21.7 tok/s. The copies (~600 MB)
+add 45-50 ms an encode: 66 ms at 4 tokens, 102 ms at 256, 267 ms at 972 (resident: 15, 58, 222). The server caches the
+last six images' rows, so a conversation's images are encoded once.
+
+**The budget.** `--image-max-tokens` (llama.cpp's name; `--image-tokens` stays the Gemma towers'), 1,024 by default
+(~1,280 x 1,280 pixels), where llama.cpp's default is 4,096: the borrowed buffers hold an encode of up to ~1,100 tokens
+(its widest activation, the FFN's 4,096 columns, is 72 MB at 1,024). A larger budget would need the MLP in row blocks.

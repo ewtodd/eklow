@@ -3,12 +3,13 @@
 Live state, written as a handoff. Design and history: `DESIGN.md` (the original target) and `DECISIONS.md` (every decision
 with its measurements); what eklow is and its numbers: `README.md`.
 
-## Now (2026-11-24)
+## Now (2026-11-25)
 
 - **Inkling 2 Mini replaces Bolt** (the owner's decision, DECISIONS 2026-11-24): the port went milestone by milestone
-  (M0 ground truth, M1 host reference and text layer, M2 the forward on the card, M3 memory, M4 the server; M5 vision and
-  M6 speed and the MTP draft to come, speed first by the owner's choice). The owner stopped Bolt on 2026-11-24 20:06;
-  Inkling's deployment is committed in /etc/nixos for the owner to deploy.
+  (M0 ground truth, M1 host reference and text layer, M2 the forward on the card, M3 memory, M4 the server, speed, M5
+  vision; the MTP draft to come). The owner stopped Bolt on 2026-11-24 20:06 and deployed Inkling on 2026-11-25
+  (`eklow-inkling.service`, eklow 27d6cea, /etc/nixos 7f045dff); M5's deployment is committed in /etc/nixos for the owner
+  to deploy.
   - **M0 is done**: llama.cpp c74c71a6's activations, logits, greedy continuations, rendered turns, parsed outputs and
     tokens on fixed synthetic prompts (67 to 32,950 tokens), from e-workstation's 4090 (DECISIONS "Inkling M0").
   - **M1 is done**: eklow's fp32 reference forward (`src/model/inkling2.*`, `src/kernels/ref_inkling.*`), the tokenizer,
@@ -34,6 +35,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
     choices) put ~780 more experts on the card. The expert GEMM had run at half occupancy (EU fusion off) since M2; fixed,
     it does ~45 TFLOPS. Prefill now goes to the expert GEMMs (~23%), the cold sets' copies (~20%: ~13 GB a 4,096-token
     step, which slow the kernels beside them by ~61 ms a GB), attention (~18%, its kernels still with EU fusion off).
+  - **M5 is done** (DECISIONS "Inkling M5: vision, ..."): the tower matches llama.cpp's mtmd (~1e-3 per row), image
+    requests render as llama-server's, the logits after an image match (KL <= 4e-10). The tower's weights live in host
+    memory and it runs in the engine's idle step buffers, so `--mmproj` costs the card 1 MiB and decode nothing; an image
+    of ~250 tokens encodes in 0.1 s, 972 in 0.27 s. `--image-max-tokens` 1,024 by default.
 
 - **fiona ran Bolt in production until 2026-11-24 20:06**, when the owner stopped it (`eklow-bolt.service`, from
   2026-11-10 22:48; maitred's "fiona" route falls back to son-of-anton's models until Inkling is deployed):
@@ -76,10 +81,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 ## Open, in order
 
-0. **Inkling's speed**: attention with EU fusion on (`FlashGroup`, `Flash`: loops of a count from the kernel's arguments,
-   no thread-specialized loaders), fewer cold-copy bytes a token (steps of 8,192 tokens: prefill ~+5%, decode ~-1.5%; or
-   placement weighed for prefill), decode's small kernels and the MTP draft. Then M5, vision. The owner deploys Inkling from the /etc/nixos commit (a `nix flake update eklow`
-   first).
+0. **Inkling**: the owner deploys M5 from the /etc/nixos commit (the projector in the inkling instance, eklow's lock
+   bumped with it). Then speed: prefill attention as segmented GEMMs (EU fusion on FlashGroup was slower, DECISIONS
+   2026-11-25), fewer cold-copy bytes a token (placement weighed for prefill), decode's small kernels (horizontal
+   fusion, fewer stages a layer) and the MTP draft.
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):
    - the kernel tests;
    - the draft's lattices and the embeddings, against main's build;
