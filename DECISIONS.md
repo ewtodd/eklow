@@ -4592,3 +4592,43 @@ Kept and rejected, from the sweeps (1 row, Q|R|gate / K / O, wall ms):
 `EKLOW_NO_HEAD` skips the head. `xmx::g_event_log`, when set, collects the events of the int8 decode path's kernels
 (quantize, `gemv_t`, `matmul_fused`) for device times. EKLOW_FUSED_NG, _T set the fused kernel's groups per thread and K
 split for measuring.
+
+## 2026-11-25 — Inkling speed, third round: decode ~18.4 -> ~21.8 tok/s
+
+The owner: "whatever it takes to get it running fast". Three workers took the expert decode kernel, the int8 decode GEMVs
+and the CPU's cold experts (their entries above and below); the lead took the small kernels, attention and the prefill
+expert GEMM.
+
+**Kept** (decode at 12k / 33k, production's shape without the checker; each step checked against llama.cpp CUDA's
+continuations, top-1 32/32 or a near tie, mean KL 0.5-1.6e-3):
+- short convolutions of up to 16 tokens in one launch: a work-item a (chunk, channel) walks its tokens with the last three
+  inputs in registers and writes the new state itself (the two-kernel form waited for every token to read the old state):
+  18.3 -> 20.0 / 17.4 -> 19.1 tok/s;
+- the residual adds folded into the attention's and the FFN's output convolutions, and K and V convolved in one launch:
+  20.8 / 19.2;
+- Q|R|gate, K and V quantized and multiplied in one launch, and O, through the worker's `xmx::matmul_fused`: 21.8 / 21.0.
+
+**Tried and dropped:**
+- `attn::attend_few`, a plain-SYCL decode attention (a work-group per token, K/V head and block of keys, then a merge):
+  correct (rel L2 ~6e-6 against the reference, against the matrix-unit kernel's ~2e-4) but slower: 71 us a sliding call
+  warm against 79, 419 us a full one at 12k against 228; with splits of 16 keys, four work-items a key, 145 and 751.
+- Prefetching the next layer application's sliding window of K/V into L2 while the card waits for the CPU's cold rows:
+  the projections between that wait and the attention stream ~20 MB of weights through the 16 MB L2 and evict it again
+  (sliding attention 6.5 -> 7.3 ms a token).
+- A keep-alive kernel through those waits: a kernel polling a host-memory flag never sees the host's write (no USM atomics
+  on host allocations on the A770M; the test hung until killed), and no wake-up cost after the card idles showed in a
+  test (a 16 MB read: 44.6 us after 50 to 400 us of idle and after a spin alike), against the worker's measurement.
+- The DSpark block drafter Inkling ships (mtp.safetensors: 3 layers, blocks of 8, a rank-256 recurrent "Markov" head over
+  the target's head, reading the target at layer applications 5, 23, 41, 48): others report 1.06-1.41x at greedy decoding
+  and ~1.0-1.24x at temperature 1 (fiona samples at 1) on cards that hold every expert; on fiona a verify step's union of
+  experts goes to the CPU's cold path, so not now.
+- The prefill expert GEMM: with n_ff 1,152 (not 768, as earlier entries assumed) it runs at ~18.5 TFLOPS at 4,096 tokens,
+  near the 26B's grouped GEMMs (21-26), where eklow's dense fp16 GEMM reaches 47-56 on Q4_0 and 40-51 on Q5_K. A
+  single shared buffer (four work-groups an Xe-core instead of two: 10% slower), K steps of 32 instead of 64 (8% slower),
+  activations loaded from global memory at use instead of shared memory (4% slower), tiles of 128 x 256 or 256 x 128 (more
+  than the 64 KB of shared memory a work-group may have) did not help. Without the per-step dequantize-and-store the GEMM
+  takes 80% of the time, without the dpas and the activations' shared-memory loads 47%.
+
+Where decode's ~46 ms a token goes now (device time, with marker overhead): the hot experts 11.4, attention 10.1 (sliding
+7.4: its K/V from DRAM), Q|R|gate+K+V 6.4 (at the card's rate for their bytes), the card idle on the CPU's cold rows 4.8,
+the controllers 3.3, the mixes 3.6, O 1.9, the head 1.5, the router 1.8, the norms 1.8.
