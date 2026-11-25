@@ -205,7 +205,9 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   ring_k_ = sycl::malloc_device<sycl::half>(ring_elems, q_);
   ring_v_ = sycl::malloc_device<sycl::half>(ring_elems, q_);
   max_pages_ = c_.max_ctx / attn::kPage;
-  n_pages_ = max_pages_ * c_.n_slots;
+  n_pages_ = c_.pool_positions > 0 ? c_.pool_positions / attn::kPage : max_pages_ * c_.n_slots;
+  if (c_.pool_positions % attn::kPage || (c_.pool_positions > 0 && n_pages_ < max_pages_))
+    throw std::runtime_error("inkling engine: pool_positions must be a multiple of the page size and at least max_ctx");
   page_table_ = sycl::malloc_device<int32_t>(size_t(c_.n_slots * max_pages_), q_);
   if (!ring_k_ || !ring_v_ || !page_table_) throw std::runtime_error("inkling engine: out of device memory for the K/V cache");
   for (void* p : {static_cast<void*>(ring_k_), static_cast<void*>(ring_v_), static_cast<void*>(page_table_)}) owned_.push_back(p);

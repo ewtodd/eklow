@@ -209,6 +209,39 @@ void Scheduler::start(int s, std::shared_ptr<Request> r, int64_t lcp) {
   note_positions();
 }
 
+bool Scheduler::release_idle() {
+  int pick = -1;
+  for (size_t s = 0; s < seqs_.size(); ++s)
+    if (!seqs_[s].req && eng_.length(int(s)) > 0 && (pick < 0 || seqs_[s].used < seqs_[size_t(pick)].used)) pick = int(s);
+  if (pick < 0) return false;
+  eng_.release(pick);
+  seqs_[size_t(pick)].tokens.clear();
+  std::lock_guard lk(mu_);
+  note_positions();
+  return true;
+}
+
+void Scheduler::requeue(int s) {
+  Seq& q = seqs_[size_t(s)];
+  std::shared_ptr<Request> r = std::move(q.req);
+  q.parser.reset();
+  q.sampler.reset();
+  q.grammar.reset();
+  q.held.clear();
+  q.next_token = -1;
+  eng_.release(s);
+  q.tokens.clear();
+  std::lock_guard lk(mu_);
+  --stats_.active;
+  if (r->prefill_only) {
+    prefill_only_.push_front(std::move(r));
+  } else {
+    waiting_.push_front(std::move(r));
+    ++stats_.waiting;
+  }
+  note_positions();
+}
+
 void Scheduler::run(const std::atomic<bool>& stop) {
   uint64_t seen = 0;
   while (!stop.load()) {
@@ -268,6 +301,46 @@ void Scheduler::step() {
   std::vector<engine::inkling::Chunk> chunks;
   std::vector<Item> items;
   int64_t budget = c_.max_batch;
+  // The K/V pool the slots share (engine Config::pool_positions): this step's tokens take free pages, then idle slots'
+  // cached sequences (the least recently used first). A generating sequence that still finds no page makes room by
+  // restarting a request that is still reading its prompt (it has sent nothing yet), or else by ending the most recently
+  // admitted other request; a prefill takes what fits and waits for the rest. One request alone always fits (the pool
+  // holds max_ctx).
+  std::vector<int64_t> counted(seqs_.size(), 0);  // pages this step takes for each slot
+  auto avail = [&] {
+    int64_t a = eng_.free_pages();
+    for (int64_t c : counted) a -= c;
+    return a;
+  };
+  auto take = [&](int s, int64_t positions) {
+    const int64_t more = eng_.pages_needed(s, positions) - counted[size_t(s)];
+    if (more <= 0) return true;
+    while (more > avail() && release_idle()) {
+    }
+    if (more > avail()) return false;
+    counted[size_t(s)] += more;
+    return true;
+  };
+  for (size_t s = 0; s < seqs_.size(); ++s) {
+    Seq& q = seqs_[s];
+    if (!q.req || q.next_token < 0 || take(int(s), int64_t(q.tokens.size()) + 1)) continue;
+    int victim = -1;
+    for (size_t t = 0; t < seqs_.size(); ++t)
+      if (t != s && seqs_[t].req && seqs_[t].next_token < 0 && seqs_[t].generated == 0) victim = int(t);
+    if (victim >= 0) {
+      requeue(victim);
+    } else {
+      for (size_t t = 0; t < seqs_.size(); ++t)
+        if (t != s && seqs_[t].req && (victim < 0 || seqs_[t].used > seqs_[size_t(victim)].used)) victim = int(t);
+      if (victim >= 0) {
+        finish(victim, "length", "the K/V pool is full: another conversation needed its room");
+        eng_.release(victim);
+        seqs_[size_t(victim)].tokens.clear();
+      }
+    }
+    if (victim >= 0) counted[size_t(victim)] = 0;
+    if (!take(int(s), int64_t(q.tokens.size()) + 1)) finish(int(s), "length", "the K/V pool is full");
+  }
   // Generating slots first, a token each.
   for (size_t s = 0; s < seqs_.size(); ++s) {
     Seq& q = seqs_[s];
@@ -286,12 +359,25 @@ void Scheduler::step() {
     if (!q.req || q.next_token >= 0 || q.fed >= q.req->prompt.size()) continue;
     if (q.req->prefill_only && others) continue;
     const int64_t P = int64_t(q.req->prompt.size());
+    // Only when the rest of the prompt fits beside the generating sequences, with 4 pages (1,024 positions) each for them
+    // to grow: a prefill that half fits would be restarted whenever they need a page.
+    int64_t reserve = 0;
+    for (size_t t = 0; t < seqs_.size(); ++t)
+      if (t != s && seqs_[t].req && seqs_[t].next_token >= 0) reserve += 4;
+    while (eng_.pages_needed(int(s), P) - counted[s] > avail() - reserve && release_idle()) {
+    }
+    if (eng_.pages_needed(int(s), P) - counted[s] > avail() - reserve) continue;
     for (int64_t fed = int64_t(q.fed), at = int64_t(q.tokens.size()); budget > 0 && fed < P;) {
       int64_t n = std::min<int64_t>({q.req->prefill_only ? c_.prefill_only_chunk : c_.max_chunk, budget, P - fed});
       // The prompt's last token goes in a step of its own, after a checkpoint before it: a request whose prompt is this
       // one again (a retry) rewinds there and feeds that token for its logits. It costs a decode-sized step per request.
       if (!q.req->prefill_only && fed + n == P && n > 1) --n;
+      // no more than the pool has room for (idle slots' caches given up first); the rest waits
+      while ((eng_.pages_held(int(s)) + counted[s] + avail()) * attn::kPage - at < n && release_idle()) {
+      }
+      n = std::min<int64_t>(n, (eng_.pages_held(int(s)) + counted[s] + avail()) * attn::kPage - at);
       if (n <= 0) break;
+      take(int(s), at + n);
       const bool last = fed + n == P && !q.req->prefill_only;
       chunks.push_back({int(s), at,
                         std::vector<int32_t>(q.req->prompt.begin() + std::ptrdiff_t(fed), q.req->prompt.begin() + std::ptrdiff_t(fed + n)),

@@ -117,6 +117,8 @@ class Scheduler {
 
   bool admit();
   void start(int s, std::shared_ptr<Request> r, int64_t lcp);
+  bool release_idle();   // drops the least recently used idle slot's cached sequence; false if there is none
+  void requeue(int s);   // puts a request still reading its prompt back at the head of the queue, its slot emptied
   void step();
   std::string on_token(int slot, int32_t token);
   void finish(int slot, const std::string& reason, const std::string& error = "");

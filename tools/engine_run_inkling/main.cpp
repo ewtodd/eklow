@@ -69,7 +69,7 @@ std::vector<int32_t> ids_of(const std::string& path) {
 int main(int argc, char** argv) {
   std::string model, out, tokens_json, teacher_dir, gen_json, twin_tokens;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
-  int64_t chunk = 1024, max_ctx = 0, dump_last = 0, slots = 1, step_tokens = 0;
+  int64_t chunk = 1024, max_ctx = 0, dump_last = 0, slots = 1, step_tokens = 0, kv_pool = 0;
   std::string experts;
   double reserve_gib = 0;
   int64_t cpu_max_tokens = -1;
@@ -86,6 +86,7 @@ int main(int argc, char** argv) {
     else if (a == "--dump-last") dump_last = std::atoll(next().c_str());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
     else if (a == "--step") step_tokens = std::atoll(next().c_str());
+    else if (a == "--kv-pool") kv_pool = std::atoll(next().c_str());
     else if (a == "--max-ctx") max_ctx = std::atoll(next().c_str());
     else if (a == "--experts") experts = next();
     else if (a == "--reserve-gib") reserve_gib = std::atof(next().c_str());
@@ -129,6 +130,7 @@ int main(int argc, char** argv) {
     // (Config::max_step)
     if (step_tokens < chunk) step_tokens = chunk;
     cfg.max_step = step_tokens;
+    cfg.pool_positions = kv_pool;  // --kv-pool: one K/V pool of this many positions for the slots (0: max-ctx each)
     cfg.max_logits = int(last);
     cfg.expert_profile = experts;
     cfg.card_reserve_bytes = uint64_t(reserve_gib * 1073741824.0);

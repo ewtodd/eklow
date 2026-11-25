@@ -17,6 +17,7 @@
 
 #include <sycl/sycl.hpp>
 
+#include <algorithm>
 #include <cstdint>
 #include <map>
 #include <string>
@@ -51,6 +52,10 @@ struct Config {
   // layer application over every sub-batch before the next), so that a long prompt's cold sets are copied onto the card
   // once a step rather than once a chunk; the sequences' blocks are held for all of them (8 x max_step x n_embd floats).
   int64_t max_step = 0;
+  // Positions of the full layers' K/V, one pool the slots share (0: n_slots x max_ctx, a slot's room each). At least
+  // max_ctx, a multiple of attn::kPage. A smaller pool frees card memory for experts; when the slots' sequences need more
+  // pages than are free, the scheduler releases or holds back (pages_needed).
+  int64_t pool_positions = 0;
   // LoopCD's hidden-state form (arXiv 2610.02185; DECISIONS 2026-11-24): what the coda reads of the core, its two blocks'
   // outputs, becomes h + w (h - h_1), h_1 the same after the first pass. 0: the model as trained.
   float loopcd = 0.0f;
@@ -91,6 +96,11 @@ class Engine {
   // The full applications' page pool: pages in all and free now (a page is attn::kPage positions).
   int64_t pool_pages() const { return n_pages_; }
   int64_t free_pages() const { return int64_t(free_pages_.size()); }
+  int64_t pages_held(int slot) const { return int64_t(slots_[size_t(slot)].pages.size()); }
+  // Pages a slot's sequence would take beyond those it holds, to reach `positions`.
+  int64_t pages_needed(int slot, int64_t positions) const {
+    return std::max<int64_t>(0, (positions + attn::kPage - 1) / attn::kPage - int64_t(slots_[size_t(slot)].pages.size()));
+  }
 
   void set_profile(std::map<std::string, double>* p) { profile_ = p; }
   const model::Inkling2Config& model() const { return cfg_; }

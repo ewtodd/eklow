@@ -4442,3 +4442,18 @@ smoke checks all pass.
 
 **Checks.** Decode against llama.cpp CUDA's continuations after a layer-major prefill: top-1 32/32 at 12k and at 33k,
 mean KL 1.6e-3 and 2.3e-4 (M3: 1.7e-3 and 9.9e-4; llama.cpp's own CPU against CUDA ~7e-2).
+
+## 2026-11-24 — Inkling speed: one K/V pool for the two slots
+
+The owner's choice (B of three ways to free card memory for experts, with C, the side models on the Iris Xe): the eight full
+layers' K/V is one pool of 65,536 positions the two slots share, instead of 65,536 each (`Config::pool_positions`;
+eklow-server `--kv-pool`, for Inkling by default `--ctx`). It frees 2.0 GiB: 2,312 -> 1,833 cold experts (the 12k prompt's
+decode steps: 120 -> 67 cold pairs, the CPU's part 19.6 -> 11.4 ms), decode at 12k 16.1-16.5 -> 17.8-17.9 tok/s.
+
+When the slots' sequences need more pages than are free, the scheduler gives up idle slots' cached sequences first (the
+least recently used first). A prompt starts or goes on only when its rest fits beside the generating sequences with 4 pages
+(1,024 positions) each for them to grow (a prefill that half fit would be restarted whenever they needed a page). A
+generating sequence that still finds no page restarts a request still reading its prompt (it has sent nothing), or else ends
+the most recently admitted other request with "the K/V pool is full". One request alone always fits. Checked through
+eklow-server on fiona: two 37k-token conversations at once, the second waits for the first (its first token after 116 s),
+then takes its idle cache, so the first prefills again when it returns; the smoke checks pass.

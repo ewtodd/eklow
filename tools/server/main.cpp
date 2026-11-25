@@ -430,6 +430,7 @@ int main(int argc, char** argv) {
   int cpu_threads = 8, checkpoints = 2;
   int64_t cpu_max_tokens = 128;
   int64_t step_tokens = 4096;  // Inkling: tokens a step may carry, run layer by layer over sub-batches of --batch
+  int64_t kv_pool = 0;         // Inkling: the full layers' K/V positions the slots share (0: --ctx, one slot's room in all)
   double loopcd = 0;  // Inkling: LoopCD's contrast strength (0: off)
   bool kv_int8 = false, preserve_thinking = false;
   double log_interval = 10;  // seconds between the engine's log lines while there is traffic; 0: none
@@ -495,8 +496,9 @@ int main(int argc, char** argv) {
     else if (a == "--cpu-max-tokens") cpu_max_tokens = std::atoll(next().c_str());
     else if (a == "--checkpoints") checkpoints = std::atoi(next().c_str());
     else if (a == "--step-tokens") step_tokens = std::atoll(next().c_str());
+    else if (a == "--kv-pool") kv_pool = std::atoll(next().c_str());
     else if (a == "--loopcd") loopcd = std::atof(next().c_str());
-    else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" || a == "--kv-pool" ||
+    else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" ||
                a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib" ||
                a == "--experts-on-card" || a == "--verification" || a == "--draft-reserve-mib") {
       std::fprintf(stderr, "eklow-server: %s was the Qwen3.6-35B-A3B server's, which eklow no longer has (2026-11-11)\n", a.c_str());
@@ -508,7 +510,7 @@ int main(int argc, char** argv) {
                            "[--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]] "
                            "[--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S] "
                            "[--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N] [--prefix-cache-buffers N]] "
-                           "[--expert-profile JSON] [--card-margin-mib N] [--cpu-threads N] [--cpu-max-tokens N] [--checkpoints N] [--step-tokens N] [--loopcd W]\n");
+                           "[--expert-profile JSON] [--card-margin-mib N] [--cpu-threads N] [--cpu-max-tokens N] [--checkpoints N] [--step-tokens N] [--kv-pool N] [--loopcd W]\n");
       return 2;
     }
   }
@@ -710,6 +712,9 @@ int main(int argc, char** argv) {
       ic.cpu_max_tokens = cpu_max_tokens;
       ic.checkpoints = checkpoints;
       ic.max_step = std::max(step_tokens, batch);
+      // One K/V pool for the slots (the owner's choice, 2026-11-24): by default a slot's room in all, so that two long
+      // conversations share it and the card's memory goes to experts (DECISIONS "Inkling speed: the shared pool ...").
+      ic.pool_positions = (kv_pool > 0 ? (kv_pool + attn::kPage - 1) / attn::kPage * attn::kPage : max_ctx);
       ic.loopcd = float(loopcd);
       ieng = std::make_unique<engine::inkling::Engine>(q, file, ic);
       std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights on the card, %lld cold experts (%.2f GiB) on the CPU with %d threads, %.2f GiB of caches (%d slots of %lld), %.1f s\n",
