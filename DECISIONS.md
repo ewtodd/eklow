@@ -4490,3 +4490,40 @@ threads read shared memory 24 times for 32 dpas (shared-memory bound at about a 
 tile than 128 x 128 does not fit the 64 KB of shared memory a work-group may have with double buffering (128 x 256 and 256
 x 128 failed to build). The next step there is a different kernel: activation tiles loaded into registers with the
 card's 2D block loads instead of through shared memory.
+
+## 2026-11-25 — Inkling cold experts: the host pass is at fiona's memory bandwidth; Q5_K compute cut
+
+The brief assumed ~3 MB an NVFP4 expert (26.5 GB/s at 113 us); the GGUF's layers 0-19 have n_ff 1152, not 768: an expert is
+2 x 1152 x 2304 + 2304 x 1152 weights at 36 B per 64 = 4.48 MB (Q5_K/Q8_0 layers 20-23: 6.47 MB), so 113 us an expert is
+already ~39.6 GB/s, at the 38 GB/s that 8 threads read (43 GB/s from 12). eklow-cpu-expert-test on fiona, 8 threads, experts
+rotated through the layer so the weights come from RAM, median us (GB/s of weights), before:
+
+  layer 6 NVFP4:   1 expert 116 (38.4)   2 experts 219 (40.9)   8 in one pass 828 (43.3)   8 one by one 908 (39.5)
+                   2 tokens: 1 expert 126 (35.6)   2 experts 236 (37.9)   8 experts 858 (41.8)
+  layer 23 Q5_K/Q8_0: 1 expert 168 (38.5)   2 experts 323 (40.0)   8 in one pass 1247 (41.5)
+                   2 tokens: 1 expert 198 (32.7)   2 experts 384 (33.7)   8 experts 1462 (35.4)
+
+Where the time goes, from the same runs with one expert repeated (weights in cache, so compute and pool barriers only): NVFP4
+1 token 66 us, 2 tokens 100 us (so memory is 60% / 90% of the time: the decode and the dot products hide behind the loads at
+one token, but two tokens are close to compute-bound); Q5_K/Q8_0 1 token 108 us, 2 tokens 207 us (compute-bound at two tokens:
+198 us measured). Thread counts 6, 10, 12 gave 35, 37, 37 GB/s (1 expert) against 38.4 at 8; pinning to the P-cores (EKLOW_CPU_PIN
+with or without the hyperthread siblings) was no better than the scheduler's own placement (36, 35 GB/s). The 8-in-one-pass
+saves 9% over eight single-expert calls (one barrier pair, not eight). Nothing further to find on the memory side from the
+host code: the one-token numbers are within 5-10% of the streaming-read ceiling.
+
+Changed: the Q5_K row loop (qgemv.cpp) did its scales per sub-block in scalar code: eight scalar scale and minimum products and
+the minimum correction per input per superblock. Now the eight scales and minimums are vectors (times d, dmin), each input's
+d x s products one vector multiply, the correction one vector fma over the superblock's eight sums accumulated across the row
+and reduced once, and each sub-block's scale is a lane broadcast. Cached-weight compute of the Q5_K/Q8_0 layer at two tokens
+207 -> 144 us. Cold, layer 23: 1 token 171 us (37.8 GB/s; 1 expert), 313 (2 experts), 1212 (8 in one pass, 42.7); 2 tokens 182
+(35.5; was 198), 343 (was 384), 1292 (was 1462, 40.1 GB/s). The check (all layers 0, 6, 19, 20, 23) passes: vs the int8-rounded
+reference 2e-7 (NVFP4), 4-6e-7 (Q5_K); the multi-expert pass is bit-identical to one call each.
+
+Tried and dropped: decoding NVFP4's UE4M3 scales with vector integer arithmetic instead of the 256-entry table (bit-identical
+to it for all 256 codes): the cached-weight 1-token time went 66 -> 78 us (the blends cost more than four L1 loads).
+
+The test gained two-token rows (1, 2, 8 experts, one pass) and EKLOW_TEST_HOT=1 (the same experts every repetition: compute
+without the memory). For the engine: nothing to change in how it calls experts_ffn (one call per layer application, all cold
+experts and all decoding slots in it); the only host-side lever left is the thread count (12 reads 43 GB/s against 38, but the
+experts' kernels did not get faster with it, and the engine's own thread submits GPU work), and huge pages for the pinned cold
+memory were not tested (the pool's per-row software prefetch already covers 4 KB page starts).
