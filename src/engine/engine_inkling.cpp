@@ -675,6 +675,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   std::vector<Sub> subs;
   std::vector<int32_t> tok, slot, pos, base, logit_rows;
   std::vector<int64_t> in_step(size_t(c_.n_slots), 0);  // each slot's tokens in the chunks so far
+  struct Span {
+    int64_t row, n;
+    const float* rows;
+  };
+  std::vector<Span> image_spans;  // the chunks' images, by their first row in the step
   for (const auto& c : chunks) {
     if (c.slot < 0 || c.slot >= c_.n_slots) throw std::runtime_error("inkling engine: bad slot");
     if (c.start_pos != slots_[size_t(c.slot)].length + in_step[size_t(c.slot)])
@@ -690,6 +695,10 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     }
     Sub& sb = subs.back();
     const int64_t b = int64_t(tok.size()) - sb.row0;
+    for (const auto& im : c.images) {
+      if (im.offset < 0 || im.n <= 0 || im.offset + im.n > n || !im.rows) throw std::runtime_error("inkling engine: an image outside its chunk");
+      image_spans.push_back({int64_t(tok.size()) + im.offset, im.n, im.rows});
+    }
     sb.ch.base[sb.ch.count] = int32_t(b), sb.ch.n[sb.ch.count] = int32_t(n), sb.ch.slot[sb.ch.count] = c.slot, ++sb.ch.count;
     for (int64_t i = 0; i < n; ++i) {
       tok.push_back(c.tokens[size_t(i)]);
@@ -806,10 +815,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   // The embeddings: rows from the GGUF's mapping through pinned memory, then the token norm.
   float* const e0 = blk_[0];
   for (int64_t t = 0; t < TA; ++t)
-    std::memcpy(emb_host_ + uint64_t(t) * embd_row_bytes_, embd_->data + uint64_t(tok[size_t(t)]) * embd_row_bytes_, embd_row_bytes_);
+    std::memcpy(emb_host_ + uint64_t(t) * embd_row_bytes_, embd_->data + uint64_t(std::max(tok[size_t(t)], 0)) * embd_row_bytes_, embd_row_bytes_);
   q_.memcpy(emb_dev_, emb_host_, size_t(uint64_t(TA) * embd_row_bytes_));
   ref::embed(q_, ref::Weight{embd_->type, E, TA, emb_dev_, embd_row_bytes_}, iota_, TA, 1.0f, e0);
   fast::rmsnorm(q_, e0, tok_norm_, TA, E, cfg_.eps, e0);
+  for (const Span& sp : image_spans) q_.memcpy(e0 + sp.row * E, sp.rows, size_t(sp.n * E) * sizeof(float));
   mark("embed");
 
   // Buffers: e0 (block 0), the prelude's output (block 1), the core's layer-11 and layer-17 outputs of the current and

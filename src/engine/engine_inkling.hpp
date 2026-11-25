@@ -30,6 +30,7 @@
 #include "cpu/expert.hpp"
 #include <memory>
 #include "model/dump.hpp"
+#include "model/image_rows.hpp"
 #include "model/gguf.hpp"
 #include "model/inkling2.hpp"
 
@@ -67,6 +68,10 @@ struct Chunk {
   int64_t start_pos;  // position of tokens[0]
   std::vector<int32_t> tokens;
   int64_t logits_rows = 1;
+  // Images' rows (Inkling M5): each stands for n of the chunk's tokens from its offset, whose ids are not looked up (any
+  // id; the server's are negative). The rows go in after the token norm, as llama.cpp's (an embeddings batch is not
+  // normalized), and must outlive the step.
+  std::vector<model::ImageRows> images = {};
 };
 
 class Engine {

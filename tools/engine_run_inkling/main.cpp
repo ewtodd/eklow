@@ -38,6 +38,8 @@
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <map>
 #include "engine/engine_inkling.hpp"
+#include "model/vision_inkling2v.hpp"
+#include "image/inkling_image.hpp"
 #include "kernels/attention.hpp"
 #include "model/gguf.hpp"
 #include "rt/device.hpp"
@@ -155,12 +157,20 @@ int main(int argc, char** argv) {
   int cpu_threads = 0;  // 0: the engine's default (8)
   double loopcd = 0;  // LoopCD's contrast strength (Config::loopcd)
   bool profile = false, rewind = false, twin = false;
+  // --mmproj FILE --image FILE [--image-tokens N] (Inkling M5): the prompt's image (an oracle's tokens.json lists its
+  // positions) encoded by the vision tower before the engine loads, its rows put in at those positions
+  std::string mmproj, image_path;
+  int64_t image_tokens = 4096;
+  int64_t generate = 0;  // --generate N: N tokens decoded greedily after the prompt, their ids into DIR/generated.json
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
     if (a == "--model") model = next();
     else if (a == "--out") out = next();
     else if (a == "--tokens-json") tokens_json = next();
+    else if (a == "--mmproj") mmproj = next();
+    else if (a == "--image") image_path = next();
+    else if (a == "--image-tokens") image_tokens = std::atoll(next().c_str());
     else if (a == "--tensors") prefixes = split(next(), ',');
     else if (a == "--dump-last") dump_last = std::atoll(next().c_str());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
@@ -172,6 +182,7 @@ int main(int argc, char** argv) {
     else if (a == "--slots") slots = std::atoll(next().c_str());
     else if (a == "--teacher") teacher_dir = next();
     else if (a == "--gen-json") gen_json = next();
+    else if (a == "--generate") generate = std::atoll(next().c_str());
     else if (a == "--profile") profile = true;
     else if (a == "--rewind") rewind = true;
     else if (a == "--twin") twin = true;
@@ -217,6 +228,29 @@ int main(int argc, char** argv) {
     if (cpu_max_tokens >= 0) cfg.cpu_max_tokens = cpu_max_tokens;
     cfg.loopcd = float(loopcd);
     if (cpu_threads > 0) cfg.cpu_threads = cpu_threads;
+    std::vector<float> image_rows;
+    int64_t image_pos = -1, image_n = 0;
+    if (!mmproj.empty()) {
+      std::ifstream tin(tokens_json);
+      const json::Value doc = json::parse(std::string((std::istreambuf_iterator<char>(tin)), {}));
+      const json::Value* ims = doc.find("images");
+      if (!ims || !ims->is_array() || ims->items().size() != 1) throw std::runtime_error(tokens_json + ": one image expected");
+      image_pos = std::atoll(ims->items()[0].find("pos")->int_digits().c_str());
+      image_n = std::atoll(ims->items()[0].find("n")->int_digits().c_str());
+      std::ifstream iin(image_path, std::ios::binary);
+      const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(iin)), {});
+      const gguf::File mf = gguf::File::open(mmproj);
+      model::VisionInkling2V vt(q, mf);
+      image_rows = vt.encode(image::prepare_inkling(image::decode(bytes), image_tokens));
+      if (int64_t(image_rows.size()) != image_n * vt.n_out()) throw std::runtime_error("the image's tokens differ from the oracle's");
+      std::printf("image: %lld tokens at %lld\n", (long long)image_n, (long long)image_pos);
+    }
+    auto attach = [&](engine::inkling::Chunk& c) {
+      const int64_t end = c.start_pos + int64_t(c.tokens.size());
+      if (image_pos < 0 || image_pos + image_n <= c.start_pos || image_pos >= end) return;
+      if (image_pos < c.start_pos || image_pos + image_n > end) throw std::runtime_error("an image across chunks");
+      c.images.push_back({image_pos - c.start_pos, image_n, image_rows.data()});
+    };
     engine::inkling::Engine eng(q, f, cfg);
     std::printf("engine: %.2f GiB of weights on %s, %lld cold experts (%.2f GiB) on the CPU, %.2f GiB of caches, %.2f GiB free "
                 "before the experts, %.1f s\n",
@@ -270,6 +304,7 @@ int main(int argc, char** argv) {
       while (teacher_dir.empty() && q < n - last && q + std::min(chunk, n - last - q) - p <= step_tokens) {
         const int64_t e = std::min(q + chunk, n - last);
         cs.push_back({0, q, std::vector<int32_t>(tokens.begin() + q, tokens.begin() + e), 0});
+        attach(cs.back());
         q = e;
       }
       if (cs.size() > 1) {
@@ -280,6 +315,7 @@ int main(int argc, char** argv) {
       }
       const int64_t end = p < n - last ? std::min(p + chunk, n - last) : n;
       engine::inkling::Chunk c{0, p, std::vector<int32_t>(tokens.begin() + p, tokens.begin() + end), end == n ? last : 0};
+      attach(c);
       dumping = end == n;
       from = p, rows = end - p;
       logits = eng.step({c}, &sink, teacher_dir.empty() ? nullptr : &teacher);
@@ -361,6 +397,21 @@ int main(int argc, char** argv) {
       return 0;
     }
 
+    if (generate > 0) {
+      const int64_t VO = eng.model().n_vocab_out;
+      std::vector<int32_t> ids;
+      std::vector<float> l(logits.end() - VO, logits.end());
+      for (int64_t i = 0; i < generate; ++i) {
+        const int32_t t = int32_t(std::max_element(l.begin(), l.end()) - l.begin());
+        ids.push_back(t);
+        engine::inkling::Chunk c{0, n + i, {t}, 1};
+        l = eng.step({c});
+      }
+      std::ofstream gj(out + "/generated.json");
+      gj << "[";
+      for (size_t i = 0; i < ids.size(); ++i) gj << (i ? "," : "") << ids[i];
+      gj << "]\n";
+    }
     if (!gen.empty()) {
       const int64_t VO = eng.model().n_vocab_out;
       std::ofstream gl(out + "/logits_gen.f32", std::ios::binary);
