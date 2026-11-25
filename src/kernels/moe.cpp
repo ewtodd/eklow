@@ -308,6 +308,56 @@ void group(sycl::queue& q, const int32_t* ids, const int32_t* slot_of, int64_t P
   });
 }
 
+// The same grouping for a few pairs (P <= kExperts: decode's 1 to 16 tokens), in one work-group of P items instead of the
+// 128 x 128 histogram: item p holds its expert in shared local memory, counts the pairs of its expert and those before it
+// (its rank in the segment), and sums the padded segment sizes and tile counts of the experts below its own. Same layout,
+// same order (an expert's pairs in pair order, segments by ascending slot) as `group`.
+void group_few(sycl::queue& q, const int32_t* ids, const int32_t* slot_of, int64_t P, int T, int32_t* tl, int32_t* rop) {
+  q.submit([&](sycl::handler& h) {
+    sycl::local_accessor<int32_t, 1> es(sycl::range<1>(kExperts), h), rows(sycl::range<1>(kExperts), h), tiles(sycl::range<1>(kExperts), h);
+    const int32_t p_n = int32_t(P);
+    h.parallel_for(sycl::nd_range<1>(kExperts, kExperts), [=](sycl::nd_item<1> it) {
+      const int p = int(it.get_local_id(0));
+      const int e = p < p_n ? (slot_of ? slot_of[ids[p]] : ids[p]) : -1;
+      es[p] = e;
+      sycl::group_barrier(it.get_group());
+      int cnt = 0, rank = 0;
+      for (int q2 = 0; q2 < p_n; ++q2) {
+        const int eq = es[q2] == e ? 1 : 0;
+        cnt += eq;
+        rank += q2 < p ? eq : 0;
+      }
+      const bool first = e >= 0 && rank == 0;
+      rows[p] = first ? (cnt + 7) / 8 * 8 : 0;
+      tiles[p] = first ? (cnt + T - 1) / T : 0;
+      sycl::group_barrier(it.get_group());
+      int start = 0, tstart = 0, rtot = 0, ttot = 0;
+      for (int q2 = 0; q2 < p_n; ++q2) {
+        const int lower = es[q2] < e ? 1 : 0;
+        start += lower * rows[q2];
+        tstart += lower * tiles[q2];
+        rtot += rows[q2];
+        ttot += tiles[q2];
+      }
+      if (e < 0) {
+        if (p < p_n) rop[p] = -1;
+      } else {
+        rop[p] = start + rank;
+        if (first)
+          for (int j = 0; j < tiles[p]; ++j) {
+            tl[4 + 4 * (tstart + j)] = e;
+            tl[5 + 4 * (tstart + j)] = start + j * T;
+            tl[6 + 4 * (tstart + j)] = sycl::min(T, cnt - j * T);
+          }
+      }
+      if (p == 0) {
+        tl[0] = ttot;
+        tl[1] = rtot;
+      }
+    });
+  });
+}
+
 // x[p / n_used][:] (fp32) of every pair p into its sorted row of `a` (act16 layout, width k).
 struct Gather {
   const float* x;
@@ -326,7 +376,9 @@ struct Gather {
   }
 };
 
-// out[t][:] = sum_i w[t][i] y[rop[t n_used + i]][:], in the order i = 0 .. n_used - 1 (the reference's).
+// out[t][:] = sum_i w[t][i] y[rop[t n_used + i]][:], in the order i = 0 .. n_used - 1 (the reference's). The token's rows and
+// weights are loaded at once and the rows' loads go out four at a time, ahead of the sums (a chain of load, branch and sum
+// per expert cost ~7 us at one token).
 struct Combine {
   const sycl::half* y;
   const float* w;
@@ -337,11 +389,34 @@ struct Combine {
   void operator()(sycl::id<2> id) const SYCL_ESIMD_KERNEL {
     const int t = int(id[0]), j = int(id[1]);
     esimd::simd<float, 128> acc = 0;
-    for (int i = 0; i < n_used; ++i) {
-      const float wt = w[t * n_used + i];
-      const int row = rop[t * n_used + i];
-      if (row < 0) continue;
-      acc += wt * esimd::simd<float, 128>(esimd::block_load<sycl::half, 128>(y + int64_t(row) * n + j * 128));
+    if (n_used <= 16) {
+      const esimd::simd<uint32_t, 16> off(0, 4);
+      const esimd::simd<int32_t, 16> idx(0, 1);
+      const esimd::simd_mask<16> m = idx < n_used;
+      const esimd::simd<int32_t, 16> ro = esimd::gather<int32_t, 16>(rop + t * n_used, off, m, -1);
+      const esimd::simd<float, 16> wv = esimd::gather<float, 16>(w + t * n_used, off, m, 0.0f);
+      for (int i0 = 0; i0 < n_used; i0 += 4) {
+        esimd::simd<sycl::half, 128> yv[4];
+        int32_t rows[4];
+        float ws[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          const int i = i0 + k < 15 ? i0 + k : 15;
+          rows[k] = i0 + k < n_used ? int32_t(ro[i]) : -1;
+          ws[k] = wv[i];
+          yv[k] = esimd::block_load<sycl::half, 128>(y + int64_t(rows[k] > 0 ? rows[k] : 0) * n + j * 128);
+        }
+#pragma unroll
+        for (int k = 0; k < 4; ++k)
+          if (rows[k] >= 0) acc += ws[k] * esimd::simd<float, 128>(yv[k]);
+      }
+    } else {
+      for (int i = 0; i < n_used; ++i) {
+        const float wt = w[t * n_used + i];
+        const int row = rop[t * n_used + i];
+        if (row < 0) continue;
+        acc += wt * esimd::simd<float, 128>(esimd::block_load<sycl::half, 128>(y + int64_t(row) * n + j * 128));
+      }
     }
     if (cold) acc += esimd::block_load<float, 128>(cold + int64_t(t) * n + j * 128);
     esimd::block_store<float, 128>(out + int64_t(t) * n + j * 128, acc);
@@ -964,7 +1039,10 @@ void ffn(sycl::queue& q, const Layer& L, const float* x, int64_t n_tok, const in
     const bool use_gemm = tc > gemm_min;
     const int T = use_gemm ? 16 * wm : kGemvRows;
     const int64_t tiles = std::min<int64_t>(P, (P + T - 1) / T + L.n_expert);
-    stage(0, [&] { group(q, ids + t0 * n_used, L.slot_of, P, L.n_hot, T, s.tl, s.rop); });
+    stage(0, [&] {
+      if (P <= kExperts) group_few(q, ids + t0 * n_used, L.slot_of, P, T, s.tl, s.rop);
+      else group(q, ids + t0 * n_used, L.slot_of, P, L.n_hot, T, s.tl, s.rop);
+    });
     stage(1, [&] {
       q.parallel_for(sycl::range<2>(size_t(P), size_t(L.n_embd / 64)), Gather{x + t0 * L.n_embd, s.rop, s.a, int32_t(n_used), int32_t(L.n_embd)});
     });
