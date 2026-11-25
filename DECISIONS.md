@@ -4690,3 +4690,38 @@ and 1.34e-3 max), rebased copies identical, layers 0, 6, 17, 19, 20, 23 at 1, 2,
   producers but ~1 launch in 200 timed out at 4,096 producers (work-groups waiting while producers were still undispatched),
   atomics on one address cost 50-100 ns each (the counters must be spread), the fence's cost could not be separated from the
   other users of the card, and a kernel that spins is a hang risk on the production card. It needs the owner's say.
+
+## 2026-11-25 — The expert GEMM at half occupancy (EU fusion), and the cold copies
+
+**EU fusion.** DG2 runs EUs in fused pairs. When a kernel has a dpas under control flow the compiler cannot prove the
+same for both threads of a pair, the compiler marks it `require_disable_eufusion` (in the zeinfo of an
+`IGC_ShaderDumpEnable=1` build) and the card runs one EU of each pair: half the threads. Small kernels on fiona's
+compiler (IGC 2.42) pin the rule: a dpas inside a loop whose trip count is loaded from memory, after an early return on
+a loaded value, under a branch on a loaded value, or under a branch on the thread's id, each turns fusion off; a trip
+count from a kernel argument keeps it on. Barriers, loads and stores under such branches do not matter by themselves.
+- The expert GEMM had all of these (a work-group past the tile list returned, the step count was `live ? kst : 0`, each
+  dpas sat under a check of the thread's rows): with them gone (work-groups past the list repeat the last tile, every
+  thread multiplies its padding rows too, the grid is the tile count read back once a call) and steps of 32 K (two
+  work-groups an Xe-core), gate_up / down at 4,096 tokens went 19.3 / 9.6 -> 7.7 / 4.0 ms on layer 6 (~45 TFLOPS) and
+  20.0 / 9.5 -> 8.2 / 4.2 ms on layer 20. The dense fp16 GEMM, run on the same buffers for comparison, does 55 TFLOPS.
+  Prefill 888 -> 1,035 tok/s at 12k, 872 -> 1,006 at 33k, the logits unchanged.
+- How it was found: the GEMM's dpas-and-shared-memory loop alone took longer than the whole dense GEMM on the same
+  shapes, though the two loops compile to the same instructions; padding the dense GEMM's shared memory to 64 KB (one
+  work-group an Xe-core) slowed it 1.46x while the expert GEMM did not change, so the expert GEMM already ran at half.
+  Tried before and dropped on the way: 256-row tiles, single buffers, activations from global memory, the larger
+  register file (the property did not apply), flushing fp16 subnormals, random activations, the clock (1,600-1,800 MHz
+  in both).
+- The decode GEMV (`Gemv`) keeps fusion off: with it on (rows a tile from the host, the last tile repeated), the
+  NVFP4 scale-after path, which feeds the e2m1 codes to the dpas as fp16 subnormals, gives wrong results (rel L2 ~0.7)
+  though the floating-point control register is set alike; Q5_K / Q8_0 were right and 6% faster at one token.
+- Still off: every attention kernel (`Flash`, `FlashGroup`: the block loop runs between loaded bounds) and the int8
+  GEMVs of `xmx` (`gemv_t`, `gemv1`, near the card's bandwidth already).
+
+**The cold copies.** With the GEMMs 2.5x faster, staging the cold sets is a fifth of prefill: skipping the copies
+(timing only) takes 12k from ~1,030 to 1,268 tok/s. A step copies ~13 GB (the non-looped layers keep 32-52 of 128
+experts on the card, cold sets of 340-612 MB; the looped ones 69-95, 148-264 MB, copied once a pass). Host-to-card
+copies slow the kernels beside them whatever runs them: on the copy engine (now used, `rt::CopyEngine`, ~+1.5%) the
+expert GEMM runs 3.5x slower at full rate, and the loss is a fixed ~61 ms of the card's time a GB copied at any rate
+from 1 to 11.7 GB/s (so pacing the copies cannot help), with the copy into uncached memory, from huge-page host memory,
+the clock unchanged; card-to-card copies cost nothing. What helps is copying less a token: steps of 8,192 tokens give
+1,087 tok/s at 12k (decode 22.2 -> 21.9: the larger step's buffers take 92 experts off the card).
