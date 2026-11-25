@@ -429,7 +429,11 @@ int main(int argc, char** argv) {
   int64_t card_margin_mib = 1024;
   int cpu_threads = 8, checkpoints = 2;
   int64_t cpu_max_tokens = 128;
-  int64_t step_tokens = 4096;  // Inkling: tokens a step may carry, run layer by layer over sub-batches of --batch
+  // Inkling: tokens a step may carry, run layer by layer over sub-batches of --batch. 8,192: each layer application's
+  // cold set is copied to the card once a step, and the copies cost the card ~61 ms a GB, so longer steps copy less a
+  // token (prefill at 12k 1,032 -> 1,087 tok/s, decode 22.2 -> 21.9: the step's buffers take ~90 experts off the card;
+  // DECISIONS 2026-11-25).
+  int64_t step_tokens = 8192;
   int64_t kv_pool = 0;         // Inkling: the full layers' K/V positions the slots share (0: --ctx, one slot's room in all)
   double loopcd = 0;  // Inkling: LoopCD's contrast strength (0: off)
   bool kv_int8 = false, preserve_thinking = false;
