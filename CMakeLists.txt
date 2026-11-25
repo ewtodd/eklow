@@ -88,6 +88,7 @@ add_library(eklow_model STATIC
   src/kernels/inkling_fast.cpp
   src/kernels/xmx.cpp
   src/kernels/xmx_fmt.cpp
+  src/kernels/xmx_fused_q8.cpp
   src/kernels/xmx_gemv_iq4xs.cpp
   src/kernels/xmx_gemv_q4k.cpp
   src/kernels/xmx_gemv_q5k.cpp

@@ -4490,3 +4490,68 @@ threads read shared memory 24 times for 32 dpas (shared-memory bound at about a 
 tile than 128 x 128 does not fit the 64 KB of shared memory a work-group may have with double buffering (128 x 256 and 256
 x 128 failed to build). The next step there is a different kernel: activation tiles loaded into registers with the
 card's 2D block loads instead of through shared memory.
+
+## 2026-11-25 — Inkling's decode GEMVs: one launch for quantize + the projections (`xmx::matmul_fused`)
+
+The decode GEMVs of Q|R|gate (6,528 x 2,304, 16 MB), K and V (1,024 x 2,304), O (2,304 x 3,072) and the head (200,064 x
+2,304) were read at 140 GB/s in the engine's profile. Measured alone on the card (`eklow-qfmt-test --formats Q8_0 --bench
+--inkling`, weights in a pool of copies so each call reads cold; 1 row, the kernels' own run times from their profiling
+events, not the host's wall clock):
+
+| matrix | matmul | quantize + matmul | GB/s of weights (matmul) |
+|---|---|---|---|
+| Q\|R\|gate | 50.6 us | 55.6 | 316 |
+| K, V | 11.4 | 17.0 | 219 |
+| O | 29.6 | 34.8 | 255 |
+| head | 1.33 ms | 1.34 | 368 |
+
+So the kernels are at the card's rate for their size: a matrix of 2-16 MB runs about 7 us of launch and ramp plus its bytes at
+~370 GB/s (K: 2.4 MB = 6.4 + 5; Q|R|gate: 43.5 + 7). 2 rows cost the same within 0-4 us (Q|R|gate 53.9, O 31.8). The thread
+target (1,024 to 65,536), as the first round found, changes nothing (+-10%).
+
+**Why the engine sees 2x that.** The card is slow to start a kernel after it has idled. Calls timed after a pause on the host:
+no pause up to ~50 us of gap between submissions: unchanged; a 100 us gap: K 11 -> 51 us, Q|R|gate 50 -> 62; 2 ms: Q|R|gate 87,
+K 51, O 69 us; 10 ms: Q|R|gate 98, K 62, O 75. A first kernel after a gap of >= ~100 us takes ~40-50 us longer whatever it is
+(the clock or power state of the matrix units, the same effect as the ramp noted at 2026-10-26). The engine's decode step
+leaves the card waiting for the host between kernel groups (the CPU experts, ~13-19 ms of submissions a token), so many of its
+GEMVs are first kernels after a gap: the profile's 115 us for Q|R|gate is ~60 us of kernel and ~50 of start. The kernel cannot
+fix that; fewer separate launches (each of which may be a first one) and a card kept busy through the gaps can.
+
+**`xmx::matmul_fused(q, jobs, njobs, m)`** (`src/kernels/xmx_fused.hpp`, `xmx_fused_q8.cpp`; Q8_0I, 1 or 2 rows, up to 4
+matrices of one K, each job with its own fp32 activations and output): a thread quantizes the fp32 activations of its slice of
+K to int8 per 32-block (the same scale and rounding as `quantize`: a half-away-from-zero round on 32 lanes), feeds the dpas from
+registers and merges the K slices through shared memory as the other GEMVs do. No quantize launch, no int8 round trip, and
+the matrices of a layer's projections go out in one launch (a job per matrix; the group index picks the job). A thread covers
+2 adjacent 8-column groups (one quantization for both, two chunks of weights in flight) and the chunk after the one being
+multiplied is loaded first. Outputs equal quantize + matmul's to 1e-5 of the largest (the K split differs; K and V bit for bit):
+0 of 6,528 / 13,056 / 1,024 / 2,304 / 200,064 off.
+
+| 1 row, device time | quantize + matmul | matmul_fused |
+|---|---|---|
+| Q\|R\|gate | 56.8 us | 51.5 (311 GB/s) |
+| K, V | 17.0 | 12.9 |
+| O | 34.7 | 29.2 (258 GB/s) |
+| Q\|R\|gate + K + V (sliding layers' one input), 3 x (quantize + matmul) vs one launch | 92.7 (wall 126) | 72.9 (wall 75) |
+
+2 rows: Q|R|gate 55.0, K 16.6, O 30.7, the three in one launch 73.3 us (3 x (quantize + matmul): 101.6, wall 138). After a
+100 us gap or more it also saves what a first kernel costs once instead of three times.
+
+Kept and rejected, from the sweeps (1 row, Q|R|gate / K / O, wall ms):
+- Threads: about 512 a row in all (a work-group per two column groups and 1-16 threads splitting K by that), since 1, 2, 4, 8,
+  16, 32 threads a group gave Q|R|gate 54 / 58 / 61 / 66 / 68 / 82 us (NG = 2): more threads were slower in every shape, and a
+  small matrix (K: 64 groups' worth) wants 8-16 to fill the card (T = 1: 35 us, 8: 15).
+- 4 column groups a thread: 68-140 us (registers spill); 1 group: 3-10% slower than 2 on the big matrix.
+- Interleaving the K chunks of a work-group's threads (thread t takes chunks t, t + T, ...) instead of a contiguous slice each:
+  the same times (+-1%): the loads are not limited by DRAM page locality.
+- Loading the next chunk before the current one's dpas (double buffering): the same times as loading each chunk in turn; kept.
+- The quantization's arithmetic is not what the fused kernel pays for: with it replaced by a bare convert (wrong results) the
+  times were the same within 2 us.
+- 3 to 8 rows in the fused kernel: 4 rows 64 GB/s, 8 rows 26 GB/s (the activation registers spill); not offered, more than 2 rows
+  stay on quantize + matmul. The head stays unfused (the 8,000 thread groups: fused 1.49-1.59 ms against 1.33 for matmul).
+- Changing the existing GEMV (`gemv_t`): at 50.6 us for 16 MB there is nothing left in it.
+
+`eklow-qfmt-test --inkling` adds Inkling's five matrices to `--check` and `--bench` (also the fused path and Q|R|gate + K + V),
+`EKLOW_IDLE_US` / `EKLOW_SPIN_US` time calls after a gap on the host, `EKLOW_POOL_MB` sets the pool of weight copies and
+`EKLOW_NO_HEAD` skips the head. `xmx::g_event_log`, when set, collects the events of the int8 decode path's kernels
+(quantize, `gemv_t`, `matmul_fused`) for device times. EKLOW_FUSED_NG, _T set the fused kernel's groups per thread and K
+split for measuring.
