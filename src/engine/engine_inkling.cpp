@@ -399,6 +399,12 @@ void Engine::place_experts(const gguf::File& f) {
     sycl::free(L.cold_set.base, q_);
     L.cold_set.base = nullptr;
   }
+  if (std::getenv("EKLOW_PLACEMENT_LOG")) {  // the placement: hot experts and cold set a layer
+    for (int l = 0; l < NL; ++l)
+      std::fprintf(stderr, "placement layer %d: %lld hot, cold set %.1f MB\n", l, (long long)std::count(hot[size_t(l)].begin(), hot[size_t(l)].end(), true),
+                   layers_[size_t(l)].cold_host ? double(layers_[size_t(l)].cold_set.bytes) / 1e6 : 0.0);
+    if (const std::optional<uint64_t> f2 = rt::free_memory(q_.get_device())) std::fprintf(stderr, "placement: free %.0f MB at placement, %.0f MB now\n", double(free_at_placement_) / 1e6, double(*f2) / 1e6);
+  }
   // the staging region holds the largest cold set as moe lays it out; the cold sets' tables point into it from now on
   uint64_t stage_bytes = 0;
   for (const auto& L : layers_)
@@ -411,7 +417,7 @@ void Engine::place_experts(const gguf::File& f) {
     }
     for (auto& L : layers_)
       if (L.cold_host) moe::rebase(q_, L.cold_set, staging_[0]);
-    copy_q_ = std::make_unique<sycl::queue>(q_.get_context(), q_.get_device(), sycl::property::queue::in_order());
+    copy_ = std::make_unique<rt::CopyEngine>(q_);
   }
   for (int l = 0; l < NL; ++l) {
     Layer& L = layers_[size_t(l)];
@@ -448,7 +454,7 @@ void Engine::place_experts(const gguf::File& f) {
 
 Engine::~Engine() {
   q_.wait();
-  if (copy_q_) copy_q_->wait();
+  if (copy_) copy_->wait(copy_->fence());
   xmx::free_activations(q_, act_);
   xmx::free_activations(q_, act_head_);
   for (void* p : {static_cast<void*>(attn_scratch_.q), static_cast<void*>(attn_scratch_.part), static_cast<void*>(attn_scratch_.part2),
@@ -576,7 +582,13 @@ int Engine::stage(int layer, int avoid) {
   if (!L.cold_host) return -1;
   // into the region `avoid` is not, or (a use that found its set in neither) the one the latest set did not run from
   const int b = avoid >= 0 ? 1 - avoid : 1 - last_staged_use_;
-  copied_[b] = copy_q_->memcpy(staging_[b], L.cold_host, L.cold_set.bytes, used_[b]);
+  // On the copy engine (rt::CopyEngine; a SYCL queue's memcpy runs on the compute engine), which takes no queue's events
+  // to wait for: the region's last use is waited for on the host, which in prefill has passed it already (moe::ffn read
+  // back a later kernel's result). Copies from the host slow the kernels beside them all the same, ~61 ms of the card's
+  // time a GB at any rate (DECISIONS 2026-11-25, "the cold copies"): a step's copies are ~13 GB.
+  used_[b].wait();
+  copy_->copy(staging_[b], L.cold_host, L.cold_set.bytes);
+  copied_[b] = copy_->event(copy_->fence());
   staged_[b] = layer;
   return b;
 }

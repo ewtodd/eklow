@@ -26,6 +26,7 @@
 #include "kernels/attention.hpp"
 #include "kernels/moe.hpp"
 #include "kernels/xmx.hpp"
+#include "rt/copy_engine.hpp"
 #include "cpu/expert.hpp"
 #include <memory>
 #include "model/dump.hpp"
@@ -181,7 +182,7 @@ class Engine {
   uint8_t* staging_[2] = {nullptr, nullptr};
   int staged_[2] = {-1, -1};
   sycl::event copied_[2], used_[2];
-  std::unique_ptr<sycl::queue> copy_q_;
+  std::unique_ptr<rt::CopyEngine> copy_;  // the card's copy engine: a queue's memcpy would share the compute engine
   std::vector<int> exec_layers_;  // the physical layer of each layer application, in the order a step runs them
   int stage(int layer, int avoid);  // the region holding `layer`'s cold set, its copy issued if needed (never into `avoid`)
   int last_staged_use_ = 0;         // the region the latest cold set ran from

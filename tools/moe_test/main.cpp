@@ -15,6 +15,11 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <atomic>
+#include <thread>
+#include <fstream>
+#include <sys/mman.h>
+#include <memory>
 #include <cstdlib>
 #include <cstring>
 #include <random>
@@ -23,6 +28,10 @@
 #include <vector>
 
 #include "kernels/moe.hpp"
+#include "rt/copy_engine.hpp"
+
+#include <level_zero/ze_api.h>
+#include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include "kernels/ref.hpp"
 #include "kernels/ref_inkling.hpp"
 #include "model/gguf.hpp"
@@ -144,7 +153,7 @@ int main(int argc, char** argv) {
       q.wait();
       std::vector<int32_t> hids(size_t(T * c.NU));
       q.memcpy(hids.data(), ids, hids.size() * 4).wait();
-      // EKLOW_MOE_TEST_ROUTE (speed work): "even" spreads the pairs over the experts evenly (token t's slot j to expert
+      // EKLOW_MOE_TEST_ROUTE: "even" spreads the pairs over the experts evenly (token t's slot j to expert
       // (8 t + j) mod n_expert, so every expert gets the same count), "few" puts them on experts 0-7 only.
       if (const char* rt = std::getenv("EKLOW_MOE_TEST_ROUTE")) {
         const std::string r = rt;
@@ -222,6 +231,60 @@ int main(int argc, char** argv) {
           moe::ffn(q, layer, x, n, ids, wts, c.NU, c.beta, c.lb, *scratch, out);
           q.wait();
           moe::profile_print(false);
+          // EKLOW_MOE_TEST_COPY=MB: host-to-card copies of that size kept running on the copy engine during the timing, to
+          // measure what they cost the kernels (DECISIONS 2026-11-25, "the cold copies")
+          std::unique_ptr<rt::CopyEngine> ce;
+          std::thread pacer;
+          std::atomic<bool> pacer_stop{false};
+          uint8_t *ch = nullptr, *cd = nullptr;
+          if (const char* cm = std::getenv("EKLOW_MOE_TEST_COPY")) {
+            const size_t mb = size_t(std::atoll(cm)) << 20;
+            ce = std::make_unique<rt::CopyEngine>(q);
+            // EKLOW_MOE_TEST_COPY_SRC: "dev" card to card, "huge" host memory on 2 MB transparent huge pages imported into
+            // Level Zero, else pinned host memory from the runtime
+            const std::string src = std::getenv("EKLOW_MOE_TEST_COPY_SRC") ? std::getenv("EKLOW_MOE_TEST_COPY_SRC") : "";
+            if (src == "dev") {
+              ch = sycl::malloc_device<uint8_t>(mb, q);
+              q.memset(ch, 1, mb).wait();
+            } else if (src == "huge") {
+              void* p = mmap(nullptr, mb + (2u << 20), PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+              ch = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(p) + (2u << 20) - 1) & ~uintptr_t((2u << 20) - 1));
+              madvise(ch, mb, MADV_HUGEPAGE);
+              std::memset(ch, 1, mb);
+              using Import = ze_result_t (*)(ze_driver_handle_t, void*, size_t);
+              ze_driver_handle_t drv = sycl::get_native<sycl::backend::ext_oneapi_level_zero>(q.get_device().get_platform());
+              void* fn = nullptr;
+              zeDriverGetExtensionFunctionAddress(drv, "zexDriverImportExternalPointer", &fn);
+              if (!fn || reinterpret_cast<Import>(fn)(drv, ch, mb) != ZE_RESULT_SUCCESS) throw std::runtime_error("import failed");
+              std::ifstream mi("/proc/meminfo");
+              for (std::string l; std::getline(mi, l);)
+                if (l.rfind("AnonHugePages", 0) == 0) std::printf("    %s\n", l.c_str());
+            } else {
+              ch = sycl::malloc_host<uint8_t>(mb, q);
+              std::memset(ch, 1, mb);
+            }
+            cd = sycl::malloc_device<uint8_t>(mb, q);
+            if (!std::getenv("EKLOW_MOE_TEST_COPY_RATE")) {
+              for (int i = 0; i < 40; ++i) ce->copy(cd, ch, mb);
+            } else {
+              // EKLOW_MOE_TEST_COPY_RATE=GB/s: 8 MB copies appended at that rate by a host thread while the timing runs
+              const double rate = std::atof(std::getenv("EKLOW_MOE_TEST_COPY_RATE"));
+              pacer_stop = false;
+              pacer = std::thread([&ce, ch, cd, mb, rate, &pacer_stop] {
+                const size_t chunk = size_t(8) << 20;
+                const auto t0 = std::chrono::steady_clock::now();
+                size_t sent = 0;
+                while (!pacer_stop.load()) {
+                  const double due = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() * rate * 1e9;
+                  while (double(sent) < due) {
+                    ce->copy(cd + (sent % mb) / chunk * chunk % mb, ch + (sent % mb) / chunk * chunk % mb, chunk);
+                    sent += chunk;
+                  }
+                  std::this_thread::sleep_for(std::chrono::microseconds(200));
+                }
+              });
+            }
+          }
           const auto s0 = std::chrono::steady_clock::now();
           const int r = n >= 512 ? std::max(2, reps / 4) : reps;
           for (int i = 0; i < r; ++i) moe::ffn(q, layer, x, n, ids, wts, c.NU, c.beta, c.lb, *scratch, out);
@@ -234,6 +297,17 @@ int main(int argc, char** argv) {
           std::printf("  time  %5lld tokens: %8.3f ms  %5lld experts %7.1f MB read, %6.1f GB/s  %9.0f tokens/s\n", (long long)n, ms,
                       (long long)distinct, bytes / 1e6, bytes / (ms * 1e-3) / 1e9, double(n) / (ms * 1e-3));
           if (std::getenv("EKLOW_MOE_PROFILE")) moe::profile_print();
+          if (pacer.joinable()) {
+            pacer_stop = true;
+            pacer.join();
+          }
+          if (ce) {
+            const auto c0 = std::chrono::steady_clock::now();
+            ce->wait(ce->fence());
+            std::printf("    copies drained %.1f ms after the timing\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - c0).count());
+            if (!std::getenv("EKLOW_MOE_TEST_COPY_SRC") || std::string(std::getenv("EKLOW_MOE_TEST_COPY_SRC")) != "huge") sycl::free(ch, q);
+            sycl::free(cd, q);
+          }
         }
       }
       // ---- residency: only the busiest experts on the card, the rest's weighted sum from the reference ops
