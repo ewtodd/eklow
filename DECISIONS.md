@@ -4725,3 +4725,31 @@ expert GEMM runs 3.5x slower at full rate, and the loss is a fixed ~61 ms of the
 from 1 to 11.7 GB/s (so pacing the copies cannot help), with the copy into uncached memory, from huge-page host memory,
 the clock unchanged; card-to-card copies cost nothing. What helps is copying less a token: steps of 8,192 tokens give
 1,087 tok/s at 12k (decode 22.2 -> 21.9: the larger step's buffers take 92 experts off the card).
+
+## 2026-11-25 — Where Inkling's decode goes (the tracer), and what did not help
+
+**Measuring.** The fine profile (EKLOW_PROFILE_FINE's marker kernels) slows decode 22.2 -> 18.2 tok/s and spreads the
+markers' cost over the kernels around them; it had put attention at ~10 ms a token. The tracer (eklow-engine-run-inkling
+with EKLOW_TRACE=1: a timestamp written after every kernel and copy through the Level Zero tracing layer) gives a step
+of ~44 ms at 12k as ~1,500 commands:
+- the experts ~10.6 ms (gate_up GEMV ~130 us a layer in place, down ~46, grouping, gather and combine ~13 each);
+- the int8 projections ~7.7 ms (Q|R|gate+K+V ~125 us in place against 73 us alone, O ~37);
+- attention ~6.8 ms (the flash kernel ~95 us a call on average, its fold and merge ~17 us each, the K/V write 12);
+- the card waiting for the CPU's cold rows ~4.7-6 ms (the copy after each layer's cold pairs);
+- ~1,200 small kernels at 11-20 us each, ~16 ms: the depth mixes (119 calls), the RMS norms (154), the controllers
+  (192), small fp32 matmuls (112), short convolutions, routing, packing, the heads' norms, the gates.
+With the CPU's cold experts left out (EKLOW_SKIP_COLD=1, timing only) the host has the whole step submitted after 4.7
+ms and the card takes 40.5: decode is bound by the card's own timeline, not by the host.
+
+**Tried and dropped:**
+- The cold pairs on a worker thread, the card waiting for them on a host-signaled Level Zero event so that the host
+  submits the next layer meanwhile: correct, no faster (22.2 tok/s): the host was not on the critical path.
+- Polling the routing's event instead of waiting on it: no difference.
+- Attention's query and R tiles made inside the split kernel instead of by two kernels before it: correct, no faster
+  (76 us a sliding call either way: the kernel grew by the two it replaced). Merging the splits in the kernel, the last
+  work-group of a tile merging after a counter: wrong rows (stale partials) and 207 us a call (the merge is serial).
+- The depth mix of a decode row in one launch (every work-group summing the whole row, then writing its slice): 37 us,
+  then 32 us with its loads unrolled, against two launches of ~16 us: the same.
+What is left is the count of dependent small kernels each costing ~11-20 us on the card; merging two dependent ones
+does not shorten the chain. Next for decode: launching independent ones together (the controllers and norms of a full
+layer's three inputs), or fewer stages per layer.
