@@ -5,9 +5,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 ## Now (2026-11-24)
 
-- **Inkling 2 Mini is to replace Bolt** (the owner's decision, DECISIONS 2026-11-24): the port is on branch
-  `inkling/port`, milestone by milestone (M0 ground truth, M1 host reference and text layer, M2 the forward on the card,
-  M3 memory, M4 the server and the replay, M5 vision, M6 the MTP draft). Bolt serves until Inkling wins through eklow.
+- **Inkling 2 Mini replaces Bolt** (the owner's decision, DECISIONS 2026-11-24): the port went milestone by milestone
+  (M0 ground truth, M1 host reference and text layer, M2 the forward on the card, M3 memory, M4 the server; M5 vision and
+  M6 speed and the MTP draft to come, speed first by the owner's choice). The owner stopped Bolt on 2026-11-24 20:06;
+  Inkling's deployment is committed in /etc/nixos for the owner to deploy.
   - **M0 is done**: llama.cpp c74c71a6's activations, logits, greedy continuations, rendered turns, parsed outputs and
     tokens on fixed synthetic prompts (67 to 32,950 tokens), from e-workstation's 4090 (DECISIONS "Inkling M0").
   - **M1 is done**: eklow's fp32 reference forward (`src/model/inkling2.*`, `src/kernels/ref_inkling.*`), the tokenizer,
@@ -22,10 +23,17 @@ with its measurements); what eklow is and its numbers: `README.md`.
     experts on the CPU in decode and staged onto the card in prefill, two slots of 64k, checkpoints and rewind. In
     production's shape (2.53 GiB kept for the side models): decode 11.4 to 10.7 tok/s at 67 to 33k positions, prefill ~365
     tok/s, inside llama.cpp's spread.
-  - Next: M4, eklow-server for Inkling and the private replay through it; speed (prefill's cold-set copies, the per-layer
-    small kernels, the MTP draft) after.
+  - **M4 is done** (DECISIONS "Inkling M4: eklow-server for Inkling, ..." and "the tool-call grammar"): the request layer,
+    the scheduler (two slots, prefix reuse through checkpoints), llama.cpp's tool grammar (equal allowed sets on 39,619
+    sequences), the side models beside it. The private replay through it: 40 of 41 episodes on the 7 moments it covered,
+    where the 4090 passed 41 of 42; the owner stopped it there. Decode 10.5 tok/s, prefill ~365 tok/s, a next turn's first
+    token after ~2.4 s. LoopCD's hidden form did not help (108 against 111 of 132 on the 4090); `--loopcd` stays off.
+  - Next: speed. Decode is bound by kernel launches and host round trips (98 ms a token, 3-4 ms of it the weights' bytes);
+    prefill spends 63% of its time copying cold sets onto the card.
 
-- **fiona runs eklow's milestone in production** (`eklow-bolt.service` since 2026-11-10 22:48): Nemotron-3.5-Bolt-E4B with
+- **fiona ran Bolt in production until 2026-11-24 20:06**, when the owner stopped it (`eklow-bolt.service`, from
+  2026-11-10 22:48; maitred's "fiona" route falls back to son-of-anton's models until Inkling is deployed):
+  Nemotron-3.5-Bolt-E4B with
   NVIDIA's DFlash draft and Gemma 4's projector, EmbeddingGemma 2 with its projector, vega's end-of-turn checker (the
   vega-cv32 policy) and Qwen3-Reranker, in one `eklow-server` on the A770M, every cache fp16 (DECISIONS 2026-11-11, "fiona's
   milestone").
@@ -64,10 +72,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 ## Open, in order
 
-0. **Inkling M4**: eklow-server for Inkling (the text layer is ported; the tool grammar, sampling, metrics, checkpoint at
-   each prefill's end and rewind on the next turn), side models beside it, then the private replay through it against the
-   4090's 110/126. Open choices for the owner: the text layer's llama.cpp quirks (DECISIONS "the text layer"), and whether
-   the side models move to the Iris Xe (needs non-XMX kernels; about half the cold pairs).
+0. **Inkling's speed** (DECISIONS "Inkling M4", its last paragraph): decode's launches and host round trips (fused small
+   kernels, fewer waits on the CPU's cold experts, the MTP draft), prefill's cold-set copies (overlapped with compute, or
+   once a prompt). Then M5, vision. The owner deploys Inkling from the /etc/nixos commit (a `nix flake update eklow`
+   first).
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):
    - the kernel tests;
    - the draft's lattices and the embeddings, against main's build;

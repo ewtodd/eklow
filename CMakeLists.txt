@@ -250,6 +250,8 @@ eklow_sycl(eklow-xmx-bench)
 
 install(TARGETS eklow-qfmt-test eklow-gguf eklow-tok eklow-probe eklow-xmx-bench eklow-ref-run eklow-attn-test eklow-embed eklow-vision eklow-image-prep eklow-engine-run-gemma4 eklow-engine-bench-gemma4 eklow-prompt-gemma4 eklow-server eklow-vega eklow-rerank RUNTIME DESTINATION bin)
 install(TARGETS eklow-grammar-test-gemma4 eklow-chat-gemma4 eklow-parse-gemma4 RUNTIME DESTINATION bin)
+# Inkling's routing profile (counts only), which places its experts between the card and the CPU (--expert-profile).
+install(FILES data/inkling-2-mini-experts.json DESTINATION share/eklow)
 
 # Inkling 2 Mini's experts on the card against the reference ops.
 add_executable(eklow-moe-test tools/moe_test/main.cpp)

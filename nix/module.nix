@@ -6,9 +6,9 @@
 }:
 
 # Each instance is a chat model served by eklow-server, as its own unit eklow-<name>.service, with the card's other models
-# (EmbeddingGemma 2, the end-of-turn checker, the reranker) beside it. The server runs Gemma 4 E4B (gemma4: NVIDIA's
-# Nemotron-3.5-Bolt-E4B) and refuses anything else; the Qwen3.6-35B-A3B server and its options left on 2026-11-11 (eklow
-# DECISIONS). The instances share the card and the side models' ports, so at most one runs: each conflicts with the others,
+# (EmbeddingGemma 2, the end-of-turn checker, the reranker) beside it. The server runs Inkling 2 Mini (inkling2_loop, its
+# experts split between the card and the CPU) and Gemma 4 E4B (gemma4: NVIDIA's Nemotron-3.5-Bolt-E4B), and refuses anything
+# else; the Qwen3.6-35B-A3B server and its options left on 2026-11-11 (eklow DECISIONS). The instances share the card and the side models' ports, so at most one runs: each conflicts with the others,
 # and starting one stops the one running (systemctl start, or a mode switch such as the house's llm-mode).
 let
   cfg = config.services.eklow;
@@ -22,10 +22,10 @@ let
       options = {
         model = lib.mkOption {
           type = lib.types.path;
-          example = lib.literalExpression "inputs.eklow.packages.x86_64-linux.bolt-e4b";
+          example = lib.literalExpression "inputs.eklow.packages.x86_64-linux.inkling-2-mini";
           description = ''
-            The chat model's GGUF: Gemma 4 E4B as NVIDIA publishes Nemotron-3.5-Bolt-E4B (Q4_K_M, the whole model on the card;
-            the flake's `bolt-e4b`).
+            The chat model's GGUF: Inkling 2 Mini as Unsloth publishes it (UD-Q4_K_M, the flake's `inkling-2-mini`; set
+            `expertProfile`), or Gemma 4 E4B as NVIDIA publishes Nemotron-3.5-Bolt-E4B (Q4_K_M, the flake's `bolt-e4b`).
           '';
         };
 
@@ -103,6 +103,17 @@ let
           '';
         };
 
+        expertProfile = lib.mkOption {
+          type = lib.types.nullOr lib.types.path;
+          default = null;
+          example = lib.literalExpression ''"''${inputs.eklow.packages.x86_64-linux.default}/share/eklow/inkling-2-mini-experts.json"'';
+          description = ''
+            Inkling 2 Mini's routing profile (`--expert-profile`, the package's share/eklow/inkling-2-mini-experts.json): its
+            experts do not all fit the card, and the busiest go on it while the card has room (what the side models leave,
+            less a 1 GiB margin); the rest run on the CPU. Required for Inkling; Bolt takes none.
+          '';
+        };
+
         extraArgs = lib.mkOption {
           type = lib.types.listOf lib.types.str;
           default = [ ];
@@ -157,7 +168,7 @@ in
         ];
 
   options.services.eklow = {
-    enable = lib.mkEnableOption "eklow: Nemotron-3.5-Bolt-E4B with a DFlash draft, EmbeddingGemma 2, vega's end-of-turn checker and Qwen3-Reranker on an Intel Arc A770M behind OpenAI-compatible APIs";
+    enable = lib.mkEnableOption "eklow: Inkling 2 Mini or Nemotron-3.5-Bolt-E4B, EmbeddingGemma 2, vega's end-of-turn checker and Qwen3-Reranker on an Intel Arc A770M behind OpenAI-compatible APIs";
 
     package = lib.mkOption {
       type = lib.types.package;
@@ -514,6 +525,10 @@ in
             ++ lib.optionals (inst.mmproj != null) [
               "--mmproj"
               inst.mmproj
+            ]
+            ++ lib.optionals (inst.expertProfile != null) [
+              "--expert-profile"
+              inst.expertProfile
             ]
             ++ lib.optionals (cfg.embedModel != null) [
               "--embed-model"

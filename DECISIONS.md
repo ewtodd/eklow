@@ -4321,3 +4321,67 @@ treats as a named token (above). **Speed** (replaying all 1.97 M steps, one thre
 ~200k ids), so a request pays a few ms once per distinct state it reaches, and a tool set already seen pays nothing. The
 bench's own mean (73 us) is its 412 grammars thrashing the cache (cleared past 64 M ids); one production grammar fits.
 `eklow-grammar-test-inkling check` compares a stopped run's finished sequences only.
+
+## 2026-11-24 — Inkling M4: eklow-server for Inkling, and Inkling in Bolt's place
+
+**What.** `eklow-server` serves a GGUF of architecture `inkling2_loop` beside Bolt's `gemma4`
+(`src/serve/{openai,scheduler}_inkling.*`, `tools/server/main.cpp`):
+- **Requests**: rendered by the ported template with llama-server's request handling (`render_inkling_request`), the body
+  read as llama.cpp reads JSON, request text never tokenized as special tokens; sampling, `max_tokens` (0: prefill-only),
+  `stop`, `stream` and usage as for Bolt. The response is Bolt's `ChatResponse`, which now writes a tool call's arguments as
+  the model wrote them when the parser kept that text (llama-server passes them on; Bolt's parser keeps none).
+- **Scheduler**: continuous batching over the engine's slots (two of 64k): each step decodes a token for every generating
+  sequence, then fills the batch (1,024) with prefill chunks (1,024 a sequence). A request takes the free slot whose
+  sequence shares the longest prefix with its prompt (the least recently used among equals); when the prompt continues the
+  slot, it goes on from its end, else the slot rewinds to its latest checkpoint at or before the shared prefix, else starts
+  over. The checkpoint goes **before each prompt's last token**: the last token then goes in a step of its own (a
+  decode-sized step, ~90 ms a request), so that the same prompt again (a retry) resumes there and feeds that token for its
+  logits; a next turn resumes there too. Prefill-only requests checkpoint at their end and run only while nothing else does.
+- **Tools**: llama.cpp's grammar (the entry before this one) from the first sampled token when a request has tools and
+  `tool_choice` is not none. Where it allows everything (auto mode before a call), the sampler skips the mask and bans the
+  332 tokens llama.cpp's grammar can never accept.
+- **Stop strings** end the content, as for Bolt (llama-server matches them over the whole output, reasoning included).
+- **Refused for Inkling**: `--draft`, `--mmproj`, `--prefix-cache`, `--kv-int8`, `--preserve-thinking` (its MTP draft and
+  vision are later milestones; its sliding rings and convolution states are rewound from checkpoints in host memory, not
+  from a disk cache). New flags: `--expert-profile` (required), `--card-margin-mib`, `--cpu-threads`, `--cpu-max-tokens`,
+  `--checkpoints`, `--loopcd` (below).
+- **The side models stay on the A770M** (the owner left it to me; their suggestion was the Iris Xe): they load before
+  the engine, so the experts' placement sees what they leave (2,067 of 3,072 experts cold, 9.4 GiB on the CPU, with
+  EmbeddingGemma 2 and its projector, the checker and the reranker on the card). On the Iris Xe they would free ~2.5 GiB
+  (~600 experts, about half the cold pairs), but the Xe shares the DDR4 the cold experts are bound by (their FFN reads
+  ~113 us an expert at DRAM speed), has no matrix units (four models' kernels to port), and already runs the title
+  model; the gain (~3% decode, ~30% prefill at the measured split) is less than the cheaper levers below.
+- **Stopping**: when the engine thread stops, what still runs or waits ends with an error ("the server is stopping"), so
+  the HTTP server's stop does not wait on requests the engine will never finish (Bolt's scheduler had the same gap: a
+  SIGTERM with a request in flight hung until systemd's kill).
+
+**Checks** (fiona, the test server with production's side models; `tools/ref/inkling/m4_smoke.py`): a plain answer, a tool
+call whole and streamed, `tool_choice` required, the turn after the tool's result (304 of 312 prompt tokens from the slot),
+the same prompt again (193 of 194), two requests at once, a stop string, prefill-only, a prompt past the context (400). The
+private replay through eklow-server, the same sampling as the 4090's llama-server (the GGUF's: temperature 1, top-p 1, top-k
+0): **40 of 41 episodes pass on the 7 moments it covered, where the 4090 passed 41 of 42** (40.0 expected at its rates),
+no errors. The owner stopped it there (its noise at 132 episodes is ±4, so the remaining repeats could only catch a
+breakage, and speed makes every later check cheaper): the full gate was not run.
+
+Over the 212 requests of that replay (one at a time, prompts up to 28.6k): decode 10.5 tok/s median (8.8-11.0); a new
+prompt of 8-16k prefills at 367 tok/s (first token after 36 s), 16-28k at 365 (63 s); 80% of prompt tokens came from the
+slot, and a next turn's first token came after 2.4 s (median, 286 new tokens).
+
+**LoopCD** (arXiv 2610.02185, a training-free contrastive decoding for looped models; reported on Inkling 2 Mini with gains
+across benchmarks): its hidden-state form, the coda reading h + w (h - h_1) for both of the core's block outputs, h_1 their
+values after the first pass, at w = 0.25, in llama.cpp c74c71a6 (a ten-line patch to the loop graph) on the 4090 with the
+private replay: **108 of 132 against 111 of 132 without**, inside the noise, and 6% fewer tokens. No gain on fiona's
+moments. The logits form (pass 1's prediction against pass 3's) needs the coda run twice with its own caches (~12% decode,
+~0.5 GiB) and was not tried. The engine keeps the hidden form behind `--loopcd W` (off: nothing changes; on: two buffers and
+two kernels a token).
+
+**Bolt leaves** (the owner, 2026-11-24): eklow-bolt was stopped after a bad run of its replies in fiona's chats; maitred's "fiona"
+route falls back to son-of-anton's models until Inkling is deployed in its place (`nix/models.nix` pins Unsloth's
+UD-Q4_K_M at 8078d149, `services.eklow.instances.<name>.expertProfile` passes the profile, which the package installs in
+share/eklow).
+
+**Where the time goes next** (fiona, production's shape, `eklow-engine-run-inkling --profile`): decode at 12k context, 98
+ms a token: the 48 layer applications' inputs (depth mixes, controllers, norms) 21 ms, the router 19, waiting on the CPU's
+cold experts 15, projections 13, hot experts 10, sliding attention 7, the rest 13. The weights a token reads would take
+3-4 ms at the card's bandwidth: decode is bound by kernel launches and host round trips. Prefill of 12k: 34 s, of which
+21.5 s copy cold sets onto the card (each layer application's, every chunk).

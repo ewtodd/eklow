@@ -236,6 +236,25 @@ void Scheduler::run(const std::atomic<bool>& stop) {
     stats_.prefill_seq_s += dt * step_prefill_seqs_;
     stats_.decode_seq_s += dt * step_decode_seqs_;
   }
+  // The server is stopping: what still runs or waits ends here with an error, so that no request thread waits on an engine
+  // that has stopped (the HTTP server's stop joins them).
+  for (size_t s = 0; s < seqs_.size(); ++s)
+    if (seqs_[s].req) finish(int(s), "stop", "the server is stopping");
+  std::deque<std::shared_ptr<Request>> left;
+  {
+    std::lock_guard lk(mu_);
+    for (auto* d : {&waiting_, &prefill_only_}) {
+      left.insert(left.end(), d->begin(), d->end());
+      d->clear();
+    }
+    stats_.waiting = stats_.prefill_only_waiting = 0;
+  }
+  for (const auto& r : left) {
+    Event e;
+    e.done = true, e.finish_reason = "stop", e.error = "the server is stopping", e.prefill_only = r->prefill_only;
+    e.prompt_tokens = int64_t(r->prompt.size());
+    r->push(std::move(e));
+  }
 }
 
 void Scheduler::step() {

@@ -1,11 +1,11 @@
-# The model files of fiona's deployment, as derivations: Bolt with its projector and DFlash draft, vega's reader for the
-# end-of-turn checker, and Qwen3-Reranker (EmbeddingGemma 2 and vega-U are the module's defaults). Published files are
-# fetched at a pinned revision by the sha256 Hugging Face lists for them. The two that nobody publishes in the form eklow
+# The model files of fiona's deployment, as derivations: Inkling 2 Mini, Bolt with its projector and DFlash draft, vega's
+# reader for the end-of-turn checker, and Qwen3-Reranker (EmbeddingGemma 2 and vega-U are the module's defaults). Published
+# files are fetched at a pinned revision by the sha256 Hugging Face lists for them. The two that nobody publishes in the form eklow
 # serves are made here, with the flake's pinned llama.cpp:
 # - the draft's Q8_0, quantized from NVIDIA's BF16 GGUF;
 # - vega's reader, Qwen3.5-0.8B converted to a BF16 GGUF.
-# Licenses: Bolt and its draft, NVIDIA's OpenMDW-1.1 (https://openmdw.ai/license/1-1/); the Gemma 4 E4B projector,
-# Qwen3.5-0.8B, Qwen3-Reranker-0.6B, EmbeddingGemma 2 and vega-U, Apache-2.0.
+# Licenses: Bolt and its draft, NVIDIA's OpenMDW-1.1 (https://openmdw.ai/license/1-1/); Inkling 2 Mini, the Gemma 4 E4B
+# projector, Qwen3.5-0.8B, Qwen3-Reranker-0.6B, EmbeddingGemma 2 and vega-U, Apache-2.0.
 {
   lib,
   fetchurl,
@@ -66,6 +66,15 @@ let
   ]);
 in
 {
+  # Unsloth's UD-Q4_K_M, the file fiona's replay scored and eklow's port was checked on (DECISIONS 2026-11-24): NVFP4 experts
+  # in layers 0-19, Q5_K/Q8_0 in 20-23, 15.5 GiB. Fetching it with curl crawls (1-5 MB/s from Hugging Face's CDN): seed the
+  # store from a copy fetched with `hf download` (`nix-store --add-fixed sha256 Inkling-2-Mini-UD-Q4_K_M.gguf` gives this
+  # path).
+  inkling-2-mini =
+    hf "unsloth/Inkling-2-Mini-GGUF" "8078d149286eec7193795413b9e0643da6d11fa1"
+      "Inkling-2-Mini-UD-Q4_K_M.gguf"
+      "78fcedcf93c5d1bfe83e225513b71392bb52259be0eaa5f8899c856a2e5834ae";
+
   bolt-e4b =
     hf "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB" "1db54d5b12533ff1bcaa8e42cf4c667988a1f1be"
       "Nemotron-3.5-Bolt-E4B-Q4_K_M.gguf"
