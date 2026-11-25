@@ -900,10 +900,16 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     mark("proj");
     float* hist = conv_ + int64_t(app) * 3 * CC;
     const int64_t sstride = NA * 3 * CC;
-    ik::short_conv(q_, kr_, KD, T, KD, ch, slot_d, base_d, hist, sstride, CC, L.k_conv, swa ? nullptr : kd_, HK, kb_);
-    fine("conv.k");
-    ik::short_conv(q_, vr_, KD, T, KD, ch, slot_d, base_d, hist + KD, sstride, CC, L.v_conv, swa ? nullptr : vd_, HK, vb_);
-    fine("conv.v");
+    if (T <= 16) {
+      ik::short_conv2(q_, T, ch, sstride, CC, ik::ConvArgs{kr_, KD, KD, hist, L.k_conv, swa ? nullptr : kd_, HK, kb_},
+                      ik::ConvArgs{vr_, KD, KD, hist + KD, L.v_conv, swa ? nullptr : vd_, HK, vb_});
+      fine("conv.kv");
+    } else {
+      ik::short_conv(q_, kr_, KD, T, KD, ch, slot_d, base_d, hist, sstride, CC, L.k_conv, swa ? nullptr : kd_, HK, kb_);
+      fine("conv.k");
+      ik::short_conv(q_, vr_, KD, T, KD, ch, slot_d, base_d, hist + KD, sstride, CC, L.v_conv, swa ? nullptr : vd_, HK, vb_);
+      fine("conv.v");
+    }
     ik::heads(q_, qrg_, QRG, kb_, vb_, pos_d, T, H, HK, D, NR, L.q_clip, L.rel_clip, cfg_.qk_clip, cfg_.rel_clip, !swa, cfg_.log_alpha,
               float(cfg_.log_floor), cfg_.eps, qb_, rb_, kb_, vb_);
     emit("Qcur" + sl, qb_, {D, H, T});
@@ -933,11 +939,16 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     fine("o.gate");
     mm(L.o, att_, HD, o_);
     fine("o.mm");
-    ik::short_conv(q_, o_, E, T, E, ch, slot_d, base_d, hist + 2 * KD, sstride, CC, L.attn_post_conv, nullptr, 0, oc_);
+    // the stream's residual added in the convolution, where nothing reads the attention's output alone
+    const bool fuse_res = ip % cfg_.block != 0 && !dump;
+    ik::short_conv(q_, o_, E, T, E, ch, slot_d, base_d, hist + 2 * KD, sstride, CC, L.attn_post_conv, nullptr, 0, fuse_res ? out : oc_,
+                   fuse_res ? x : nullptr);
     mark("o");
     // A block's first layer starts a new stream; the others add to theirs. The stream goes to `out`.
     const float* cur;
-    if (ip % cfg_.block == 0) {
+    if (fuse_res) {
+      cur = out;
+    } else if (ip % cfg_.block == 0) {
       blocks.push_back(x);
       cur = oc_;
       // a step of several sub-batches finishes the FFN after all of them: the new stream waits in `out`
@@ -1005,10 +1016,15 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       mark("cold");
     }
     emit("ffn_moe_out" + sl, f_, {E, T});
-    ik::short_conv(q_, f_, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_);
-    fine("ffn.conv");
-    emit("ffn_out" + sl, o_, {E, T});
-    ref::add(q_, cur, o_, T * E, out);
+    if (dump) {
+      ik::short_conv(q_, f_, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_);
+      fine("ffn.conv");
+      emit("ffn_out" + sl, o_, {E, T});
+      ref::add(q_, cur, o_, T * E, out);
+    } else {
+      ik::short_conv(q_, f_, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, out, cur);
+      fine("ffn.conv");
+    }
     if (teacher) {
       std::vector<float> forced;
       if ((*teacher)("l_out" + sl, forced) && int64_t(forced.size()) == T * E)
@@ -1060,8 +1076,8 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       for (size_t g = 0; g < subs.size(); ++g) {
         use_sub(g);
         const int64_t off = row_off * E;
-        ik::short_conv(q_, f_ + off, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_);
-        ref::add(q_, out + off, o_, T * E, out + off);
+        ik::short_conv(q_, f_ + off, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, out + off,
+                       out + off);
       }
       mark("ffn_out");
     }

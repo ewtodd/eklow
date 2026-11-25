@@ -32,9 +32,21 @@ struct Chunks {
 // ref::inkling::short_conv for a step: x [T][channels] (row stride ld_x), the state of token t's sequence at
 // conv + slot[t] * state_stride + (r * hist_stride) for rows r = 0..2 (x[-3], x[-2], x[-1] before the chunk), read for the
 // chunk's first three tokens and then replaced by the chunk's last three inputs. dyn [T][heads][4] or null. out [T][channels].
+// With `resid` ([T][channels], may be `out`), out = resid + the convolution's output (a residual add fused in).
 void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t channels, const Chunks& ch, const int32_t* slot,
                 const int32_t* base, float* conv, int64_t state_stride, int64_t hist_stride, const float* w, const float* dyn,
-                int64_t heads, float* out);
+                int64_t heads, float* out, const float* resid = nullptr);
+// Two convolutions of the same step (K and V) in one launch, for steps of up to 16 tokens: each as short_conv's arguments.
+struct ConvArgs {
+  const float* x;
+  int64_t ld_x, channels;
+  float* conv;
+  const float* w;
+  const float* dyn;
+  int64_t heads;
+  float* out;
+};
+void short_conv2(sycl::queue& q, int64_t T, const Chunks& ch, int64_t state_stride, int64_t hist_stride, const ConvArgs& a, const ConvArgs& b);
 
 // The heads of an attention from its projections and convolutions, per token t (position pos[t]):
 //   Q [t][n_head][D]  = clip(q[t] * q_clip, qk_clip) * tau,   R [t][n_head][n_rel] = clip(r[t] * rel_clip, rel_clip_t) * tau

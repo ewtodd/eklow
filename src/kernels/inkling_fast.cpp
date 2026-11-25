@@ -268,7 +268,7 @@ void depth_mix(sycl::queue& q, const States& s, const float* query, int n_query,
 
 void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t channels, const Chunks& ch, const int32_t* slot,
                 const int32_t* base, float* conv, int64_t state_stride, int64_t hist_stride, const float* w, const float* dyn,
-                int64_t heads, float* out) {
+                int64_t heads, float* out, const float* resid) {
   const bool has_dyn = dyn != nullptr;
   const float s = 1.0f / std::sqrt(float((has_dyn ? 2 : 1) * 4 + 1));
   const int64_t per_head = has_dyn ? channels / heads : 1;
@@ -292,7 +292,7 @@ void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t
           const float* d = dyn + (t * heads + c / per_head) * 4;
           acc += d[0] * xt + d[1] * h2 + d[2] * h1 + d[3] * h0;
         }
-        out[t * channels + c] = (xt + acc) * s;
+        out[t * channels + c] = (xt + acc) * s + (resid ? resid[t * channels + c] : 0.0f);
         h0 = h1, h1 = h2, h2 = xt;
       }
       hist[c] = h0, hist[hist_stride + c] = h1, hist[2 * hist_stride + c] = h2;
@@ -313,7 +313,7 @@ void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t
       const float* d = dyn + (t * heads + c / per_head) * 4;
       for (int lag = 0; lag < 4; ++lag) acc += d[lag] * at(lag);
     }
-    out[t * channels + c] = (x[t * ld_x + c] + acc) * s;
+    out[t * channels + c] = (x[t * ld_x + c] + acc) * s + (resid ? resid[t * channels + c] : 0.0f);
   });
   // the new state: each chunk's last three inputs, older state where the chunk has fewer
   const Chunks cc = ch;
@@ -328,6 +328,37 @@ void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t
       h[i] = p >= 0 ? x[(b + p) * ld_x + c] : hist[(3 + p) * hist_stride + c];
     }
     for (int64_t i = 0; i < 3; ++i) hist[i * hist_stride + c] = h[i];
+  });
+}
+
+void short_conv2(sycl::queue& q, int64_t T, const Chunks& ch, int64_t state_stride, int64_t hist_stride, const ConvArgs& a, const ConvArgs& b) {
+  if (T > 16) throw std::runtime_error("inkling::short_conv2: steps of up to 16 tokens");
+  const Chunks cc = ch;
+  const ConvArgs A = a, Bc = b;
+  q.parallel_for(sycl::range<2>(size_t(cc.count), size_t(a.channels + b.channels)), [=](sycl::id<2> id) {
+    const int k = int(id[0]);
+    const bool first = int64_t(id[1]) < A.channels;
+    const ConvArgs& u = first ? A : Bc;
+    const int64_t c = first ? int64_t(id[1]) : int64_t(id[1]) - A.channels;
+    const bool has_dyn = u.dyn != nullptr;
+    const float s = has_dyn ? 0.33333334f : 0.4472136f;  // 1 / sqrt(2 * 4 + 1), 1 / sqrt(4 + 1)
+    const int64_t per_head = has_dyn ? u.channels / u.heads : 1;
+    const int64_t b0 = cc.base[k], n = cc.n[k];
+    float* hist = u.conv + int64_t(cc.slot[k]) * state_stride;
+    float h0 = hist[c], h1 = hist[hist_stride + c], h2 = hist[2 * hist_stride + c];
+    const float w0 = u.w[c * 4], w1 = u.w[c * 4 + 1], w2 = u.w[c * 4 + 2], w3 = u.w[c * 4 + 3];
+    for (int64_t i = 0; i < n; ++i) {
+      const int64_t t = b0 + i;
+      const float xt = u.x[t * u.ld_x + c];
+      float acc = w0 * h0 + w1 * h1 + w2 * h2 + w3 * xt;
+      if (has_dyn) {
+        const float* d = u.dyn + (t * u.heads + c / per_head) * 4;
+        acc += d[0] * xt + d[1] * h2 + d[2] * h1 + d[3] * h0;
+      }
+      u.out[t * u.channels + c] = (xt + acc) * s;
+      h0 = h1, h1 = h2, h2 = xt;
+    }
+    hist[c] = h0, hist[hist_stride + c] = h1, hist[2 * hist_stride + c] = h2;
   });
 }
 
