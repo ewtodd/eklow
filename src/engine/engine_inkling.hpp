@@ -112,6 +112,15 @@ class Engine {
   const model::Inkling2Config& model() const { return cfg_; }
   const Config& config() const { return c_; }
   uint64_t weight_bytes() const { return weight_bytes_; }
+  // The step's block buffers ([max_step][n_embd] fp32 each): nothing in them outlives a step, so between steps another
+  // user may borrow them (Inkling's vision encoder, with the scheduler held), after drain() and done before the next
+  // step.
+  std::vector<std::pair<void*, size_t>> idle_workspace() const {
+    std::vector<std::pair<void*, size_t>> out;
+    for (int i = 0; i < 8; ++i) out.push_back({blk_[size_t(i)], size_t(max_step_ * cfg_.n_embd) * sizeof(float)});
+    return out;
+  }
+  void drain() { q_.wait(); }
   uint64_t host_expert_bytes() const { return host_expert_bytes_; }
   int64_t cold_experts() const { return n_cold_; }
   uint64_t free_at_placement() const { return free_at_placement_; }

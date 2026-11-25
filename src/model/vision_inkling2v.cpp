@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 
 #include "image/inkling_image.hpp"
 #include "kernels/ref.hpp"
@@ -80,14 +81,25 @@ xmx::Weight VisionInkling2V::upload_f16(const std::vector<const gguf::Tensor*>& 
   auto* dev = sycl::malloc_device<uint16_t>(host.size(), q_);
   if (!dev) throw std::runtime_error("inkling2v: out of device memory");
   q_.memcpy(dev, host.data(), host.size() * 2).wait();
-  const xmx::Weight w = xmx::repack(q_, ref::Weight{gguf::Type::F16, k_pad, n, reinterpret_cast<const uint8_t*>(dev), uint64_t(k_pad) * 2});
+  xmx::Weight w = xmx::repack(q_, ref::Weight{gguf::Type::F16, k_pad, n, reinterpret_cast<const uint8_t*>(dev), uint64_t(k_pad) * 2});
   q_.wait();
   sycl::free(dev, q_);
-  bytes_ += uint64_t(n) * uint64_t(k_pad) * 2;
+  const uint64_t b = wbytes(w);
+  if (host_weights_) {
+    // repacked on the card, kept in pinned host memory
+    auto* h = sycl::malloc_host<uint8_t>(b, q_);
+    if (!h) throw std::runtime_error("inkling2v: out of pinned host memory");
+    q_.memcpy(h, w.tiles, b).wait();
+    sycl::free(w.tiles, q_);
+    w.tiles = h;
+    host_bytes_ += b;
+  } else {
+    bytes_ += b;
+  }
   return w;
 }
 
-VisionInkling2V::VisionInkling2V(sycl::queue& q, const gguf::File& f) : q_(q) {
+VisionInkling2V::VisionInkling2V(sycl::queue& q, const gguf::File& f, bool host_weights) : q_(q), host_weights_(host_weights) {
   if (f.at("general.architecture").as_string() != "clip" || !f.find("clip.vision.projector_type") ||
       f.at("clip.vision.projector_type").as_string() != "inkling2v")
     throw std::runtime_error(f.path() + ": not an mmproj with the inkling2v projector");
@@ -166,15 +178,108 @@ VisionInkling2V::VisionInkling2V(sycl::queue& q, const gguf::File& f) : q_(q) {
 
 VisionInkling2V::~VisionInkling2V() {
   q_.wait();
+  if (copy_q_) copy_q_->wait();
   for (auto& L : layers_)
     for (xmx::Weight* w : {&L.qkv, &L.o, &L.up, &L.down}) xmx::free_weight(q_, *w);
   for (xmx::Weight* w : {&patch_w_, &mm1_, &mm2_}) xmx::free_weight(q_, *w);
   for (void* p : owned_) sycl::free(p, q_);
-  for (void* p : {static_cast<void*>(x_), static_cast<void*>(h_), static_cast<void*>(qkv_), static_cast<void*>(wide_), static_cast<void*>(pin_),
-                  static_cast<void*>(rp_), static_cast<void*>(qt_), static_cast<void*>(kt_), static_cast<void*>(vt_)})
-    if (p) sycl::free(p, q_);
-  if (cap_) xmx::free_activations(q_, act_);
-  vattn::release(q_, att_);
+  if (cap_) {  // (the workspace's are someone else's)
+    for (void* p : {static_cast<void*>(x_), static_cast<void*>(h_), static_cast<void*>(qkv_), static_cast<void*>(wide_), static_cast<void*>(pin_),
+                    static_cast<void*>(rp_), static_cast<void*>(qt_), static_cast<void*>(kt_), static_cast<void*>(vt_)})
+      if (p) sycl::free(p, q_);
+    xmx::free_activations(q_, act_);
+    vattn::release(q_, att_);
+  }
+}
+
+void VisionInkling2V::use_workspace(std::vector<std::pair<void*, size_t>> regions, std::function<void()> drain) {
+  if (cap_) throw std::runtime_error("inkling2v: the encoder has activations of its own already");
+  ws_ = std::move(regions);
+  drain_ = std::move(drain);
+  if (host_weights_ && !copy_q_) copy_q_ = std::make_unique<sycl::queue>(q_.get_context(), q_.get_device(), sycl::property::queue::in_order());
+}
+
+uint64_t VisionInkling2V::layer_wbytes() const {
+  const Layer& L = layers_.front();
+  return wbytes(L.qkv) + wbytes(L.o) + wbytes(L.up) + wbytes(L.down);
+}
+
+// The buffers an encode of n_pos positions uses (as ensure allocates them, and with host weights the weight slots),
+// largest first, each into the first workspace region with room (4 KiB aligned).
+bool VisionInkling2V::place(int64_t n_pos, bool apply) {
+  const int64_t R = vattn::rows_padded(n_pos), kp = (3 * image::kInklingPatch * image::kInklingPatch + 31) / 32 * 32, E = n_embd_;
+  const int64_t cap = R * std::max({kp, n_ff_, 4 * E});
+  const vattn::ScratchSizes ss = vattn::scratch_sizes(R, d_head_, n_head_);
+  struct Item {
+    uint64_t bytes;
+    std::function<void(uint8_t*)> set;
+  };
+  auto as = [](auto*& p) { return [&p](uint8_t* a) { p = reinterpret_cast<std::remove_reference_t<decltype(p)>>(a); }; };
+  std::vector<Item> items = {
+      {uint64_t(R * E) * 4, as(x_)},
+      {uint64_t(R * E) * 4, as(h_)},
+      {uint64_t(R * 3 * E) * 4, as(qkv_)},
+      {uint64_t(R * std::max(n_ff_, 4 * E)) * 4, as(wide_)},
+      {uint64_t(R * kp) * 4, as(pin_)},
+      {uint64_t(2 * R) * 4, as(rp_)},
+      {uint64_t(R * E) * 2, as(qt_)},
+      {uint64_t(R * E) * 2, as(kt_)},
+      {uint64_t(R * E) * 2, as(vt_)},
+      {uint64_t(cap), as(act_.q)},
+      {uint64_t(cap / 32) * 4, as(act_.s)},
+      {uint64_t(cap) * 2, as(act_.h)},
+      {uint64_t(ss.p_halves) * 2, as(att_.p)},
+      {uint64_t(ss.stat_floats) * 4, as(att_.stat)},
+  };
+  if (host_weights_) {
+    for (int i = 0; i < 2; ++i) items.push_back({layer_wbytes(), as(slot_[i])});
+    items.push_back({wbytes(patch_w_), as(dpatch_.tiles)});
+    items.push_back({wbytes(mm1_), as(dmm1_.tiles)});
+    items.push_back({wbytes(mm2_), as(dmm2_.tiles)});
+  }
+  std::stable_sort(items.begin(), items.end(), [](const Item& a, const Item& b) { return a.bytes > b.bytes; });
+  std::vector<uint64_t> used(ws_.size(), 0);
+  std::vector<uint8_t*> at;
+  for (const Item& it : items) {
+    size_t r = 0;
+    for (; r < ws_.size() && used[r] + it.bytes > ws_[r].second; ++r) {
+    }
+    if (r == ws_.size()) return false;
+    at.push_back(static_cast<uint8_t*>(ws_[r].first) + used[r]);
+    used[r] = (used[r] + it.bytes + 4095) / 4096 * 4096;
+  }
+  if (apply) {
+    for (size_t i = 0; i < items.size(); ++i) items[i].set(at[i]);
+    act_.capacity = cap;
+    att_.p_halves = ss.p_halves, att_.stat_floats = ss.stat_floats;
+    if (host_weights_) {
+      dpatch_ = xmx::Weight{patch_w_.k, patch_w_.n, dpatch_.tiles, nullptr, patch_w_.format};
+      dmm1_ = xmx::Weight{mm1_.k, mm1_.n, dmm1_.tiles, nullptr, mm1_.format};
+      dmm2_ = xmx::Weight{mm2_.k, mm2_.n, dmm2_.tiles, nullptr, mm2_.format};
+    }
+  }
+  return true;
+}
+
+VisionInkling2V::Layer VisionInkling2V::slot_layer(size_t l, int slot) const {
+  Layer L = layers_[l];
+  uint8_t* p = slot_[slot];
+  for (xmx::Weight* w : {&L.qkv, &L.o, &L.up, &L.down}) w->tiles = p, p += wbytes(*w);
+  return L;
+}
+
+sycl::event VisionInkling2V::put_layer(size_t l, int slot, const std::vector<sycl::event>& after) {
+  const Layer& L = layers_[l];
+  uint8_t* p = slot_[slot];
+  sycl::event e;
+  for (const xmx::Weight* w : {&L.qkv, &L.o, &L.up, &L.down}) {
+    e = copy_q_->submit([&](sycl::handler& h) {
+      h.depends_on(after);
+      h.memcpy(p, w->tiles, wbytes(*w));
+    });
+    p += wbytes(*w);
+  }
+  return e;
 }
 
 void VisionInkling2V::ensure(int64_t n_pos) {
@@ -188,7 +293,7 @@ void VisionInkling2V::ensure(int64_t n_pos) {
   cap_ = n_pos;
   const int64_t R = vattn::rows_padded(cap_), kp = (3 * image::kInklingPatch * image::kInklingPatch + 31) / 32 * 32;
   x_ = sycl::malloc_device<float>(size_t(R * n_embd_), q_);
-  h_ = sycl::malloc_device<float>(size_t(R * std::max(n_embd_, n_proj_)), q_);
+  h_ = sycl::malloc_device<float>(size_t(R * n_embd_), q_);
   qkv_ = sycl::malloc_device<float>(size_t(R * 3 * n_embd_), q_);
   wide_ = sycl::malloc_device<float>(size_t(R * std::max(n_ff_, 4 * n_embd_)), q_);
   pin_ = sycl::malloc_device<float>(size_t(R * kp), q_);
@@ -199,13 +304,34 @@ void VisionInkling2V::ensure(int64_t n_pos) {
   if (!x_ || !h_ || !qkv_ || !wide_ || !pin_ || !rp_ || !qt_ || !kt_ || !vt_) throw std::runtime_error("inkling2v: out of device memory for the activations");
   act_ = xmx::alloc_activations(q_, R, std::max({kp, n_ff_, 4 * n_embd_}));
   vattn::reserve(q_, att_, R, d_head_, n_head_);
+  act_bytes_ = uint64_t(R) * uint64_t(n_embd_ + n_embd_ + 3 * n_embd_ + std::max(n_ff_, 4 * n_embd_) + kp + 2) * 4 +
+               uint64_t(R) * uint64_t(3 * n_embd_) * 2 + uint64_t(act_.capacity) * 3 + vattn::scratch_bytes(R, d_head_, n_head_);
 }
 
 std::vector<float> VisionInkling2V::encode(const image::Patches& p, const Dump& dump) {
   const int64_t gw = p.cols, gh = p.rows, n_patch = gw * gh, n = n_patch + 1, E = n_embd_, H = n_head_, D = d_head_;
   if (gw % 2 || gh % 2) throw std::runtime_error("inkling2v: the patch grid must be even (2 x 2 merges)");
   const int64_t kp = (p.dim + 31) / 32 * 32, R = vattn::rows_padded(n), tokens = n_patch / 4;
-  ensure(n);
+  if (!ws_.empty()) {
+    if (!place(n, true)) throw std::invalid_argument("inkling2v: the image does not fit the encoder's workspace");
+    if (drain_) drain_();
+    q_.memset(att_.p, 0, att_.p_halves * sizeof(sycl::half));  // as vattn::reserve leaves it
+    q_.memset(att_.stat, 0, att_.stat_floats * sizeof(float));
+  } else {
+    if (host_weights_) throw std::runtime_error("inkling2v: host weights need a workspace");
+    ensure(n);
+  }
+  // With host weights: the patch embedding and the first two layers on their way (the rest follow as slots free up,
+  // the projector after the last layer).
+  std::vector<sycl::event> lay(layers_.size());
+  sycl::event e_patch, e_mm;
+  if (host_weights_) {
+    e_patch = copy_q_->memcpy(dpatch_.tiles, patch_w_.tiles, wbytes(patch_w_));
+    for (size_t l = 0; l < std::min<size_t>(2, layers_.size()); ++l) lay[l] = put_layer(l, int(l), {});
+  }
+  const xmx::Weight& patch_w = host_weights_ ? dpatch_ : patch_w_;
+  const xmx::Weight& mm1 = host_weights_ ? dmm1_ : mm1_;
+  const xmx::Weight& mm2 = host_weights_ ? dmm2_ : mm2_;
   // the patches, K padded
   {
     std::vector<float> host(size_t(n_patch * kp), 0.0f);
@@ -214,7 +340,8 @@ std::vector<float> VisionInkling2V::encode(const image::Patches& p, const Dump& 
   }
   act_.k = kp;
   xmx::quantize(q_, pin_, n_patch, act_, true);
-  xmx::matmul(q_, act_, patch_w_, x_ + E);  // rows 1..n: the patches (row 0, the CLS token, follows)
+  if (host_weights_) q_.ext_oneapi_submit_barrier({e_patch});
+  xmx::matmul(q_, act_, patch_w, x_ + E);  // rows 1..n: the patches (row 0, the CLS token, follows)
   // the position grid resized to gh x gw (ggml_interpolate, bilinear, half-pixel centers), added on the host's copy
   {
     std::vector<float> pos(static_cast<size_t>(n_patch * E));
@@ -263,7 +390,8 @@ std::vector<float> VisionInkling2V::encode(const image::Patches& p, const Dump& 
   layernorm(q_, x_, pre_ln_w_, pre_ln_b_, n, E, eps_, x_);
   const float scale = 1.0f / std::sqrt(float(D)), theta = theta_;
   for (size_t l = 0; l < layers_.size(); ++l) {
-    const Layer& L = layers_[l];
+    const Layer L = host_weights_ ? slot_layer(l, int(l % 2)) : layers_[l];
+    if (host_weights_) q_.ext_oneapi_submit_barrier({lay[l]});
     layernorm(q_, x_, L.ln1_w, L.ln1_b, n, E, eps_, h_);
     act_.k = E;
     xmx::quantize(q_, h_, n, act_, true);
@@ -310,10 +438,15 @@ std::vector<float> VisionInkling2V::encode(const image::Patches& p, const Dump& 
     xmx::quantize(q_, wide_, n, act_, true);
     xmx::matmul(q_, act_, L.down, h_);
     residual(q_, x_, h_, L.b_down, L.ls2, n, E);
+    if (host_weights_ && l + 2 < layers_.size()) lay[l + 2] = put_layer(l + 2, int(l % 2), {q_.ext_oneapi_submit_barrier()});
     if (dump) {
       q_.wait();
       dump("layer_out-" + std::to_string(l), x_, n, E);
     }
+  }
+  if (host_weights_) {
+    copy_q_->memcpy(dmm1_.tiles, mm1_.tiles, wbytes(mm1_));
+    e_mm = copy_q_->memcpy(dmm2_.tiles, mm2_.tiles, wbytes(mm2_));
   }
   // the CLS token dropped; each 2 x 2 block of patches one token: (top left, top right, bottom left, bottom right)
   {
@@ -333,11 +466,12 @@ std::vector<float> VisionInkling2V::encode(const image::Patches& p, const Dump& 
   }
   act_.k = 4 * E;
   xmx::quantize(q_, wide_, tokens, act_, true);
-  xmx::matmul(q_, act_, mm1_, qkv_);
+  if (host_weights_) q_.ext_oneapi_submit_barrier({e_mm});
+  xmx::matmul(q_, act_, mm1, qkv_);
   bias_act(q_, qkv_, nullptr, tokens, n_proj_, true);
   act_.k = n_proj_;
   xmx::quantize(q_, qkv_, tokens, act_, true);
-  xmx::matmul(q_, act_, mm2_, h_);
+  xmx::matmul(q_, act_, mm2, h_);
   std::vector<float> out(static_cast<size_t>(tokens * n_out_));
   q_.memcpy(out.data(), h_, out.size() * 4).wait();
   if (dump) dump("projected", h_, tokens, n_out_);

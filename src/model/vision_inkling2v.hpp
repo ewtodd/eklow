@@ -11,6 +11,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -23,8 +24,11 @@ namespace eklow::model {
 
 class VisionInkling2V {
  public:
-  // The mmproj file (general.architecture clip, clip.vision.projector_type inkling2v).
-  VisionInkling2V(sycl::queue& q, const gguf::File& f);
+  // The mmproj file (general.architecture clip, clip.vision.projector_type inkling2v). With host_weights the linears'
+  // weights (repacked) stay in pinned host memory, ~600 MB the card does not hold, and each encode copies them in a
+  // layer at a time (two layers' slots, the next copied while one runs; ~0.6 GB a picture) into the workspace
+  // (use_workspace, which host_weights needs).
+  VisionInkling2V(sycl::queue& q, const gguf::File& f, bool host_weights = false);
   ~VisionInkling2V();
   VisionInkling2V(const VisionInkling2V&) = delete;
   VisionInkling2V& operator=(const VisionInkling2V&) = delete;
@@ -35,7 +39,19 @@ class VisionInkling2V {
   // The image's tokens ([tokens][2304] fp32, raster order over the merged grid) from image::prepare_inkling's patches.
   std::vector<float> encode(const image::Patches& p, const Dump& dump = {});
   int64_t n_out() const { return n_out_; }
-  uint64_t bytes() const { return bytes_; }
+  // The activations for images of up to max_tokens tokens, allocated now and kept (an encode of a larger image grows
+  // them).
+  void reserve(int64_t max_tokens) { ensure(4 * max_tokens + 1); }
+  // Card memory to place an encode's activations (and, with host_weights, its weight slots) in, instead of allocations
+  // of its own: regions someone else owns, idle while an encode runs (the Inkling engine's step buffers, under the
+  // scheduler's hold); drain is called before each encode (the owner's queue finished). Throws for an image that
+  // does not fit them.
+  void use_workspace(std::vector<std::pair<void*, size_t>> regions, std::function<void()> drain);
+  // Whether an image of max_tokens tokens fits the workspace.
+  bool fits(int64_t max_tokens) { return place(4 * max_tokens + 1, false); }
+  // On the card: the weights (not the host ones) and the activations allocated so far (not the workspace's).
+  uint64_t bytes() const { return bytes_ + act_bytes_; }
+  uint64_t host_bytes() const { return host_bytes_; }
 
  private:
   struct Layer {
@@ -44,6 +60,11 @@ class VisionInkling2V {
     float *ln1_w = nullptr, *ln1_b = nullptr, *ln2_w = nullptr, *ln2_b = nullptr, *ls1 = nullptr, *ls2 = nullptr;
   };
   void ensure(int64_t n_pos);
+  bool place(int64_t n_pos, bool apply);  // the activations (and weight slots) in the workspace
+  static uint64_t wbytes(const xmx::Weight& w) { return uint64_t(w.k) * uint64_t(w.n) * 2; }  // F16 tiles
+  uint64_t layer_wbytes() const;
+  sycl::event put_layer(size_t l, int slot, const std::vector<sycl::event>& after);  // host weights into a slot
+  Layer slot_layer(size_t l, int slot) const;  // the layer's weights as in the slot
   float* upload_f32(const gguf::Tensor& t);
   xmx::Weight upload_f16(const std::vector<const gguf::Tensor*>& parts, int64_t k, int64_t k_pad);
 
@@ -55,9 +76,17 @@ class VisionInkling2V {
   float *pre_ln_w_ = nullptr, *pre_ln_b_ = nullptr, *cls_ = nullptr;
   std::vector<float> pos_;  // host: the position grid [grid * grid][n_embd]
   std::vector<void*> owned_;
-  uint64_t bytes_ = 0;
+  uint64_t bytes_ = 0, host_bytes_ = 0;
+  bool host_weights_ = false;
+  std::unique_ptr<sycl::queue> copy_q_;  // host weights' copies, beside the encode
+  std::vector<std::pair<void*, size_t>> ws_;
+  std::function<void()> drain_;
+  // with host weights, during an encode: the card copies of the patch embedding and the projector, two layer slots
+  xmx::Weight dpatch_, dmm1_, dmm2_;
+  uint8_t* slot_[2] = {nullptr, nullptr};
   // activations, for up to cap_ rows (positions)
   int64_t cap_ = 0;
+  uint64_t act_bytes_ = 0;
   float *x_ = nullptr, *h_ = nullptr, *qkv_ = nullptr, *wide_ = nullptr, *pin_ = nullptr;
   int32_t* rp_ = nullptr;  // per row: the RoPE column and row
   sycl::half *qt_ = nullptr, *kt_ = nullptr, *vt_ = nullptr;

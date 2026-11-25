@@ -400,6 +400,11 @@ Sizes max_sizes(int64_t rows, int64_t D, int64_t n_head) {
 
 }  // namespace
 
+ScratchSizes scratch_sizes(int64_t rows, int64_t D, int64_t n_head) {
+  const Sizes m = max_sizes(rows, D, n_head);
+  return {m.p_halves, m.stat_floats};
+}
+
 uint64_t scratch_bytes(int64_t rows, int64_t D, int64_t n_head) {
   const Sizes m = max_sizes(rows, D, n_head);
   return uint64_t(m.p_halves) * sizeof(sycl::half) + uint64_t(m.stat_floats) * sizeof(float);

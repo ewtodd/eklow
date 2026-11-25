@@ -4,9 +4,11 @@
 // image::prepare_inkling and the encoder, each stage compared by relative L2 per row (median and max) and the image's
 // embeddings (image_0.f32) overall.
 //
-//   eklow-inkling-vision-test --mmproj GGUF --case DIR IMAGE [--case DIR IMAGE ...] [--max-tokens N] [--reps N]
+//   eklow-inkling-vision-test --mmproj GGUF --case DIR IMAGE [--case DIR IMAGE ...] [--max-tokens N] [--reps N] [--host-weights]
 //
 // --max-tokens is the image budget the oracle ran with (4096 unless --image-tokens). --reps times the encoder.
+// --host-weights runs it as the server does beside Inkling: the weights in host memory, the activations and weight
+// slots in a workspace of eight [8,192][2,304] fp32 buffers (the engine's step buffers at 8,192-token steps).
 // Exit status 1 when the projected rows differ by more than 2e-2 (median) from the oracle's.
 #include <sycl/sycl.hpp>
 
@@ -62,12 +64,14 @@ int main(int argc, char** argv) {
   std::vector<std::pair<std::string, std::string>> cases;
   int64_t max_tokens = 4096;
   int reps = 0;
+  bool host_weights = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--mmproj" && i + 1 < argc) mmproj = argv[++i];
     else if (a == "--case" && i + 2 < argc) cases.push_back({argv[i + 1], argv[i + 2]}), i += 2;
     else if (a == "--max-tokens" && i + 1 < argc) max_tokens = std::atoll(argv[++i]);
     else if (a == "--reps" && i + 1 < argc) reps = std::atoi(argv[++i]);
+    else if (a == "--host-weights") host_weights = true;
     else {
       std::fprintf(stderr, "usage: eklow-inkling-vision-test --mmproj GGUF --case DIR IMAGE [...] [--max-tokens N] [--reps N]\n");
       return 2;
@@ -79,8 +83,20 @@ int main(int argc, char** argv) {
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     gguf::File f = gguf::File::open(mmproj);
     const auto t0 = std::chrono::steady_clock::now();
-    model::VisionInkling2V v(q, f);
-    std::printf("loaded %.1f MB in %.2f s\n", double(v.bytes()) / 1e6, std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+    model::VisionInkling2V v(q, f, host_weights);
+    std::vector<void*> ws_mem;
+    if (host_weights) {
+      std::vector<std::pair<void*, size_t>> regions;
+      for (int i = 0; i < 8; ++i) {
+        const size_t b = size_t(8192) * 2304 * sizeof(float);
+        ws_mem.push_back(sycl::malloc_device(b, q));
+        regions.push_back({ws_mem.back(), b});
+      }
+      v.use_workspace(regions, [&] { q.wait(); });
+      std::printf("workspace: images of 1,024 tokens %s, of 1,100 %s\n", v.fits(1024) ? "fit" : "do not fit", v.fits(1100) ? "fit" : "do not fit");
+    }
+    std::printf("loaded %.1f MB on the card, %.1f MB on the host, in %.2f s\n", double(v.bytes()) / 1e6, double(v.host_bytes()) / 1e6,
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
     for (const auto& [dir, path] : cases) {
       std::ifstream in(path, std::ios::binary);
       const std::vector<uint8_t> bytes((std::istreambuf_iterator<char>(in)), {});
@@ -116,6 +132,8 @@ int main(int argc, char** argv) {
         std::printf("  encode %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - s0).count() / reps);
       }
     }
+    q.wait();
+    for (void* p : ws_mem) sycl::free(p, q);
   } catch (const std::exception& e) {
     std::fprintf(stderr, "eklow-inkling-vision-test: %s\n", e.what());
     return 1;

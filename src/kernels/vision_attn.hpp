@@ -36,6 +36,11 @@ struct Scratch {
 // Bytes reserve() allocates for up to `rows` rows of head size D and n_head heads (the heads go through together in
 // groups, as many as fit a 64 MB probability buffer).
 uint64_t scratch_bytes(int64_t rows, int64_t D, int64_t n_head);
+// The two buffers' sizes, for a caller that places them in memory of its own (zeroed before use, as reserve does).
+struct ScratchSizes {
+  size_t p_halves = 0, stat_floats = 0;
+};
+ScratchSizes scratch_sizes(int64_t rows, int64_t D, int64_t n_head);
 void reserve(sycl::queue& q, Scratch& s, int64_t rows, int64_t D, int64_t n_head);
 void release(sycl::queue& q, Scratch& s);
 
