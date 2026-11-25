@@ -144,6 +144,15 @@ int main(int argc, char** argv) {
       q.wait();
       std::vector<int32_t> hids(size_t(T * c.NU));
       q.memcpy(hids.data(), ids, hids.size() * 4).wait();
+      // EKLOW_MOE_TEST_ROUTE (speed work): "even" spreads the pairs over the experts evenly (token t's slot j to expert
+      // (8 t + j) mod n_expert, so every expert gets the same count), "few" puts them on experts 0-7 only.
+      if (const char* rt = std::getenv("EKLOW_MOE_TEST_ROUTE")) {
+        const std::string r = rt;
+        for (int64_t t = 0; t < T; ++t)
+          for (int64_t j = 0; j < c.NU; ++j)
+            hids[size_t(t * c.NU + j)] = int32_t(r == "few" ? j : (t * c.NU + j) % c.NE);
+        q.memcpy(ids, hids.data(), hids.size() * 4).wait();
+      }
 
       for (int64_t n : tokens) {
         // ---- check

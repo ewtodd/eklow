@@ -291,6 +291,8 @@ void group(sycl::queue& q, const int32_t* ids, const int32_t* slot_of, int64_t P
           }
           row += (c + 7) / 8 * 8;
         }
+        // no tiles: a tile of no rows at index 0, which the GEMM's work-groups fall back on (Gemm: "the last tile")
+        if (nt == 0) tl[4] = tl[5] = tl[6] = 0;
         tl[0] = nt;
         tl[1] = row;
       }
@@ -353,6 +355,7 @@ void group_few(sycl::queue& q, const int32_t* ids, const int32_t* slot_of, int64
       if (p == 0) {
         tl[0] = ttot;
         tl[1] = rtot;
+        if (ttot == 0) tl[4] = tl[5] = tl[6] = 0;  // as group()'s
       }
     });
   });
@@ -555,15 +558,23 @@ struct Gemv {
 // Prefill: a grouped fp16 GEMM. A work-group of WM x WN threads takes one tile of 16 WM rows of one expert and 32 WN
 // output columns (4 WN column groups); a thread computes 16 x 32. Per K step the threads dequantize the group's records
 // to fp16 B operands (a thread a piece: 8 columns x 16 K) and copy the activation pieces into shared local memory (two buffers:
-// the next step's global loads go out before this step's dpas), then every thread reads its operands from there. D > 1
-// (loads D steps ahead) and NA > 1 (more accumulators) were measured slower: the registers spill.
-template <Format F, bool GU, int WM, int WN, int CG, int NA, int D>
+// the next step's global loads go out before this step's dpas), then every thread reads its operands from there. Loads
+// more than a step ahead and more accumulators were measured slower: the registers spill.
+// Every branch here is one the whole work-group takes alike and the compiler can see as such (kernel arguments, constants):
+// a branch on a loaded value or on the thread's id around the loop's loads, stores or barrier makes the compiler require
+// the fused EU pairs split, which halves the threads an Xe-core runs (DECISIONS 2026-11-25, "the expert GEMM at half
+// occupancy"). Work-groups past the list compute the last tile again (writing the same values twice), and partial tiles
+// multiply their padding rows too.
+// KS: K16 pieces a step (4: a whole record of 64 K, two 64 KB buffers, one work-group an Xe-core; 2: half a record, 32 KB,
+// two). PF: each B piece loaded from shared memory ahead of the dpas of the one before. The engine runs KS 2 with PF.
+template <Format F, bool GU, int WM, int WN, int CG, int KS, bool PF>
 struct Gemm {
-  static constexpr int NT = WM * WN, BT = WN * 4, AT = WM * 2, REC = Fd<F>::REC;
-  static constexpr int kBPieces = BT * 4, kAPieces = AT * 4;
-  static constexpr int BP = kBPieces / NT, AP = (kAPieces + NT - 1) / NT;  // pieces a thread dequantizes / copies a step
+  static constexpr int NT = WM * WN, BT = WN * 4, AT = WM * 2, REC = Fd<F>::REC, SPR = 4 / KS;  // steps a record
+  static constexpr int kBPieces = BT * KS, kAPieces = AT * KS;
+  static constexpr int BP = kBPieces / NT, AP = kAPieces / NT;  // pieces a thread dequantizes / copies a step
   static constexpr uint32_t kBBuf = kBPieces * 256, kBuf = kBBuf + kAPieces * 256;
-  static_assert(kBPieces % NT == 0, "the pieces of a step split evenly over the threads");
+  static_assert(kBPieces % NT == 0 && kAPieces % NT == 0, "the pieces of a step split evenly over the threads");
+  static_assert(2 * kBuf <= 65536, "two buffers in a work-group's shared memory");
   const sycl::half* a;
   const uint8_t* data;
   uint64_t expert_bytes;
@@ -578,85 +589,73 @@ struct Gemm {
     esimd::slm_init<2 * kBuf>();
     const int tid = int(it.get_local_linear_id()), wi = tid / WN, wj = tid % WN;
     const int tm = int(it.get_group(0)), tn = int(it.get_group(1));
-    const bool live = tm < tl[0];
-    const int e = live ? tl[4 + 4 * tm] : 0, row0 = live ? tl[5 + 4 * tm] : 0, valid = live ? tl[6 + 4 * tm] : 0;
-    const int kbl = live ? int(kst) : 0, kh = 4 * kst;
+    const int last = tl[0] - 1, t = tm > last ? (last > 0 ? last : 0) : tm;  // past the list: the last tile again
+    const int e = tl[4 + 4 * t], row0 = tl[5 + 4 * t], valid = tl[6 + 4 * t];
+    const int nst = int(kst) * SPR, kh = 4 * int(kst);
     const uint8_t* eb = data + uint64_t(e) * expert_bytes;
-    typename Dec<F>::Pc R[D][BP];
+    typename Dec<F>::Pc R[BP];
     esimd::simd<sycl::half, 128> Araw[AP];
-    // thread t dequantizes pieces t + i NT of the step: column group p / 4 of the work-group, K16 piece p % 4
-    auto load = [&](int slot, int b) SYCL_ESIMD_FUNCTION {
+    // step s: thread t dequantizes pieces t + i NT, column group p / KS of the work-group, K16 piece (s % SPR) KS + p % KS
+    // of record s / SPR, and copies activation pieces t + i NT (8-row tile p / KS, the same K16 pieces)
+    auto load = [&](int s) SYCL_ESIMD_FUNCTION {
+      const int rb = s / SPR, hb = (s % SPR) * KS;
 #pragma unroll
       for (int i = 0; i < BP; ++i) {
-        const int p = tid + i * NT, g = tn * BT + p / 4;
-        Dec<F>::load(R[slot][i], eb + ((int64_t(g / CG) * kst + b) * CG + g % CG) * REC, p % 4);
+        const int p = tid + i * NT, g = tn * BT + p / KS;
+        Dec<F>::load(R[i], eb + ((int64_t(g / CG) * kst + rb) * CG + g % CG) * REC, hb + p % KS);
       }
-    };
-    auto load_a = [&](int b) SYCL_ESIMD_FUNCTION {
 #pragma unroll
       for (int i = 0; i < AP; ++i) {
         const int p = tid + i * NT;
-        if (p >= kAPieces) break;
-        Araw[i] = esimd::block_load<sycl::half, 128>(a + (int64_t(row0 / 8 + p / 4) * kh + 4 * b + p % 4) * 128);
+        Araw[i] = esimd::block_load<sycl::half, 128>(a + (int64_t(row0 / 8 + p / KS) * kh + 4 * rb + hb + p % KS) * 128);
       }
     };
-    auto store = [&](int slot, uint32_t buf) SYCL_ESIMD_FUNCTION {
+    auto store = [&](uint32_t buf) SYCL_ESIMD_FUNCTION {
 #pragma unroll
-      for (int i = 0; i < BP; ++i) esimd::slm_block_store<sycl::half, 128>(buf + (tid + i * NT) * 256, Dec<F>::dequant(R[slot][i]));
+      for (int i = 0; i < BP; ++i) esimd::slm_block_store<sycl::half, 128>(buf + (tid + i * NT) * 256, Dec<F>::dequant(R[i]));
 #pragma unroll
-      for (int i = 0; i < AP; ++i)
-        if (tid + i * NT < kAPieces) esimd::slm_block_store<sycl::half, 128>(buf + kBBuf + (tid + i * NT) * 256, Araw[i]);
+      for (int i = 0; i < AP; ++i) esimd::slm_block_store<sycl::half, 128>(buf + kBBuf + (tid + i * NT) * 256, Araw[i]);
     };
-    esimd::simd<float, 64> acc[NA][2][4];
-#pragma unroll
-    for (int n = 0; n < NA; ++n)
-#pragma unroll
-      for (int r = 0; r < 2; ++r)
-#pragma unroll
-        for (int c = 0; c < 4; ++c) acc[n][r][c] = 0;
-    if (kbl > 0) {
-#pragma unroll
-      for (int j = 0; j < D; ++j)
-        if (j < kbl) load(j, j);
-      load_a(0);
-      store(0, 0);
-    }
-    esimd::barrier();
-    // step b computes from the shared buffer b % 2 while the registers of slot b % D hold step b's pieces, already stored;
-    // loads for step b + D go into that slot, and step b + 1's pieces (slot (b + 1) % D) are dequantized into the other buffer
-    for (int b0 = 0; b0 < kbl; b0 += D) {
-#pragma unroll
-      for (int j = 0; j < D; ++j) {
-        const int b = b0 + j;
-        if (b >= kbl) break;
-        const uint32_t cur = (b & 1) * kBuf, nxt = kBuf - cur;
-        if (b + D < kst) load(j, b + D);
-        if (b + 1 < kst) load_a(b + 1);
-#pragma unroll
-        for (int h = 0; h < 4; ++h) {
-          esimd::simd<sycl::half, 128> A[2];
-#pragma unroll
-          for (int r = 0; r < 2; ++r) A[r] = esimd::slm_block_load<sycl::half, 128>(cur + kBBuf + ((wi * 2 + r) * 4 + h) * 256);
-#pragma unroll
-          for (int c = 0; c < 4; ++c) {
-            const esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4 + c) * 4 + h) * 256);
-#pragma unroll
-            for (int r = 0; r < 2; ++r)
-              if ((wi * 2 + r) * 8 < valid) acc[h % NA][r][c] = xmxd::dpas<8, 8, float>(acc[h % NA][r][c], B, A[r]);
-          }
-        }
-        if (b + 1 < kst) store((j + 1) % D, nxt);
-        esimd::barrier();
-      }
-    }
-    if (!live) return;
-    const float sc = scale ? scale[e] : 1.0f;
+    esimd::simd<float, 64> acc[2][4];
 #pragma unroll
     for (int r = 0; r < 2; ++r)
 #pragma unroll
-      for (int c = 0; c < 4; ++c)
+      for (int c = 0; c < 4; ++c) acc[r][c] = 0;
+    load(0);
+    store(0);
+    esimd::barrier();
+    // step b computes from buffer b % 2 while step b + 1's loads are out; they are stored into the other buffer after
+    for (int b = 0; b < nst; ++b) {
+      const uint32_t cur = (b & 1) * kBuf, nxt = kBuf - cur;
+      if (b + 1 < nst) load(b + 1);
 #pragma unroll
-        for (int n = 1; n < NA; ++n) acc[0][r][c] += acc[n][r][c];
+      for (int h = 0; h < KS; ++h) {
+        esimd::simd<sycl::half, 128> A[2];
+#pragma unroll
+        for (int r = 0; r < 2; ++r) A[r] = esimd::slm_block_load<sycl::half, 128>(cur + kBBuf + ((wi * 2 + r) * KS + h) * 256);
+        if constexpr (PF) {
+          esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4) * KS + h) * 256);
+#pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            esimd::simd<sycl::half, 128> Bn;
+            if (c + 1 < 4) Bn = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4 + c + 1) * KS + h) * 256);
+#pragma unroll
+            for (int r = 0; r < 2; ++r) acc[r][c] = xmxd::dpas<8, 8, float>(acc[r][c], B, A[r]);
+            B = Bn;
+          }
+        } else {
+#pragma unroll
+          for (int c = 0; c < 4; ++c) {
+            const esimd::simd<sycl::half, 128> B = esimd::slm_block_load<sycl::half, 128>(cur + ((wj * 4 + c) * KS + h) * 256);
+#pragma unroll
+            for (int r = 0; r < 2; ++r) acc[r][c] = xmxd::dpas<8, 8, float>(acc[r][c], B, A[r]);
+          }
+        }
+      }
+      if (b + 1 < nst) store(nxt);
+      esimd::barrier();
+    }
+    const float sc = scale ? scale[e] : 1.0f;
 #pragma unroll
     for (int r = 0; r < 2; ++r)
 #pragma unroll
@@ -667,8 +666,7 @@ struct Gemm {
         if constexpr (GU) {
 #pragma unroll
           for (int c = 0; c < 4; c += 2) {
-            const esimd::simd<float, 8> g = acc[0][r][c].template select<8, 1>(i * 8) * sc,
-                                        up = acc[0][r][c + 1].template select<8, 1>(i * 8) * sc;
+            const esimd::simd<float, 8> g = acc[r][c].template select<8, 1>(i * 8) * sc, up = acc[r][c + 1].template select<8, 1>(i * 8) * sc;
             esimd::simd<sycl::half, 8> h = situ8(g, up, beta, lb);
             const int pu = (tn * BT + wj * 4 + c) / 2;
             esimd::block_store<sycl::half, 8>(out_h + act16_index(row, pu * 8, n_ff / 16), h);
@@ -677,7 +675,7 @@ struct Gemm {
 #pragma unroll
           for (int c = 0; c < 4; ++c)
             esimd::block_store<sycl::half, 8>(out_y + int64_t(row) * n_out + (tn * BT + wj * 4 + c) * 8,
-                                              esimd::simd<sycl::half, 8>(acc[0][r][c].template select<8, 1>(i * 8) * sc));
+                                              esimd::simd<sycl::half, 8>(acc[r][c].template select<8, 1>(i * 8) * sc));
         }
       }
   }
@@ -968,19 +966,19 @@ void gemv_down(sycl::queue& q, const Layer& L, Scratch& s, int64_t max_tiles) {
   gemv_down_s<F, CG, 3, F == Format::NVFP4>(q, L, s, max_tiles);
 }
 
-template <Format F, int CG, int WM, int NA, int D>
+template <Format F, int CG, int WM, int KS, bool PF>
 void gemm_gu(sycl::queue& q, const Layer& L, Scratch& s, int64_t max_tiles, float beta, float lb) {
   const Table& t = L.gate_up;
   constexpr int WN = 4;
-  Gemm<F, true, WM, WN, CG, NA, D> k{s.a, L.base + t.offset, t.expert_bytes, s.tl, L.gate_up_scale, s.h, nullptr, int32_t(t.k / kStepK), int32_t(t.n), int32_t(L.n_ff), beta, lb};
+  Gemm<F, true, WM, WN, CG, KS, PF> k{s.a, L.base + t.offset, t.expert_bytes, s.tl, L.gate_up_scale, s.h, nullptr, int32_t(t.k / kStepK), int32_t(t.n), int32_t(L.n_ff), beta, lb};
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(max_tiles) * WM, size_t(t.n / 8 / 4 / WN) * WN), sycl::range<2>(WM, WN)), k);
 }
 
-template <Format F, int CG, int WM, int NA, int D>
+template <Format F, int CG, int WM, int KS, bool PF>
 void gemm_down(sycl::queue& q, const Layer& L, Scratch& s, int64_t max_tiles) {
   const Table& t = L.down;
   constexpr int WN = 4;
-  Gemm<F, false, WM, WN, CG, NA, D> k{s.h, L.base + t.offset, t.expert_bytes, s.tl, L.down_scale, nullptr, s.y, int32_t(t.k / kStepK), int32_t(t.n), 0, 0, 0};
+  Gemm<F, false, WM, WN, CG, KS, PF> k{s.h, L.base + t.offset, t.expert_bytes, s.tl, L.down_scale, nullptr, s.y, int32_t(t.k / kStepK), int32_t(t.n), 0, 0, 0};
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(max_tiles) * WM, size_t(t.n / 8 / 4 / WN) * WN), sycl::range<2>(WM, WN)), k);
 }
 
@@ -992,7 +990,7 @@ namespace {
 double g_prof[6] = {};
 const char* const kProfNames[6] = {"group", "gather", "gate_up", "down", "combine", "calls"};
 
-template <int WM, int NA, int D>
+template <int WM, int KS, bool PF>
 void gemms(sycl::queue& q, const Layer& L, Scratch& s, int64_t tiles, float beta, float lb, bool prof) {
   auto stage = [&](int i, auto&& f) {
     if (!prof) return f();
@@ -1003,12 +1001,12 @@ void gemms(sycl::queue& q, const Layer& L, Scratch& s, int64_t tiles, float beta
     g_prof[i] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
   };
   stage(2, [&] {
-    if (L.gate_up.format == Format::NVFP4) gemm_gu<Format::NVFP4, 2, WM, NA, D>(q, L, s, tiles, beta, lb);
-    else gemm_gu<Format::Q5_K, 2, WM, NA, D>(q, L, s, tiles, beta, lb);
+    if (L.gate_up.format == Format::NVFP4) gemm_gu<Format::NVFP4, 2, WM, KS, PF>(q, L, s, tiles, beta, lb);
+    else gemm_gu<Format::Q5_K, 2, WM, KS, PF>(q, L, s, tiles, beta, lb);
   });
   stage(3, [&] {
-    if (L.down.format == Format::NVFP4) gemm_down<Format::NVFP4, 2, WM, NA, D>(q, L, s, tiles);
-    else gemm_down<Format::Q8_0, 1, WM, NA, D>(q, L, s, tiles);
+    if (L.down.format == Format::NVFP4) gemm_down<Format::NVFP4, 2, WM, KS, PF>(q, L, s, tiles);
+    else gemm_down<Format::Q8_0, 1, WM, KS, PF>(q, L, s, tiles);
   });
 }
 
@@ -1038,11 +1036,19 @@ void ffn(sycl::queue& q, const Layer& L, const float* x, int64_t n_tok, const in
     const int64_t tc = std::min(s.slab, n_tok - t0), P = tc * n_used;
     const bool use_gemm = tc > gemm_min;
     const int T = use_gemm ? 16 * wm : kGemvRows;
-    const int64_t tiles = std::min<int64_t>(P, (P + T - 1) / T + L.n_expert);
+    // at most one partial tile an expert on the card; the work-groups past the list repeat its last tile
+    int64_t tiles = std::max<int64_t>(1, std::min<int64_t>(P, (P + T - 1) / T + L.n_hot));
     stage(0, [&] {
       if (P <= kExperts) group_few(q, ids + t0 * n_used, L.slot_of, P, T, s.tl, s.rop);
       else group(q, ids + t0 * n_used, L.slot_of, P, L.n_hot, T, s.tl, s.rop);
     });
+    // The GEMM's grid is the exact tile count, read back (a wait on the queue a call, ~50 us against milliseconds of GEMM):
+    // work-groups past the list would have to repeat a tile (Gemm), 20% of the work at 4,096 tokens.
+    if (use_gemm) {
+      int32_t nt = 0;
+      q.memcpy(&nt, s.tl, 4).wait();
+      tiles = std::max<int64_t>(1, nt);
+    }
     stage(1, [&] {
       q.parallel_for(sycl::range<2>(size_t(P), size_t(L.n_embd / 64)), Gather{x + t0 * L.n_embd, s.rop, s.a, int32_t(n_used), int32_t(L.n_embd)});
     });
@@ -1057,7 +1063,7 @@ void ffn(sycl::queue& q, const Layer& L, const float* x, int64_t n_tok, const in
         else gemv_down<Format::Q8_0, 1>(q, L, s, tiles);
       });
     } else {
-      gemms<kGemmWM, 1, 1>(q, L, s, tiles, situ_beta, situ_linear_beta, prof);
+      gemms<kGemmWM, 2, true>(q, L, s, tiles, situ_beta, situ_linear_beta, prof);
     }
     stage(4, [&] {
       q.parallel_for(sycl::range<2>(size_t(tc), size_t(L.n_embd / 128)), Combine{s.y, w + t0 * n_used, s.rop, out + t0 * L.n_embd, cold_rows ? cold_rows + t0 * L.n_embd : nullptr, int32_t(n_used), int32_t(L.n_embd)});

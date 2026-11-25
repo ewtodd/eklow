@@ -517,8 +517,13 @@ void bench_q6_head(sycl::queue& q, const FormatInfo& f, const std::vector<int64_
 }
 
 // The fp16 GEMM on Bolt's shapes at 2,048 and 4,096 rows, plain and with the GeGLU epilogue (gate|up interleaved).
+// With --inkling: one of Inkling's experts as a dense matrix (gate|up 2304 x 2304, down 1152 x 2304), the fp16 GEMM's rate at
+// the expert GEMM's shapes (src/kernels/moe.cpp) for comparison.
+const Shape kInklingExperts[] = {{"expert gate|up", 2304, 2304}, {"expert down", 1152, 2304}};
 void bench_gemm(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>& rows, json::Writer& jw) {
-  for (const Shape& s : kShapes) {
+  std::vector<Shape> list(std::begin(kShapes), std::end(kShapes));
+  if (g_inkling) list.assign(std::begin(kInklingExperts), std::end(kInklingExperts));
+  for (const Shape& s : list) {
     if (s.n > 100000 || s.k % refs::block_k(f.type)) continue;
     const bool glu = std::string(s.name) == "ffn gate|up";
     for (int variant = 0; variant < (glu ? 2 : 1); ++variant) {
@@ -624,7 +629,7 @@ int main(int argc, char** argv) {
         for (xmx::Glu act : {xmx::Glu::Silu, xmx::Glu::Gelu}) check_glu(q, f, 2560, 2048, act, big, jw, true);
         jw.end_array();
         jw.key(std::string("gemm_") + f.name).begin_array();
-        bench_gemm(q, f, {2048, 4096}, jw);
+        bench_gemm(q, f, g_inkling ? std::vector<int64_t>{2048, 16384, 32768} : std::vector<int64_t>{2048, 4096}, jw);
         jw.end_array();
       }
       if (bench) {
