@@ -272,6 +272,33 @@ void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t
   const bool has_dyn = dyn != nullptr;
   const float s = 1.0f / std::sqrt(float((has_dyn ? 2 : 1) * 4 + 1));
   const int64_t per_head = has_dyn ? channels / heads : 1;
+  if (T <= 16) {
+    // Few tokens (decode): one kernel, a work-item a (chunk, channel) walking its chunk's tokens with the last three inputs
+    // in registers, then writing the new state; the state of a channel is only ever its work-item's, so it needs no second
+    // launch (the two-kernel form below waits for every token to read the old state before replacing it).
+    const Chunks cc = ch;
+    q.parallel_for(sycl::range<2>(size_t(cc.count), size_t(channels)), [=](sycl::id<2> id) {
+      const int k = int(id[0]);
+      const int64_t c = int64_t(id[1]);
+      const int64_t b = cc.base[k], n = cc.n[k];
+      float* hist = conv + int64_t(cc.slot[k]) * state_stride;
+      float h0 = hist[c], h1 = hist[hist_stride + c], h2 = hist[2 * hist_stride + c];  // x[-3], x[-2], x[-1]
+      const float w0 = w[c * 4], w1 = w[c * 4 + 1], w2 = w[c * 4 + 2], w3 = w[c * 4 + 3];
+      for (int64_t i = 0; i < n; ++i) {
+        const int64_t t = b + i;
+        const float xt = x[t * ld_x + c];
+        float acc = w0 * h0 + w1 * h1 + w2 * h2 + w3 * xt;
+        if (has_dyn) {
+          const float* d = dyn + (t * heads + c / per_head) * 4;
+          acc += d[0] * xt + d[1] * h2 + d[2] * h1 + d[3] * h0;
+        }
+        out[t * channels + c] = (xt + acc) * s;
+        h0 = h1, h1 = h2, h2 = xt;
+      }
+      hist[c] = h0, hist[hist_stride + c] = h1, hist[2 * hist_stride + c] = h2;
+    });
+    return;
+  }
   q.parallel_for(sycl::range<2>(size_t(T), size_t(channels)), [=](sycl::id<2> id) {
     const int64_t t = int64_t(id[0]), c = int64_t(id[1]);
     const int64_t b = base[t];
