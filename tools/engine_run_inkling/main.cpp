@@ -69,7 +69,7 @@ std::vector<int32_t> ids_of(const std::string& path) {
 int main(int argc, char** argv) {
   std::string model, out, tokens_json, teacher_dir, gen_json, twin_tokens;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
-  int64_t chunk = 1024, max_ctx = 0, dump_last = 0, slots = 1;
+  int64_t chunk = 1024, max_ctx = 0, dump_last = 0, slots = 1, step_tokens = 0;
   std::string experts;
   double reserve_gib = 0;
   int64_t cpu_max_tokens = -1;
@@ -85,6 +85,7 @@ int main(int argc, char** argv) {
     else if (a == "--tensors") prefixes = split(next(), ',');
     else if (a == "--dump-last") dump_last = std::atoll(next().c_str());
     else if (a == "--chunk") chunk = std::atoll(next().c_str());
+    else if (a == "--step") step_tokens = std::atoll(next().c_str());
     else if (a == "--max-ctx") max_ctx = std::atoll(next().c_str());
     else if (a == "--experts") experts = next();
     else if (a == "--reserve-gib") reserve_gib = std::atof(next().c_str());
@@ -100,7 +101,7 @@ int main(int argc, char** argv) {
     else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-run-inkling --model GGUF --out DIR --tokens-json FILE [--tensors P,...] [--dump-last N]\n"
-                           "       [--chunk N] [--max-ctx N] [--slots N] [--experts PROFILE] [--reserve-gib G] [--teacher DIR]\n"
+                           "       [--chunk N] [--step N] [--max-ctx N] [--slots N] [--experts PROFILE] [--reserve-gib G] [--teacher DIR]\n"
                            "       [--gen-json FILE] [--profile]\n");
       return 2;
     }
@@ -124,6 +125,10 @@ int main(int argc, char** argv) {
     cfg.n_slots = int(slots);
     cfg.max_ctx = max_ctx;
     cfg.max_batch = cfg.max_chunk = chunk;
+    // --step: the prompt's chunks before the dumped last one go in steps of up to this many tokens, layer by layer
+    // (Config::max_step)
+    if (step_tokens < chunk) step_tokens = chunk;
+    cfg.max_step = step_tokens;
     cfg.max_logits = int(last);
     cfg.expert_profile = experts;
     cfg.card_reserve_bytes = uint64_t(reserve_gib * 1073741824.0);
@@ -178,6 +183,19 @@ int main(int argc, char** argv) {
     t0 = std::chrono::steady_clock::now();
     std::vector<float> logits;
     for (int64_t p = 0; p < n;) {
+      std::vector<engine::inkling::Chunk> cs;
+      int64_t q = p;
+      while (teacher_dir.empty() && q < n - last && q + std::min(chunk, n - last - q) - p <= step_tokens) {
+        const int64_t e = std::min(q + chunk, n - last);
+        cs.push_back({0, q, std::vector<int32_t>(tokens.begin() + q, tokens.begin() + e), 0});
+        q = e;
+      }
+      if (cs.size() > 1) {
+        dumping = false;
+        logits = eng.step(cs);
+        p = q;
+        continue;
+      }
       const int64_t end = p < n - last ? std::min(p + chunk, n - last) : n;
       engine::inkling::Chunk c{0, p, std::vector<int32_t>(tokens.begin() + p, tokens.begin() + end), end == n ? last : 0};
       dumping = end == n;

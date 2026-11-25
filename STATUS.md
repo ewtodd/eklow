@@ -28,8 +28,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
     sequences), the side models beside it. The private replay through it: 40 of 41 episodes on the 7 moments it covered,
     where the 4090 passed 41 of 42; the owner stopped it there. Decode 10.5 tok/s, prefill ~365 tok/s, a next turn's first
     token after ~2.4 s. LoopCD's hidden form did not help (108 against 111 of 132 on the 4090); `--loopcd` stays off.
-  - Next: speed. Decode is bound by kernel launches and host round trips (98 ms a token, 3-4 ms of it the weights' bytes);
-    prefill spends 63% of its time copying cold sets onto the card.
+  - **Speed, first round** (DECISIONS "Inkling speed, first round"): decode 10.2 -> ~16.5 tok/s at 12k, prefill 363 ->
+    ~600 tok/s (a new 15k prompt to its first token in 24 s). Next: fewer cold experts (a card memory choice for the
+    owner: int8 full-layer K/V, a shared pool, or the side models on the Iris Xe), the int8 GEMVs (~145 GB/s), sliding
+    attention, fusing the small kernels, then the MTP draft.
 
 - **fiona ran Bolt in production until 2026-11-24 20:06**, when the owner stopped it (`eklow-bolt.service`, from
   2026-11-10 22:48; maitred's "fiona" route falls back to son-of-anton's models until Inkling is deployed):

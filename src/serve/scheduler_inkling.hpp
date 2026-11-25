@@ -66,8 +66,8 @@ class Request {
 };
 
 struct SchedulerConfig {
-  int64_t max_batch;  // tokens per step
-  int64_t max_chunk;  // prefill tokens per sequence per step
+  int64_t max_batch;  // tokens per step (the engine's max_step)
+  int64_t max_chunk;  // tokens per prefill chunk (a slot may take several in a step)
   int64_t max_ctx;    // positions per slot
   std::function<void(const RequestLog&)> on_finish = {};
   int64_t prefill_only_chunk = 512;

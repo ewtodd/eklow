@@ -51,6 +51,7 @@ std::vector<float> as_f32(const gguf::Tensor& t) {
 }  // namespace
 
 Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), c_(cfg), cfg_(model::Inkling2Config::from_gguf(f)) {
+  max_step_ = std::max(c_.max_step, c_.max_batch);
   for (int l = 0; l < cfg_.core_start; ++l) exec_layers_.push_back(l);
   for (int p = 0; p < cfg_.n_passes; ++p)
     for (int l = cfg_.core_start; l < cfg_.core_end; ++l) exec_layers_.push_back(l);
@@ -113,7 +114,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     const gguf::Tensor& emb = need("token_embd.weight");
     embd_ = &emb;
     embd_row_bytes_ = emb.nbytes / emb.ne[1];
-    const int64_t Bm = c_.max_batch;
+    const int64_t Bm = max_step_;
     emb_host_ = sycl::malloc_host<uint8_t>(size_t(Bm) * embd_row_bytes_, q_);
     emb_dev_ = sycl::malloc_device<uint8_t>(size_t(Bm) * embd_row_bytes_, q_);
     iota_ = sycl::malloc_device<int32_t>(size_t(Bm), q_);
@@ -228,8 +229,8 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   cache_bytes_ += size_t(c_.n_slots * NA * 3 * CC) * sizeof(float);
 
   // Workspace.
-  const int64_t B = c_.max_batch, QRG = HD + H * NR + HD;
-  for (int i = 0; i < (c_.loopcd != 0.0f ? 10 : 8); ++i) blk_.push_back(dev(B * E));
+  const int64_t B = c_.max_batch, QRG = HD + H * NR + HD, S = max_step_, subs = (S + B - 1) / B + c_.n_slots;
+  for (int i = 0; i < (c_.loopcd != 0.0f ? 10 : 8); ++i) blk_.push_back(dev(S * E));
   mixq_ = dev(3 * B * E);
   msg_ = dev(4 * B * E);
   for (auto& h : h_) h = dev(B * E);
@@ -258,8 +259,9 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   logits_ = dev(int64_t(c_.max_logits) * cfg_.n_vocab);
   max_tiles_sliding_ = HK * ((B * (H / HK) + 7) / 8 + c_.n_slots);
   max_tiles_full_ = max_tiles_sliding_;
-  for (auto [p, n] : {std::pair{&ids_, B * cfg_.n_expert_used}, {&tok_, B}, {&slot_, B}, {&pos_, B}, {&base_, B},
-                      {&lrows_, int64_t(c_.max_logits)}, {&tiles_sliding_, 6 * max_tiles_sliding_}, {&tiles_full_, 6 * max_tiles_full_}}) {
+  tile_stride_s_ = 6 * max_tiles_sliding_, tile_stride_f_ = 6 * max_tiles_full_;
+  for (auto [p, n] : {std::pair{&ids_, B * cfg_.n_expert_used}, {&tok_, S}, {&slot_, S}, {&pos_, S}, {&base_, S},
+                      {&lrows_, int64_t(c_.max_logits)}, {&tiles_sliding_, subs * tile_stride_s_}, {&tiles_full_, subs * tile_stride_f_}}) {
     *p = sycl::malloc_device<int32_t>(size_t(n), q_);
     if (!*p) throw std::runtime_error("inkling engine: out of device memory");
     owned_.push_back(*p);
@@ -627,43 +629,83 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   const int64_t E = cfg_.n_embd, H = cfg_.n_head, HK = cfg_.n_head_kv, D = cfg_.head_dim, NR = cfg_.n_rel;
   const int64_t HD = H * D, KD = HK * D, QRG = HD + H * NR + HD, CC = cfg_.conv_channels(), NA = cfg_.n_slot();
   const int64_t NU = cfg_.n_expert_used, V = cfg_.n_vocab, VO = cfg_.n_vocab_out;
+  // The step's sub-batches: up to max_batch rows each, a slot at most once in each (a slot's consecutive chunks go in
+  // consecutive sub-batches). Rows are numbered across the step; within a sub-batch, chunks start at their row in it.
+  struct Sub {
+    int64_t row0 = 0, T = 0;
+    ik::Chunks ch;
+    attn::TileList tiles_s, tiles_f;
+    explicit Sub(int64_t d) : tiles_s(d), tiles_f(d) {}
+  };
+  std::vector<Sub> subs;
   std::vector<int32_t> tok, slot, pos, base, logit_rows;
-  ik::Chunks ch;
-  attn::TileList tiles_s(D), tiles_f(D);
+  std::vector<int64_t> in_step(size_t(c_.n_slots), 0);  // each slot's tokens in the chunks so far
   for (const auto& c : chunks) {
     if (c.slot < 0 || c.slot >= c_.n_slots) throw std::runtime_error("inkling engine: bad slot");
-    if (c.start_pos != slots_[size_t(c.slot)].length) throw std::runtime_error("inkling engine: chunk does not continue its slot");
-    const int64_t b = int64_t(tok.size()), n = int64_t(c.tokens.size());
+    if (c.start_pos != slots_[size_t(c.slot)].length + in_step[size_t(c.slot)])
+      throw std::runtime_error("inkling engine: chunk does not continue its slot");
+    const int64_t n = int64_t(c.tokens.size());
     if (n > c_.max_chunk) throw std::runtime_error("inkling engine: chunk longer than max_chunk");
     if (n == 0) continue;
-    for (int k = 0; k < ch.count; ++k)
-      if (ch.slot[k] == c.slot) throw std::runtime_error("inkling engine: two chunks of one slot in a step");
-    ch.base[ch.count] = int32_t(b), ch.n[ch.count] = int32_t(n), ch.slot[ch.count] = c.slot, ++ch.count;
+    bool fresh = subs.empty() || subs.back().T + n > c_.max_batch;
+    for (int k = 0; !fresh && k < subs.back().ch.count; ++k) fresh = subs.back().ch.slot[k] == c.slot;
+    if (fresh) {
+      subs.emplace_back(D);
+      subs.back().row0 = int64_t(tok.size());
+    }
+    Sub& sb = subs.back();
+    const int64_t b = int64_t(tok.size()) - sb.row0;
+    sb.ch.base[sb.ch.count] = int32_t(b), sb.ch.n[sb.ch.count] = int32_t(n), sb.ch.slot[sb.ch.count] = c.slot, ++sb.ch.count;
     for (int64_t i = 0; i < n; ++i) {
       tok.push_back(c.tokens[size_t(i)]);
       slot.push_back(c.slot);
       pos.push_back(int32_t(c.start_pos + i));
       base.push_back(int32_t(b));
     }
-    tiles_s.add_chunk(int32_t(b), n, c.start_pos + n - 1, H / HK, HK, cfg_.window);
-    tiles_f.add_chunk(int32_t(b), n, c.start_pos + n - 1, H / HK, HK, 0);
-    for (int64_t r = std::max<int64_t>(0, n - c.logits_rows); r < n; ++r) logit_rows.push_back(int32_t(b + r));
+    sb.tiles_s.add_chunk(int32_t(b), n, c.start_pos + n - 1, H / HK, HK, cfg_.window);
+    sb.tiles_f.add_chunk(int32_t(b), n, c.start_pos + n - 1, H / HK, HK, 0);
+    sb.T += n;
+    for (int64_t r = std::max<int64_t>(0, n - c.logits_rows); r < n; ++r) logit_rows.push_back(int32_t(sb.row0 + b + r));
     ensure_pages(c.slot, c.start_pos + n);
+    in_step[size_t(c.slot)] += n;
   }
-  const int64_t T = int64_t(tok.size()), R = int64_t(logit_rows.size());
-  if (T == 0) return {};
-  if (T > c_.max_batch) throw std::runtime_error("inkling engine: step larger than max_batch");
+  const int64_t TA = int64_t(tok.size()), R = int64_t(logit_rows.size());
+  if (TA == 0) return {};
+  if (TA > max_step_) throw std::runtime_error("inkling engine: step larger than max_step");
   if (R > c_.max_logits) throw std::runtime_error("inkling engine: too many logits rows");
-  q_.memcpy(tok_, tok.data(), size_t(T) * 4);
-  q_.memcpy(slot_, slot.data(), size_t(T) * 4);
-  q_.memcpy(pos_, pos.data(), size_t(T) * 4);
-  q_.memcpy(base_, base.data(), size_t(T) * 4);
+  if (subs.size() > 1 && (dump || teacher)) throw std::runtime_error("inkling engine: dumps and teachers take steps of one sub-batch");
+  if (int64_t(subs.size()) > (max_step_ + c_.max_batch - 1) / c_.max_batch + c_.n_slots)
+    throw std::runtime_error("inkling engine: too many sub-batches in a step");
+  q_.memcpy(tok_, tok.data(), size_t(TA) * 4);
+  q_.memcpy(slot_, slot.data(), size_t(TA) * 4);
+  q_.memcpy(pos_, pos.data(), size_t(TA) * 4);
+  q_.memcpy(base_, base.data(), size_t(TA) * 4);
   if (R) q_.memcpy(lrows_, logit_rows.data(), size_t(R) * 4);
-  const std::vector<int32_t> packed_s = tiles_s.packed(), packed_f = tiles_f.packed();
-  q_.memcpy(tiles_sliding_, packed_s.data(), packed_s.size() * 4);
-  q_.memcpy(tiles_full_, packed_f.data(), packed_f.size() * 4);
+  std::vector<std::vector<int32_t>> packed(2 * subs.size());  // kept until the copies are done
+  for (size_t g = 0; g < subs.size(); ++g) {
+    packed[2 * g] = subs[g].tiles_s.packed(), packed[2 * g + 1] = subs[g].tiles_f.packed();
+    if (int64_t(packed[2 * g].size()) > tile_stride_s_ || int64_t(packed[2 * g + 1].size()) > tile_stride_f_)
+      throw std::runtime_error("inkling engine: a sub-batch's attention tiles overflow");
+    q_.memcpy(tiles_sliding_ + int64_t(g) * tile_stride_s_, packed[2 * g].data(), packed[2 * g].size() * 4);
+    q_.memcpy(tiles_full_ + int64_t(g) * tile_stride_f_, packed[2 * g + 1].data(), packed[2 * g + 1].size() * 4);
+  }
   q_.memcpy(page_table_, page_table_host_.data(), page_table_host_.size() * 4);
-  const attn::Tokens toks{slot_, pos_, T};
+  // The sub-batch the layer code runs on: its rows (T), tokens, chunks, tiles and per-token arrays.
+  int64_t T = TA;
+  attn::Tokens toks{slot_, pos_, TA};
+  ik::Chunks ch;
+  const attn::TileList* tl_s = &subs[0].tiles_s;
+  const attn::TileList* tl_f = &subs[0].tiles_f;
+  const int32_t *tl_s_dev = tiles_sliding_, *tl_f_dev = tiles_full_, *slot_d = slot_, *base_d = base_, *pos_d = pos_;
+  int64_t row_off = 0;
+  auto use_sub = [&](size_t g) {
+    const Sub& sb = subs[g];
+    T = sb.T, row_off = sb.row0, ch = sb.ch;
+    toks = attn::Tokens{slot_ + sb.row0, pos_ + sb.row0, sb.T};
+    tl_s = &sb.tiles_s, tl_f = &sb.tiles_f;
+    tl_s_dev = tiles_sliding_ + int64_t(g) * tile_stride_s_, tl_f_dev = tiles_full_ + int64_t(g) * tile_stride_f_;
+    slot_d = slot_ + sb.row0, base_d = base_ + sb.row0, pos_d = pos_ + sb.row0;
+  };
 
   auto t_mark = std::chrono::steady_clock::now();
   // With a queue that keeps timestamps (EKLOW_PROFILE_DEVICE in the driver), a mark is an empty kernel whose times are read
@@ -725,11 +767,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
 
   // The embeddings: rows from the GGUF's mapping through pinned memory, then the token norm.
   float* const e0 = blk_[0];
-  for (int64_t t = 0; t < T; ++t)
+  for (int64_t t = 0; t < TA; ++t)
     std::memcpy(emb_host_ + uint64_t(t) * embd_row_bytes_, embd_->data + uint64_t(tok[size_t(t)]) * embd_row_bytes_, embd_row_bytes_);
-  q_.memcpy(emb_dev_, emb_host_, size_t(uint64_t(T) * embd_row_bytes_));
-  ref::embed(q_, ref::Weight{embd_->type, E, T, emb_dev_, embd_row_bytes_}, iota_, T, 1.0f, e0);
-  fast::rmsnorm(q_, e0, tok_norm_, T, E, cfg_.eps, e0);
+  q_.memcpy(emb_dev_, emb_host_, size_t(uint64_t(TA) * embd_row_bytes_));
+  ref::embed(q_, ref::Weight{embd_->type, E, TA, emb_dev_, embd_row_bytes_}, iota_, TA, 1.0f, e0);
+  fast::rmsnorm(q_, e0, tok_norm_, TA, E, cfg_.eps, e0);
   mark("embed");
 
   // Buffers: e0 (block 0), the prelude's output (block 1), the core's layer-11 and layer-17 outputs of the current and
@@ -743,7 +785,6 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   // One layer application, as the reference's Forward::layer.
   int exec_i = 0;  // layer applications started in this step (the next one's physical layer: exec_layers_[exec_i])
   auto layer = [&](int app, int ip, const float* x, std::vector<const float*>& blocks, const float* msgs, const Loop* lp, float* out) {
-    ++exec_i;
     const Layer& L = layers_[size_t(ip)];
     const bool swa = cfg_.sliding[size_t(ip)];
     const std::string sl = "-" + std::to_string(app);
@@ -813,11 +854,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     mark("proj");
     float* hist = conv_ + int64_t(app) * 3 * CC;
     const int64_t sstride = NA * 3 * CC;
-    ik::short_conv(q_, kr_, KD, T, KD, ch, slot_, base_, hist, sstride, CC, L.k_conv, swa ? nullptr : kd_, HK, kb_);
+    ik::short_conv(q_, kr_, KD, T, KD, ch, slot_d, base_d, hist, sstride, CC, L.k_conv, swa ? nullptr : kd_, HK, kb_);
     fine("conv.k");
-    ik::short_conv(q_, vr_, KD, T, KD, ch, slot_, base_, hist + KD, sstride, CC, L.v_conv, swa ? nullptr : vd_, HK, vb_);
+    ik::short_conv(q_, vr_, KD, T, KD, ch, slot_d, base_d, hist + KD, sstride, CC, L.v_conv, swa ? nullptr : vd_, HK, vb_);
     fine("conv.v");
-    ik::heads(q_, qrg_, QRG, kb_, vb_, pos_, T, H, HK, D, NR, L.q_clip, L.rel_clip, cfg_.qk_clip, cfg_.rel_clip, !swa, cfg_.log_alpha,
+    ik::heads(q_, qrg_, QRG, kb_, vb_, pos_d, T, H, HK, D, NR, L.q_clip, L.rel_clip, cfg_.qk_clip, cfg_.rel_clip, !swa, cfg_.log_alpha,
               float(cfg_.log_floor), cfg_.eps, qb_, rb_, kb_, vb_);
     emit("Qcur" + sl, qb_, {D, H, T});
     emit("Kcur" + sl, kb_, {D, HK, T});
@@ -832,13 +873,13 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       const attn::Cache cache{ring_k_ + r * ring_layer_stride_, ring_v_ + r * ring_layer_stride_, nullptr, ring_pages_, cfg_.window, HK, D};
       attn::write(q_, kb_, vb_, toks, cache);
       fine("attn.write");
-      attn::attend(q_, qb_, toks, tiles_s, tiles_sliding_, cache, H, scale, bias, att_, attn_scratch_);
+      attn::attend(q_, qb_, toks, *tl_s, tl_s_dev, cache, H, scale, bias, att_, attn_scratch_);
     } else {
       const auto& kv = pages_kv_[size_t(page_of_[size_t(app)])];
       const attn::Cache cache{kv.first, kv.second, page_table_, max_pages_, 0, HK, D};
       attn::write(q_, kb_, vb_, toks, cache);
       fine("attn.write");
-      attn::attend(q_, qb_, toks, tiles_f, tiles_full_, cache, H, scale, bias, att_, attn_scratch_);
+      attn::attend(q_, qb_, toks, *tl_f, tl_f_dev, cache, H, scale, bias, att_, attn_scratch_);
     }
     emit("kqv_out" + sl, att_, {HD, T});
     mark(swa ? "attn_sliding" : "attn_full");
@@ -846,7 +887,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     fine("o.gate");
     mm(L.o, att_, HD, o_);
     fine("o.mm");
-    ik::short_conv(q_, o_, E, T, E, ch, slot_, base_, hist + 2 * KD, sstride, CC, L.attn_post_conv, nullptr, 0, oc_);
+    ik::short_conv(q_, o_, E, T, E, ch, slot_d, base_d, hist + 2 * KD, sstride, CC, L.attn_post_conv, nullptr, 0, oc_);
     mark("o");
     // A block's first layer starts a new stream; the others add to theirs. The stream goes to `out`.
     const float* cur;
@@ -909,7 +950,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       mark("cold");
     }
     emit("ffn_moe_out" + sl, f_, {E, T});
-    ik::short_conv(q_, f_, E, T, E, ch, slot_, base_, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_);
+    ik::short_conv(q_, f_, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_);
     fine("ffn.conv");
     emit("ffn_out" + sl, o_, {E, T});
     ref::add(q_, cur, o_, T * E, out);
@@ -922,11 +963,33 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     mark("ffn_out");
   };
 
+  // One layer application over every sub-batch, in order: `blocks`, `x` and `out` are whole-step buffers; a loop pass's
+  // messages are mixed per sub-batch from the previous pass's bank.
+  auto apply = [&](int app, int ip, const float* x, std::vector<const float*>& blocks, const Loop* lp, float* out,
+                   const std::vector<const float*>* bank, const float* bank_out) {
+    ++exec_i;
+    for (size_t g = 0; g < subs.size(); ++g) {
+      use_sub(g);
+      const int64_t off = row_off * E;
+      std::vector<const float*> bg;
+      for (const float* p : blocks) bg.push_back(p + off);
+      const float* msgs = nullptr;
+      if (lp) {
+        ik::States st;
+        for (const float* b : *bank) st.p[st.n++] = b + off;
+        st.p[st.n++] = bank_out + off;
+        ik::depth_mix(q_, st, lp->msg_query, 4, T, E, 1e-6f, msg_, mixp_);
+        msgs = msg_;
+      }
+      layer(app, ip, x + off, bg, msgs, lp, out + off);
+    }
+    if (ip % cfg_.block == 0) blocks.push_back(x);
+  };
   std::vector<const float*> blocks;
   const float* x = e0;
   for (int l = 0; l < cfg_.core_start; ++l) {
     float* out = l == cfg_.core_start - 1 ? prelude : next_of(x);
-    layer(l, l, x, blocks, nullptr, nullptr, out);
+    apply(l, l, x, blocks, nullptr, out, nullptr, nullptr);
     x = out;
   }
   const std::vector<const float*> prelude_blocks = blocks;
@@ -943,35 +1006,28 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       const int app = cfg_.slot(l, pass);
       // the core's two blocks end at layers 11 and 17: their outputs are a later block's input and the next pass's bank
       float* out = l == cfg_.core_end - 1 ? o17[pass % 2] : l == cfg_.core_start + cfg_.block - 1 ? o11[pass % 2] : next_of(x);
-      if (pass == 0) {
-        layer(app, l, x, blocks, nullptr, nullptr, out);
-      } else {
-        const Loop& lp = loops_[size_t(l - cfg_.core_start)];
-        ik::States st;
-        for (const float* b : bank) st.p[st.n++] = b;
-        st.p[st.n++] = bank_out;
-        ik::depth_mix(q_, st, lp.msg_query, 4, T, E, 1e-6f, msg_, mixp_);
-        layer(app, l, x, blocks, msg_, &lp, out);
-      }
+      if (pass == 0) apply(app, l, x, blocks, nullptr, out, nullptr, nullptr);
+      else apply(app, l, x, blocks, &loops_[size_t(l - cfg_.core_start)], out, &bank, bank_out);
       x = out;
     }
     // LoopCD: the first pass's blocks are kept (a later pass of the same parity writes over them), and the last pass's
     // become h + w (h - h_1) in place, before the coda and the output mix read them.
     if (c_.loopcd != 0.0f && cfg_.n_passes > 1) {
       if (pass == 0) {
-        q_.memcpy(blk_[8], o11[0], size_t(T * E) * sizeof(float));
-        q_.memcpy(blk_[9], o17[0], size_t(T * E) * sizeof(float));
+        q_.memcpy(blk_[8], o11[0], size_t(TA * E) * sizeof(float));
+        q_.memcpy(blk_[9], o17[0], size_t(TA * E) * sizeof(float));
       } else if (pass == cfg_.n_passes - 1) {
-        ik::contrast(q_, o11[pass % 2], blk_[8], c_.loopcd, T * E);
-        ik::contrast(q_, o17[pass % 2], blk_[9], c_.loopcd, T * E);
+        ik::contrast(q_, o11[pass % 2], blk_[8], c_.loopcd, TA * E);
+        ik::contrast(q_, o17[pass % 2], blk_[9], c_.loopcd, TA * E);
       }
     }
   }
   for (int l = cfg_.core_end; l < cfg_.n_layer; ++l) {
     float* out = next_of(x);
-    layer(l, l, x, blocks, nullptr, nullptr, out);
+    apply(l, l, x, blocks, nullptr, out, nullptr, nullptr);
     x = out;
   }
+  T = TA;
   for (const auto& c : chunks) slots_[size_t(c.slot)].length += int64_t(c.tokens.size());
   if (R == 0) {
     q_.wait();

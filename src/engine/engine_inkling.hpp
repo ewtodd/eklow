@@ -47,6 +47,10 @@ struct Config {
   int64_t cpu_max_tokens = 128;                    // steps up to this many tokens run cold experts on the CPU; longer
                                                    // ones copy the layer's cold set onto the card and run it there
   int checkpoints = 2;                             // per slot: saved states a sequence can be rewound to (rewind)
+  // Tokens a step may carry (0: max_batch). Past max_batch a step runs layer by layer over sub-batches of max_batch (each
+  // layer application over every sub-batch before the next), so that a long prompt's cold sets are copied onto the card
+  // once a step rather than once a chunk; the sequences' blocks are held for all of them (8 x max_step x n_embd floats).
+  int64_t max_step = 0;
   // LoopCD's hidden-state form (arXiv 2610.02185; DECISIONS 2026-11-24): what the coda reads of the core, its two blocks'
   // outputs, becomes h + w (h - h_1), h_1 the same after the first pass. 0: the model as trained.
   float loopcd = 0.0f;
@@ -168,6 +172,8 @@ class Engine {
   std::vector<int> exec_layers_;  // the physical layer of each layer application, in the order a step runs them
   int stage(int layer, int avoid);  // the region holding `layer`'s cold set, its copy issued if needed (never into `avoid`)
   int last_staged_use_ = 0;         // the region the latest cold set ran from
+  int64_t max_step_ = 0;            // tokens a step may carry (Config::max_step, at least max_batch)
+  int64_t tile_stride_s_ = 0, tile_stride_f_ = 0;  // a sub-batch's share of the tile buffers
   uint64_t free_at_placement_ = 0;
   // The cold path: the step's routing and expert inputs on the host, the cold rows, their device copy, the pool.
   int32_t* hids_ = nullptr;

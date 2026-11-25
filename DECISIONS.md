@@ -4385,3 +4385,60 @@ ms a token: the 48 layer applications' inputs (depth mixes, controllers, norms) 
 cold experts 15, projections 13, hot experts 10, sliding attention 7, the rest 13. The weights a token reads would take
 3-4 ms at the card's bandwidth: decode is bound by kernel launches and host round trips. Prefill of 12k: 34 s, of which
 21.5 s copy cold sets onto the card (each layer application's, every chunk).
+
+## 2026-11-24 — Inkling speed, first round: decode 10.2 -> ~16.5 tok/s, prefill 363 -> ~600 tok/s
+
+The owner chose speed before vision (M5), so that every later check is cheaper. Measured on fiona in production's shape
+(two slots of 64k, 2.5 GiB kept for the side models), `eklow-engine-run-inkling` on M0's 12k and 33k prompts.
+
+**Where decode went.** Launches are cheap on the A770M: ~4 us a small kernel back to back, 2.3 us to submit (a
+microbenchmark; a recorded graph: 2.7 us), so 2,000 kernels a token would cost ~10 ms. Device timestamps per kernel
+group (`EKLOW_PROFILE_DEVICE` with `--profile` and `EKLOW_PROFILE_FINE`: empty marker kernels read after the step; host
+marks had paid a wake-up each) showed a few kernels at 10-30x their work instead, and `EKLOW_STEP_TIMING` split a step's
+host time into waiting for the routing (the card's work before each router) and the CPU's cold experts.
+- `matmul_f32` with few outputs over long rows (the controllers' 4,608-wide down projection, the router, the sinks, the
+  dynamic taps) gave each output one sub-group walking its row: a work-group an output now (80-180 us -> a few us).
+- `depth_mix` at a decode step was one work-group on the card running up to 40 group reductions in a row: rows of up to 16
+  split across work-groups, two kernels through a small scratch.
+- `route` was one work-item a token with an insertion sort in global memory, then a sub-group whose per-lane array spilled:
+  a sub-group a token with its experts in registers (a template count), the same picks in the same order (tied logits
+  included).
+- A loop controller at up to 16 tokens is two kernels instead of five, its up projection a sub-group an element so its
+  rows are read in 64-byte runs.
+- Attention splits of at least 2 blocks for 128-wide heads (Bolt's keep 4): a one-token sliding step ran 256 threads (105
+  -> 77 us in `eklow-attn-test`).
+`eklow-inkling-fast-test` checks the new kernels against the reference ones (52 checks to 1e-6). Decode at 12k: 10.2 ->
+16.3-17.0 tok/s; at 33k: 9.9 -> ~15.8.
+
+What decode spends now (~60 ms a token at 12k): ~35 ms of the card's work before the routers (sliding attention 6.5, the
+fused Q/R/gate GEMV 5.5, the K, V and O GEMVs 5, the controllers 3, the mixes 3.3, many small kernels), ~13-19 ms of CPU
+cold experts, during which the card idles ~10 ms a token after its own hot experts. The cold path runs at DRAM speed:
+more threads, P-cores only or E-cores only did not help (`EKLOW_CPU_PIN`). It shrinks only with fewer cold pairs (23% of
+decode's routed pairs today; ~13% with ~450 more experts on the card), which takes card memory: int8 K/V for the full
+layers, a pool shared by the two slots, or the side models on the Iris Xe. The int8 GEMVs run at ~145 GB/s whatever their
+thread target (1,024 to 65,536).
+
+**Prefill.** A 1,024-token chunk copied every layer application's cold set onto the card, ~20 GiB, and host to card
+measures 11.7 GB/s on fiona (one queue or four; the copy engine settings that split it crash the runtime): copies were 21.5
+of a 12k prompt's 33 s.
+- The copies now run on a queue of their own into a second staging region, beside the compute (33.0 -> 30.4 s); the
+  region costs ~170 experts on the card.
+- A step may carry several sub-batches of 1,024 (`Config::max_step`, eklow-server `--step-tokens`, 4,096 by default), run
+  layer by layer: each layer application over every sub-batch before the next, so a cold set is copied once a step. The
+  sequences' block buffers hold the whole step (8 x 4,096 x 2,304 floats); everything else stays a sub-batch's. The
+  scheduler gives a prefilling slot consecutive chunks in a step, stopping at the chunk that ends before the prompt's last
+  token (its checkpoint). A second slot's decode waits for such a step (~6 s).
+
+| step | 12k prefill | 33k prefill | cold experts |
+|---|---|---|---|
+| 1,024, copies in line | 33.0 s (363 tok/s) | 94 s (349) | 2,090 |
+| 1,024, copies beside | 30.4 s (395) | | 2,263 |
+| 4,096 | 20.3 s (592) | 56.0 s (588) | 2,312 |
+| 8,192 | 19.2 s (625) | 50.9 s (648) | 2,387 |
+
+That is M2's all-on-card prefill (637 tok/s): prefill is the card's compute again. Through eklow-server: a new 15.4k prompt
+to its first token in 23.9 s (644 tok/s; ~42 s at M4), the same prompt again in 0.09 s, the next turn in 0.49 s; the M4
+smoke checks all pass.
+
+**Checks.** Decode against llama.cpp CUDA's continuations after a layer-major prefill: top-1 32/32 at 12k and at 33k,
+mean KL 1.6e-3 and 2.3e-4 (M3: 1.7e-3 and 9.9e-4; llama.cpp's own CPU against CUDA ~7e-2).

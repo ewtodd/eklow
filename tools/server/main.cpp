@@ -429,6 +429,7 @@ int main(int argc, char** argv) {
   int64_t card_margin_mib = 1024;
   int cpu_threads = 8, checkpoints = 2;
   int64_t cpu_max_tokens = 128;
+  int64_t step_tokens = 4096;  // Inkling: tokens a step may carry, run layer by layer over sub-batches of --batch
   double loopcd = 0;  // Inkling: LoopCD's contrast strength (0: off)
   bool kv_int8 = false, preserve_thinking = false;
   double log_interval = 10;  // seconds between the engine's log lines while there is traffic; 0: none
@@ -493,6 +494,7 @@ int main(int argc, char** argv) {
     else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
     else if (a == "--cpu-max-tokens") cpu_max_tokens = std::atoll(next().c_str());
     else if (a == "--checkpoints") checkpoints = std::atoi(next().c_str());
+    else if (a == "--step-tokens") step_tokens = std::atoll(next().c_str());
     else if (a == "--loopcd") loopcd = std::atof(next().c_str());
     else if (a == "--chat-template" || a == "--snapshot-mib" || a == "--snapshot-every" || a == "--group" || a == "--group-busy" || a == "--kv-pool" ||
                a == "--image-rows-dir" || a == "--image-max-tokens" || a == "--vision-reserve-mib" ||
@@ -506,7 +508,7 @@ int main(int argc, char** argv) {
                            "[--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]] "
                            "[--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S] "
                            "[--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N] [--prefix-cache-buffers N]] "
-                           "[--expert-profile JSON] [--card-margin-mib N] [--cpu-threads N] [--cpu-max-tokens N] [--checkpoints N] [--loopcd W]\n");
+                           "[--expert-profile JSON] [--card-margin-mib N] [--cpu-threads N] [--cpu-max-tokens N] [--checkpoints N] [--step-tokens N] [--loopcd W]\n");
       return 2;
     }
   }
@@ -707,13 +709,14 @@ int main(int argc, char** argv) {
       ic.cpu_threads = cpu_threads;
       ic.cpu_max_tokens = cpu_max_tokens;
       ic.checkpoints = checkpoints;
+      ic.max_step = std::max(step_tokens, batch);
       ic.loopcd = float(loopcd);
       ieng = std::make_unique<engine::inkling::Engine>(q, file, ic);
       std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights on the card, %lld cold experts (%.2f GiB) on the CPU with %d threads, %.2f GiB of caches (%d slots of %lld), %.1f s\n",
                    alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), ieng->weight_bytes() / GiB, (long long)ieng->cold_experts(),
                    ieng->host_expert_bytes() / GiB, cpu_threads, ieng->cache_bytes() / GiB, slots, (long long)max_ctx,
                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
-      serve::inkling::SchedulerConfig sc{batch, chunk, max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }};
+      serve::inkling::SchedulerConfig sc{ic.max_step, chunk, max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }};
       isched = std::make_unique<serve::inkling::Scheduler>(*ieng, *itok, sc);
       chat_stats = [&] { return isched->stats(); };
       hold = [&] { return std::static_pointer_cast<void>(std::make_shared<serve::inkling::Scheduler::Hold>(*isched)); };

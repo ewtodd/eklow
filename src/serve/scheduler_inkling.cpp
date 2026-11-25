@@ -279,21 +279,28 @@ void Scheduler::step() {
   // Prefill chunks in what is left; a prefill-only request gets none while another request runs, and smaller chunks.
   bool others = false;
   for (const Seq& q : seqs_) others = others || (q.req && !q.req->prefill_only);
+  // A slot may take several consecutive chunks in a step (the engine runs a step of more than a sub-batch layer by layer,
+  // so a long prompt's cold experts are copied onto the card once a step).
   for (size_t s = 0; s < seqs_.size() && budget > 0; ++s) {
     Seq& q = seqs_[s];
     if (!q.req || q.next_token >= 0 || q.fed >= q.req->prompt.size()) continue;
     if (q.req->prefill_only && others) continue;
-    const int64_t fed = int64_t(q.fed), P = int64_t(q.req->prompt.size());
-    int64_t n = std::min<int64_t>({q.req->prefill_only ? c_.prefill_only_chunk : c_.max_chunk, budget, P - fed});
-    // The prompt's last token goes in a step of its own, after a checkpoint before it: a request whose prompt is this one
-    // again (a retry) rewinds there and feeds that token for its logits. It costs a decode-sized step per request.
-    if (!q.req->prefill_only && fed + n == P && n > 1) --n;
-    if (n <= 0) continue;
-    const bool last = fed + n == P && !q.req->prefill_only;
-    chunks.push_back({int(s), int64_t(q.tokens.size()),
-                      std::vector<int32_t>(q.req->prompt.begin() + std::ptrdiff_t(fed), q.req->prompt.begin() + std::ptrdiff_t(fed + n)), last ? 1 : 0});
-    items.push_back({true, int(s), last ? 1 : 0});
-    budget -= n;
+    const int64_t P = int64_t(q.req->prompt.size());
+    for (int64_t fed = int64_t(q.fed), at = int64_t(q.tokens.size()); budget > 0 && fed < P;) {
+      int64_t n = std::min<int64_t>({q.req->prefill_only ? c_.prefill_only_chunk : c_.max_chunk, budget, P - fed});
+      // The prompt's last token goes in a step of its own, after a checkpoint before it: a request whose prompt is this
+      // one again (a retry) rewinds there and feeds that token for its logits. It costs a decode-sized step per request.
+      if (!q.req->prefill_only && fed + n == P && n > 1) --n;
+      if (n <= 0) break;
+      const bool last = fed + n == P && !q.req->prefill_only;
+      chunks.push_back({int(s), at,
+                        std::vector<int32_t>(q.req->prompt.begin() + std::ptrdiff_t(fed), q.req->prompt.begin() + std::ptrdiff_t(fed + n)),
+                        last ? 1 : 0});
+      items.push_back({true, int(s), last ? 1 : 0});
+      budget -= n, fed += n, at += n;
+      // the checkpoint goes where the step ends: none of the slot's chunks after the one that ends before the last token
+      if (last || (!q.req->prefill_only && fed + 1 == P)) break;
+    }
   }
   if (chunks.empty()) return;
   for (const Item& it : items) ++(it.prefill ? step_prefill_seqs_ : step_decode_seqs_);
