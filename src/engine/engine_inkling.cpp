@@ -75,6 +75,18 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     return static_cast<const float*>(d);
   };
   auto vec = [&](const std::string& name) { return up_f32(as_f32(need(name))); };
+  // fp32 rows [n][k] on the card as an fp16 GEMM weight of `rows` outputs (n of them, then zeros)
+  auto f16_padded = [&](const float* w, int64_t n, int64_t k, int64_t rows) {
+    float* tmp = sycl::malloc_device<float>(size_t(rows * k), q_);
+    q_.memset(tmp, 0, size_t(rows * k) * sizeof(float));
+    q_.memcpy(tmp, w, size_t(n * k) * sizeof(float));
+    xmx::Weight out = xmx::repack(q_, ref::Weight{gguf::Type::F32, k, rows, reinterpret_cast<const uint8_t*>(tmp), uint64_t(k) * sizeof(float)});
+    q_.wait();
+    sycl::free(tmp, q_);
+    owned_.push_back(out.tiles);
+    if (out.scales) owned_.push_back(out.scales);
+    return out;
+  };
 
   // Matrices go through one staging buffer and are repacked for the matrix units (Q8_0 as Q8_0I); Q, R and the gate read
   // the same input and are stacked.
@@ -143,6 +155,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
       L.sink32 = dev(32 * E);
       q_.memset(L.sink32, 0, size_t(32 * E) * sizeof(float));
       q_.memcpy(L.sink32, L.sink, size_t(cfg_.n_head * E) * sizeof(float));
+      L.sink16 = f16_padded(L.sink, cfg_.n_head, E, 128);
     }
     L.router = vec(b + "ffn_gate_inp.weight");
     L.q_clip = vec(b + "attn_q_clip.weight");
@@ -184,6 +197,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     for (int k = 0; k < 4; ++k) {
       const std::string n = b + "loop_" + kCtrl[k] + "_ctrl_";
       lp.down[k] = vec(n + "down.weight");
+      lp.down16[k] = f16_padded(lp.down[k], cfg_.gate_rank, 2 * E, (cfg_.gate_rank + 127) / 128 * 128);
       // gain and forget (k = gate_rank 64) on the fp16 GEMM, from the fp32 rows
       for (auto [dst, d32, name] : {std::tuple{&lp.gain[k], &lp.gain32[k], "gain.weight"}, {&lp.forget[k], &lp.forget32[k], "forget.weight"}}) {
         const float* w32 = *d32 = vec(n + name);
@@ -259,7 +273,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   ci_ = dev(B * 2 * E);
   cd_ = dev(B * cfg_.gate_rank);
   mixp_ = dev(B * ik::kMixScratch);
-  skp_ = dev(B * 32);
+  skp_ = dev(B * 128);
   cg_ = dev(B * E);
   cf_ = dev(B * E);
   lg_ = dev(B * cfg_.n_expert);
@@ -278,7 +292,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   const int64_t bias_extent = std::max(cfg_.window, cfg_.rel_extent);
   attn::reserve(q_, attn_scratch_, max_tiles_sliding_, c_.max_chunk * (H / HK), HK, D, H / HK, cfg_.window + c_.max_chunk, bias_extent);
   attn::reserve(q_, attn_scratch_, max_tiles_full_, c_.max_chunk * (H / HK), HK, D, H / HK, c_.max_ctx + attn::kPage, bias_extent);
-  act_ = xmx::alloc_activations(q_, B, std::max<int64_t>(E, HD));
+  act_ = xmx::alloc_activations(q_, B, std::max<int64_t>({E, HD, 2 * E}));
   moe_scratch_ = moe::reserve(q_, S, cfg_.n_expert_used, E, cfg_.n_ff_exp);
   place_experts(f);
   // The cold path's buffers: the step's routing and expert inputs on the host (the card writes them there), the cold
@@ -820,7 +834,14 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
         return;
       }
       ik::control_input(q_, cur, msgs + int64_t(k) * T * E, T, E, 1e-6f, ci_);
-      mm32(lp->down[k], cfg_.gate_rank, 2 * E, ci_, cd_);
+      if (T > xmx::kFp16Rows) {
+        act_.k = 2 * E;
+        xmx::quantize(q_, ci_, T, act_, true);
+        xmx::matmul(q_, act_, lp->down16[k], skp_);
+        ik::gather_cols(q_, skp_, lp->down16[k].n, T, cfg_.gate_rank, cd_);
+      } else {
+        mm32(lp->down[k], cfg_.gate_rank, 2 * E, ci_, cd_);
+      }
       if (T <= kFewTokens) {
         ik::matmul_f32(q_, lp->gain32[k], E, cfg_.gate_rank, cd_, cfg_.gate_rank, T, cg_, E);
         ik::matmul_f32(q_, lp->forget32[k], E, cfg_.gate_rank, cd_, cfg_.gate_rank, T, cf_, E);
@@ -852,12 +873,19 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     mark("inputs");
     // Projections; K and V through their convolutions (full layers: with taps from their inputs), then the heads.
     mm(L.qrg, hin[0], E, qrg_);
+    // the sinks from the same activations, on the fp16 GEMM, when they are fp16 (steps of more than kFp16Rows)
+    const bool sink_done = T > xmx::kFp16Rows && L.sink16.tiles;
+    if (sink_done) {
+      xmx::matmul(q_, act_, L.sink16, skp_);
+      ik::gather_cols(q_, skp_, L.sink16.n, T, H, sk_);
+    }
     fine("proj.qrg");
     mm(L.k, hin[1], E, kr_);
     fine("proj.k");
     mm(L.v, hin[2], E, vr_);
     fine("proj.v");
-    if (T > kFewTokens && L.sink32) {
+    if (sink_done) {
+    } else if (T > kFewTokens && L.sink32) {
       // 24 outputs miss the tiled fp32 GEMM (a multiple of 32): 32 of them, the padding dropped after
       fast::matmul_f32(q_, L.sink32, 32, E, hin[0], T, skp_);
       ik::gather_cols(q_, skp_, 32, T, H, sk_);
