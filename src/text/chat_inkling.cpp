@@ -356,6 +356,12 @@ std::vector<ChatPart> render_inkling(const Value& messages, const Value& tools, 
           continue;
         }
         V type = sub(part, "type");
+        if (eq(type, "media_marker")) {
+          // (not the template's: llama-server's media part, any role; see render_inkling_request)
+          r.append(hdr);
+          r.lit(std::string("<|content_image|>") + kInklingImagePlaceholder + "<|end_message|>");
+          continue;
+        }
         if (!type || eq(type, "text") || eq(type, "input_text")) {
           V text = sub(part, "text");
           r.append(hdr);
@@ -468,7 +474,7 @@ std::string need_string(const Value& obj, std::string_view key, const char* what
 }
 
 // The message as llama.cpp reads it (common_chat_msgs_parse_oaicompat), after the checks oaicompat_chat_params_parse makes.
-Msg read_message(const Value& message) {
+Msg read_message(const Value& message, bool allow_image) {
   if (!message.is_object()) fail("Failed to parse messages: Expected 'message' to be an object");
   Msg m;
   const std::string role0 = str_or(message, "role", "");
@@ -484,6 +490,15 @@ Msg read_message(const Value& message) {
       m.has_parts = true;
       for (const auto& part : content->items()) {
         const std::string type = str_or(part, "type", "");
+        // oaicompat_content_load_media: a media part becomes a media marker (the bytes are the caller's)
+        const char* hint = " input is not supported - hint: if this is unexpected, you may need to provide the mmproj";
+        if (type == "image_url") {
+          if (!allow_image) fail(std::string("image") + hint);
+          m.parts.emplace_back("media_marker", "");
+          continue;
+        }
+        if (type == "input_audio") fail(std::string("audio") + hint);
+        if (type == "input_video" || type == "video_url") fail(std::string("video") + hint);
         if (type != "text" && type != "tool_reference") fail("unsupported content[].type");
         if (type == "text") m.parts.emplace_back(type, need_string(part, "text", "content part text"));
         else m.parts.emplace_back(type, need_string(part, "name", "content part name"));
@@ -532,7 +547,7 @@ Value message_json(const Msg& m) {
     for (const auto& [type, text] : m.parts) {
       Value p = Value::object();
       p.set("type", Value::string(type));
-      p.set(type == "tool_reference" ? "name" : "text", Value::string(text));
+      if (type != "media_marker") p.set(type == "tool_reference" ? "name" : "text", Value::string(text));
       parts.push_back(std::move(p));
     }
     j.set("content", Value::array(std::move(parts)));
@@ -596,7 +611,7 @@ Value read_tools(const Value* tools, std::vector<std::string>& names) {
 
 }  // namespace
 
-InklingChat render_inkling_request(const Value& raw) {
+InklingChat render_inkling_request(const Value& raw, bool allow_image) {
   const Value body = llama_json(raw);
   if (!body.is_object()) fail("'messages' is required");
   InklingChat chat;
@@ -640,7 +655,7 @@ InklingChat render_inkling_request(const Value& raw) {
   if (!messages_v) fail("'messages' is required");
   if (!messages_v->is_array()) fail("Expected 'messages' to be an array");
   std::vector<Msg> msgs;
-  for (const auto& m : messages_v->items()) msgs.push_back(read_message(m));
+  for (const auto& m : messages_v->items()) msgs.push_back(read_message(m, allow_image));
 
   const Value* agp = body.find("add_generation_prompt");
   bool add_generation_prompt = agp && agp->is_bool() ? agp->as_bool() : true;

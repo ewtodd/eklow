@@ -1,12 +1,13 @@
 // eklow-chat-inkling: Inkling 2 Mini's chat template port (and llama-server's request handling around it) from the command line.
 //
-//   eklow-chat-inkling render [--tokens GGUF] < REQUESTS > RESULTS
+//   eklow-chat-inkling render [--tokens GGUF] [--allow-image] < REQUESTS > RESULTS
 //                                         REQUESTS: one OpenAI chat completion body per line (messages, tools, tool_choice,
 //                                         reasoning_effort, chat_template_kwargs, ...), as llama-server receives it;
 //                                         RESULTS: one line per request, {"prompt": ..., "parts": [[text, is_input], ...],
 //                                         "generation_prompt": ..., "mode": {...the output parser's view of the request}}
 //                                         or {"error": ...}; with --tokens, also "ids", the prompt tokenized with special
 //                                         tokens recognized only in template text, and "roundtrip", whether they decode to it.
+//                                         --allow-image: image_url parts as a server with Inkling's mmproj takes them.
 //   eklow-chat-inkling check FILE         whether FILE (a GGUF's tokenizer.chat_template, or a chat_template.jinja read whole)
 //                                         is the template that was ported, byte for byte
 #include <cstdio>
@@ -56,13 +57,15 @@ int main(int argc, char** argv) {
     }
   }
   std::string tokens_path;
+  bool allow_image = false;
   bool usage = mode != "render";
   for (int i = 2; i < argc && !usage; ++i) {
     if (!std::strcmp(argv[i], "--tokens") && i + 1 < argc) tokens_path = argv[++i];
+    else if (!std::strcmp(argv[i], "--allow-image")) allow_image = true;
     else usage = true;
   }
   if (usage) {
-    std::fprintf(stderr, "usage: eklow-chat-inkling render [--tokens GGUF] < REQUESTS > RESULTS | eklow-chat-inkling check FILE\n");
+    std::fprintf(stderr, "usage: eklow-chat-inkling render [--tokens GGUF] [--allow-image] < REQUESTS > RESULTS | eklow-chat-inkling check FILE\n");
     return 2;
   }
   try {
@@ -79,7 +82,7 @@ int main(int argc, char** argv) {
     while (std::getline(std::cin, line)) {
       json::Writer w(false);
       try {
-        const text::InklingChat chat = text::render_inkling_request(text::parse_llama_json(line));
+        const text::InklingChat chat = text::render_inkling_request(text::parse_llama_json(line), allow_image);
         w.begin_object().kv("prompt", text::join(chat.parts)).key("parts").begin_array();
         for (const auto& p : chat.parts) w.begin_array().value(p.text).value(p.input).end_array();
         w.end_array().kv("generation_prompt", chat.generation_prompt);

@@ -54,7 +54,14 @@ struct InklingChat {
 //
 // eklow does not follow llama.cpp in two things: other chat_template_kwargs than reasoning_effort are ignored (llama.cpp
 // lets a kwarg named "messages" or "tools" replace them), and request text never parses as special tokens (the parts).
-InklingChat render_inkling_request(const json::Value& body);
+//
+// With allow_image (a server with Inkling's vision tower), an image_url part is a media part, as llama-server makes it:
+// its own block in any role, <header><|content_image|><|unused_200054|><|end_message|> (llama.cpp's inkling_split_media
+// takes the media marker out of its text block, and mtmd opens it with <|content_image|>), the placeholder for the
+// caller to expand to the image's rows in the order of the parts. Without, an image_url part is refused as llama-server
+// refuses it without an mmproj; audio and video always are.
+inline constexpr const char* kInklingImagePlaceholder = "<|unused_200054|>";
+InklingChat render_inkling_request(const json::Value& body, bool allow_image = false);
 
 // Whether `tmpl` is the template that was ported (byte for byte): the caller refuses a GGUF that carries anything else
 // rather than render it wrong.

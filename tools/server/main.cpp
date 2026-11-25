@@ -7,6 +7,7 @@
 //   eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N]
 //                [--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--preserve-thinking on|off]
 //                [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] [--image-tokens N]
+//                [--image-max-tokens N]
 //                [--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]]
 //                [--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]]
 //                [--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S]
@@ -22,10 +23,12 @@
 // draft's trained block, 2 to 16) per step, accepted losslessly (the sampler's every feature, the tool grammar
 // included); a request may choose its own with "speculative": N (0 or false: plain decode). The draft shares the engine's
 // head on the matrix units and reads the token table from the GGUF's mapping.
-// --mmproj (a Gemma 4 projector GGUF) lets chat requests carry images (OpenAI image_url parts with base64 data: URLs),
-// --embed-mmproj (EmbeddingGemma 2's) lets an embeddings input be an array of text and image_url parts; --image-tokens is
-// the budget of rows per image (llama.cpp's image_max_tokens, 70 to 1,120, 280 by default). Each image is encoded on its
-// request's thread with the scheduler held, one at a time per encoder, and counts in the prompt tokens.
+// --mmproj (a Gemma 4 projector GGUF, or Inkling 2's inkling2v) lets chat requests carry images (OpenAI image_url parts
+// with base64 data: URLs), --embed-mmproj (EmbeddingGemma 2's) lets an embeddings input be an array of text and
+// image_url parts; --image-tokens is the Gemma towers' budget of rows per image (llama.cpp's image_max_tokens, 70 to
+// 1,120, 280 by default), --image-max-tokens Inkling's (1 to 4,096, 1,024 by default: a larger image is resized down, and
+// the encoder's activations for it stay on the card). Each image is encoded on its request's thread with the scheduler
+// held, one at a time per encoder, and counts in the prompt tokens.
 // Endpoints: POST /v1/chat/completions (streamed or whole), GET /v1/models, GET /health, GET /metrics (Prometheus text, for llmtop; no
 // auth; tools/server/metrics.hpp, K/V use is the global layers' pages); with an embedding model, POST /v1/embeddings, GET /v1/models
 // and GET /health on its own port (the house runs chat and embeddings as separate upstreams). The checker (--checker-*: POST
@@ -77,6 +80,8 @@
 #include "model/embed_gemma2.hpp"
 #include "model/gguf.hpp"
 #include "model/vision_gemma4v.hpp"
+#include "model/vision_inkling2v.hpp"
+#include "image/inkling_image.hpp"
 #include "rt/device.hpp"
 #include "serve/openai_gemma4.hpp"
 #include "serve/openai_inkling.hpp"
@@ -210,9 +215,24 @@ void reply_error(httplib::Response& res, const serve::gemma4::ApiError& e) {
 // conversation sends its images again every turn, and the rows are the same.
 class ImageService {
  public:
-  ImageService(sycl::queue& q, model::VisionGemma4V& v, int tokens) : q_(q), v_(v), tokens_(tokens) {}
+  // Gemma 4's tower (Bolt's, EmbeddingGemma 2's): tokens is the soft-token budget.
+  ImageService(sycl::queue& q, model::VisionGemma4V& v, int tokens) : tokens_(tokens), n_embd_(v.n_embd()) {
+    prepare_ = [&v, tokens](const image::Rgb& rgb) { return image::prepare(rgb, v.spec(tokens)); };
+    encode_ = [&q, &v](const image::Patches& p) {
+      const model::DeviceRows rows = v.encode(p);
+      auto host = std::make_shared<std::vector<float>>(size_t(rows.n * rows.dim));
+      q.memcpy(host->data(), rows.data.get(), host->size() * sizeof(float)).wait();
+      return host;
+    };
+  }
+  // Inkling 2's tower: tokens is the most an image may take (a larger one is resized down, as mtmd's
+  // image_max_tokens).
+  ImageService(model::VisionInkling2V& v, int tokens) : tokens_(tokens), n_embd_(v.n_out()) {
+    prepare_ = [tokens](const image::Rgb& rgb) { return image::prepare_inkling(rgb, tokens); };
+    encode_ = [&v](const image::Patches& p) { return std::make_shared<std::vector<float>>(v.encode(p)); };
+  }
   void bind(std::function<std::shared_ptr<void>()> hold) { hold_ = std::move(hold); }
-  int64_t n_embd() const { return v_.n_embd(); }
+  int64_t n_embd() const { return n_embd_; }
 
   serve::gemma4::EncodedImage operator()(std::span<const uint8_t> bytes) {
     uint64_t h = 0xcbf29ce484222325ull ^ uint64_t(tokens_);  // FNV-1a over the bytes, from the budget
@@ -227,7 +247,7 @@ class ImageService {
     }
     image::Patches patches;
     try {
-      patches = image::prepare(image::decode(bytes), v_.spec(tokens_));
+      patches = prepare_(image::decode(bytes));
     } catch (const std::invalid_argument& e) {
       throw serve::gemma4::ApiError(400, "invalid_request_error", "unsupported_content", std::string("image_url: ") + e.what());
     }
@@ -236,25 +256,25 @@ class ImageService {
     std::shared_ptr<void> hold;
     if (hold_) hold = hold_();
     const auto t1 = std::chrono::steady_clock::now();
-    model::DeviceRows rows;
+    std::shared_ptr<std::vector<float>> host;
     try {
-      rows = v_.encode(patches);
+      host = encode_(patches);
     } catch (const std::invalid_argument& e) {
       throw serve::gemma4::ApiError(400, "invalid_request_error", "unsupported_content", std::string("image_url: ") + e.what());
     }
-    auto host = std::make_shared<std::vector<float>>(size_t(rows.n * rows.dim));
-    q_.memcpy(host->data(), rows.data.get(), host->size() * sizeof(float)).wait();
+    const int64_t n = int64_t(host->size()) / n_embd_;
+    hold.reset();  // the rows are on the host: the scheduler goes on while they are checked and cached
     size_t bad = 0;
     for (float x : *host) bad += !std::isfinite(x);
     if (bad) log_line(fmt("image: %zu of %zu row values are not finite", bad, host->size()));
-    log_line(fmt("image: %dx%d patches, %lld rows | wait %.2f s, encoded in %.2f s", patches.cols, patches.rows, (long long)rows.n,
+    log_line(fmt("image: %dx%d patches, %lld rows | wait %.2f s, encoded in %.2f s", patches.cols, patches.rows, (long long)n,
                  seconds(t1 - t0), seconds(std::chrono::steady_clock::now() - t1)));
     {
       std::lock_guard ck(cache_mu_);
-      cache_.push_front({h, int64_t(bytes.size()), rows.n, host});
+      cache_.push_front({h, int64_t(bytes.size()), n, host});
       if (cache_.size() > 6) cache_.pop_back();
     }
-    return {h, rows.n, host};
+    return {h, n, host};
   }
 
  private:
@@ -263,9 +283,10 @@ class ImageService {
     int64_t n_bytes, n;
     std::shared_ptr<const std::vector<float>> rows;
   };
-  sycl::queue& q_;
-  model::VisionGemma4V& v_;
   int tokens_;
+  int64_t n_embd_;
+  std::function<image::Patches(const image::Rgb&)> prepare_;
+  std::function<std::shared_ptr<std::vector<float>>(const image::Patches&)> encode_;
   std::function<std::shared_ptr<void>()> hold_;
   std::mutex enc_mu_, cache_mu_;
   std::list<Entry> cache_;
@@ -417,6 +438,7 @@ void serve_embeddings(httplib::Server& http, model::EmbedGemma2& m, const text::
 int main(int argc, char** argv) {
   std::string model_path, alias = "nemotron-3.5-bolt-e4b", host = "127.0.0.1", embed_path, embed_alias = "embeddinggemma-2", mmproj_path, embed_mmproj_path;
   int image_tokens = 280;
+  int image_max_tokens = 1024;  // Inkling 2's chat images (--image-max-tokens, as llama.cpp's)
   std::string draft_path;
   int draft_block = 0;
   int64_t draft_full_context = 0;  // a plain draft's full-attention layer: positions per slot it keeps (0: the draft code's 32,768)
@@ -464,6 +486,7 @@ int main(int argc, char** argv) {
     else if (a == "--mmproj") mmproj_path = next();
     else if (a == "--embed-mmproj") embed_mmproj_path = next();
     else if (a == "--image-tokens") image_tokens = std::atoi(next().c_str());
+    else if (a == "--image-max-tokens") image_max_tokens = std::atoi(next().c_str());
     else if (a == "--kv-int8") kv_int8 = true;
     else if (a == "--kv-fp16") kv_int8 = false;
     else if (a == "--preserve-thinking") {
@@ -510,7 +533,7 @@ int main(int argc, char** argv) {
     } else {
       std::fprintf(stderr, "usage: eklow-server --model GGUF [--alias NAME] [--host ADDR] [--port N] [--slots N] [--ctx N] "
                            "[--batch N] [--chunk N] [--kv-int8 | --kv-fp16] [--preserve-thinking on|off] [--mmproj GGUF] [--embed-model GGUF --embed-port N [--embed-alias NAME] [--embed-mmproj GGUF]] "
-                           "[--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] "
+                           "[--draft GGUF [--draft-block B] [--draft-full-context N] [--draft-sliding-causal -1|0|1]] [--image-tokens N] [--image-max-tokens N] "
                            "[--checker-reader GGUF --checker-vega DIR [--checker-policy DIR] --checker-port N [--checker-alias NAME] [--checker-max-tokens N]] "
                            "[--rerank-model GGUF --rerank-port N [--rerank-alias NAME] [--rerank-max-tokens N]] [--log-interval S] [--keepalive S] "
                            "[--prefix-cache DIR --prefix-cache-key FILE [--prefix-cache-gib N] [--prefix-cache-buffers N]] "
@@ -547,6 +570,10 @@ int main(int argc, char** argv) {
     std::fprintf(stderr, "eklow-server: --image-tokens must be 70 to 1120\n");
     return 2;
   }
+  if (image_max_tokens < 1 || image_max_tokens > 4096) {
+    std::fprintf(stderr, "eklow-server: --image-max-tokens must be 1 to 4096\n");
+    return 2;
+  }
   try {
     auto t0 = std::chrono::steady_clock::now();
     auto file = gguf::File::open(model_path);
@@ -567,8 +594,8 @@ int main(int argc, char** argv) {
     if (inkling) {
       // M4 of the port (DECISIONS 2026-11-24): text and tools. Its vision is M5 and its MTP draft M6; it keeps no disk prefix
       // cache (its sliding rings and convolution states are rewound from checkpoints, engine_inkling.hpp).
-      if (!draft_path.empty() || !mmproj_path.empty() || !prefix_dir.empty() || kv_int8 || preserve_thinking)
-        throw std::runtime_error("Inkling 2 Mini is served without --draft, --mmproj, --prefix-cache, --kv-int8 and --preserve-thinking");
+      if (!draft_path.empty() || !prefix_dir.empty() || kv_int8 || preserve_thinking)
+        throw std::runtime_error("Inkling 2 Mini is served without --draft, --prefix-cache, --kv-int8 and --preserve-thinking");
       if (!tmpl || !text::is_inkling_template(tmpl->as_string()))
         throw std::runtime_error(model_path + ": its chat template is not Inkling 2 Mini's, which eklow ports");
       if (const gguf::Value* n = file.find("inkling2_loop.context_length"); n && ctx > n->as_int())
@@ -633,8 +660,18 @@ int main(int argc, char** argv) {
     std::unique_ptr<gguf::File> vision_file, embed_vision_file;
     std::unique_ptr<sycl::queue> vision_q, embed_vision_q;
     std::unique_ptr<model::VisionGemma4V> vision, embed_vision;
+    std::unique_ptr<model::VisionInkling2V> ivision;
     std::unique_ptr<ImageService> images, embed_images;
-    if (!mmproj_path.empty()) {
+    if (!mmproj_path.empty() && inkling) {
+      vision_file = std::make_unique<gguf::File>(gguf::File::open(mmproj_path));
+      vision_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
+      // The weights in pinned host memory, copied in a layer at a time per encode, and the activations in the engine's
+      // step buffers (idle while the scheduler is held): the experts keep the card (DECISIONS 2026-11-25, "Inkling M5").
+      ivision = std::make_unique<model::VisionInkling2V>(*vision_q, *vision_file, true);
+      std::fprintf(stderr, "eklow-server: vision projector %s, %.0f MiB on the card and %.0f MiB of weights in host memory, images of up to %d tokens\n",
+                   mmproj_path.c_str(), double(ivision->bytes()) / 1048576.0, double(ivision->host_bytes()) / 1048576.0, image_max_tokens);
+      images = std::make_unique<ImageService>(*ivision, image_max_tokens);
+    } else if (!mmproj_path.empty()) {
       vision_file = std::make_unique<gguf::File>(gguf::File::open(mmproj_path));
       vision_q = std::make_unique<sycl::queue>(q.get_device(), sycl::property::queue::in_order());
       vision = std::make_unique<model::VisionGemma4V>(*vision_q, *vision_file);
@@ -721,6 +758,15 @@ int main(int argc, char** argv) {
       ic.pool_positions = (kv_pool > 0 ? (kv_pool + attn::kPage - 1) / attn::kPage * attn::kPage : max_ctx);
       ic.loopcd = float(loopcd);
       ieng = std::make_unique<engine::inkling::Engine>(q, file, ic);
+      if (ivision) {
+        if (ivision->n_out() != ieng->model().n_embd)
+          throw std::runtime_error(mmproj_path + ": projects to " + std::to_string(ivision->n_out()) + " but the model's width is " +
+                                   std::to_string(ieng->model().n_embd));
+        ivision->use_workspace(ieng->idle_workspace(), [e = ieng.get()] { e->drain(); });
+        if (!ivision->fits(image_max_tokens))
+          throw std::runtime_error("--image-max-tokens " + std::to_string(image_max_tokens) + ": the encoder's activations for an image that large do not fit the engine's step buffers at --step-tokens " +
+                                   std::to_string(ic.max_step) + "; lower it");
+      }
       std::fprintf(stderr, "eklow-server: %s on %s, %.2f GiB of weights on the card, %lld cold experts (%.2f GiB) on the CPU with %d threads, %.2f GiB of caches (%d slots of %lld), %.1f s\n",
                    alias.c_str(), q.get_device().get_info<sycl::info::device::name>().c_str(), ieng->weight_bytes() / GiB, (long long)ieng->cold_experts(),
                    ieng->host_expert_bytes() / GiB, cpu_threads, ieng->cache_bytes() / GiB, slots, (long long)max_ctx,
@@ -825,6 +871,7 @@ int main(int argc, char** argv) {
     serve::apply_gguf_sampling(file, sampling);
     serve::gemma4::ChatDefaults defaults{sampling, max_ctx, which.value_or(text::Gemma4Template::Bolt), preserve_thinking};
     const serve::inkling::ChatDefaults idefaults{sampling};
+    const serve::gemma4::ImageEncoder encode_image = [&](std::span<const uint8_t> bytes) { return (*images)(bytes); };
     std::fprintf(stderr, "eklow-server: sampling defaults: temperature %.2f, top_k %d, top_p %.2f, min_p %.2f, penalty_last_n %d, repeat %.2f\n",
                  double(sampling.temperature), int(sampling.top_k), double(sampling.top_p), double(sampling.min_p), int(sampling.penalty_last_n),
                  double(sampling.repeat_penalty));
@@ -905,12 +952,13 @@ int main(int argc, char** argv) {
           } catch (const std::exception& e) {
             throw serve::gemma4::ApiError(400, "invalid_request_error", "", std::string("the body is not JSON: ") + e.what());
           }
-          cr = serve::inkling::parse_chat(body, *itok, idefaults);
+          cr = serve::inkling::parse_chat(body, *itok, idefaults, images ? &encode_image : nullptr);
         } catch (const serve::gemma4::ApiError& e) {
           return fail(e);
         }
         auto r = std::make_shared<serve::inkling::Request>();
         r->prompt = std::move(cr.prompt);
+        r->images = std::move(cr.images);
         r->prefill = std::move(cr.prefill);
         r->sampling = cr.sampling;
         r->max_tokens = cr.max_tokens;

@@ -29,7 +29,7 @@ std::vector<int32_t> encode(const text::InklingTokenizer& tok, const std::vector
 
 }  // namespace
 
-ChatRequest parse_chat(const json::Value& body, const text::InklingTokenizer& tok, const ChatDefaults& d) {
+ChatRequest parse_chat(const json::Value& body, const text::InklingTokenizer& tok, const ChatDefaults& d, const gemma4::ImageEncoder* images) {
   if (!body.is_object()) throw bad("the body must be a JSON object");
   ChatRequest r;
   r.sampling = d.sampling;
@@ -38,13 +38,47 @@ ChatRequest parse_chat(const json::Value& body, const text::InklingTokenizer& to
 
   text::InklingChat chat;
   try {
-    chat = text::render_inkling_request(body);
+    chat = text::render_inkling_request(body, images != nullptr);
   } catch (const text::ChatError& e) {
     throw bad(e.what());
   }
   r.prompt = encode(tok, chat.parts);
   if (!chat.generation_parts.empty()) r.prefill = encode(tok, chat.generation_parts);
   r.mode = chat.mode;
+
+  // Images (only with an encoder: the renderer refuses image_url parts without): the parts' bytes in the order the
+  // template wrote their placeholders (messages, then parts), each encoded and its placeholder expanded to its rows.
+  std::vector<std::vector<uint8_t>> pictures;
+  if (const json::Value* msgs = field(body, "messages"); images && msgs && msgs->is_array())
+    for (const auto& m : msgs->items()) {
+      const json::Value* content = m.is_object() ? field(m, "content") : nullptr;
+      if (!content || !content->is_array()) continue;
+      for (const auto& part : content->items()) {
+        const json::Value* type = part.is_object() ? field(part, "type") : nullptr;
+        if (!type || !type->is_string() || type->as_string() != "image_url") continue;
+        const json::Value* iu = field(part, "image_url");
+        const json::Value* url = iu && iu->is_object() ? iu->find("url") : nullptr;
+        if (!url || !url->is_string()) throw bad("an image_url part needs image_url.url");
+        pictures.push_back(gemma4::image_bytes(url->as_string()));
+      }
+    }
+  if (!pictures.empty()) {
+    const int32_t placeholder = tok.id(text::kInklingImagePlaceholder);
+    std::vector<int32_t> out;
+    size_t k = 0;
+    for (const int32_t id : r.prompt) {
+      if (id != placeholder) {
+        out.push_back(id);
+        continue;
+      }
+      if (k >= pictures.size()) throw bad("more image placeholders than image parts");
+      const gemma4::EncodedImage e = (*images)(pictures[k++]);
+      r.images.push_back({int64_t(out.size()), e.n, e.rows});
+      for (int64_t row = 0; row < e.n; ++row) out.push_back(gemma4::image_row_id(e.hash, row));
+    }
+    if (k != pictures.size()) throw bad("image parts without their placeholders in the prompt");
+    r.prompt = std::move(out);
+  }
 
   // llama-server's sampling fields over the server's defaults; a random seed unless one is sent.
   r.sampling.seed = std::random_device{}();

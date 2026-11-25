@@ -173,6 +173,7 @@ void Scheduler::start(int s, std::shared_ptr<Request> r, int64_t lcp) {
   // else from its latest checkpoint at or before the shared prefix, else from the start.
   int64_t keep = std::min(lcp, P - 1);
   const int64_t len = eng_.length(s);
+  auto piece = [&](int32_t id) { return id < 0 ? std::string("<image>") : tok_.bytes(id); };  // image rows hold ids below zero
   if (keep < len) {
     int64_t point = -1;
     for (int64_t c : eng_.checkpoint_positions(s))
@@ -180,7 +181,7 @@ void Scheduler::start(int s, std::shared_ptr<Request> r, int64_t lcp) {
     if (point >= 0 && eng_.rewind(s, point)) {
       if (keep >= 256 && lcp < int64_t(q.tokens.size()) && lcp < P)
         std::fprintf(stderr, "eklow-server: prefix: the slot's sequence (%zu tokens) and the prompt (%lld) part at token %lld: sampled %s, prompt %s; resuming at %lld\n",
-                     q.tokens.size(), (long long)P, (long long)lcp, tok_.bytes(q.tokens[size_t(lcp)]).c_str(), tok_.bytes(r->prompt[size_t(lcp)]).c_str(),
+                     q.tokens.size(), (long long)P, (long long)lcp, piece(q.tokens[size_t(lcp)]).c_str(), piece(r->prompt[size_t(lcp)]).c_str(),
                      (long long)point);
       keep = point;
     } else {
@@ -382,6 +383,12 @@ void Scheduler::step() {
       chunks.push_back({int(s), at,
                         std::vector<int32_t>(q.req->prompt.begin() + std::ptrdiff_t(fed), q.req->prompt.begin() + std::ptrdiff_t(fed + n)),
                         last ? 1 : 0});
+      // the images' rows in the chunk: an image decodes causally, as text, so a chunk may hold part of one (a long image,
+      // a step's end, a rewind to a checkpoint inside one)
+      for (const auto& im : q.req->images) {
+        const int64_t lo = std::max(im.start, fed), hi = std::min(im.start + im.n, fed + n);
+        if (lo < hi) chunks.back().images.push_back({lo - fed, hi - lo, im.rows->data() + (lo - im.start) * eng_.model().n_embd});
+      }
       items.push_back({true, int(s), last ? 1 : 0});
       budget -= n, fed += n, at += n;
       // the checkpoint goes where the step ends: none of the slot's chunks after the one that ends before the last token
@@ -508,6 +515,7 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
     RequestLog l;
     l.tag = q.req->tag, l.reason = q.req->cancelled() ? "cancelled" : e.finish_reason, l.error = error;
     l.prompt_tokens = e.prompt_tokens, l.cached_tokens = e.cached_tokens, l.completion_tokens = e.completion_tokens;
+    for (const auto& im : q.req->images) l.image_tokens += im.n;
     l.prefill_only = q.req->prefill_only, l.held = e.held;
     if (q.req->prefill_only) l.prefill_s = seconds(now - q.admitted);
     l.queue_s = seconds(q.admitted - q.req->submitted);

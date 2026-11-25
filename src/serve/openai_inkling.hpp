@@ -32,9 +32,14 @@ struct ChatRequest {
   bool prefill_only = false;  // max_tokens (or max_completion_tokens) 0: the prompt into a slot, nothing generated
   std::vector<std::string> stop;
   bool stream = false, include_usage = false;
+  // The prompt's images (M5): each image part's placeholder (<|unused_200054|>, as the template writes it) became the
+  // image's rows, ids below zero naming them (gemma4::image_row_id), in the order of the parts.
+  std::vector<gemma4::ImageInput> images;
 };
 
 // `body` as text::parse_llama_json reads it. Throws ApiError (400) for what llama-server refuses or the template raises.
-ChatRequest parse_chat(const json::Value& body, const text::InklingTokenizer& tok, const ChatDefaults& d);
+// With `images` (a server with Inkling's vision tower) each image part is encoded; without, an image part is a 400.
+ChatRequest parse_chat(const json::Value& body, const text::InklingTokenizer& tok, const ChatDefaults& d,
+                       const gemma4::ImageEncoder* images = nullptr);
 
 }  // namespace eklow::serve::inkling

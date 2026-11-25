@@ -34,11 +34,13 @@
 namespace eklow::serve::inkling {
 
 using gemma4::Event;
+using gemma4::ImageInput;
 using gemma4::RequestLog;
 
 class Request {
  public:
   std::vector<int32_t> prompt;
+  std::vector<gemma4::ImageInput> images;  // the prompt's image spans (their positions hold ids below zero naming the rows)
   std::vector<int32_t> prefill;    // the prompt's last tokens that open the assistant turn being continued (the parser's)
   text::InklingMode mode;          // for the output parser
   SamplingParams sampling;
