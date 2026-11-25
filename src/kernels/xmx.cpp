@@ -199,7 +199,7 @@ void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a, bool fp
   }
   int8_t* qd = a.q;
   float* sd = a.s;
-  q.parallel_for(sycl::range<2>(size_t(m_pad), size_t(kb)), [=](sycl::id<2> id) {
+  const sycl::event ev = q.parallel_for(sycl::range<2>(size_t(m_pad), size_t(kb)), [=](sycl::id<2> id) {
      const int64_t r = int64_t(id[0]), b = int64_t(id[1]);
      int8_t* dst = qd + ((r / 8) * kb + b) * kATileBytes + (r % 8) * 32;
      float* sc = sd + ((r / 8) * kb + b) * 8 + r % 8;
@@ -215,6 +215,7 @@ void quantize(sycl::queue& q, const float* x, int64_t m, Activations& a, bool fp
      }
      *sc = quantize_run(v, amax, dst);
    });
+  if (g_event_log) g_event_log->push_back(ev);
 }
 
 void set_rows(Activations& a, int64_t m, int64_t k, bool fp16) {

@@ -117,10 +117,23 @@ inline float quantize_run(const float (&x)[N], float amax, int8_t* dst) {
 // never stores their results.
 void set_rows(Activations& a, int64_t m, int64_t k, bool fp16 = false);
 
+
+// A measuring hook: when set, the int8 decode path (quantize, the GEMVs, matmul_fused) appends each kernel's event here.
+extern std::vector<sycl::event>* g_event_log;
 // out[m][n] = a . w^T, fp32, row-major. Up to 256 int8 rows run K-split GEMV schedules; fp16
 // activations the shared-memory GEMM (n a multiple of 128). quantize and matmul only enqueue (the
 // queue must be in order); the caller waits.
 void matmul(sycl::queue& q, const Activations& a, const Weight& w, float* out);
+
+// Quantize + decode GEMV in one launch (src/kernels/xmx_fused.hpp), for 1 to 4 Q8_0I matrices of one K and 1 or 2 rows:
+// out_i[m][n_i] = quantize(x_i[m][k]) . w_i^T, each job with its own fp32 activations (they may be the same pointer).
+// The activations are quantized as `quantize` does, so the results equal quantize + matmul's. Only enqueues.
+struct FusedJob {
+  const Weight* w;
+  const float* x;
+  float* out;
+};
+void matmul_fused(sycl::queue& q, const FusedJob* jobs, int njobs, int64_t m);
 
 // The activation of the fused GLU kernels: the GeGLU (gelu_tanh(gate) * up) or Qwen's SwiGLU (silu(gate) * up).
 // The kernels named geglu serve both; the default is GeGLU, so existing callers are unchanged.

@@ -96,7 +96,7 @@ void gemv_t(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
   const float* as = a.s;
   const uint8_t* bt = w.tiles;
   const uint8_t* bm = reinterpret_cast<const uint8_t*>(w.scales);
-  q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(ng), size_t(row_groups), size_t(T)), sycl::range<3>(1, 1, size_t(T))),
+  const sycl::event ev = q.parallel_for(sycl::nd_range<3>(sycl::range<3>(size_t(ng), size_t(row_groups), size_t(T)), sycl::range<3>(1, 1, size_t(T))),
                  [=](sycl::nd_item<3> it) SYCL_ESIMD_KERNEL {
                    constexpr int slm = slm_base + (T > 1 ? T * slm_part : 0);
                    if constexpr (slm > 0) esimd::slm_init<slm>();
@@ -135,6 +135,7 @@ void gemv_t(sycl::queue& q, const Activations& a, const Weight& w, float* out) {
                      }
                    }
                  });
+  if (g_event_log) g_event_log->push_back(ev);
 }
 
 template <WeightFormat F, int R, int RT>

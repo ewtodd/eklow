@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -58,6 +59,16 @@ const Shape kShapes[] = {
     {"attn_k / attn_v (sliding)", 2560, 512}, {"attn_q (global)", 2560, 4096}, {"attn_k / attn_v (global)", 2560, 1024},
     {"attn_output (global)", 4096, 2560}, {"head", 2560, 262144},
 };
+
+// Inkling 2 Mini's decode matrices (hidden 2304): Q|R|gate stacked, K, V, O, the head (padded to 8 columns). --inkling swaps them
+// in for Bolt's in --bench and adds them to --check.
+const Shape kInkling[] = {
+    {"Q|R|gate", 2304, 6528}, {"K", 2304, 1024}, {"V", 2304, 1024}, {"O", 3072, 2304}, {"head", 2304, 200064},
+};
+bool g_inkling = false;
+inline std::pair<const Shape*, const Shape*> shapes() {
+  return g_inkling ? std::make_pair(std::begin(kInkling), std::end(kInkling)) : std::make_pair(std::begin(kShapes), std::end(kShapes));
+}
 
 std::vector<int64_t> parse_list(const std::string& s) {
   std::vector<int64_t> v;
@@ -108,7 +119,7 @@ Mat make_mat(sycl::queue& q, const FormatInfo& f, int64_t n, int64_t k, bool int
 
 // Copies of a repacked weight (a pool larger than L2, so that every call reads from VRAM).
 std::vector<xmx::Weight> make_pool(sycl::queue& q, const FormatInfo& f, const xmx::Weight& w, uint64_t bytes, int64_t target_bytes) {
-  const int64_t copies = std::clamp<int64_t>(target_bytes / int64_t(bytes) + 1, 1, 64);
+  const int64_t copies = std::clamp<int64_t>(target_bytes / int64_t(bytes) + 1, 1, 1024);
   const uint64_t tb = f.format == xmx::WeightFormat::Q4_0 ? xmx::weight_tile_bytes(w.k, w.n) : xmx::weight_tile_bytes(f.format, w.k, w.n);
   const uint64_t sb = bytes - tb;
   std::vector<xmx::Weight> pool{w};
@@ -134,6 +145,33 @@ double best_time(sycl::queue& q, int calls, F&& fn) {
     q.wait();
     const double dt = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count() / calls;
     if (rep) best = std::min(best, dt);
+  }
+  return best;
+}
+
+// Device time of fn(i) calls: the sum of its kernels' own run times (no host submission or gaps), best of 4 reps, in seconds a call.
+template <class F>
+double dev_time(sycl::queue& q, int calls, F&& fn) {
+  double best = 1e30;
+  for (int rep = 0; rep < 5; ++rep) {
+    std::vector<sycl::event> log;
+    xmx::g_event_log = &log;
+    for (int i = 0; i < calls; ++i) {
+      if (const char* sp = std::getenv("EKLOW_SPIN_US")) {  // a host slower than the card: gaps between submissions
+        const auto t0 = std::chrono::steady_clock::now();
+        while (std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() < std::atof(sp)) {}
+      }
+      fn(i);
+      if (const char* idle = std::getenv("EKLOW_IDLE_US")) {  // the engine's card idles between a layer's kernels: time them after a pause
+        q.wait();
+        std::this_thread::sleep_for(std::chrono::microseconds(std::atoll(idle)));
+      }
+    }
+    q.wait();
+    xmx::g_event_log = nullptr;
+    double sum = 0;
+    for (auto& e : log) sum += double(e.get_profiling_info<sycl::info::event_profiling::command_end>() - e.get_profiling_info<sycl::info::event_profiling::command_start>()) * 1e-9;
+    if (rep) best = std::min(best, sum / calls);
   }
   return best;
 }
@@ -335,14 +373,16 @@ void check_rows_of(sycl::queue& q, const FormatInfo& f, json::Writer& jw) {
 }
 
 void bench_decode(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>& rows, json::Writer& jw) {
-  for (const Shape& s : kShapes) {
+  for (const Shape* sp = shapes().first; sp != shapes().second; ++sp) {
+    const Shape& s = *sp;
     if (s.k % refs::block_k(f.type)) continue;
     const bool head = s.n > 100000;
     Mat mat = make_mat(q, f, s.n, s.k, false);
-    auto pool = make_pool(q, f, mat.w, mat.bytes, 96ll << 20);
+    auto pool = make_pool(q, f, mat.w, mat.bytes, (std::getenv("EKLOW_POOL_MB") ? std::atoll(std::getenv("EKLOW_POOL_MB")) : 96ll) << 20);
     const int64_t max_m = *std::max_element(rows.begin(), rows.end());
     xmx::Activations act = xmx::alloc_activations(q, max_m, s.k);
     auto* xd = sycl::malloc_device<float>(size_t(max_m * s.k), q);
+    auto* yd2 = sycl::malloc_device<float>(size_t(max_m * s.n), q);
     auto* yd = sycl::malloc_device<float>(size_t(max_m * s.n), q);
     for (int64_t m : rows) {
       const auto x = random_x(m, s.k);
@@ -351,8 +391,49 @@ void bench_decode(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t
       const int calls = std::max<int>(8, int(pool.size()) * 2);
       const double t = best_time(q, calls, [&](int i) { xmx::matmul(q, act, pool[size_t(i) % pool.size()], yd); });
       const double gbps = double(mat.bytes) / t / 1e9;
-      std::printf("  %-8s %-24s %4lldx%-7lld rows %3lld  %9.4f ms %8.0f GB/s  (%.3f bits a weight)\n", f.name, s.name, (long long)s.k, (long long)s.n,
+      std::printf("  %-8s %-24s %4lldx%-7lld rows %3lld  %9.4f ms %8.0f GB/s  (%.3f bits a weight)", f.name, s.name, (long long)s.k, (long long)s.n,
                   (long long)m, t * 1e3, gbps, double(mat.bytes) * 8 / (double(s.k) * double(s.n)));
+      const double dt = dev_time(q, calls, [&](int i) { xmx::matmul(q, act, pool[size_t(i) % pool.size()], yd); });
+      if (g_inkling) std::printf("  [device %8.4f ms %6.0f GB/s]", dt * 1e3, double(mat.bytes) / dt / 1e9);
+      if (g_inkling) {  // the engine's pair: quantize, then matmul
+        const double tq = best_time(q, calls, [&](int i) {
+          xmx::quantize(q, xd, m, act);
+          xmx::matmul(q, act, pool[size_t(i) % pool.size()], yd);
+        });
+        std::printf("  | quantize+matmul %9.4f ms %6.0f GB/s", tq * 1e3, double(mat.bytes) / tq / 1e9);
+        const double dq = dev_time(q, calls, [&](int i) {
+          xmx::quantize(q, xd, m, act);
+          xmx::matmul(q, act, pool[size_t(i) % pool.size()], yd);
+        });
+        std::printf("  [device %8.4f ms %6.0f GB/s]", dq * 1e3, double(mat.bytes) / dq / 1e9);
+      }
+      std::printf("\n");
+      if (g_inkling && f.format == xmx::WeightFormat::Q8_0I && m <= 2) {  // quantize + GEMV in one launch
+        const double tf = best_time(q, calls, [&](int i) {
+          xmx::FusedJob job{&pool[size_t(i) % pool.size()], xd, yd2};
+          xmx::matmul_fused(q, &job, 1, m);
+        });
+        const double tfd = dev_time(q, calls, [&](int i) {
+          xmx::FusedJob job{&pool[size_t(i) % pool.size()], xd, yd2};
+          xmx::matmul_fused(q, &job, 1, m);
+        });
+        // against quantize + matmul: the results must be identical
+        xmx::quantize(q, xd, m, act);
+        xmx::matmul(q, act, pool[0], yd);
+        xmx::FusedJob job{&pool[0], xd, yd2};
+        xmx::matmul_fused(q, &job, 1, m);
+        std::vector<float> a1(size_t(m * s.n)), a2(size_t(m * s.n));
+        q.memcpy(a1.data(), yd, a1.size() * 4).wait();
+        q.memcpy(a2.data(), yd2, a2.size() * 4).wait();
+        size_t diff = 0;  // outputs off by more than float rounding of another K split (1e-5 of the largest)
+        float amax = 0;
+        for (float v : a1) amax = std::max(amax, std::fabs(v));
+        for (size_t i = 0; i < a1.size(); ++i) diff += std::fabs(a1[i] - a2[i]) > 1e-5f * amax;
+        std::printf("  %-8s %-24s fused quantize+GEMV rows %3lld  %9.4f ms %6.0f GB/s   [device %8.4f ms %6.0f GB/s]  off by over 1e-5 of the largest, vs quantize+matmul: %zu of %zu\n", f.name, s.name,
+                    (long long)m, tf * 1e3, double(mat.bytes) / tf / 1e9, tfd * 1e3, double(mat.bytes) / tfd / 1e9, diff, a1.size());
+        jw.begin_object().kv("format", f.name).kv("shape", std::string(s.name) + " fused").kv("rows", m).kv("ms", tf * 1e3).kv("weight_gbps", double(mat.bytes) / tf / 1e9)
+            .kv("differing", int64_t(diff)).end_object();
+      }
       jw.begin_object().kv("format", f.name).kv("shape", s.name).kv("k", s.k).kv("n", s.n).kv("rows", m).kv("ms", t * 1e3).kv("weight_gbps", gbps)
           .kv("bytes", mat.bytes).end_object();
     }
@@ -365,6 +446,51 @@ void bench_decode(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t
   }
 }
 
+
+// Inkling's projections as the engine runs them: Q|R|gate, K and V from one activation (sliding layers), each quantize + matmul,
+// against one matmul_fused launch over the three.
+void bench_multi(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>& rows, json::Writer& jw) {
+  const Shape sh[3] = {kInkling[0], kInkling[1], kInkling[2]};
+  const int64_t k = sh[0].k, max_m = *std::max_element(rows.begin(), rows.end());
+  std::vector<std::vector<xmx::Weight>> pools;
+  uint64_t bytes = 0;
+  for (const Shape& s : sh) {
+    Mat mat = make_mat(q, f, s.n, s.k, false);
+    pools.push_back(make_pool(q, f, mat.w, mat.bytes, 96ll << 20));
+    bytes += mat.bytes;
+  }
+  xmx::Activations act = xmx::alloc_activations(q, max_m, k);
+  auto* xd = sycl::malloc_device<float>(size_t(max_m * k), q);
+  float* y[3];
+  for (int i = 0; i < 3; ++i) y[i] = sycl::malloc_device<float>(size_t(max_m * sh[i].n), q);
+  const int calls = 16;
+  for (int64_t m : rows) {
+    const auto x = random_x(m, k);
+    q.memcpy(xd, x.data(), x.size() * 4).wait();
+    auto sep = [&](int c) {
+      for (int i = 0; i < 3; ++i) {
+        xmx::quantize(q, xd, m, act);
+        xmx::matmul(q, act, pools[size_t(i)][size_t(c) % pools[size_t(i)].size()], y[i]);
+      }
+    };
+    auto one = [&](int c) {
+      xmx::FusedJob jobs[3];
+      for (int i = 0; i < 3; ++i) jobs[i] = {&pools[size_t(i)][size_t(c) % pools[size_t(i)].size()], xd, y[i]};
+      xmx::matmul_fused(q, jobs, 3, m);
+    };
+    const double ts = best_time(q, calls, sep), ds = dev_time(q, calls, sep), t1 = best_time(q, calls, one), d1 = dev_time(q, calls, one);
+    std::printf("  %-8s Q|R|gate + K + V, rows %lld: 3 x (quantize + matmul) %8.4f ms wall %8.4f ms device (%4.0f GB/s) | one fused launch %8.4f ms wall %8.4f ms device (%4.0f GB/s)\n",
+                f.name, (long long)m, ts * 1e3, ds * 1e3, double(bytes) / ds / 1e9, t1 * 1e3, d1 * 1e3, double(bytes) / d1 / 1e9);
+    jw.begin_object().kv("shape", "Q|R|gate+K+V").kv("rows", m).kv("separate_ms", ts * 1e3).kv("separate_dev_ms", ds * 1e3).kv("fused_ms", t1 * 1e3).kv("fused_dev_ms", d1 * 1e3).end_object();
+  }
+  for (auto& p : pools) {
+    for (size_t c = 1; c < p.size(); ++c) xmx::free_weight(q, p[c]);
+    xmx::free_weight(q, p[0]);
+  }
+  sycl::free(xd, q);
+  for (float* p : y) sycl::free(p, q);
+  xmx::free_activations(q, act);
+}
 // The existing Q6_K head (fast::matmul_q6: fp32 activations, one sub-group a column) on the head's shape, for comparison with
 // the dpas GEMV on int8 activations.
 void bench_q6_head(sycl::queue& q, const FormatInfo& f, const std::vector<int64_t>& rows, json::Writer& jw) {
@@ -445,6 +571,7 @@ int main(int argc, char** argv) {
     else if (a == "--check") check = true;
     else if (a == "--bench") bench = true;
     else if (a == "--gemm") gemm = true;
+    else if (a == "--inkling") g_inkling = true;
     else {
       std::fprintf(stderr, "usage: eklow-qfmt-test [--formats LIST] [--gguf FORMAT=PATH] [--check] [--bench] [--gemm] [--rows LIST] [--json FILE]\n");
       return 2;
@@ -452,7 +579,7 @@ int main(int argc, char** argv) {
   }
   if (!check && !bench && !gemm) check = true;
   try {
-    sycl::queue q(rt::pick_device(), {sycl::property::queue::in_order()});
+    sycl::queue q(rt::pick_device(), {sycl::property::queue::in_order(), sycl::property::queue::enable_profiling()});
     json::Writer jw;
     jw.begin_object().kv("device", q.get_device().get_info<sycl::info::device::name>());
     for (const FormatInfo& f : kFormats) {
@@ -474,8 +601,9 @@ int main(int argc, char** argv) {
             xmx::free_weight(q, mat.w);
           }
         }
-        for (const Shape& s : kShapes) {
-          if (s.n > 100000 || s.k % refs::block_k(f.type)) continue;
+        for (const Shape* sp = shapes().first; sp != shapes().second; ++sp) {
+          const Shape& s = *sp;
+          if ((s.n > 100000 && !g_inkling) || s.k % refs::block_k(f.type)) continue;
           Mat mat = make_mat(q, f, s.n, s.k, false);
           check_matmul(q, f, s.name, mat, rows, jw);
           xmx::free_weight(q, mat.w);
@@ -502,6 +630,7 @@ int main(int argc, char** argv) {
       if (bench) {
         jw.key(std::string("decode_") + f.name).begin_array();
         bench_decode(q, f, rows, jw);
+        if (g_inkling && f.format == xmx::WeightFormat::Q8_0I) bench_multi(q, f, rows, jw);
         if (f.format == xmx::WeightFormat::Q6_K) bench_q6_head(q, f, rows, jw);
         jw.end_array();
       }
