@@ -77,32 +77,42 @@ inline void row_dot(const uint8_t* row, int64_t nb, const In* in, float* out) {
         acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dot_s(w, ld(in[r].q + b * 32))), _mm256_set1_ps(d * in[r].s[b]), acc[r]);
     }
   } else {
+    __m256 cacc[R];
+    for (int r = 0; r < R; ++r) cacc[r] = _mm256_setzero_ps();
+    const __m256i one = _mm256_set1_epi8(1);
+    const __m256i pidx[8] = {_mm256_set1_epi32(0), _mm256_set1_epi32(1), _mm256_set1_epi32(2), _mm256_set1_epi32(3),
+                             _mm256_set1_epi32(4), _mm256_set1_epi32(5), _mm256_set1_epi32(6), _mm256_set1_epi32(7)};
     for (int64_t sb = 0; sb < nb; ++sb) {
       const uint8_t* blk = row + sb * 176;
       const float d = f16(blk), dmin = f16(blk + 2);
-      int sc[8], mn[8];
+      alignas(32) int sc[8], mn[8];
       for (int j = 0; j < 8; ++j) scale_min(j, blk + 4, sc[j], mn[j]);
+      // the 8 sub-blocks' scales and minimums (times d, dmin) as lanes
+      const __m256 scv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_load_si256(reinterpret_cast<const __m256i*>(sc))), _mm256_set1_ps(d));
+      const __m256 mnv = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_load_si256(reinterpret_cast<const __m256i*>(mn))), _mm256_set1_ps(dmin));
       const uint8_t* qs = blk + 48;
       const __m256i qh = ld(blk + 16);
+      __m256 ds[R];
+      for (int r = 0; r < R; ++r) {
+        const __m256 sv = _mm256_loadu_ps(in[r].s + sb * 8);
+        ds[r] = _mm256_mul_ps(scv, sv);
+        cacc[r] = _mm256_fmadd_ps(_mm256_mul_ps(mnv, _mm256_cvtepi32_ps(ld(in[r].sum + sb * 8))), sv, cacc[r]);
+      }
       for (int i = 0; i < 4; ++i) {
         const __m256i q = ld(qs + 32 * i);
         __m256i lo = _mm256_and_si256(q, m0f), hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), m0f);
         // The 5th bit: bit j of qh's byte l is the high bit of weight 32 j + l of the superblock.
-        const __m256i one = _mm256_set1_epi8(1);
         lo = _mm256_or_si256(lo, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * i), one), 4));
         hi = _mm256_or_si256(hi, _mm256_slli_epi16(_mm256_and_si256(_mm256_srli_epi16(qh, 2 * i + 1), one), 4));
         const int64_t b = sb * 8 + 2 * i;
-        const float d0 = d * float(sc[2 * i]), d1 = d * float(sc[2 * i + 1]);
-        const float m0 = dmin * float(mn[2 * i]), m1 = dmin * float(mn[2 * i + 1]);
         for (int r = 0; r < R; ++r) {
           const __m256i dl = dot_u(lo, ld(in[r].q + b * 32)), dh = dot_u(hi, ld(in[r].q + (b + 1) * 32));
-          const float s0 = in[r].s[b], s1 = in[r].s[b + 1];
-          acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dl), _mm256_set1_ps(d0 * s0), acc[r]);
-          acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dh), _mm256_set1_ps(d1 * s1), acc[r]);
-          corr[r] += m0 * s0 * float(in[r].sum[b]) + m1 * s1 * float(in[r].sum[b + 1]);
+          acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dl), _mm256_permutevar8x32_ps(ds[r], pidx[2 * i]), acc[r]);
+          acc[r] = _mm256_fmadd_ps(_mm256_cvtepi32_ps(dh), _mm256_permutevar8x32_ps(ds[r], pidx[2 * i + 1]), acc[r]);
         }
       }
     }
+    for (int r = 0; r < R; ++r) corr[r] = hsum(cacc[r]);
   }
   for (int r = 0; r < R; ++r) out[r] = hsum(acc[r]) - corr[r];
 }

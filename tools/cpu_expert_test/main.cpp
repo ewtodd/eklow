@@ -355,7 +355,7 @@ int main(int argc, char** argv) {
         std::vector<float> out(size_t(8) * size_t(NXMAX) * size_t(E));
         auto run = [&](int nx, int ne, bool together, int rep) {
           std::vector<cpu::ExpertRef> es;
-          for (int i = 0; i < ne; ++i) es.push_back(ref_of((int64_t(rep) * 37 + i * 13 + 5) % NE));
+          for (int i = 0; i < ne; ++i) es.push_back(ref_of(std::getenv("EKLOW_TEST_HOT") ? int64_t(i) : (int64_t(rep) * 37 + i * 13 + 5) % NE));
           std::vector<const float*> xp(size_t(nx), nullptr);
           for (int j = 0; j < nx; ++j) xp[size_t(j)] = &xs[size_t(j) * size_t(E)];
           std::vector<float*> yp(size_t(ne) * size_t(nx), nullptr);
@@ -378,6 +378,8 @@ int main(int argc, char** argv) {
         bench("one expert", 1, 1, false);
         bench("8 experts one after another", 1, 8, false);
         bench("8 experts in one pass", 1, 8, true);
+        bench("2 experts in one pass", 1, 2, true);
+        for (int ne : {1, 2, 8}) bench("two tokens, one pass", 2, ne, true);
         for (int64_t nx : nxs) bench("one expert, many inputs", int(nx), 1, false);
       }
     }
