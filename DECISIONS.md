@@ -4490,3 +4490,61 @@ threads read shared memory 24 times for 32 dpas (shared-memory bound at about a 
 tile than 128 x 128 does not fit the 64 KB of shared memory a work-group may have with double buffering (128 x 256 and 256
 x 128 failed to build). The next step there is a different kernel: activation tiles loaded into registers with the
 card's 2D block loads instead of through shared memory.
+
+## 2026-11-25 — Inkling decode: the experts' few-token path (`moe::ffn` up to 16 tokens), 0.193 -> 0.158 ms a layer
+
+The lead asked for the hot experts' kernels at decode to reach >= 330 GB/s at one token (all 8 experts hot: layer 6 NVFP4,
+layer 20 Q5_K gate_up + Q8_0 down). Measured on fiona (`eklow-moe-test`, 300 reps back to back, the card to ourselves).
+
+**Where a one-token call went** (layer 6, 0.193 ms, 35.8 MB): `group` ~35 us (one work-group of 128 items zeroing and
+filling a 128 x 128 histogram, then item 0 laying out the tiles serially), gate_up ~85 (24 MB), down ~48 (12 MB), gather and
+combine ~3 and ~7. Ablations on the GEMVs (kernel run 3 times in the step, marginal cost of the extra runs; so each number is
+that kernel alone): none of the decode ALU work matters, since removing the e2m1 unpack, the scale conversion, the dpas or the
+A loads (separately and together) changes no time, and neither do the epilogue, the shared-memory reduction and barrier, or
+the dependent `tl` loads; K splits of 2 to 12 threads and loads 1 to 3 steps ahead are flat too (4 steps spills on Q5_K).
+The GEMVs are memory-pattern bound: a fit over 1 and 2 tokens gives ~3.0 us per MB (333 GB/s) plus ~12 us a kernel.
+
+**The ceiling.** A bare streaming kernel (`block_load` of 256 B, contiguous per thread, 9,216 to 18,432 threads, back to back
+on distinct data) reads 24 MB in 72 us and 36 MB in 108 us: 333 to 350 GB/s, not the 400+ of the first estimate (the 2-token
+step's marginal rate reaches 400 only because its fixed costs are spread). 4,096 threads exactly is the worst shape (82-93 us
+for 24 MB), 4,608 (ours) 78-80. So one token's 35.8 MB cannot go below ~105 us (>= 330 GB/s) even with no other work; the
+three-kernel chain (group, gate_up, down, plus gather and combine) costs ~12 us of ramp and drain a dependent kernel on top
+of its bytes, and an empty kernel ~2.5 us (device time, 1.6 us to submit).
+
+**Kept** (`moe.cpp`):
+- `group_few`: for up to 128 pairs (1 to 16 tokens) one work-group of P items; item p counts the pairs of its expert and
+  those before it (its rank in the segment, in shared memory) and sums the padded segment and tile counts of the experts
+  below its own; the same segments, tiles and rows as `group`, whose 128 x 128 histogram stays for longer steps. ~35 -> ~6 us.
+- `Combine`: a token's rows and weights come in with one gather each and the rows' loads go out four at a time before the
+  sums (the chain of scalar load, branch and block load per expert is gone); the sums keep the reference's order.
+
+| layer, tokens | before ms (GB/s) | after ms (GB/s) |
+|---|---|---|
+| 6, 1 | 0.193 (185) | 0.158 (227) |
+| 6, 2 | 0.297 (241) | 0.263 (272) |
+| 6, 16 | 1.051 (302) | 1.028 (309) |
+| 20, 1 | 0.271 (201) | 0.235 (232) |
+| 20, 2 | 0.413 (247) | 0.377 (271) |
+| 20, 16 | 1.894 (291) | 1.774 (311) |
+
+At 75% of the experts hot the times are the same as all hot (the test's routing puts every pair on the card at 1 to 16 tokens
+there; 50% and 25% fall as before, with the pairs left). The checks are unchanged (rel L2 3.9e-4 and 1.2e-3 medians, 4.1e-4
+and 1.34e-3 max), rebased copies identical, layers 0, 6, 17, 19, 20, 23 at 1, 2, 3, 8, 16, 17 and 32 tokens, all hot and at
+75, 50 and 25% hot. In the engine a decode step applies the experts 48 times: ~35 us a call is ~1.7 ms of a 54 ms token.
+
+**Rejected** (measured, then dropped):
+- Fusing three kernels into two (`group_dec` writing 8-int tiles with each row's pair; gate_up reading the fp32 activations
+  itself, so no gather; down summing a token's experts in shared memory, so no combine): correct (same checks, identical
+  rebased copies) but slower: 168 us at one token (layer 6) against 158, and 1.76 ms against 1.03 at 16 tokens, because
+  gate_up's activation loads (64 B a row and piece, converted in the loop) cost ~15 us more than the gather saved, and a
+  work-group per column unit (144) walking the tiles in rounds of 8 with a barrier each hides far less latency than a
+  work-group per tile and unit. Layer 20's down (Q8_0, 288 units) gained from it alone (0.271 -> 0.243) but lost at 16.
+- Activation pieces loaded with the weights a step ahead (+7%), deeper weight loads with 64-byte cache-line chunks and
+  streaming L1 hints (no change), more K-split threads (flat).
+- **A single kernel for the whole call** (group, gate_up, down and combine as roles of one launch, the later roles'
+  work-groups waiting on counters the earlier ones increment, so the ramp and drain of each kernel overlap the next one's weight
+  loads) is the one change left that could reach ~120 us at one token (290 GB/s): not built. A feasibility test of the
+  mechanism (atomic counter, fence at GPU scope, polling with a bound) on this card gave correct results at 64 to 1,024
+  producers but ~1 launch in 200 timed out at 4,096 producers (work-groups waiting while producers were still undispatched),
+  atomics on one address cost 50-100 ns each (the counters must be spread), the fence's cost could not be separated from the
+  other users of the card, and a kernel that spins is a hang risk on the production card. It needs the owner's say.
