@@ -159,7 +159,7 @@ int main(int argc, char** argv) {
   int64_t cpu_max_tokens = -1;
   int cpu_threads = 0;  // 0: the engine's default (8)
   double loopcd = 0;  // LoopCD's contrast strength (Config::loopcd)
-  bool profile = false, rewind = false, twin = false;
+  bool profile = false, rewind = false, twin = false, kv_int8 = false;
   // --mmproj FILE --image FILE [--image-tokens N] (Inkling M5): the prompt's image (an oracle's tokens.json lists its
   // positions) encoded by the vision tower before the engine loads, its rows put in at those positions
   std::string mmproj, image_path;
@@ -192,6 +192,7 @@ int main(int argc, char** argv) {
     else if (a == "--twin-tokens") twin_tokens = next(), twin = true;
     else if (a == "--cpu-max-tokens") cpu_max_tokens = std::atoll(next().c_str());
     else if (a == "--loopcd") loopcd = std::atof(next().c_str());
+    else if (a == "--kv-int8") kv_int8 = true;
     else if (a == "--cpu-threads") cpu_threads = std::atoi(next().c_str());
     else {
       std::fprintf(stderr, "usage: eklow-engine-run-inkling --model GGUF --out DIR --tokens-json FILE [--tensors P,...] [--dump-last N]\n"
@@ -230,6 +231,7 @@ int main(int argc, char** argv) {
     cfg.card_reserve_bytes = uint64_t(reserve_gib * 1073741824.0);
     if (cpu_max_tokens >= 0) cfg.cpu_max_tokens = cpu_max_tokens;
     cfg.loopcd = float(loopcd);
+    cfg.kv_int8 = kv_int8;
     if (cpu_threads > 0) cfg.cpu_threads = cpu_threads;
     std::vector<float> image_rows;
     int64_t image_pos = -1, image_n = 0;
@@ -405,12 +407,15 @@ int main(int argc, char** argv) {
       const int64_t VO = eng.model().n_vocab_out;
       std::vector<int32_t> ids;
       std::vector<float> l(logits.end() - VO, logits.end());
+      const auto tg = std::chrono::steady_clock::now();
       for (int64_t i = 0; i < generate; ++i) {
         const int32_t t = int32_t(std::max_element(l.begin(), l.end()) - l.begin());
         ids.push_back(t);
         engine::inkling::Chunk c{0, n + i, {t}, 1};
         l = eng.step({c});
       }
+      const double dt = since(tg);
+      std::printf("decode: %lld greedy steps in %.2f s (%.2f tok/s)\n", (long long)generate, dt, double(generate) / dt);
       std::ofstream gj(out + "/generated.json");
       gj << "[";
       for (size_t i = 0; i < ids.size(); ++i) gj << (i ? "," : "") << ids[i];

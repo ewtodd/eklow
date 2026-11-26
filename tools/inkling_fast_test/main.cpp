@@ -8,11 +8,15 @@
 // Exit status 1 on any difference past its tolerance.
 #include <sycl/sycl.hpp>
 
+#include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <string>
 #include <cstdio>
 #include <random>
 #include <vector>
 
+#include "kernels/fast.hpp"
 #include "kernels/inkling_fast.hpp"
 #include "kernels/ref_inkling.hpp"
 #include "rt/device.hpp"
@@ -86,8 +90,8 @@ void test_route(sycl::queue& q, std::mt19937& rng) {
 void test_depth_mix(sycl::queue& q, std::mt19937& rng) {
   const int64_t E = 2304;
   std::normal_distribution<float> nd(0, 1);
-  for (int64_t rows : {int64_t(1), int64_t(7), int64_t(64), int64_t(200), int64_t(1024)})
-    for (int n_states : {1, 3, 6})
+  for (int64_t rows : {int64_t(1), int64_t(2), int64_t(3), int64_t(7), int64_t(64), int64_t(200), int64_t(1024)})
+    for (int n_states : {1, 3, 6, 8})
       for (int n_query : {1, 3}) {
         std::vector<float*> sp;
         for (int s = 0; s < n_states; ++s) {
@@ -200,12 +204,73 @@ void test_control(sycl::queue& q, std::mt19937& rng) {
   }
 }
 
+// --time: decode shapes, each a chain of dependent launches on the in-order queue, host-timed, us a call
+void time_kernels(sycl::queue& q) {
+  const int64_t E = 2304;
+  const int K = 400;
+  std::vector<float> h(size_t(8 * E), 0.5f);
+  std::vector<float*> sp;
+  for (int s = 0; s < 8; ++s) sp.push_back(dev(q, std::vector<float>(h.begin(), h.begin() + E)));
+  float* dq = dev(q, std::vector<float>(size_t(4 * E), 0.01f));
+  float* out = sycl::malloc_device<float>(size_t(4 * 2 * E), q);
+  float* scratch = sycl::malloc_device<float>(size_t(2 * ik::kMixScratch), q);
+  float* w = dev(q, std::vector<float>(size_t(E), 1.0f));
+  auto time = [&](const char* name, auto&& f) {
+    for (int i = 0; i < 20; ++i) f();
+    q.wait();
+    const auto t0 = std::chrono::steady_clock::now();
+    for (int i = 0; i < K; ++i) f();
+    q.wait();
+    std::printf("  %-44s %6.2f us\n", name, std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count() / K);
+  };
+  for (int64_t rows : {int64_t(1), int64_t(2)})
+    for (int n : {2, 4, 8})
+      for (int nq : {1, 3}) {
+        ik::States st;
+        for (int j = 0; j < n; ++j) st.p[st.n++] = sp[size_t(j)];
+        char name[80];
+        std::snprintf(name, sizeof name, "depth_mix %lld rows, %d states, %d queries", (long long)rows, n, nq);
+        time(name, [&] { ik::depth_mix(q, st, dq, nq, rows, E, 1e-6f, out, scratch); });
+      }
+  // independent kernels one after another against one launch of their rows together (the in-order queue runs the former
+  // in series)
+  float* x4 = dev(q, std::vector<float>(size_t(4 * E), 0.5f));  // rows for the batched forms
+  time("rmsnorm 1 row", [&] { fast::rmsnorm(q, sp[0], w, 1, E, 1e-6f, out); });
+  time("rmsnorm 1 row x 3 launches", [&] { for (int i = 0; i < 3; ++i) fast::rmsnorm(q, sp[0], w, 1, E, 1e-6f, out + i * E); });
+  time("rmsnorm 3 rows, 1 launch", [&] { fast::rmsnorm(q, x4, w, 3, E, 1e-6f, out); });
+  {
+    const int64_t R = 64;
+    float* dw = dev(q, std::vector<float>(size_t(2 * E * R), 0.001f));
+    float* gw = dev(q, std::vector<float>(size_t(E * R), 0.001f));
+    float* cd = sycl::malloc_device<float>(size_t(4 * R), q);
+    time("control 1 token", [&] { ik::control(q, sp[0], sp[1], dw, gw, gw, 1, E, R, 1e-6f, cd, out); });
+    time("control 1 token x 3 launches", [&] {
+      for (int i = 0; i < 3; ++i) ik::control(q, sp[0], sp[1], dw, gw, gw, 1, E, R, 1e-6f, cd + i * R, out + i * E);
+    });
+    time("control 3 tokens, 1 launch", [&] { ik::control(q, x4, x4, dw, gw, gw, 3, E, R, 1e-6f, cd, out); });
+    float* mw = dev(q, std::vector<float>(size_t(32 * E), 0.001f));
+    time("matmul_f32 32 x 2304, 1 row", [&] { ik::matmul_f32(q, mw, 32, E, sp[0], E, 1, out, 32); });
+    time("matmul_f32 32 x 2304 x 3 launches", [&] { for (int i = 0; i < 3; ++i) ik::matmul_f32(q, mw, 32, E, sp[0], E, 1, out + i * 32, 32); });
+    time("matmul_f32 32 x 2304, 3 rows, 1 launch", [&] { ik::matmul_f32(q, mw, 32, E, x4, E, 3, out, 32); });
+    for (void* p : {(void*)dw, (void*)gw, (void*)cd, (void*)mw}) sycl::free(p, q);
+  }
+  sycl::free(x4, q);
+  float* o2 = out;
+  time("trivial kernel (2,304 floats)", [&] { q.parallel_for(sycl::range<1>(size_t(E)), [=](sycl::id<1> i) { o2[i] = o2[i] * 0.5f + 1.0f; }); });
+  for (void* p : sp) sycl::free(p, q);
+  for (void* p : {(void*)dq, (void*)out, (void*)scratch, (void*)w}) sycl::free(p, q);
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   try {
     sycl::queue q(rt::pick_device(), sycl::property::queue::in_order());
     std::printf("%s\n", q.get_device().get_info<sycl::info::device::name>().c_str());
+    if (argc > 1 && std::string(argv[1]) == "--time") {
+      time_kernels(q);
+      return 0;
+    }
     std::mt19937 rng(20261124);
     test_route(q, rng);
     test_depth_mix(q, rng);
