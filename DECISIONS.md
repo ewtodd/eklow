@@ -4806,3 +4806,43 @@ last six images' rows, so a conversation's images are encoded once.
 **The budget.** `--image-max-tokens` (llama.cpp's name; `--image-tokens` stays the Gemma towers'), 1,024 by default
 (~1,280 x 1,280 pixels), where llama.cpp's default is 4,096: the borrowed buffers hold an encode of up to ~1,100 tokens
 (its widest activation, the FFN's 4,096 columns, is 72 MB at 1,024). A larger budget would need the MLP in row blocks.
+
+## 2026-11-26 — Inkling on Level Zero's v2 adapter, and uploads by kernel
+
+**Why.** llama.cpp's PR 33060 fuses Inkling's short convolution, depth mix, loop controller, L2 clip and situ chains on
+CUDA (decode +28-31%, 5,745 -> 2,584 launches a token), and Betelgeuse (a native CUDA Inkling engine on an RTX 3060, 45
+tok/s decode) has, by its CUPTI profile, ~2 ms of a 19 ms token in those small ops, where eklow's tracer puts ~16 ms
+(DECISIONS 2026-11-25, "Where Inkling's decode goes"). So first: what does a small dependent kernel cost on the A770M?
+
+**The floor.** A chain of 2,000 dependent tiny kernels (a row of 2,304 floats each), host-timed: 4.3-5 us a kernel on
+the default adapter (9 us for a one-work-group norm); ~2 us (~4 for the norm) with driver in-order lists
+(UR_L0_USE_DRIVER_INORDER_LISTS=1) or the v2 adapter (SYCL_UR_USE_LEVEL_ZERO_V2=1); a SYCL graph's replay 1.9-2.9 us,
+no better than v2; batched regular lists (UR_L0_USE_IMMEDIATE_COMMANDLISTS=0) worse. On the step at 12k in production's
+shape: decode 21.7 -> 23.9 tok/s on v2 (+10%), 23.1 on in-order lists; prefill 1,088 -> 1,170 (+7.5%).
+
+**What in-order lists broke.** Decode under them ran each step on the previous token's embedding, bit for bit, even
+with a q.wait() after the upload: a memcpy into device memory the card had read before left its kernels reading the old
+contents. Rewind (logits off by 48) and the vision tower were wrong too. eklow now copies by kernel where the card reads
+after (`kernels/kcopy`: a kernel's writes go through the card's caches): the embedding rows read from pinned host
+memory by the dequantizing kernel; the step's arrays (tokens, slots, positions, bases, logit rows, tiles, page table)
+staged in pinned memory and copied by one launch instead of eight memcpys; image rows; checkpoints and slot resets; the
+device-to-device copies; the vision tower's uploads and host weights; and the CPU's cold rows added from host memory
+with no copy. In-order lists still break decode and the tower after that (not traced further); eklow does not use them.
+
+**v2.** It was correct before these changes too: its logits differ from the default adapter's bit for bit, first
+because it leaves more memory free (5 more experts on the card, 1,653 cold against 1,658), and with the same placement
+(EKLOW_PLACEMENT_FREE_MB, for checks) still by rounding (likely the work-group sizes the runtime picks), but they are as
+close to llama.cpp (decode KL 3e-4 to 1.3e-3 on M0's three prompts, both adapters), deterministic run to run, with the
+twin and rewind checks exact; EmbeddingGemma's text and image embeddings and the reranker come out bit for bit the
+default adapter's, and the vision tower is as accurate. eklow-server (for Inkling) and eklow-engine-run-inkling set
+SYCL_UR_USE_LEVEL_ZERO_V2=1 unless it is set. Through the server in production's shape: a 12k prompt prefills at
+1,347-1,400 tok/s against 1,303-1,318 and decodes at 24.1-24.2 against 22.7; a short prompt decodes at 23.0 against 22.3.
+
+**The twin check had been wrong since M3**: with the same prompt in both slots, slot 1 decoded the prompt's own tokens
+as filler instead of the continuation, so the two slots were compared on different sequences (top-1 4/64). Not the
+engine: fixed, 64/64 and KL 0.
+
+**Next.** The fusions, as PR 33060's: a work-group a row doing a chain's norm, dot products, softmax and sum with one
+barrier (eklow's fused depth mix of 2026-11-25 split the row over work-groups that each repeated the reductions: 32 us
+against two kernels of 16). Then attention (6.8 ms a token at 12k, against Betelgeuse's 1.5-2.6 ms at short context and
+16K), and decode's use of the prefill workspace for more experts (Betelgeuse's dual phase).

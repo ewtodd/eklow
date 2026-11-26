@@ -3,7 +3,7 @@
 Live state, written as a handoff. Design and history: `DESIGN.md` (the original target) and `DECISIONS.md` (every decision
 with its measurements); what eklow is and its numbers: `README.md`.
 
-## Now (2026-11-25)
+## Now (2026-11-26)
 
 - **Inkling 2 Mini replaces Bolt** (the owner's decision, DECISIONS 2026-11-24): the port went milestone by milestone
   (M0 ground truth, M1 host reference and text layer, M2 the forward on the card, M3 memory, M4 the server, speed, M5
@@ -35,6 +35,9 @@ with its measurements); what eklow is and its numbers: `README.md`.
     choices) put ~780 more experts on the card. The expert GEMM had run at half occupancy (EU fusion off) since M2; fixed,
     it does ~45 TFLOPS. Prefill now goes to the expert GEMMs (~23%), the cold sets' copies (~20%: ~13 GB a 4,096-token
     step, which slow the kernels beside them by ~61 ms a GB), attention (~18%, its kernels still with EU fusion off).
+  - **Level Zero's v2 adapter** (DECISIONS 2026-11-26): a dependent small kernel costs ~2 us there against ~4.5, so
+    eklow-server runs Inkling on it: at 12k decode 22.7 -> 24.1 tok/s, prefill ~1,310 -> ~1,370 through the server.
+    Uploads the card reads after go by kernel (`kernels/kcopy`); driver in-order lists stay off (they broke decode).
   - **M5 is done** (DECISIONS "Inkling M5: vision, ..."): the tower matches llama.cpp's mtmd (~1e-3 per row), image
     requests render as llama-server's, the logits after an image match (KL <= 4e-10). The tower's weights live in host
     memory and it runs in the engine's idle step buffers, so `--mmproj` costs the card 1 MiB and decode nothing; an image
@@ -81,10 +84,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 ## Open, in order
 
-0. **Inkling**: the owner deploys M5 from the /etc/nixos commit (the projector in the inkling instance, eklow's lock
-   bumped with it). Then speed: prefill attention as segmented GEMMs (EU fusion on FlashGroup was slower, DECISIONS
-   2026-11-25), fewer cold-copy bytes a token (placement weighed for prefill), decode's small kernels (horizontal
-   fusion, fewer stages a layer) and the MTP draft.
+0. **Inkling's speed**: the owner deploys the v2 adapter from the /etc/nixos commit. Then decode's small kernels fused as
+   llama.cpp's PR 33060 does (a work-group a row: depth mix, controller, short convolution, L2 clip, situ), decode
+   attention (6.8 ms a token at 12k), the prefill workspace lent to decode's experts, prefill attention as segmented
+   GEMMs, the MTP draft.
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):
    - the kernel tests;
    - the draft's lattices and the embeddings, against main's build;
