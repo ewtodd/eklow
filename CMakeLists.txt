@@ -88,6 +88,7 @@ add_library(eklow_model STATIC
   src/kernels/moe.cpp
   src/kernels/ref_inkling.cpp
   src/kernels/inkling_fast.cpp
+  src/kernels/kcopy.cpp
   src/kernels/xmx.cpp
   src/kernels/xmx_fmt.cpp
   src/kernels/xmx_fused_q8.cpp

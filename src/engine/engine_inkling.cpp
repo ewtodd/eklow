@@ -1,5 +1,7 @@
 #include "engine/engine_inkling.hpp"
 
+#include "kernels/kcopy.hpp"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdlib>
@@ -128,11 +130,9 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     embd_row_bytes_ = emb.nbytes / emb.ne[1];
     const int64_t Bm = max_step_;
     emb_host_ = sycl::malloc_host<uint8_t>(size_t(Bm) * embd_row_bytes_, q_);
-    emb_dev_ = sycl::malloc_device<uint8_t>(size_t(Bm) * embd_row_bytes_, q_);
     iota_ = sycl::malloc_device<int32_t>(size_t(Bm), q_);
-    if (!emb_host_ || !emb_dev_ || !iota_) throw std::runtime_error("inkling engine: out of memory for the embedding rows");
+    if (!emb_host_ || !iota_) throw std::runtime_error("inkling engine: out of memory for the embedding rows");
     owned_.push_back(emb_host_);
-    owned_.push_back(emb_dev_);
     owned_.push_back(iota_);
     std::vector<int32_t> iota(static_cast<size_t>(Bm));
     for (int64_t i = 0; i < Bm; ++i) iota[size_t(i)] = int32_t(i);
@@ -283,6 +283,11 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   max_tiles_sliding_ = HK * ((B * (H / HK) + 7) / 8 + c_.n_slots);
   max_tiles_full_ = max_tiles_sliding_;
   tile_stride_s_ = 6 * max_tiles_sliding_, tile_stride_f_ = 6 * max_tiles_full_;
+  // a step's arrays: tokens, slots, positions, bases, logit rows, every sub-batch's tiles, the page table
+  up_words_ = size_t(4 * S + c_.max_logits + subs * (tile_stride_s_ + tile_stride_f_) + int64_t(c_.n_slots) * max_pages_);
+  up_host_ = sycl::malloc_host<int32_t>(up_words_, q_);
+  if (!up_host_) throw std::runtime_error("inkling engine: out of pinned host memory for the step's arrays");
+  owned_.push_back(up_host_);
   for (auto [p, n] : {std::pair{&ids_, S * cfg_.n_expert_used}, {&tok_, S}, {&slot_, S}, {&pos_, S}, {&base_, S},
                       {&lrows_, int64_t(c_.max_logits)}, {&tiles_sliding_, subs * tile_stride_s_}, {&tiles_full_, subs * tile_stride_f_}}) {
     *p = sycl::malloc_device<int32_t>(size_t(n), q_);
@@ -356,6 +361,10 @@ void Engine::place_experts(const gguf::File& f) {
     const std::optional<uint64_t> fm = rt::free_memory(q_.get_device());
     if (!fm) throw std::runtime_error("inkling engine: the driver does not say how much memory is free");
     free_at_placement_ = *fm;
+    // EKLOW_PLACEMENT_FREE_MB (checks): place as if at most this much were free, so that runs whose runtimes leave
+    // different amounts free (the v2 adapter leaves more) put the same experts on the card and can be compared bit for bit
+    uint64_t free_mem = *fm;
+    if (const char* f = std::getenv("EKLOW_PLACEMENT_FREE_MB")) free_mem = std::min<uint64_t>(free_mem, uint64_t(std::atoll(f)) << 20);
     const uint64_t keep = c_.card_margin_bytes + c_.card_reserve_bytes;
     // per expert on the card: its two matrices and scales as stored, plus a share of the layer's tables and rounding. The
     // staging region for the largest cold set comes out of the same memory, and its size depends on the placement: grow
@@ -367,7 +376,7 @@ void Engine::place_experts(const gguf::File& f) {
     };
     uint64_t stage = 0;
     for (int round = 0; round < 8; ++round) {
-      uint64_t budget = *fm > keep + 2 * stage ? *fm - keep - 2 * stage : 0;  // two staging regions
+      uint64_t budget = free_mem > keep + 2 * stage ? free_mem - keep - 2 * stage : 0;  // two staging regions
       for (auto& row : hot) std::fill(row.begin(), row.end(), false);
       for (const Cand& c : cand) {
         if (per(c.layer) > budget) continue;  // a smaller expert of another layer may still fit
@@ -455,6 +464,7 @@ void Engine::place_experts(const gguf::File& f) {
 Engine::~Engine() {
   q_.wait();
   if (copy_) copy_->wait(copy_->fence());
+  if (img_host_) sycl::free(img_host_, q_);
   xmx::free_activations(q_, act_);
   xmx::free_activations(q_, act_head_);
   for (void* p : {static_cast<void*>(attn_scratch_.q), static_cast<void*>(attn_scratch_.part), static_cast<void*>(attn_scratch_.part2),
@@ -510,7 +520,7 @@ void Engine::checkpoint(int slot) {
   }
   uint64_t at = 0;
   for (const auto& [p, n] : state_parts(slot)) {
-    q_.memcpy(dst->data + at, p, n);
+    kcopy::copy(q_, dst->data + at, p, n);
     at += n;
   }
   q_.wait();
@@ -527,7 +537,7 @@ bool Engine::rewind(int slot, int64_t pos) {
   if (!src) return false;
   uint64_t at = 0;
   for (const auto& [p, n] : state_parts(slot)) {
-    q_.memcpy(p, src->data + at, n);
+    kcopy::copy(q_, p, src->data + at, n);  // (a memcpy here could leave the card reading the old state: kcopy.hpp)
     at += n;
   }
   q_.wait();
@@ -557,7 +567,8 @@ void Engine::release(int slot) {
   s.length = 0;
   for (auto& c : s.ckpt) c.pos = -1;
   const int64_t per = int64_t(cfg_.n_slot()) * 3 * cfg_.conv_channels();
-  q_.memset(conv_ + int64_t(slot) * per, 0, size_t(per) * sizeof(float)).wait();
+  kcopy::zero(q_, conv_ + int64_t(slot) * per, size_t(per) * sizeof(float));
+  q_.wait();
 }
 
 cpu::QType Engine::cpu_type(gguf::Type t) {
@@ -652,8 +663,11 @@ void Engine::cold(const Layer& L, int64_t T, sycl::event packed) {
       for (int64_t e = 0; e < E; ++e) row[e] += w * y[e];
     }
   }
-  q_.memcpy(cr_, hrows_, size_t(T * E) * sizeof(float));
-  ref::add(q_, f_, cr_, T * E, f_);
+  // The card adds the rows straight from pinned host memory (T x 9 KB): no copy whose source the next layer's pass could
+  // overwrite before a copy engine reads it. The next layer's pass starts after its own packing, which the in-order queue
+  // runs after this add, so hrows_ is free again by then (driver in-order lists and the v2 adapter ran the old
+  // memcpy + add out of step with it: decode drifted, DECISIONS 2026-11-26).
+  ref::add(q_, f_, hrows_, T * E, f_);
 }
 
 std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::DumpSink* dump, const model::Teacher* teacher) {
@@ -720,20 +734,34 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   if (subs.size() > 1 && (dump || teacher)) throw std::runtime_error("inkling engine: dumps and teachers take steps of one sub-batch");
   if (int64_t(subs.size()) > (max_step_ + c_.max_batch - 1) / c_.max_batch + c_.n_slots)
     throw std::runtime_error("inkling engine: too many sub-batches in a step");
-  q_.memcpy(tok_, tok.data(), size_t(TA) * 4);
-  q_.memcpy(slot_, slot.data(), size_t(TA) * 4);
-  q_.memcpy(pos_, pos.data(), size_t(TA) * 4);
-  q_.memcpy(base_, base.data(), size_t(TA) * 4);
-  if (R) q_.memcpy(lrows_, logit_rows.data(), size_t(R) * 4);
-  std::vector<std::vector<int32_t>> packed(2 * subs.size());  // kept until the copies are done
-  for (size_t g = 0; g < subs.size(); ++g) {
-    packed[2 * g] = subs[g].tiles_s.packed(), packed[2 * g + 1] = subs[g].tiles_f.packed();
-    if (int64_t(packed[2 * g].size()) > tile_stride_s_ || int64_t(packed[2 * g + 1].size()) > tile_stride_f_)
-      throw std::runtime_error("inkling engine: a sub-batch's attention tiles overflow");
-    q_.memcpy(tiles_sliding_ + int64_t(g) * tile_stride_s_, packed[2 * g].data(), packed[2 * g].size() * 4);
-    q_.memcpy(tiles_full_ + int64_t(g) * tile_stride_f_, packed[2 * g + 1].data(), packed[2 * g + 1].size() * 4);
+  // The step's arrays go up through pinned memory and copying kernels (kcopy.hpp: a memcpy into memory the card has read
+  // can leave it reading the old contents under driver in-order lists; one launch instead of eight copies, too).
+  {
+    std::vector<kcopy::Seg> segs;
+    size_t used = 0;
+    auto put = [&](void* dst, const int32_t* src, size_t words) {
+      if (words == 0) return;
+      if (used + words > up_words_) throw std::runtime_error("inkling engine: the step's arrays overflow their staging");
+      std::memcpy(up_host_ + used, src, words * 4);
+      segs.push_back({dst, up_host_ + used, uint32_t(words)});
+      used += words;
+    };
+    put(tok_, tok.data(), size_t(TA));
+    put(slot_, slot.data(), size_t(TA));
+    put(pos_, pos.data(), size_t(TA));
+    put(base_, base.data(), size_t(TA));
+    put(lrows_, logit_rows.data(), size_t(R));
+    for (size_t g = 0; g < subs.size(); ++g) {
+      const std::vector<int32_t> ts = subs[g].tiles_s.packed(), tf = subs[g].tiles_f.packed();
+      if (int64_t(ts.size()) > tile_stride_s_ || int64_t(tf.size()) > tile_stride_f_)
+        throw std::runtime_error("inkling engine: a sub-batch's attention tiles overflow");
+      put(tiles_sliding_ + int64_t(g) * tile_stride_s_, ts.data(), ts.size());
+      put(tiles_full_ + int64_t(g) * tile_stride_f_, tf.data(), tf.size());
+    }
+    put(page_table_, page_table_host_.data(), page_table_host_.size());
+    for (size_t i = 0; i < segs.size(); i += kcopy::kMaxSegs)
+      kcopy::copy_segs(q_, segs.data() + i, int(std::min<size_t>(segs.size() - i, kcopy::kMaxSegs)));
   }
-  q_.memcpy(page_table_, page_table_host_.data(), page_table_host_.size() * 4);
   // The sub-batch the layer code runs on: its rows (T), tokens, chunks, tiles and per-token arrays.
   int64_t T = TA;
   attn::Tokens toks{slot_, pos_, TA};
@@ -816,10 +844,25 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   float* const e0 = blk_[0];
   for (int64_t t = 0; t < TA; ++t)
     std::memcpy(emb_host_ + uint64_t(t) * embd_row_bytes_, embd_->data + uint64_t(std::max(tok[size_t(t)], 0)) * embd_row_bytes_, embd_row_bytes_);
-  q_.memcpy(emb_dev_, emb_host_, size_t(uint64_t(TA) * embd_row_bytes_));
-  ref::embed(q_, ref::Weight{embd_->type, E, TA, emb_dev_, embd_row_bytes_}, iota_, TA, 1.0f, e0);
+  ref::embed(q_, ref::Weight{embd_->type, E, TA, emb_host_, embd_row_bytes_}, iota_, TA, 1.0f, e0);  // read over the bus
   fast::rmsnorm(q_, e0, tok_norm_, TA, E, cfg_.eps, e0);
-  for (const Span& sp : image_spans) q_.memcpy(e0 + sp.row * E, sp.rows, size_t(sp.n * E) * sizeof(float));
+  if (!image_spans.empty()) {
+    size_t need = 0;
+    for (const Span& sp : image_spans) need += size_t(sp.n * E);
+    if (need > img_floats_) {
+      q_.wait();
+      if (img_host_) sycl::free(img_host_, q_);
+      img_host_ = sycl::malloc_host<float>(need, q_);
+      if (!img_host_) throw std::runtime_error("inkling engine: out of pinned host memory for image rows");
+      img_floats_ = need;
+    }
+    size_t at = 0;
+    for (const Span& sp : image_spans) {
+      std::memcpy(img_host_ + at, sp.rows, size_t(sp.n * E) * sizeof(float));
+      kcopy::copy(q_, e0 + sp.row * E, img_host_ + at, size_t(sp.n * E) * sizeof(float));
+      at += size_t(sp.n * E);
+    }
+  }
   mark("embed");
 
   // Buffers: e0 (block 0), the prelude's output (block 1), the core's layer-11 and layer-17 outputs of the current and
@@ -990,7 +1033,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       cur = oc_;
       // a step of several sub-batches finishes the FFN after all of them: the new stream waits in `out`
       if (multi) {
-        q_.memcpy(out, oc_, size_t(T * E) * sizeof(float));
+        kcopy::copy(q_, out, oc_, size_t(T * E) * sizeof(float));
         cur = out;
       }
     } else {
@@ -1023,7 +1066,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     }
     mark("router");
     if (multi) {
-      q_.memcpy(hs_ + row_off * E, h_[0], size_t(T * E) * sizeof(float));
+      kcopy::copy(q_, hs_ + row_off * E, h_[0], size_t(T * E) * sizeof(float));
       return;  // the experts, the FFN's convolution and its residual run over the whole step (apply)
     }
     // Cold experts: the routing and the inputs go to pinned host memory ahead of the hot experts' kernels; the host waits
@@ -1151,8 +1194,8 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     // become h + w (h - h_1) in place, before the coda and the output mix read them.
     if (c_.loopcd != 0.0f && cfg_.n_passes > 1) {
       if (pass == 0) {
-        q_.memcpy(blk_[8], o11[0], size_t(TA * E) * sizeof(float));
-        q_.memcpy(blk_[9], o17[0], size_t(TA * E) * sizeof(float));
+        kcopy::copy(q_, blk_[8], o11[0], size_t(TA * E) * sizeof(float));
+        kcopy::copy(q_, blk_[9], o17[0], size_t(TA * E) * sizeof(float));
       } else if (pass == cfg_.n_passes - 1) {
         ik::contrast(q_, o11[pass % 2], blk_[8], c_.loopcd, TA * E);
         ik::contrast(q_, o17[pass % 2], blk_[9], c_.loopcd, TA * E);

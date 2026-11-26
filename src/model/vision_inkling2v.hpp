@@ -81,6 +81,8 @@ class VisionInkling2V {
   std::unique_ptr<sycl::queue> copy_q_;  // host weights' copies, beside the encode
   std::vector<std::pair<void*, size_t>> ws_;
   std::function<void()> drain_;
+  float* up_host_ = nullptr;  // an encode's uploads on their way (pinned)
+  size_t up_floats_ = 0;
   // with host weights, during an encode: the card copies of the patch embedding and the projector, two layer slots
   xmx::Weight dpatch_, dmm1_, dmm2_;
   uint8_t* slot_[2] = {nullptr, nullptr};

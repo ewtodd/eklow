@@ -184,7 +184,11 @@ class Engine {
   xmx::Weight head_w_;
   const gguf::Tensor* embd_ = nullptr;
   uint64_t embd_row_bytes_ = 0;
-  uint8_t *emb_host_ = nullptr, *emb_dev_ = nullptr;
+  uint8_t* emb_host_ = nullptr;  // the step's embedding rows, which the card reads from here
+  int32_t* up_host_ = nullptr;   // the step's arrays on their way up (kcopy)
+  size_t up_words_ = 0;
+  float* img_host_ = nullptr;    // a step's image rows on their way up (grown as needed)
+  size_t img_floats_ = 0;
   int32_t* iota_ = nullptr;
   const float *tok_norm_ = nullptr, *output_norm_ = nullptr, *output_res_query_ = nullptr;
   std::vector<Layer> layers_;  // physical

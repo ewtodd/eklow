@@ -7,6 +7,7 @@
 #include <type_traits>
 
 #include "image/inkling_image.hpp"
+#include "kernels/kcopy.hpp"
 #include "kernels/ref.hpp"
 
 namespace eklow::model {
@@ -183,6 +184,7 @@ VisionInkling2V::~VisionInkling2V() {
     for (xmx::Weight* w : {&L.qkv, &L.o, &L.up, &L.down}) xmx::free_weight(q_, *w);
   for (xmx::Weight* w : {&patch_w_, &mm1_, &mm2_}) xmx::free_weight(q_, *w);
   for (void* p : owned_) sycl::free(p, q_);
+  if (up_host_) sycl::free(up_host_, q_);
   if (cap_) {  // (the workspace's are someone else's)
     for (void* p : {static_cast<void*>(x_), static_cast<void*>(h_), static_cast<void*>(qkv_), static_cast<void*>(wide_), static_cast<void*>(pin_),
                     static_cast<void*>(rp_), static_cast<void*>(qt_), static_cast<void*>(kt_), static_cast<void*>(vt_)})
@@ -271,12 +273,11 @@ VisionInkling2V::Layer VisionInkling2V::slot_layer(size_t l, int slot) const {
 sycl::event VisionInkling2V::put_layer(size_t l, int slot, const std::vector<sycl::event>& after) {
   const Layer& L = layers_[l];
   uint8_t* p = slot_[slot];
+  // copying kernels, not memcpys (kcopy.hpp: the slots are memory the card has read)
+  if (!after.empty()) copy_q_->ext_oneapi_submit_barrier(after);
   sycl::event e;
   for (const xmx::Weight* w : {&L.qkv, &L.o, &L.up, &L.down}) {
-    e = copy_q_->submit([&](sycl::handler& h) {
-      h.depends_on(after);
-      h.memcpy(p, w->tiles, wbytes(*w));
-    });
+    e = kcopy::copy(*copy_q_, p, w->tiles, wbytes(*w));
     p += wbytes(*w);
   }
   return e;
@@ -326,17 +327,33 @@ std::vector<float> VisionInkling2V::encode(const image::Patches& p, const Dump& 
   std::vector<sycl::event> lay(layers_.size());
   sycl::event e_patch, e_mm;
   if (host_weights_) {
-    e_patch = copy_q_->memcpy(dpatch_.tiles, patch_w_.tiles, wbytes(patch_w_));
+    e_patch = kcopy::copy(*copy_q_, dpatch_.tiles, patch_w_.tiles, wbytes(patch_w_));
     for (size_t l = 0; l < std::min<size_t>(2, layers_.size()); ++l) lay[l] = put_layer(l, int(l), {});
   }
   const xmx::Weight& patch_w = host_weights_ ? dpatch_ : patch_w_;
   const xmx::Weight& mm1 = host_weights_ ? dmm1_ : mm1_;
   const xmx::Weight& mm2 = host_weights_ ? dmm2_ : mm2_;
+  // the encode's uploads (patches, position grid, RoPE positions) through pinned memory and copying kernels (kcopy.hpp)
+  const size_t up_need = size_t(n_patch * kp + n_patch * E + 2 * R);
+  if (up_need > up_floats_) {
+    q_.wait();
+    if (up_host_) sycl::free(up_host_, q_);
+    up_host_ = sycl::malloc_host<float>(up_need, q_);
+    if (!up_host_) throw std::runtime_error("inkling2v: out of pinned host memory");
+    up_floats_ = up_need;
+  }
+  size_t up_at = 0;
+  auto staged = [&](size_t floats) {
+    float* p = up_host_ + up_at;
+    up_at += floats;
+    return p;
+  };
   // the patches, K padded
   {
-    std::vector<float> host(size_t(n_patch * kp), 0.0f);
-    for (int64_t i = 0; i < n_patch; ++i) std::memcpy(host.data() + i * kp, p.data.data() + i * p.dim, size_t(p.dim) * 4);
-    q_.memcpy(pin_, host.data(), host.size() * 4).wait();
+    float* host = staged(size_t(n_patch * kp));
+    std::memset(host, 0, size_t(n_patch * kp) * 4);
+    for (int64_t i = 0; i < n_patch; ++i) std::memcpy(host + i * kp, p.data.data() + i * p.dim, size_t(p.dim) * 4);
+    kcopy::copy(q_, pin_, host, size_t(n_patch * kp) * 4);
   }
   act_.k = kp;
   xmx::quantize(q_, pin_, n_patch, act_, true);
@@ -369,7 +386,9 @@ std::vector<float> VisionInkling2V::encode(const image::Patches& p, const Dump& 
         }
       }
     }
-    q_.memcpy(h_, pos.data(), pos.size() * 4).wait();
+    float* host = staged(pos.size());
+    std::memcpy(host, pos.data(), pos.size() * 4);
+    kcopy::copy(q_, h_, host, pos.size() * 4);
     float *x = x_, *h = h_;
     const float* cls = cls_;
     q_.parallel_for(sycl::range<2>(size_t(n), size_t(E)), [=](sycl::id<2> id) {
@@ -381,7 +400,9 @@ std::vector<float> VisionInkling2V::encode(const image::Patches& p, const Dump& 
   {
     std::vector<int32_t> rp(size_t(2 * R), 0);
     for (int64_t i = 0; i < n_patch; ++i) rp[size_t(2 * (i + 1))] = int32_t(i % gw + 1), rp[size_t(2 * (i + 1) + 1)] = int32_t(i / gw + 1);
-    q_.memcpy(rp_, rp.data(), rp.size() * 4).wait();
+    int32_t* host = reinterpret_cast<int32_t*>(staged(rp.size()));
+    std::memcpy(host, rp.data(), rp.size() * 4);
+    kcopy::copy(q_, rp_, host, rp.size() * 4);
   }
   if (dump) {
     q_.wait();
@@ -445,8 +466,8 @@ std::vector<float> VisionInkling2V::encode(const image::Patches& p, const Dump& 
     }
   }
   if (host_weights_) {
-    copy_q_->memcpy(dmm1_.tiles, mm1_.tiles, wbytes(mm1_));
-    e_mm = copy_q_->memcpy(dmm2_.tiles, mm2_.tiles, wbytes(mm2_));
+    kcopy::copy(*copy_q_, dmm1_.tiles, mm1_.tiles, wbytes(mm1_));
+    e_mm = kcopy::copy(*copy_q_, dmm2_.tiles, mm2_.tiles, wbytes(mm2_));
   }
   // the CLS token dropped; each 2 x 2 block of patches one token: (top left, top right, bottom left, bottom right)
   {
