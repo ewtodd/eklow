@@ -37,6 +37,19 @@ void heads(sycl::queue& q, const float* src, int64_t ld, int64_t n_tok, int nq, 
   });
 }
 
+void conv(sycl::queue& q, const float* x, const float* dyn, const float* base, int side, int64_t rows, int64_t block_len, int64_t hidden,
+          int64_t group, float* out, bool accumulate) {
+  const int64_t groups = hidden / group;
+  q.parallel_for(sycl::range<2>(size_t(rows), size_t(hidden)), [=](sycl::id<2> id) {
+    const int64_t t = int64_t(id[0]), c = int64_t(id[1]);
+    const bool has_prev = t % block_len != 0;
+    const float* d = dyn + t * 4 * groups + int64_t(side) * 2 * groups + c / group;  // kernel size 2: [side][tap][group]
+    float acc = (base[(int64_t(side) * 2) * hidden + c] + d[0]) * x[t * hidden + c];
+    if (has_prev) acc += (base[(int64_t(side) * 2 + 1) * hidden + c] + d[groups]) * x[(t - 1) * hidden + c];
+    out[t * hidden + c] = accumulate ? out[t * hidden + c] + acc : acc;
+  });
+}
+
 int64_t topk_chunks(int64_t n) { return (n + kChunk - 1) / kChunk; }
 
 namespace {
@@ -44,7 +57,9 @@ namespace {
 inline bool better(float va, int32_t ia, float vb, int32_t ib) { return va > vb || (va == vb && ia < ib); }
 }  // namespace
 
-void topk16(sycl::queue& q, const float* x, int64_t rows, int64_t n, int32_t* scratch_ids, float* scratch_vals, int32_t* ids, float* vals) {
+void topk16(sycl::queue& q, const float* x, int64_t rows, int64_t n, int32_t* scratch_ids, float* scratch_vals, int32_t* ids, float* vals,
+            int64_t ld) {
+  if (ld == 0) ld = n;
   const int64_t chunks = topk_chunks(n);
   if (chunks * kTop > kChunk) throw std::runtime_error("topk16: row too long for the merge");
   q.parallel_for(sycl::nd_range<2>(sycl::range<2>(size_t(rows), size_t(chunks) * kWg), sycl::range<2>(1, kWg)), [=](sycl::nd_item<2> it) {
@@ -56,7 +71,7 @@ void topk16(sycl::queue& q, const float* x, int64_t rows, int64_t n, int32_t* sc
     for (int j = 0; j < kPer; ++j) {
       const int64_t e = ch * kChunk + i + int64_t(j) * kWg;
       id[j] = int32_t(e);
-      v[j] = e < n ? x[r * n + e] : kNegInf;
+      v[j] = e < n ? x[r * ld + e] : kNegInf;
     }
     auto g = it.get_group();
     for (int round = 0; round < kTop; ++round) {
@@ -106,6 +121,13 @@ void topk16(sycl::queue& q, const float* x, int64_t rows, int64_t n, int32_t* sc
       for (int j = 0; j < kPer; ++j)
         if (id[j] == mi && v[j] == m) v[j] = kNegInf, id[j] = std::numeric_limits<int32_t>::max();
     }
+  });
+}
+
+void predecessor_ids(sycl::queue& q, const int32_t* cand, const int32_t* anchors, int64_t blocks, int64_t P, int32_t* ids) {
+  q.parallel_for(sycl::range<3>(size_t(blocks), size_t(P), kTop), [=](sycl::id<3> id) {
+    const int64_t b = int64_t(id[0]), i = int64_t(id[1]), a = int64_t(id[2]);
+    ids[(b * P + i) * kTop + a] = i == 0 ? anchors[b] : cand[(b * P + i - 1) * kTop + a];
   });
 }
 

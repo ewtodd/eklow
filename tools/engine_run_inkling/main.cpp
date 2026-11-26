@@ -165,6 +165,9 @@ int main(int argc, char** argv) {
   std::string mmproj, image_path;
   int64_t image_tokens = 4096;
   int64_t generate = 0;  // --generate N: N tokens decoded greedily after the prompt, their ids into DIR/generated.json
+  // --block-time K,...: a speculative verify's cost: after --generate's tokens, rewind to the prompt's end and feed them
+  // again in steps of K tokens (one slot), for each K, timing the steps
+  std::vector<int64_t> block_time;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -186,6 +189,8 @@ int main(int argc, char** argv) {
     else if (a == "--teacher") teacher_dir = next();
     else if (a == "--gen-json") gen_json = next();
     else if (a == "--generate") generate = std::atoll(next().c_str());
+    else if (a == "--block-time")
+      for (const std::string& v : split(next(), ',')) block_time.push_back(std::atoll(v.c_str()));
     else if (a == "--profile") profile = true;
     else if (a == "--rewind") rewind = true;
     else if (a == "--twin") twin = true;
@@ -407,6 +412,7 @@ int main(int argc, char** argv) {
       const int64_t VO = eng.model().n_vocab_out;
       std::vector<int32_t> ids;
       std::vector<float> l(logits.end() - VO, logits.end());
+      if (!block_time.empty()) eng.checkpoint(0);
       const auto tg = std::chrono::steady_clock::now();
       for (int64_t i = 0; i < generate; ++i) {
         const int32_t t = int32_t(std::max_element(l.begin(), l.end()) - l.begin());
@@ -416,6 +422,19 @@ int main(int argc, char** argv) {
       }
       const double dt = since(tg);
       std::printf("decode: %lld greedy steps in %.2f s (%.2f tok/s)\n", (long long)generate, dt, double(generate) / dt);
+      for (int rep = 0; rep < 2; ++rep)
+        for (const int64_t K : block_time) {
+          if (!eng.rewind(0, n)) throw std::runtime_error("--block-time: no checkpoint at the prompt's end");
+          const int64_t steps = generate / K;
+          const auto tb = std::chrono::steady_clock::now();
+          for (int64_t s = 0; s < steps; ++s) {
+            engine::inkling::Chunk c{0, n + s * K, std::vector<int32_t>(ids.begin() + s * K, ids.begin() + (s + 1) * K), K};
+            (void)eng.step({c});
+          }
+          const double ms = since(tb) * 1e3 / double(steps);
+          std::printf("block %2lld tokens: %6.2f ms a step (%.2f x one token's), %lld steps\n", (long long)K, ms,
+                      ms / (dt * 1e3 / double(generate)), (long long)steps);
+        }
       std::ofstream gj(out + "/generated.json");
       gj << "[";
       for (size_t i = 0; i < ids.size(); ++i) gj << (i ? "," : "") << ids[i];

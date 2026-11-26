@@ -4887,3 +4887,41 @@ no longer buy much decode: the cold path's remaining time is spread over many ra
 latency rather than the launches; the sliding attention's flash kernel, which reads its 4.2 MB at ~127 GB/s (33 us a
 call; a plain-SYCL kernel lost, 2026-11-25, so it needs a new ESIMD one); the CPU's cold rows; and the MTP drafter, which
 waits on the cold path (2026-11-25).
+
+## 2026-11-26 — Inkling M6: speculative decoding with incoai's DFlash 2 draft, the reference
+
+**The draft.** incoai/Inkling-2-Mini-DFlash2 (4f9088ea, Apache-2.0): DFlash 2 as eklow ran it for Qwen3.6 in October
+(z-lab's design: `fc` over the target's features, five Qwen3 layers with two-tap dynamic convolutions around attention
+and MLP, all sliding over 2,048 positions and non-causal in the block, blocks of 8, the candidate selector of rank 256 over
+the top 16), 32 query heads over 8, RoPE base 10,000, and three Inkling things: the features are the stream at the input
+of layer visits 5, 23 and 41 and the final norm's output (visit 48), as llama.cpp's DSpark capture (#32218) takes them;
+the target's embedding rows go through Inkling's token norm; the final softcap (30) applies to the selector's scores after
+its correction, not to the logits. llama.cpp supports the pair since #33073 (55d48281, 2026-11-26), whose converter
+writes the draft's GGUF (82 tensors with the borrowed token norm, the selector's codebooks cut to the 200,058 real tokens).
+The one target tensor the converter reads, `model.llm.embed_norm.weight`, was fetched from the checkpoint's shard by its
+safetensors offsets: bit for bit the GGUF's `token_embd_norm`.
+
+**What a verify costs on fiona** (eklow-engine-run-inkling --block-time: 64 greedy tokens, then from the prompt's end the
+same tokens in steps of K, one slot, v2 adapter): at 12k a step of 1 token 40.3 ms, 2 tokens 52.1 (1.27 x), 4 71.4 (1.74
+x), 8 98.7 (2.41 x), 16 151 (3.68 x); the 67-token prompt the same within 2%. The step's union of experts and the CPU's cold
+pairs grow far less than the tokens: decode is latency-bound.
+
+**The reference acceptance** (llama.cpp 55d48281 CUDA on the 4090, llama-server --spec-type draft-dflash2
+--spec-draft-n-max 7, the UD-Q4_K_M target and the BF16 draft; z-lab's protocol, tools dflash2_accept.py, 16 requests
+a dataset, up to 2,048 tokens; tokens per verify step):
+
+| sampling | GSM8K | HumanEval | MT-Bench |
+|---|---|---|---|
+| temperature 1, top-p 1 (Inkling's) | 4.32 | 3.93 | 3.79 |
+| greedy | 5.07 | 4.89 | 4.59 |
+
+Inco's card (SGLang, the original weights, temperature 1): 4.96 / 4.80 / 3.90.
+
+**What it should give on fiona.** At ~4 tokens a verify of 8, a step of 98.7 ms plus ~6-8 ms of draft (5.6 ms a block for
+Qwen's six-layer draft on the A770M in October) is ~37 tok/s against 24.8; with the per-position acceptance this implies
+(~0.81), blocks of 5 or 6 (verify 77-84 ms, ~3.4-3.6 tokens) give ~40 tok/s, ~1.6 x.
+
+**Work on branch `inkling/dflash2`.** DFlash 2's convolutions and selector restored from before 9548266 (the removal
+with Qwen3.6), with Inkling's additions: the raw visit ids, the post-correction softcap, the token norm, target tables
+taken by their first 200,058 rows, the head's logits at the head's own stride (the selector's top 16 assumed rows of the
+vocabulary's width). Compiles; not yet checked against a reference.
