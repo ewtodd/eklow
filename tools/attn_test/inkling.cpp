@@ -2,7 +2,7 @@
 // K/V heads) against ref::inkling::attention's arithmetic, and its speed against the plain kernel of the same shape.
 //
 //   eklow-attn-test --inkling [--gguf FILE] [--len N] [--chunk N] [--samples N] [--time-ctx N,...] [--pf N] [--only sliding|full]
-//                   [--no-check] [--no-speed] [--attribute]
+//                   [--no-check] [--no-speed] [--attribute] [--int8]
 //
 // Correctness: two slots hold different random sequences of --len positions (default 33,000) in the model's shapes: Q and K
 // clipped to norms up to 22.6 and drawn from a few shared directions, so that a fraction of the keys scores near 40 against a
@@ -175,7 +175,7 @@ int inkling_main(int argc, char** argv) {
   std::string gguf_path = std::string(std::getenv("HOME") ? std::getenv("HOME") : ".") + "/models/inkling/Inkling-2-Mini-UD-Q4_K_M.gguf", only;
   int64_t len = 33000, chunk = 2048, samples = 64, pf = 2048;
   std::vector<int64_t> time_ctx = {8192, 32768};
-  bool no_check = false, no_speed = false, attribute = false;
+  bool no_check = false, no_speed = false, attribute = false, int8 = false;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -194,8 +194,9 @@ int inkling_main(int argc, char** argv) {
     else if (a == "--no-check") no_check = true;
     else if (a == "--no-speed") no_speed = true;
     else if (a == "--attribute") attribute = true;
+    else if (a == "--int8") int8 = true;
     else {
-      std::fprintf(stderr, "usage: eklow-attn-test --inkling [--gguf FILE] [--len N] [--chunk N] [--samples N] [--time-ctx N,...] [--pf N] [--only sliding|full] [--no-check] [--no-speed] [--attribute]\n");
+      std::fprintf(stderr, "usage: eklow-attn-test --inkling [--gguf FILE] [--len N] [--chunk N] [--samples N] [--time-ctx N,...] [--pf N] [--only sliding|full] [--no-check] [--no-speed] [--attribute] [--int8]\n");
       return 2;
     }
   }
@@ -304,8 +305,10 @@ int inkling_main(int argc, char** argv) {
             table_dev = upload(q, table_host);
           }
           const size_t elems = size_t(kSlots * cache.pages * kHkv * attn::kPage * kD);
-          cache.k = sycl::malloc_device(elems * 2, q);
-          cache.v = sycl::malloc_device(elems * 2, q);
+          const bool q8 = int8 && ly.window == 0;  // --int8: the full layers' cache in int8 with a scale a 16 values
+          cache.k = sycl::malloc_device(elems * (q8 ? 1 : 2), q);
+          cache.v = sycl::malloc_device(elems * (q8 ? 1 : 2), q);
+          if (q8) cache.ks = sycl::malloc_device<sycl::half>(elems / 16, q), cache.vs = sycl::malloc_device<sycl::half>(elems / 16, q);
           cache.table = table_dev;
           cache.window = ly.window;
           cache.n_head_kv = kHkv;
@@ -441,7 +444,9 @@ int inkling_main(int argc, char** argv) {
             td = upload(q, th);
           }
           const size_t elems = size_t(cache.pages * kHkv * attn::kPage * kD);
-          cache.k = sycl::malloc_device(elems * 2, q), cache.v = sycl::malloc_device(elems * 2, q);
+          const bool q8 = int8 && ly.window == 0;
+          cache.k = sycl::malloc_device(elems * (q8 ? 1 : 2), q), cache.v = sycl::malloc_device(elems * (q8 ? 1 : 2), q);
+          if (q8) cache.ks = sycl::malloc_device<sycl::half>(elems / 16, q), cache.vs = sycl::malloc_device<sycl::half>(elems / 16, q);
           cache.table = td, cache.window = ly.window, cache.n_head_kv = kHkv, cache.head_dim = kD;
           const int64_t nt = chunk_pf;
           std::mt19937 r2(3);

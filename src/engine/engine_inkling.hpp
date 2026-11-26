@@ -58,6 +58,9 @@ struct Config {
   // max_ctx, a multiple of attn::kPage. A smaller pool frees card memory for experts; when the slots' sequences need more
   // pages than are free, the scheduler releases or holds back (pages_needed).
   int64_t pool_positions = 0;
+  // The full layers' K/V in int8, a scale a 16 values (attention's Q8 kernels), half of fp16's bytes: the pool's memory goes
+  // to experts. The sliding rings stay fp16.
+  bool kv_int8 = false;
   // LoopCD's hidden-state form (arXiv 2610.02185; DECISIONS 2026-11-24): what the coda reads of the core, its two blocks'
   // outputs, becomes h + w (h - h_1), h_1 the same after the first pass. 0: the model as trained.
   float loopcd = 0.0f;
@@ -217,7 +220,11 @@ class Engine {
   std::vector<int> ring_of_, page_of_;  // per application slot: its ring or page-cache index, -1 otherwise
   sycl::half *ring_k_ = nullptr, *ring_v_ = nullptr;
   int64_t ring_layer_stride_ = 0, ring_pages_ = 0, n_pages_ = 0, max_pages_ = 0;
-  std::vector<std::pair<sycl::half*, sycl::half*>> pages_kv_;
+  struct FullKV {
+    void *k = nullptr, *v = nullptr;            // fp16 or int8
+    sycl::half *ks = nullptr, *vs = nullptr;  // int8's scales
+  };
+  std::vector<FullKV> pages_kv_;
   int32_t* page_table_ = nullptr;
   std::vector<int32_t> page_table_host_, free_pages_;
   std::vector<Slot> slots_;

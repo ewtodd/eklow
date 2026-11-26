@@ -1198,9 +1198,10 @@ void bias_table(sycl::queue& q, const float* table, int64_t extent, sycl::half* 
 void attend(sycl::queue& q, const float* Q, const Tokens& tok, const TileList& list, const int32_t* packed, const Cache& c,
             int64_t n_head, float scale, const Bias& bias, float* out, Scratch& scratch) {
   if (list.size() == 0) return;
-  if (c.head_dim != 128 || n_head != 3 * c.n_head_kv || c.int8() || bias.n_rel != 16)
-    throw std::runtime_error("attention: the bias is written for head 128, group 3, fp16 caches, 16 values a head");
-  run<128, 3, false, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch, &bias);
+  if (c.head_dim != 128 || n_head != 3 * c.n_head_kv || bias.n_rel != 16)
+    throw std::runtime_error("attention: the bias is written for head 128, group 3, 16 values a head");
+  if (c.int8()) run<128, 3, true, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch, &bias);
+  else run<128, 3, false, true>(q, Q, tok, list, packed, c, n_head, scale, out, scratch, &bias);
 }
 
 void reserve(sycl::queue& q, Scratch& s, int64_t max_tiles, int64_t max_chunk_rows, int64_t n_head_kv, int64_t head_dim, int64_t group,

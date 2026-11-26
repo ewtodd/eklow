@@ -232,14 +232,17 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   for (void* p : {static_cast<void*>(ring_k_), static_cast<void*>(ring_v_), static_cast<void*>(page_table_)}) owned_.push_back(p);
   cache_bytes_ = ring_elems * 2 * sizeof(sycl::half);
   const size_t page_elems = size_t(n_pages_ * HK * attn::kPage * D);
+  const size_t elem = c_.kv_int8 ? 1 : 2;
   for (int l = 0; l < n_full; ++l) {
-    auto* k = sycl::malloc_device<sycl::half>(page_elems, q_);
-    auto* v = sycl::malloc_device<sycl::half>(page_elems, q_);
-    if (!k || !v) throw std::runtime_error("inkling engine: out of device memory for the K/V cache");
-    owned_.push_back(k);
-    owned_.push_back(v);
-    pages_kv_.push_back({k, v});
-    cache_bytes_ += 2 * page_elems * sizeof(sycl::half);
+    FullKV kv;
+    kv.k = sycl::malloc_device(page_elems * elem, q_);
+    kv.v = sycl::malloc_device(page_elems * elem, q_);
+    if (c_.kv_int8) kv.ks = sycl::malloc_device<sycl::half>(page_elems / 16, q_), kv.vs = sycl::malloc_device<sycl::half>(page_elems / 16, q_);
+    if (!kv.k || !kv.v || (c_.kv_int8 && (!kv.ks || !kv.vs))) throw std::runtime_error("inkling engine: out of device memory for the K/V cache");
+    for (void* p : {kv.k, kv.v, static_cast<void*>(kv.ks), static_cast<void*>(kv.vs)})
+      if (p) owned_.push_back(p);
+    pages_kv_.push_back(kv);
+    cache_bytes_ += 2 * page_elems * elem + (c_.kv_int8 ? 2 * (page_elems / 16) * sizeof(sycl::half) : 0);
   }
   page_table_host_.assign(size_t(c_.n_slots * max_pages_), 0);
   for (int64_t p = n_pages_ - 1; p >= 0; --p) free_pages_.push_back(int32_t(p));
@@ -1003,7 +1006,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       attn::attend(q_, qb_, toks, *tl_s, tl_s_dev, cache, H, scale, bias, att_, attn_scratch_);
     } else {
       const auto& kv = pages_kv_[size_t(page_of_[size_t(app)])];
-      const attn::Cache cache{kv.first, kv.second, page_table_, max_pages_, 0, HK, D};
+      const attn::Cache cache{kv.k, kv.v, page_table_, max_pages_, 0, HK, D, kv.ks, kv.vs};
       attn::write(q_, kb_, vb_, toks, cache);
       fine("attn.write");
       attn::attend(q_, qb_, toks, *tl_f, tl_f_dev, cache, H, scale, bias, att_, attn_scratch_);
