@@ -4846,3 +4846,44 @@ engine: fixed, 64/64 and KL 0.
 barrier (eklow's fused depth mix of 2026-11-25 split the row over work-groups that each repeated the reductions: 32 us
 against two kernels of 16). Then attention (6.8 ms a token at 12k, against Betelgeuse's 1.5-2.6 ms at short context and
 16K), and decode's use of the prefill workspace for more experts (Betelgeuse's dual phase).
+
+## 2026-11-26 — Inkling decode on the v2 adapter: fusions, batching and int8 K/V measured, none kept on
+
+**How measured.** One 31-step decode at 12k varies by about 3% run to run on fiona (two identical runs: 22.9 and 21.8
+tok/s). The comparisons below are interleaved A/B runs of one binary switched by the environment: 160 greedy tokens after
+the 12k prompt, the same experts placed (EKLOW_PLACEMENT_FREE_MB), three rounds, where the two sides agree within ~0.5%
+when nothing differs. eklow-engine-run-inkling now prints --generate's speed.
+
+**llama.cpp PR 33060's fusions, made for DG2.**
+- The depth mix of decode rows in one launch (a work-group of 1,024 a row, its elements of every state held in
+  registers and loaded at once, one barrier for the sums and one for the weights): correct, 10.4-16.8 us alone against the
+  two launches' 11.9-17.9 (slower at two rows), and in the step 24.1 -> 22.7 tok/s.
+- The routing kernel writing the cold path's host copies (ids, weights, the 2,304 inputs) instead of pack_host: 23.0.
+- The attention gate applied in the output projection's loads (matmul_fused): 23.5.
+- Merging up to 40 splits without the fold: 23.7.
+- All four: 21.7.
+Each traded parallel width for a launch. On the A770M a narrow kernel's own latency (a reduction, a barrier and a write
+cost ~3-4 us inside a kernel; a launch ~1.7 on v2) is more than the launch it saves. Making the attention's query and R
+tiles in one launch was neutral; not kept either.
+
+**Independent kernels in one launch.** Alone they win: three one-row norms cost 15.8 us as three launches against 5.3
+as one, three controllers 22.4 against 11.1, three 32 x 2,304 products 10.6 against 3.7. Their multi-job forms pay for
+picking the job: from a struct or an array indexed at run time it sits in private memory (the controllers' three jobs
+took 198 us); with each pointer a separate scalar picked by comparisons, 6.4, 17.0 and 4.4 us. In the step (the three
+attention inputs' controllers and norms on the layers with the loop's messages, the full layers' three norms, the sinks
+with the dynamic taps) decode went 23.5-23.7 -> 23.1-23.3, and with the norms and the products alone 23.6-24.0 -> 23.3-23.5.
+In the step each controller streams 2.4 MB of fp32 weights (bandwidth-bound already), and after each wait for the CPU's
+cold rows the card waits for the host to submit what follows, where a launch of ~25 arguments costs more. Not kept.
+
+**int8 K/V on the full layers** (`Config::kv_int8`, eklow-engine-run-inkling --kv-int8; attention's biased kernels now
+instantiated for int8 caches, a scale a 16 values). The caches go 2.63 -> 1.76 GiB, which puts 212 more experts on the
+card (1,678 -> 1,466 cold): decode 23.9 -> 24.2 tok/s (+1.3%), prefill +3-5%. Its attention output is ~1.5e-2 off the
+fp32 reference a row, against fp16's 2e-4 (Inkling's scores reach 40, so K's rounding comes through the softmax
+sharpened), and against llama.cpp the decode logits' KL goes 1.3e-3 -> 3.2e-3 at 12k and 2.8e-4 -> 4.1e-4 at 33k, top-1 32
+-> 31 of 32 at both. Off; eklow-server still refuses --kv-int8 for Inkling. It also shows that more experts on the card
+no longer buy much decode: the cold path's remaining time is spread over many rarely-used experts.
+
+**What is left for decode** (~41.5 ms a token at 12k on v2): ~1,500 dependent kernels whose cost is now mostly their own
+latency rather than the launches; the sliding attention's flash kernel, which reads its 4.2 MB at ~127 GB/s (33 us a
+call; a plain-SYCL kernel lost, 2026-11-25, so it needs a new ESIMD one); the CPU's cold rows; and the MTP drafter, which
+waits on the cold path (2026-11-25).

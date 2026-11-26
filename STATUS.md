@@ -84,10 +84,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 ## Open, in order
 
-0. **Inkling's speed**: the owner deploys the v2 adapter from the /etc/nixos commit. Then decode's small kernels fused as
-   llama.cpp's PR 33060 does (a work-group a row: depth mix, controller, short convolution, L2 clip, situ), decode
-   attention (6.8 ms a token at 12k), the prefill workspace lent to decode's experts, prefill attention as segmented
-   GEMMs, the MTP draft.
+0. **Inkling's speed**: the owner deploys the v2 adapter (/etc/nixos 3241a67f, `colmena apply --on fiona`). Fusing
+   decode's chains (llama.cpp PR 33060), batching independent kernels and int8 K/V were measured and are not on
+   (DECISIONS 2026-11-26). Left: a new ESIMD sliding attention for decode (33 us a call at ~127 GB/s), prefill attention as
+   segmented GEMMs, the MTP draft once the cold path allows.
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):
    - the kernel tests;
    - the draft's lattices and the embeddings, against main's build;
