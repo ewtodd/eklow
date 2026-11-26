@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <map>
@@ -148,6 +149,8 @@ std::vector<int32_t> ids_of(const std::string& path) {
 
 int main(int argc, char** argv) {
   if (std::getenv("EKLOW_TRACE")) setenv("ZE_ENABLE_TRACING_LAYER", "1", 1);
+  // the server's runtime for Inkling (tools/server/main.cpp): Level Zero's v2 adapter unless SYCL_UR_USE_LEVEL_ZERO_V2 is set
+  if (!std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2")) setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "1", 1);
   std::string model, out, tokens_json, teacher_dir, gen_json, twin_tokens;
   std::vector<std::string> prefixes = {"l_out-", "result_norm"};
   int64_t chunk = 1024, max_ctx = 0, dump_last = 0, slots = 1, step_tokens = 0, kv_pool = 0;
@@ -388,7 +391,8 @@ int main(int argc, char** argv) {
           tg.write(reinterpret_cast<const char*>(l.data()), std::streamsize(VO * sizeof(float)));
         }
         if (i + 1 >= gen.size()) break;
-        l = eng.step({{0, n + int64_t(i), {gen[i]}, 1}, {1, n1 + int64_t(i), {other[i % size_t(n1)]}, 1}});
+        // the same prompt: slot 1 decodes the same tokens; another: its prompt's first tokens again as filler
+        l = eng.step({{0, n + int64_t(i), {gen[i]}, 1}, {1, n1 + int64_t(i), {twin_tokens.empty() ? gen[i] : other[i % size_t(n1)]}, 1}});
       }
       if (twin_tokens.empty())
         std::printf("twin: slots 0 and 1 in the same steps: top-1 %d/%d, KL mean %.2e, max %.2e\n", agree, rows, sum / rows, worst);
@@ -430,7 +434,17 @@ int main(int argc, char** argv) {
         std::vector<sycl::event> alog;
         const bool alog_on = std::getenv("EKLOW_ATTN_KERNELS") && std::getenv("EKLOW_PROFILE_DEVICE") && i == 10;
         if (alog_on) attn::g_event_log = &alog;
-        const std::vector<float> l = eng.step({c});
+        // EKLOW_DUMP_DECODE_STEP=k: decode step k's tensors (--tensors) into DIR/decode-k
+        static const long dump_step = std::getenv("EKLOW_DUMP_DECODE_STEP") ? std::atol(std::getenv("EKLOW_DUMP_DECODE_STEP")) : -1;
+        const std::string saved_out = out;
+        if (long(i) == dump_step) {
+          out += "/decode-" + std::to_string(i);
+          std::filesystem::create_directories(out);
+          dumping = true;
+        }
+        const std::vector<float> l = long(i) == dump_step ? eng.step({c}, &sink) : eng.step({c});
+        dumping = false;
+        out = saved_out;
         if (std::getenv("EKLOW_TRACE") && i == 10) {
           q.wait();
           g_tr.on = false;

@@ -580,6 +580,11 @@ int main(int argc, char** argv) {
     const gguf::Value* arch_v = file.find("general.architecture");
     const std::string arch = arch_v ? arch_v->as_string() : std::string("(none)");
     const bool inkling = arch == "inkling2_loop";
+    // Inkling runs on Level Zero's v2 adapter (before any SYCL call: the runtime reads it once): its kernels cost ~2 us a
+    // launch there against ~4.5 on the default one, decode +10% and prefill +7%, the same accuracy against llama.cpp,
+    // checked with the side models and the vision tower (DECISIONS 2026-11-26). SYCL_UR_USE_LEVEL_ZERO_V2=0 keeps the
+    // default.
+    if (inkling && !std::getenv("SYCL_UR_USE_LEVEL_ZERO_V2")) setenv("SYCL_UR_USE_LEVEL_ZERO_V2", "1", 1);
     if (arch != "gemma4" && !inkling)
       throw std::runtime_error(model_path + ": architecture " + arch +
                                "; eklow serves gemma4 (Gemma 4 E4B: Nemotron-3.5-Bolt-E4B) and inkling2_loop (Inkling 2 Mini), and no longer qwen35moe (2026-11-11)");
