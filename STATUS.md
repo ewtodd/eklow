@@ -92,7 +92,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
 0. **Inkling's speed**: the owner deploys the v2 adapter (/etc/nixos 3241a67f, `colmena apply --on fiona`). Fusing
    decode's chains (llama.cpp PR 33060), batching independent kernels and int8 K/V were measured and are not on
    (DECISIONS 2026-11-26). M6 (the DFlash 2 draft) is left to finish: the block size at temperature 1, depth, the
-   chi-square through the server, the draft's card reservation, nix and /etc/nixos. Attention: the full layers' band
+   chi-square through the server, the draft's card reservation, nix and /etc/nixos. Found by the README's run
+   (2026-11-26): the sampler's top-p sorts all 200,058 candidates (~18 ms a token, and per drafted row) when no top-k
+   runs first; the stream's usage carries no `speculation` for Inkling; and serve_perf's repeats on one document with
+   another question prefilled it again (0 cached: no checkpoint at the shared prefix). Attention: the full layers' band
    form without spills, P.V's occupancy; every Flash and FlashGroup kernel runs with EU fusion off (decode's attention,
    the sliding layers' prefill), and decode's sliding attention needs a new ESIMD kernel (33 us a call at ~127 GB/s).
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):

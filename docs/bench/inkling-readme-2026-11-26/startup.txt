@@ -1,0 +1,9 @@
+eklow-server: vision projector ~/inkling-m5/mmproj-F16.gguf, 1 MiB on the card and 604 MiB of weights in host memory, images of up to 1024 tokens
+eklow-server: vision projector /nix/store/ns0n6xhg02xrc8q5dqv6ck25yavlvm4v-mmproj-embeddinggemma-2-Q8_0.gguf, 269 MiB on the card for 1120-row images
+eklow-server: reranker qwen3-reranker-0.6b (/nix/store/17qpgics2af89fglcgm3pf23wyvfvkra-qwen3-reranker-0.6b-q8_0.gguf): 794 MiB on the card with the driver's, pairs of up to 4096 tokens, 0.3 s
+eklow-server: DFlash 2 draft ~/inkling-m6/Inkling-2-Mini-DFlash2-Q8_0.gguf: blocks of 6 (trained for 8), window 2048, 714 MiB on the card; free card memory now 1.02 GiB
+eklow-server: inkling-2-mini on Intel(R) Arc(TM) A770M Graphics, 6.43 GiB of weights on the card, 1884 cold experts (8.61 GiB) on the CPU with 8 threads, 2.63 GiB of caches (2 slots of 65536), 10.7 s
+eklow-server: sampling defaults: temperature 1.00, top_k 0, top_p 1.00, min_p 0.00, penalty_last_n 64, repeat 1.00
+eklow-server: embeddinggemma-2, 0.27 GiB, listening on 127.0.0.1:18082
+eklow-server: reranker qwen3-reranker-0.6b listening on 127.0.0.1:18085 (POST /v1/rerank)
+eklow-server: listening on 127.0.0.1:18081
