@@ -42,6 +42,11 @@ with its measurements); what eklow is and its numbers: `README.md`.
     requests render as llama-server's, the logits after an image match (KL <= 4e-10). The tower's weights live in host
     memory and it runs in the engine's idle step buffers, so `--mmproj` costs the card 1 MiB and decode nothing; an image
     of ~250 tokens encodes in 0.1 s, 972 in 0.27 s. `--image-max-tokens` 1,024 by default.
+  - **M6, speculative decoding with incoai's DFlash 2 draft, works end to end** (DECISIONS "Inkling M6 through the engine
+    and the server"): rollback exact, acceptance as llama.cpp's, 1.4-1.8x decode through the server at temperature 1 and
+    ~1.56x greedy; plain decode ~5% slower with the draft loaded (fewer experts on the card). Not yet in nix or /etc/nixos.
+  - **Full layers' prefill attention in segments** (DECISIONS 2026-11-26): 1.9x at 33k, 2.26x at 65k in the kernel, prefill
+    at 33k 1,184 -> 1,261 tok/s in the engine.
 
 - **fiona ran Bolt in production until 2026-11-24 20:06**, when the owner stopped it (`eklow-bolt.service`, from
   2026-11-10 22:48; maitred's "fiona" route falls back to son-of-anton's models until Inkling is deployed):
@@ -86,8 +91,10 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 0. **Inkling's speed**: the owner deploys the v2 adapter (/etc/nixos 3241a67f, `colmena apply --on fiona`). Fusing
    decode's chains (llama.cpp PR 33060), batching independent kernels and int8 K/V were measured and are not on
-   (DECISIONS 2026-11-26). Left: a new ESIMD sliding attention for decode (33 us a call at ~127 GB/s), prefill attention as
-   segmented GEMMs, the MTP draft once the cold path allows.
+   (DECISIONS 2026-11-26). M6 (the DFlash 2 draft) is left to finish: the block size at temperature 1, depth, the
+   chi-square through the server, the draft's card reservation, nix and /etc/nixos. Attention: the full layers' band
+   form without spills, P.V's occupancy; every Flash and FlashGroup kernel runs with EU fusion off (decode's attention,
+   the sliding layers' prefill), and decode's sliding attention needs a new ESIMD kernel (33 us a call at ~127 GB/s).
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):
    - the kernel tests;
    - the draft's lattices and the embeddings, against main's build;

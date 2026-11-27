@@ -4925,3 +4925,97 @@ Qwen's six-layer draft on the A770M in October) is ~37 tok/s against 24.8; with 
 with Qwen3.6), with Inkling's additions: the raw visit ids, the post-correction softcap, the token norm, target tables
 taken by their first 200,058 rows, the head's logits at the head's own stride (the selector's top 16 assumed rows of the
 vocabulary's width). Compiles; not yet checked against a reference.
+
+## 2026-11-26 — Inkling M6 through the engine and the server: speculative decoding works, ~1.4-1.8x
+
+**The engine's part.** `Config::capture_ids` names the draft's features by layer visit (the stream at a visit's input; the
+last id, the final norm's output, which needs the depth mix of the output computed for the captured rows only); a chunk
+asks for its last `capture_rows` rows, and `capture()` hands the step's rows (fp32 on the card, each with its slot and
+position) to the draft. A verify chunk (`Chunk::verify`, at most `kVerifyRows` = 16 rows a step) keeps the short
+convolutions' state after each of its rows (their only per-token recurrence; 48 applications x 16 rows x 3 x 6,656 fp32,
+61 MB), and `truncate(slot, length)` restores the state of the kept row and drops the rest; K/V past the kept length is
+overwritten by later tokens. The draft reads the engine's head and token table.
+
+**Rollback is exact.** eklow-engine-run-inkling --draft compares speculative greedy decoding with plain greedy decoding
+from a checkpoint at the prompt's end, row by row; with oracle drafts (EKLOW_SPEC_ORACLE: the plain run's own tokens; cuts
+at random places; garbage after the cut) every token is plain greedy's and the rows' KL is ~1e-3 (the batch shape's
+rounding), so a rejected token leaves nothing behind.
+
+**The draft is right.** Greedy GSM8K acceptance through the engine 5.39 / 4.83 / 4.70 / 4.65 tokens a verify on four
+requests, llama.cpp 55d48281's on the same four 5.13 / 5.09 / 5.61 / 4.88. Its block takes 4.7 ms, injecting a step's rows
+0.4, truncating 0.2.
+
+**The scheduler** drafts in steps that read no prompt: per generating slot a block of its request's size (2 to 8; two
+slots' blocks fill the 16 rows), the walk at the request's temperature (`serve::walk`, its own generator seeded from the
+request's), verified by the lossless acceptance (`serve::verify`) with the tool grammar cloned row by row, so a drafted
+token the grammar forbids has probability zero. Committed rows (prefill's last `window`, decode tokens, a verify's kept
+ones) go into the draft's context; a request that never speculates (`"speculative": 0` or a sampler without a stated
+distribution) captures nothing. eklow-server takes `--draft` and `--draft-block` (6 by default) for Inkling, and reserves
+the draft's file size plus 256 MiB of card before the experts are placed.
+
+**Through the server on fiona** (production's flags and side models, blocks of 6, GSM8K chat requests; decode tok/s):
+
+| | request 0 | 1 | 2 | 3 |
+|---|---|---|---|---|
+| temperature 1, speculative | 35.0 (4.31 a verify) | 26.4 (3.65) | 23.8 (3.41) | 28.4 (4.04) |
+| the same server, `"speculative": 0` | 19.0 | 18.4 | 17.4 | 18.9 |
+| greedy, speculative (first round) | 36.5 (4.26) | 32.8 (3.80) | 35.4 (4.29) | 31.9 (3.65) |
+| greedy, a server without the draft | 22.1 | 22.2 | 20.8 | 22.2 |
+
+Tool calls, an image request and two requests at once (both slots verifying in one step: 20.7 and 22.2 tok/s each) come out
+right. A second round of the greedy runs gave the draft's server 10-13% less on every request, plain and speculative,
+while the plain server's second round matched its first: the card's clock under a longer hot run, most likely.
+
+**What the draft costs plain decoding** (eklow-engine-run-inkling, 12k, 160 greedy tokens, interleaved, fixed placement):
+24.0 tok/s without it, 23.1 with 0.77 GiB less for experts (-3.9%), 22.6 with the draft loaded and every token captured and
+injected (-1.9% more, ~0.8 ms a token). In the server the draft's reservation put 231 more experts on the CPU (1,884 cold
+against 1,653): plain decode ~5% slower. The reservation is ~250 MB more than the draft uses (it leaves 1.02 GiB free
+where the engine's margin is 1 GiB); trimming it, and the draft's own 714 MiB, is open.
+
+**Open for M6:** the block size at temperature 1 (6 against 4, 5, 8), depth (12k, 33k), `eklow-spec-test`'s chi-square
+through the server, the draft's pin in nix/models.nix and the module's `draft` for Inkling, then /etc/nixos.
+
+## 2026-11-26 — Inkling's full layers' prefill attention in segments: 1.9-2.25x at depth
+
+Profiled at 33k (eklow-engine-run-inkling --profile, 32,950 tokens in 8,192-token steps of 1,024-token chunks), prefill was
+28.0 s, of which attention 9.5 s: the 8 full applications 6.65 s (~8 TFLOPS) and the 40 sliding ones 2.8 s (~6). The 26B's
+two-GEMM segment path (2026-10-27, ~31 TFLOPS at head 512) now runs Inkling's full layers' chunks of 64 tokens or more,
+with the bias and the sink (llama.cpp's PR 33063 does the bias in its CUDA flash kernels; eklow's FlashGroup has had it in
+its kernel since M2, the question here was speed).
+
+**What head 128 needed** (`eklow-attn-test --inkling`, 1,024-token chunks at 33k; per 4,096-key segment of 7-8 heads):
+- **Every K/V head in one launch.** One head's P.V is 12 work-groups at 1,024-token chunks. The probabilities and
+  statistics of all 8 heads (~240 MB) live in the MoE scratch, idle while attention runs on the same in-order queue
+  (`moe::lendable`, `attn::Scratch::lent`): no card memory taken from the experts. Heads one at a time: 6.4 TFLOPS.
+- **Q.K^T as its own kernel** (`SegQK128`). The general kernel at head 128 is 4 K blocks of staged pipeline, four barriers
+  and one work-group a core: 3.15 ms. Knocking parts out showed the epilogue was 1.5 ms of it, and an IGC shader dump
+  (`IGC_ShaderDumpEnable=1`) why: the bias's dpas under branches on loaded values turned EU fusion off (half the threads),
+  and the epilogue's 64-lane temporaries beside 64 accumulator registers spilled 1.9 KB (9.4 KB without the bias, which
+  ran 5x slower still). The kernel now stages the work-group's 128 keys once (32 KB, one barrier, two work-groups a core),
+  loads Q from L1, keeps each thread's maximum and sum over its 32 keys (no exchange), and works on 8-lane slices a row:
+  no spill, fusion on, 0.70-0.84 ms.
+- **The bias apart.** Key tiles before every row's extent need neither bias nor mask; the host launches the band (at most
+  17 of 256 key tiles at 33k) as the `BAND` form, which adds the bias on the matrix units straight into the scores: a dpas
+  for each distinct position among a tile's 8 rows (at most 4) with R's other rows zeroed, against the table at that
+  position's alignment (`bias_table8`: the table at all 8 alignments, 278 KB, built each call). That form still spills
+  9.6 KB (its 16 table loads), which matters for the first chunks, whose keys are all in the band.
+- **P.V computes the tiles' factors** (exp(m_tile - m_new)) from the maxima as it stages them, so that the combining step
+  writes no betas and all 8 heads' statistics fit the lent memory (7 did, which left the eighth a mostly idle launch).
+
+| depth | FlashGroup | segments | |
+|---|---|---|---|
+| 12k | 18.4 ms (8.1 TFLOPS) | 14.2 ms (10.4) | 1.29x |
+| 33k | 49.5 ms (8.2) | 26.0 ms (15.6) | 1.90x |
+| 65k | 98.9 ms (8.2) | 43.8 ms (18.5) | 2.26x |
+
+A segment's kernels at 33k: Q.K^T 0.79-0.84 ms, combining 0.20, P.V 1.27-1.41 (~20 TFLOPS). Rows against the reference as
+before (rel L2 median 2.45e-4, max 2.37e-3; the gate is 2e-3 / 1e-2); the Gemma shapes' gates unchanged.
+
+**In the engine** (33k, the same placement): full-layer attention 6.66 -> 4.21 s, prefill 1,184 -> 1,261 tok/s; at 12k
+unchanged (1.0 s; its chunks are mostly band). Logits against llama.cpp: 12k top-1 237/256 and median KL 5.6e-3
+(FlashGroup 235, 6.7e-3), 33k 114/128 and 2.6e-3 (115, 2.5e-3). Decode does not use the path. EKLOW_ATTN_NO_SEGMENTS=1
+puts the full layers back on FlashGroup.
+
+**Next:** the band form without spills; P.V with V alone in shared memory (two or more work-groups a core); the
+combining folded into P.V. The same shader dump shows every Flash and FlashGroup kernel with EU fusion off: decode's
+attention (0.57 ms a full layer at 33k, ~236 GB/s) and the sliding layers' prefill (2.8 s at 33k) are the next ones.
