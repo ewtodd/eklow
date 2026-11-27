@@ -774,7 +774,7 @@ int main(int argc, char** argv) {
         if (draft_cfg.plain || draft_cfg.n_embd != mc.n_embd || draft_cfg.target_ids.empty() || draft_cfg.target_ids.back() != mc.n_slot())
           throw std::runtime_error(draft_path + ": not a DFlash 2 draft for Inkling 2 Mini (its target ids must end at the final norm's visit, " +
                                    std::to_string(mc.n_slot()) + ")");
-        if (draft_block == 0) draft_block = 6;
+        // --draft-block 0 (the default): each request's block follows its acceptance (serve::inkling's adaptive_block)
         ic.capture_ids = draft_cfg.target_ids;
         ic.max_capture_rows = int64_t(draft_cfg.window) + int64_t(slots) * 8;
         ic.max_logits = std::max<int64_t>(ic.max_logits, engine::inkling::Engine::kVerifyRows);
@@ -788,9 +788,9 @@ int main(int argc, char** argv) {
         opt.slots = slots;
         opt.max_block = 8;
         draft = std::make_unique<model::Dflash2>(q, *draft_file, target, opt);
-        std::fprintf(stderr, "eklow-server: DFlash 2 draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card; free card memory now %.2f GiB\n",
-                     draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0,
-                     rt::free_memory(q.get_device()).value_or(0) / GiB);
+        std::fprintf(stderr, "eklow-server: DFlash 2 draft %s: blocks of %s (trained for %d), window %d, %.0f MiB on the card; free card memory now %.2f GiB\n",
+                     draft_path.c_str(), draft_block ? std::to_string(draft_block).c_str() : "2 to 8 by each request's acceptance", draft_cfg.block_size,
+                     draft->window(), double(draft->bytes()) / 1048576.0, rt::free_memory(q.get_device()).value_or(0) / GiB);
       }
       if (ivision) {
         if (ivision->n_out() != ieng->model().n_embd)

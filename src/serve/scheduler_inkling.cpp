@@ -1,11 +1,33 @@
 #include "serve/scheduler_inkling.hpp"
 
+#include "text/tokenizer_inkling.hpp"
+
 #include <algorithm>
+#include <cmath>
 #include <cstdio>
 #include <span>
 #include <stdexcept>
 
 namespace eklow::serve::inkling {
+
+// The shortest system prefix that takes the slot's kept checkpoint (below, prefilling it again is ~1-2 s).
+constexpr int64_t kKeptCheckpointMin = 2048;
+
+// The block (2 to 8) that gives the most tokens a unit of time when each drafted token is accepted with probability a: a
+// verify of B rows keeps (1 - a^B) / (1 - a) tokens on average and costs kVerifyCost[B] decode steps (Inkling at 12k on
+// fiona, DECISIONS 2026-11-27: 1 / 1.28 / 1.58 / 1.71 / 1.85 / 1.95 / 2.10 / 2.24 for 1 to 8 rows) and the draft's block
+// ~0.11 more. At a ~0.6 (thinking over a document) that is 4, at ~0.8 (GSM8K) 6.
+int adaptive_block(double a) {
+  static constexpr double kVerifyCost[9] = {0, 1.00, 1.28, 1.58, 1.71, 1.85, 1.95, 2.10, 2.24};
+  a = std::clamp(a, 0.05, 0.98);
+  int best = 2;
+  double best_rate = 0;
+  for (int B = 2; B <= 8; ++B) {
+    const double rate = (1 - std::pow(a, B)) / (1 - a) / (kVerifyCost[B] + 0.11);
+    if (rate > best_rate) best_rate = rate, best = B;
+  }
+  return best;
+}
 
 namespace {
 
@@ -207,8 +229,20 @@ void Scheduler::start(int s, std::shared_ptr<Request> r, int64_t lcp) {
   q.draft_rng.seed(r->sampling.seed * 0x9e3779b97f4a7c15ull + 1);
   // A request that never drafts (a block of 0, or a sampler whose next distribution cannot be stated) captures nothing:
   // the draft's context for the slot then restarts where a later request's prefill captures from.
-  q.drafts = c_.draft && q.sampler->speculative() && (r->draft_block < 0 ? c_.draft_block : r->draft_block) >= 2;
+  q.adaptive = r->draft_block < 0 && c_.draft_block == 0;
+  q.drafts = c_.draft && q.sampler->speculative() && (q.adaptive || (r->draft_block < 0 ? c_.draft_block : r->draft_block) >= 2);
+  q.acc_s = 4, q.acc_f = 1;  // a prior of 0.8 a token: blocks of 6 until the request shows its own
   q.verifies = q.drafted = q.accepted = 0;
+  // The system messages' end (the first user message's start), when it is far enough in to be worth a checkpoint (324 MiB
+  // of pinned memory a slot, ~30 ms) and the slot does not already hold the prompt past it: there the prefill takes the
+  // slot's kept checkpoint, from which another conversation with the same system prompt (and tools) resumes instead of
+  // prefilling them again. A next turn of this one resumes from its last prompt's end, as before.
+  q.keep_at = -1;
+  {
+    const auto it = std::find(r->prompt.begin(), r->prompt.end(), text::inkling::kMessageUser);
+    const int64_t at = int64_t(it - r->prompt.begin());
+    if (it != r->prompt.end() && at >= kKeptCheckpointMin && at < P - 1 && at > keep) q.keep_at = at;
+  }
   q.sampler->accept(std::span<const int32_t>(r->prompt));  // llama-server's sampler has seen the prompt
   q.grammar = r->grammar ? std::make_unique<InklingToolGrammar>(vocab_, r->choice, r->tools, r->parallel) : nullptr;
   q.req = std::move(r);
@@ -365,6 +399,7 @@ void Scheduler::step() {
     Timer timer(mu_, stats_.draft_s);
     auto block_of = [&](const Seq& q) {
       if (!q.drafts) return 0;
+      if (q.adaptive) return adaptive_block(q.acc_s / (q.acc_s + q.acc_f));
       const int b = q.req->draft_block < 0 ? c_.draft_block : q.req->draft_block;
       return std::clamp(b, 0, 8);
     };
@@ -426,6 +461,7 @@ void Scheduler::step() {
     if (eng_.pages_needed(int(s), P) - counted[s] > avail() - reserve) continue;
     for (int64_t fed = int64_t(q.fed), at = int64_t(q.tokens.size()); budget > 0 && fed < P;) {
       int64_t n = std::min<int64_t>({q.req->prefill_only ? c_.prefill_only_chunk : c_.max_chunk, budget, P - fed});
+      if (q.keep_at > fed) n = std::min<int64_t>(n, q.keep_at - fed);  // a chunk ends at the kept checkpoint's position
       // The prompt's last token goes in a step of its own, after a checkpoint before it: a request whose prompt is this
       // one again (a retry) rewinds there and feeds that token for its logits. It costs a decode-sized step per request.
       if (!q.req->prefill_only && fed + n == P && n > 1) --n;
@@ -461,7 +497,8 @@ void Scheduler::step() {
       items.push_back({true, int(s), last ? 1 : 0});
       budget -= n, fed += n, at += n;
       // the checkpoint goes where the step ends: none of the slot's chunks after the one that ends before the last token
-      if (last || (!q.req->prefill_only && fed + 1 == P)) break;
+      // (or at the kept checkpoint's position)
+      if (last || (!q.req->prefill_only && fed + 1 == P) || fed == q.keep_at) break;
     }
   }
   if (chunks.empty()) return;
@@ -536,6 +573,9 @@ void Scheduler::step() {
         ++stats_.verifies, stats_.drafted += n, stats_.accepted += res.accepted;
       }
       ++q.verifies, q.drafted += n, q.accepted += res.accepted;
+      // the acceptance's estimate: each drafted token accepted is a success, the first rejected one a failure (decayed, so
+      // that a request's block follows its text)
+      q.acc_s = 0.9 * q.acc_s + res.accepted, q.acc_f = 0.9 * q.acc_f + (res.accepted < n ? 1 : 0);
       // The kept tokens are the anchor and d_0 .. d_{a-1}; what comes out is d_0 .. d_{a-1} and the next one (a stop ends
       // the request at its token, the rest of the block dropped). The engine goes back to the kept tokens.
       std::string why;
@@ -555,6 +595,10 @@ void Scheduler::step() {
       q.tokens.insert(q.tokens.end(), c.tokens.begin(), c.tokens.end());
       q.fed += c.tokens.size();
       inject(cap0, c.capture_rows);
+      if (int64_t(q.fed) == q.keep_at) {
+        eng_.checkpoint(it.slot, true);
+        q.keep_at = -1;
+      }
       // A checkpoint before the prompt's last token (at its end for a prefill-only request): where a next turn that departs
       // from this answer resumes, or the same prompt again.
       if (q.fed + (q.req->prefill_only ? 0 : 1) == q.req->prompt.size()) eng_.checkpoint(it.slot);
@@ -638,6 +682,7 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
   e.completion_tokens = q.generated;
   e.prefill_only = q.req->prefill_only;
   e.held = int64_t(q.fed);
+  e.verifies = q.verifies, e.drafted = q.drafted, e.accepted = q.accepted;  // the usage's speculation
   if (c_.on_finish) {
     const auto now = std::chrono::steady_clock::now();
     RequestLog l;

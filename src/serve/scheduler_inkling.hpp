@@ -79,9 +79,10 @@ struct SchedulerConfig {
   size_t max_prefill_only_waiting = 8;
   // Speculative decoding (M6): the DFlash 2 draft (null: plain decode; the engine's Config::capture_ids must be its
   // target ids) and the block B (the anchor and B - 1 drafted tokens; 2 to 8: two slots' blocks fill a 16-row verify
-  // step). Blocks run only in steps without a prompt being read.
+  // step). Blocks run only in steps without a prompt being read. 0: each request's block from its own acceptance so far
+  // (Scheduler::adaptive_block).
   model::Dflash2* draft = nullptr;
-  int draft_block = 6;
+  int draft_block = 0;
 };
 
 class Scheduler {
@@ -125,6 +126,9 @@ class Scheduler {
     bool called = false;          // a tool call came out
     std::mt19937_64 draft_rng;    // the draft's walk at the request's temperature
     bool drafts = false;          // the request speculates: its rows go into the draft's context
+    bool adaptive = false;        // its block follows its acceptance (no block asked for, the server's is 0)
+    double acc_s = 4, acc_f = 1;  // the drafted tokens accepted and the rejections, decayed (the acceptance's estimate)
+    int64_t keep_at = -1;         // where its prefill takes the slot's kept checkpoint (the system messages' end), -1: none
     int64_t verifies = 0, drafted = 0, accepted = 0;
   };
 

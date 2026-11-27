@@ -523,17 +523,24 @@ std::vector<std::pair<uint8_t*, uint64_t>> Engine::state_parts(int slot) const {
   return parts;
 }
 
-void Engine::checkpoint(int slot) {
+void Engine::checkpoint(int slot, bool kept) {
   Slot& s = slots_.at(size_t(slot));
   if (c_.checkpoints <= 0) return;
   if (int(s.ckpt.size()) < c_.checkpoints) s.ckpt.push_back({});
-  // the free one, else the one at this position, else the oldest
+  // the one at this position, else (kept) the kept one, else the free one, else the oldest; the kept one is taken by a plain
+  // checkpoint only when it is the slot's only one
   Checkpoint* dst = nullptr;
   for (auto& c : s.ckpt)
     if (c.pos == s.length) dst = &c;
-  if (!dst)
+  if (!dst && kept)
     for (auto& c : s.ckpt)
+      if (c.kept && c.pos >= 0) dst = &c;
+  if (!dst)
+    for (auto& c : s.ckpt) {
+      if (c.kept && c.pos >= 0 && s.ckpt.size() > 1) continue;
       if (!dst || c.pos < 0 || (dst->pos >= 0 && c.age < dst->age)) dst = &c;
+    }
+  const bool now_kept = kept || (dst->kept && dst->pos == s.length);  // a kept one checkpointed again stays kept
   if (!dst->data) {
     dst->data = sycl::malloc_host<uint8_t>(ckpt_bytes_, q_);
     if (!dst->data) throw std::runtime_error("inkling engine: out of pinned host memory for a checkpoint");
@@ -547,6 +554,7 @@ void Engine::checkpoint(int slot) {
   q_.wait();
   dst->pos = s.length;
   dst->age = ++ckpt_age_;
+  dst->kept = now_kept;
 }
 
 bool Engine::rewind(int slot, int64_t pos) {

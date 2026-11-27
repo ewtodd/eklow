@@ -102,7 +102,7 @@ let
         draftBlock = lib.mkOption {
           type = lib.types.nullOr (lib.types.ints.between 2 16);
           default = null;
-          description = "Tokens of a verify block (the last sampled one and the drafted ones); null: the server's default, 6 for Inkling's draft (2 to 8) and the trained 8 for Bolt's.";
+          description = "Tokens of a verify block (the last sampled one and the drafted ones); null: the server's default, for Inkling's draft each request's own (2 to 8, from its acceptance so far), for Bolt's the trained 8.";
         };
 
         preserveThinking = lib.mkOption {

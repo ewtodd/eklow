@@ -131,7 +131,9 @@ class Engine {
   // checkpoint saves it to pinned host memory at the slot's current length (replacing its oldest checkpoint), and rewind
   // goes back to a checkpoint's position exactly (its rings and convolution state restored, later pages returned). The
   // server checkpoints where a prefill ends, so that a next turn that differs from the last answer resumes there.
-  void checkpoint(int slot);
+  // `kept`: the slot's long-lived one (at most one, replaced only by another kept one; the server's is where the system
+  // messages end, so that another conversation with the same system prompt resumes there); the others replace each other.
+  void checkpoint(int slot, bool kept = false);
   bool rewind(int slot, int64_t pos);  // false when the slot has no checkpoint at pos (or pos is past its length)
   std::vector<int64_t> checkpoint_positions(int slot) const;
   int64_t length(int slot) const { return slots_[size_t(slot)].length; }
@@ -194,6 +196,7 @@ class Engine {
   struct Checkpoint {
     int64_t pos = -1;
     uint64_t age = 0;
+    bool kept = false;
     uint8_t* data = nullptr;  // pinned: every sliding application's ring K, then V, then the convolution state
   };
   struct Slot {
