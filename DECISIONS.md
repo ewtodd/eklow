@@ -5019,3 +5019,48 @@ puts the full layers back on FlashGroup.
 **Next:** the band form without spills; P.V with V alone in shared memory (two or more work-groups a core); the
 combining folded into P.V. The same shader dump shows every Flash and FlashGroup kernel with EU fusion off: decode's
 attention (0.57 ms a full layer at 33k, ~236 GB/s) and the sliding layers' prefill (2.8 s at 33k) are the next ones.
+
+## 2026-11-27 — Inkling decode: the sampler, the cold path's round trips
+
+Through the server at temperature 1 with top-p 0.95 (the README's run, 2026-11-26) decode was 16.4 / 15.0 / 14.3 tok/s at
+8k / 32k / 60k against ~24 greedy, and the draft gained nothing. Then a step's profile at 12k (eklow-engine-run-inkling
+--profile --block-time; EKLOW_STEP_TIMING; ms a step):
+
+| | the CPU's cold pairs | hot experts | projections | inputs | router | attention | O | head |
+|---|---|---|---|---|---|---|---|---|
+| decode, 1 token (44 ms) | 9.95 (wait) | 9.86 | 5.86 | 3.75 | 3.06 | 4.21 | 1.94 | 1.47 |
+| verify, 6 rows (95.5 ms) | 41.3 (wait) | 20.9 | 7.96 | 4.53 | 3.80 | 7.45 | 2.55 | 1.54 |
+
+and with the cold experts left out (EKLOW_SKIP_COLD) a token takes 30.5 ms and a verify of 6 51.7: the cold path added 12
+and 40 ms, about all of the CPU's time, as if it did not run beside the card's hot experts at all.
+
+**The sampler.** Its top-p sorted every candidate when no top-k ran first: 200,058 for Inkling, 14.2 ms a token on
+e-workstation (~18 on fiona), and once more for each drafted row of a verify. Now nth_element finds the largest k (512,
+then x8 until their probabilities reach top-p) and sorts those: by_logit breaks ties by id, so they are the full sort's
+first k with the same running sum, the same nucleus bit for bit. 1.33 ms at top-p 0.95 (~87 kept), 1.49 at 0.99 (~450).
+`tools/sampler_test` gained `--bench` (real logits) and Inkling's settings; all 18 chains match llama.cpp's candidates bit
+for bit over 262,144 and 4,096 tokens, and their draws by chi-square. A verify's rows' distributions (~1 ms each at a full
+vocabulary, mostly the 200,058 exps) now run in parallel on forks of the sampler, the rows' constraints asked for in order
+up front as far as each drafted token is allowed (`eklow-spec-test`: all 63 checks).
+
+**The cold path's round trips** (at 12k; decode tok/s, verify of 6 in ms):
+- The pool's workers spun 400 us after a job and then slept; layer applications come every ~0.6-0.9 ms, so each one paid a
+  futex wake for all of them. 3 ms (Engine's pool; EKLOW_POOL_SPIN_US): the CPU's part 11.4 -> 9.4 ms a token, decode 23.2
+  -> 24.4, verify 96.7 -> 91.5.
+- A step of several tokens ran each cold expert as its own pool call; `cpu::experts_ffn_pairs` takes them all, each with
+  its tokens, in one pass: verify 4 / 6 / 8 rows 75.0 / 91.5 / 106.1 -> 73.4 / 89.0 / 103.1, results bit for bit the same.
+- The host sees the pack's event ~200 us after the pack (the device profile: the stage from the routing to the cold rows'
+  add is ~412 us a layer application, the hot experts' 205 plus the CPU's 196 in series). Waiting on the event, polling it
+  through SYCL, polling Level Zero's zeEventQueryStatus on its native handle, waiting before the hot experts are submitted,
+  and `ext_oneapi_prod()` after them all gave the same or worse. A flag written by a kernel after the pack came before the
+  pack's data (other tokens: the host read stale routing). A kernel of bounded busy work through the wait added its whole
+  length: kept out. What works: the host marks every word the pack writes with a NaN no activation, weight or id is, submits
+  the queue (`ext_oneapi_prod`: a spinning host makes no runtime call that would) and spins until no mark is left, each word
+  checked on its own (after 0.2 s, the event). For 4 rows or more: verify 4 / 6 / 8 / 12 / 16 rows 73.5 / 88.9 / 102.6 /
+  129 / 160 -> 70.2 / 80.0 / 91.9 / 113 / 138 ms, the same tokens and logits. For 1-3 rows the words arrive no sooner than
+  the event, and watching them made a token ~3x slower (a system-scope fence in the pack and padding its last line changed
+  nothing): those steps wait on the event.
+
+Together (eklow-engine-run-inkling, 12k, fixed placement): plain greedy decode 23.2 -> 24.4 tok/s, speculative greedy in
+blocks of 6 34.0 -> 37.3 tok/s (3.84 tokens a verify, the same tokens). A verify of 6 is now ~80 ms where the card's own
+part is ~52: its hot experts' union (20.9 ms) and the CPU's cold union are what remain, both at their memory's rate.
