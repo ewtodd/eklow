@@ -160,8 +160,8 @@ Installed binaries use the system's Level Zero driver from `/run/opengl-driver` 
 `hardware.graphics.extraPackages = [ pkgs.intel-compute-runtime ]`). The dev shell carries its own copy of the drivers.
 
 The model files are flake packages too (`nix/models.nix`), fetched at pinned revisions: `inkling-2-mini` and
-`inkling-2-mini-mmproj` (Unsloth's), `qwen3-reranker`, and Bolt's files. Inco's draft is not packaged yet: llama.cpp's
-converter from 55d48281 on writes its GGUF from `incoai/Inkling-2-Mini-DFlash2`.
+`inkling-2-mini-mmproj` (Unsloth's), `inkling-2-mini-dflash2` (Inco's draft, which llama.cpp 55d48281's converter wrote
+as a GGUF and eklow publishes in Q8_0), `qwen3-reranker`, and Bolt's files.
 
 ## Running
 
@@ -210,6 +210,7 @@ services.eklow = {
   instances.inkling = {
     model = inputs.eklow.packages.${system}.inkling-2-mini;
     mmproj = inputs.eklow.packages.${system}.inkling-2-mini-mmproj;
+    draft = inputs.eklow.packages.${system}.inkling-2-mini-dflash2;
     expertProfile = "${inputs.eklow.packages.${system}.default}/share/eklow/inkling-2-mini-experts.json";
     alias = "inkling-2-mini";
     port = 8081;

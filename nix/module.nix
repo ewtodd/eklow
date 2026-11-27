@@ -92,15 +92,17 @@ let
           default = null;
           example = lib.literalExpression "inputs.eklow.packages.x86_64-linux.bolt-e4b-dflash";
           description = ''
-            A plain DFlash draft GGUF (arch "dflash") for speculative decoding, accepted losslessly; null decodes plain.
-            Bolt's is NVIDIA's Nemotron-3.5-Bolt-E4B-DFlash in Q8_0 (the flake's `bolt-e4b-dflash`, 547 MiB of the card).
+            A DFlash draft GGUF for speculative decoding, accepted losslessly; null decodes plain. Inkling 2 Mini's is Inco's
+            DFlash 2 draft in Q8_0 (the flake's `inkling-2-mini-dflash2`: 714 MiB of the card, which the server reserves before
+            it places the experts; ~1.4-1.8x decode, eklow DECISIONS 2026-11-26). Bolt's is NVIDIA's
+            Nemotron-3.5-Bolt-E4B-DFlash in Q8_0 (the flake's `bolt-e4b-dflash`, 547 MiB of the card).
           '';
         };
 
         draftBlock = lib.mkOption {
           type = lib.types.nullOr (lib.types.ints.between 2 16);
           default = null;
-          description = "Tokens of a verify block (the last sampled one and the drafted ones); null: the draft's trained block, 8 for Bolt's.";
+          description = "Tokens of a verify block (the last sampled one and the drafted ones); null: the server's default, 6 for Inkling's draft (2 to 8) and the trained 8 for Bolt's.";
         };
 
         preserveThinking = lib.mkOption {

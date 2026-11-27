@@ -1,11 +1,12 @@
-# The model files of fiona's deployment, as derivations: Inkling 2 Mini, Bolt with its projector and DFlash draft, vega's
-# reader for the end-of-turn checker, and Qwen3-Reranker (EmbeddingGemma 2 and vega-U are the module's defaults). Published
+# The model files of fiona's deployment, as derivations: Inkling 2 Mini with its projector and DFlash 2 draft, Bolt with its
+# projector and DFlash draft, vega's reader for the end-of-turn checker, and Qwen3-Reranker (EmbeddingGemma 2 and vega-U are
+# the module's defaults). Published
 # files are fetched at a pinned revision by the sha256 Hugging Face lists for them. The two that nobody publishes in the form eklow
 # serves are made here, with the flake's pinned llama.cpp:
 # - the draft's Q8_0, quantized from NVIDIA's BF16 GGUF;
 # - vega's reader, Qwen3.5-0.8B converted to a BF16 GGUF.
-# Licenses: Bolt and its draft, NVIDIA's OpenMDW-1.1 (https://openmdw.ai/license/1-1/); Inkling 2 Mini, the Gemma 4 E4B
-# projector, Qwen3.5-0.8B, Qwen3-Reranker-0.6B, EmbeddingGemma 2 and vega-U, Apache-2.0.
+# Licenses: Bolt and its draft, NVIDIA's OpenMDW-1.1 (https://openmdw.ai/license/1-1/); Inkling 2 Mini and Inco's draft for
+# it, the Gemma 4 E4B projector, Qwen3.5-0.8B, Qwen3-Reranker-0.6B, EmbeddingGemma 2 and vega-U, Apache-2.0.
 {
   lib,
   fetchurl,
@@ -80,6 +81,14 @@ in
   inkling-2-mini-mmproj =
     hf "unsloth/Inkling-2-Mini-GGUF" "8078d149286eec7193795413b9e0643da6d11fa1" "mmproj-F16.gguf"
       "3bff75ffeb2d6e0371ba7bd42e30d26a7d98aea681fa44b03b5a20891cfa2c5f";
+
+  # Inco's DFlash 2 draft for it (incoai/Inkling-2-Mini-DFlash2 at 4f9088ea, Apache-2.0), converted to GGUF by llama.cpp
+  # 55d48281's converter (which also takes the target's token-embedding norm) and quantized to Q8_0: the file eklow's M6
+  # measurements ran (DECISIONS 2026-11-26). Nobody else publishes it as a GGUF, so eklow's copy is on Hugging Face. 538 MB.
+  inkling-2-mini-dflash2 =
+    hf "ethanwtodd/Inkling-2-Mini-DFlash2-Q8_0-GGUF" "0f5f662b8da9569064a0d1b469849e719d1dc50b"
+      "Inkling-2-Mini-DFlash2-Q8_0.gguf"
+      "17b1eebdd35a37a5b8fae519314056a6ab8e021c318861a9501f0bc5223f14f9";
 
   bolt-e4b =
     hf "nvidia/NVIDIA-Nemotron-3.5-Bolt-E4B-4GB" "1db54d5b12533ff1bcaa8e42cf4c667988a1f1be"
