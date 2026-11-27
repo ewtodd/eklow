@@ -15,6 +15,8 @@ CASES = [  # name, settings, deterministic
     ("typical 0.7", "typ=0.7", True),
     ("top-n-sigma 1.5", "sigma=1.5", True),
     ("top-k 0, top-p 0.9", "top_k=0,top_p=0.9", True),
+    ("Inkling's GGUF (temp 1, top-k 0, top-p 1)", "temp=1,top_k=0,top_p=1,min_p=0", True),
+    ("temp 1, top-k 0, top-p 0.95, min-p 0", "temp=1,top_k=0,top_p=0.95,min_p=0", True),
     ("min-p 0.2, min_keep 5", "min_p=0.2,min_keep=5", True),
     ("dynatemp 0.5, exponent 1.5", "dyn=0.5,dyn_exp=1.5", True),
     ("logit bias", "bias=81:-100;90:3.5;124:false", True),

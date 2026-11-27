@@ -384,7 +384,31 @@ void Sampler::run(std::span<const float> logits, const std::vector<int32_t>* all
       case Stage::TopP: {
         if (p_.top_p >= 1.0f) break;
         softmax(cur_, sorted_, false);
-        if (!sorted_) std::sort(cur_.begin(), cur_.end(), by_logit), sorted_ = true;
+        if (!sorted_) {
+          // The nucleus is the shortest run of the candidates in descending order whose probabilities reach top_p. by_logit
+          // is a total order (the id breaks ties), so the largest k found by nth_element and sorted are the full sort's first k,
+          // and their running sum the same: sort only those, k growing until the sum reaches top_p (DECISIONS 2026-11-26: sorting
+          // all 200,058 of Inkling's candidates took 14-18 ms a token, the nucleus is ~80).
+          for (size_t k = std::min<size_t>(cur_.size(), 512);; k = std::min(cur_.size(), k * 8)) {
+            if (k < cur_.size()) std::nth_element(cur_.begin(), cur_.begin() + std::ptrdiff_t(k), cur_.end(), by_logit);
+            std::sort(cur_.begin(), cur_.begin() + std::ptrdiff_t(k), by_logit);
+            float cum = 0;
+            size_t last = 0;
+            for (size_t i = 0; i < k; ++i) {
+              cum += cur_[i].p;
+              if (cum >= p_.top_p && i + 1 >= min_keep) {
+                last = i + 1;
+                break;
+              }
+            }
+            if (last > 0 || k == cur_.size()) {
+              cur_.resize(last > 0 ? last : k);
+              break;
+            }
+          }
+          sorted_ = true;
+          break;
+        }
         float cum = 0;
         size_t last = cur_.size();
         for (size_t i = 0; i < cur_.size(); ++i) {
