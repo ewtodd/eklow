@@ -302,6 +302,8 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   attn::reserve(q_, attn_scratch_, max_tiles_full_, c_.max_chunk * (H / HK), HK, D, H / HK, c_.max_ctx + attn::kPage, bias_extent);
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>({E, HD, 2 * E}));
   moe_scratch_ = moe::reserve(q_, S, cfg_.n_expert_used, E, cfg_.n_ff_exp);
+  // The full layers' long prefill keeps its segments' probabilities in the MoE scratch, idle while attention runs (attn::Scratch::lent).
+  std::tie(attn_scratch_.lent, attn_scratch_.lent_bytes) = moe::lendable(*moe_scratch_);
   // Speculative decoding: the capture and the verify snapshots (counted before the experts are placed)
   verify_rows_.assign(size_t(c_.n_slots), VerifyRows{});
   if (!c_.capture_ids.empty()) {

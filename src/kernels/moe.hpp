@@ -17,6 +17,7 @@
 #include <sycl/sycl.hpp>
 
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #include "kernels/ref.hpp"
@@ -68,6 +69,9 @@ struct Scratch;
 Scratch* reserve(sycl::queue& q, int64_t max_tokens, int64_t n_used, int64_t n_embd, int64_t n_ff);
 void free_scratch(sycl::queue& q, Scratch* s);
 uint64_t scratch_bytes(const Scratch& s);
+// The scratch's activation buffers (one block): idle between ffn calls on the same in-order queue, so another kernel may use
+// them in between (the Inkling engine lends them to attention's long prefill, attn::Scratch::lent).
+std::pair<void*, size_t> lendable(const Scratch& s);
 int64_t scratch_slab();
 // With EKLOW_MOE_PROFILE=1 in the environment, ffn times its stages (waiting after each); prints the means per call and resets.
 void profile_print(bool print = true);

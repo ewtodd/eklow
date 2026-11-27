@@ -105,6 +105,14 @@ struct Scratch {
   // read when the caller did not prepare it (bias_table).
   sycl::half *rt = nullptr, *tv = nullptr;
   size_t rt_halves = 0, tv_halves = 0;
+  // the table at each of 8 alignments, for the full layers' long prefill (built each call from Bias::table)
+  sycl::half* tv8 = nullptr;
+  size_t tv8_halves = 0;
+  // Memory another kernel's scratch lends, idle while attention runs on the same in-order queue (the Inkling engine's MoE
+  // scratch): the long prefill of Inkling's full layers keeps every K/V head's segment probabilities and statistics there at
+  // once, so that a launch covers all the heads (one head's P.V alone is 12 work-groups at 1,024-token chunks).
+  void* lent = nullptr;
+  size_t lent_bytes = 0;
 };
 
 // out[t][h][:] = softmax(Q[t][h] . K^T * scale) V over the keys token t sees: positions up to its

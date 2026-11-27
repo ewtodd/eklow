@@ -918,8 +918,9 @@ Scratch* reserve(sycl::queue& q, int64_t max_tokens, int64_t n_used, int64_t n_e
   };
   s->tl = static_cast<int32_t*>(dev(size_t(4 + 4 * s->max_tiles) * 4));
   s->rop = static_cast<int32_t*>(dev(size_t(P) * 4));
-  s->a = static_cast<sycl::half*>(dev(size_t(s->rows * n_embd) * 2));
-  s->h = static_cast<sycl::half*>(dev(size_t(s->rows * n_ff) * 2));
+  // a and h in one block, which lendable() hands out whole
+  s->a = static_cast<sycl::half*>(dev(size_t(s->rows * n_embd + s->rows * n_ff) * 2));
+  s->h = s->a + s->rows * n_embd;
   s->y = s->a;  // (DECISIONS 2026-11-24, "Inkling speed, second round")
   return s;
 }
@@ -930,9 +931,10 @@ void free_scratch(sycl::queue& q, Scratch* s) {
   sycl::free(s->tl, q);
   sycl::free(s->rop, q);
   sycl::free(s->a, q);
-  sycl::free(s->h, q);
   delete s;
 }
+
+std::pair<void*, size_t> lendable(const Scratch& s) { return {s.a, size_t(s.rows * (s.n_embd + s.n_ff)) * 2}; }
 
 uint64_t scratch_bytes(const Scratch& s) { return s.bytes; }
 

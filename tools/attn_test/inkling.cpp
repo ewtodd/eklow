@@ -2,7 +2,11 @@
 // K/V heads) against ref::inkling::attention's arithmetic, and its speed against the plain kernel of the same shape.
 //
 //   eklow-attn-test --inkling [--gguf FILE] [--len N] [--chunk N] [--samples N] [--time-ctx N,...] [--pf N] [--only sliding|full]
-//                   [--no-check] [--no-speed] [--attribute] [--int8]
+//                   [--no-check] [--no-speed] [--attribute] [--int8] [--lend MB]
+//
+// --lend MB: the scratch borrows MB of device memory (attn::Scratch::lent, as the engine lends its MoE scratch), so that the
+// full layers' long chunks run every K/V head's segments in one launch; without it they run one head at a time.
+// EKLOW_ATTN_NO_SEGMENTS=1 puts the full layers' long chunks back on FlashGroup, for comparison.
 //
 // Correctness: two slots hold different random sequences of --len positions (default 33,000) in the model's shapes: Q and K
 // clipped to norms up to 22.6 and drawn from a few shared directions, so that a fraction of the keys scores near 40 against a
@@ -176,6 +180,7 @@ int inkling_main(int argc, char** argv) {
   int64_t len = 33000, chunk = 2048, samples = 64, pf = 2048;
   std::vector<int64_t> time_ctx = {8192, 32768};
   bool no_check = false, no_speed = false, attribute = false, int8 = false;
+  int64_t lend_mb = 0;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -195,8 +200,9 @@ int inkling_main(int argc, char** argv) {
     else if (a == "--no-speed") no_speed = true;
     else if (a == "--attribute") attribute = true;
     else if (a == "--int8") int8 = true;
+    else if (a == "--lend") lend_mb = std::atoll(next().c_str());
     else {
-      std::fprintf(stderr, "usage: eklow-attn-test --inkling [--gguf FILE] [--len N] [--chunk N] [--samples N] [--time-ctx N,...] [--pf N] [--only sliding|full] [--no-check] [--no-speed] [--attribute] [--int8]\n");
+      std::fprintf(stderr, "usage: eklow-attn-test --inkling [--gguf FILE] [--len N] [--chunk N] [--samples N] [--time-ctx N,...] [--pf N] [--only sliding|full] [--no-check] [--no-speed] [--attribute] [--int8] [--lend MB]\n");
       return 2;
     }
   }
@@ -206,6 +212,11 @@ int inkling_main(int argc, char** argv) {
     gguf::File file = gguf::File::open(gguf_path);
     std::mt19937 rng(23);
     bool ok = true;
+    void* lent = lend_mb > 0 ? sycl::malloc_device(size_t(lend_mb) << 20, q) : nullptr;
+    auto lend = [&](attn::Scratch& sc) {
+      sc.lent = lent;
+      sc.lent_bytes = lent ? size_t(lend_mb) << 20 : 0;
+    };
     // Directions shared by queries and keys: a query scores ~40 against the keys of its direction.
     std::vector<float> dirs(16 * kD);
     {
@@ -315,6 +326,7 @@ int inkling_main(int argc, char** argv) {
           cache.head_dim = kD;
         }
         attn::Scratch scratch;
+        lend(scratch);
         const int64_t max_tok = kSlots * chunk;
         float *dq = sycl::malloc_device<float>(size_t(max_tok * kH * kD), q), *dk = sycl::malloc_device<float>(size_t(max_tok * kHkv * kD), q),
               *dv = sycl::malloc_device<float>(size_t(max_tok * kHkv * kD), q), *dout = sycl::malloc_device<float>(size_t(max_tok * kH * kD), q),
@@ -461,6 +473,7 @@ int inkling_main(int argc, char** argv) {
           int32_t *dslot = sycl::malloc_device<int32_t>(size_t(nt), q), *dpos = sycl::malloc_device<int32_t>(size_t(nt), q);
           int32_t* dtl = sycl::malloc_device<int32_t>(size_t(6 * kHkv * (nt * kH / kHkv / 8 + 2)), q);
           attn::Scratch scratch;
+          lend(scratch);
           attn::TileList tl(kD);
           auto prepare = [&](int64_t a, int64_t b) {
             std::vector<int32_t> pos, slot(size_t(b - a), 0);
@@ -502,7 +515,7 @@ int inkling_main(int argc, char** argv) {
             };
             go();
             q.wait();
-            if (std::getenv("EKLOW_ATTN_KERNELS") && reps > 10) {  // each kernel of one call: device time, and the gap before it
+            if (std::getenv("EKLOW_ATTN_KERNELS") && (reps > 10 || std::string(std::getenv("EKLOW_ATTN_KERNELS")) == "2")) {  // each kernel of one call: device time, and the gap before it
               std::vector<sycl::event> log;
               attn::g_event_log = &log;
               for (int i = 0; i < 2; ++i) {
