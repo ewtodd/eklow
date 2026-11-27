@@ -47,6 +47,8 @@ using SpinClock = std::chrono::steady_clock;
 }
 
 Pool::Pool(int threads, int spin_us) : spin_us_(spin_us) {
+  // EKLOW_POOL_SPIN_US overrides the spin before a worker sleeps (speed work)
+  if (const char* e = std::getenv("EKLOW_POOL_SPIN_US")) spin_us_.store(std::atoi(e), std::memory_order_relaxed);
   // EKLOW_CPU_PIN: a comma-separated list of CPUs; worker i (1 on: the caller is 0 and stays where it is) runs on entry
   // i - 1, cycling (speed work: P-cores against E-cores).
   std::vector<int> pin;

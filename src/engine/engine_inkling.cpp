@@ -330,7 +330,10 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
     for (void* p : {static_cast<void*>(hx_), static_cast<void*>(hrows_), static_cast<void*>(hids_), static_cast<void*>(hw_)})
       owned_.push_back(p);
     cr_ = dev(max_step_ * E);
-    pool_ = std::make_unique<cpu::Pool>(c_.cpu_threads);
+    // The workers spin 3 ms after a job before they sleep: a decode step's layer applications come every ~0.6-0.9 ms, and
+    // at the pool's default 400 us each one paid a futex wake for every worker (decode at 12k 23.2 -> 24.4 tok/s, a verify
+    // of 6 rows 96.7 -> 91.5 ms; DECISIONS 2026-11-26). Prefill's cold sets run on the card, so they sleep then.
+    pool_ = std::make_unique<cpu::Pool>(c_.cpu_threads, 3000);
   }
 }
 
