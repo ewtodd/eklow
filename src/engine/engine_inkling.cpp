@@ -689,22 +689,26 @@ void Engine::cold(const Layer& L, int64_t T, sycl::event packed) {
     cpu::experts_ffn(refs.data(), int(n), E, F, &x0, 1, ys.data(), cfg_.situ_beta, cfg_.situ_linear_beta, *pool_);
     for (size_t i = 0; i < n; ++i)
       for (int64_t e = 0; e < E; ++e) hrows_[e] += wts[i] * ys[i][e];
-  } else
-  for (size_t c = 0; c < by.size(); ++c) {
-    const auto& pairs = by[c];
-    if (pairs.empty()) continue;
-    const size_t n = pairs.size();
-    if (cold_y_.size() < n * size_t(E)) cold_y_.resize(n * size_t(E));
-    std::vector<const float*> xs(n);
-    std::vector<float*> ys(n);
-    for (size_t i = 0; i < n; ++i) {
-      xs[i] = hx_ + int64_t(pairs[i].first) * E;
-      ys[i] = cold_y_.data() + i * size_t(E);
+  } else {
+    // several tokens: every cold expert of the step on its own tokens, in one pass (one pool round trip, not one an expert)
+    std::vector<cpu::ExpertRef> refs;
+    std::vector<int> off{0};
+    std::vector<const float*> xs;
+    std::vector<std::pair<int32_t, int32_t>> who;  // each pair's (token, slot)
+    for (size_t c = 0; c < by.size(); ++c) {
+      if (by[c].empty()) continue;
+      refs.push_back(L.cold_ref[c]);
+      for (const auto& pr : by[c]) xs.push_back(hx_ + int64_t(pr.first) * E), who.push_back(pr);
+      off.push_back(int(xs.size()));
     }
-    cpu::expert_ffn(L.cold_ref[c], E, F, xs.data(), int(n), ys.data(), cfg_.situ_beta, cfg_.situ_linear_beta, *pool_);
+    const size_t n = xs.size();
+    if (cold_y_.size() < n * size_t(E)) cold_y_.resize(n * size_t(E));
+    std::vector<float*> ys(n);
+    for (size_t i = 0; i < n; ++i) ys[i] = cold_y_.data() + i * size_t(E);
+    cpu::experts_ffn_pairs(refs.data(), int(refs.size()), off.data(), E, F, xs.data(), ys.data(), cfg_.situ_beta, cfg_.situ_linear_beta, *pool_);
     for (size_t i = 0; i < n; ++i) {
-      const float w = hw_[int64_t(pairs[i].first) * NU + pairs[i].second];
-      float* row = hrows_ + int64_t(pairs[i].first) * E;
+      const float w = hw_[int64_t(who[i].first) * NU + who[i].second];
+      float* row = hrows_ + int64_t(who[i].first) * E;
       const float* y = ys[i];
       for (int64_t e = 0; e < E; ++e) row[e] += w * y[e];
     }

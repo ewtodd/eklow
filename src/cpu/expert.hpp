@@ -34,4 +34,10 @@ void expert_ffn(const ExpertRef& e, int64_t n_embd, int64_t n_ff, const float* c
 void experts_ffn(const ExpertRef* e, int ne, int64_t n_embd, int64_t n_ff, const float* const* x, int nx, float* const* y,
                  float situ_beta, float situ_linear_beta, Pool& pool);
 
+// Several experts of one layer, each on its own inputs, in one parallel pass over all of them: pairs off[i] .. off[i + 1] - 1
+// are expert i's, pair p reading x[p] and writing y[p] (a step of several tokens: each expert's tokens, without a pool
+// round trip an expert).
+void experts_ffn_pairs(const ExpertRef* e, int ne, const int* off, int64_t n_embd, int64_t n_ff, const float* const* x, float* const* y,
+                       float situ_beta, float situ_linear_beta, Pool& pool);
+
 }  // namespace eklow::cpu

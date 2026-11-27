@@ -50,6 +50,8 @@ struct Work {
   std::vector<Act> xa_nv, xa_q8;  // the inputs, once per layout in use
   std::vector<Act> ha;            // situ's outputs, [ne][nx]
   std::vector<float> h;           // the same in fp32
+  std::vector<Act> xa;            // experts_ffn_pairs: each pair's input, in its expert's layout
+  std::vector<int> of;            // experts_ffn_pairs: each pair's expert
 };
 thread_local Work t_work;
 thread_local std::vector<float> t_g, t_u;  // a task's gate and up rows
@@ -124,6 +126,69 @@ void experts_ffn(const ExpertRef* e, int ne, int64_t n_embd, int64_t n_ff, const
       gemv(ex.dn_type, ex.dn + uint64_t(r0) * rb, n_ff, cnt, &w.ha[size_t(i) * size_t(nx)], nx, t_g.data(), kGrain);
       for (int j = 0; j < nx; ++j) {
         float* o = y[size_t(i) * size_t(nx) + size_t(j)] + r0;
+        for (int64_t r = 0; r < cnt; ++r) o[r] = ex.dn_scale * t_g[size_t(j) * kGrain + size_t(r)];
+      }
+    }
+  });
+}
+
+void experts_ffn_pairs(const ExpertRef* e, int ne, const int* off, int64_t n_embd, int64_t n_ff, const float* const* x, float* const* y,
+                       float beta, float lb, Pool& pool) {
+  if (ne <= 0 || off[ne] <= 0) return;
+  const int np = off[ne];
+  for (int i = 0; i < ne; ++i)
+    if (n_ff % qtype_block(e[i].dn_type) || n_embd % qtype_block(e[i].gu_type))
+      throw std::invalid_argument("expert_ffn: n_embd or n_ff is not a multiple of a format's block");
+  Work& w = t_work;
+  w.of.resize(size_t(np));
+  for (int i = 0; i < ne; ++i)
+    for (int p = off[i]; p < off[i + 1]; ++p) w.of[size_t(p)] = i;
+  w.xa.resize(size_t(np));
+  pool.for_each(np, 8, [&](int64_t lo, int64_t hi) {
+    for (int64_t p = lo; p < hi; ++p) quantize_for(e[w.of[size_t(p)]].gu_type, x[p], n_embd, w.xa[size_t(p)]);
+  });
+  w.ha.resize(size_t(np));
+  w.h.resize(size_t(np) * size_t(n_ff));
+  float* const hbase = w.h.data();
+
+  // gate_up and situ: a task is one expert's 16 gate rows and their 16 up rows against that expert's inputs.
+  const int64_t gchunks = (n_ff + kGrain - 1) / kGrain;
+  pool.for_each(int64_t(ne) * gchunks, 1, [&](int64_t lo, int64_t hi) {
+    for (int64_t t = lo; t < hi; ++t) {
+      const int i = int(t / gchunks), n = off[i + 1] - off[i];
+      if (n <= 0) continue;
+      const int64_t r0 = (t % gchunks) * kGrain, cnt = std::min(kGrain, n_ff - r0);
+      const ExpertRef& ex = e[i];
+      const uint64_t rb = qrow_bytes(ex.gu_type, n_embd);
+      t_g.resize(size_t(n) * kGrain);
+      t_u.resize(size_t(n) * kGrain);
+      gemv(ex.gu_type, ex.gu + uint64_t(r0) * rb, n_embd, cnt, &w.xa[size_t(off[i])], n, t_g.data(), kGrain);
+      gemv(ex.gu_type, ex.gu + uint64_t(n_ff + r0) * rb, n_embd, cnt, &w.xa[size_t(off[i])], n, t_u.data(), kGrain);
+      for (int j = 0; j < n; ++j) {
+        float* h = hbase + int64_t(off[i] + j) * n_ff + r0;
+        for (int64_t r = 0; r < cnt; ++r) h[r] = situ(ex.gu_scale * t_g[size_t(j) * kGrain + size_t(r)], ex.gu_scale * t_u[size_t(j) * kGrain + size_t(r)], beta, lb);
+      }
+    }
+  });
+
+  auto quant_h = [&](int64_t lo, int64_t hi) {
+    for (int64_t p = lo; p < hi; ++p) quantize_for(e[w.of[size_t(p)]].dn_type, hbase + p * n_ff, n_ff, w.ha[size_t(p)]);
+  };
+  if (np >= 16) pool.for_each(np, 4, quant_h);
+  else quant_h(0, np);
+
+  const int64_t dchunks = (n_embd + kGrain - 1) / kGrain;
+  pool.for_each(int64_t(ne) * dchunks, 1, [&](int64_t lo, int64_t hi) {
+    for (int64_t t = lo; t < hi; ++t) {
+      const int i = int(t / dchunks), n = off[i + 1] - off[i];
+      if (n <= 0) continue;
+      const int64_t r0 = (t % dchunks) * kGrain, cnt = std::min(kGrain, n_embd - r0);
+      const ExpertRef& ex = e[i];
+      const uint64_t rb = qrow_bytes(ex.dn_type, n_ff);
+      t_g.resize(size_t(n) * kGrain);
+      gemv(ex.dn_type, ex.dn + uint64_t(r0) * rb, n_ff, cnt, &w.ha[size_t(off[i])], n, t_g.data(), kGrain);
+      for (int j = 0; j < n; ++j) {
+        float* o = y[off[i] + j] + r0;
         for (int64_t r = 0; r < cnt; ++r) o[r] = ex.dn_scale * t_g[size_t(j) * kGrain + size_t(r)];
       }
     }
