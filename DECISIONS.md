@@ -5064,3 +5064,32 @@ up front as far as each drafted token is allowed (`eklow-spec-test`: all 63 chec
 Together (eklow-engine-run-inkling, 12k, fixed placement): plain greedy decode 23.2 -> 24.4 tok/s, speculative greedy in
 blocks of 6 34.0 -> 37.3 tok/s (3.84 tokens a verify, the same tokens). A verify of 6 is now ~80 ms where the card's own
 part is ~52: its hot experts' union (20.9 ms) and the CPU's cold union are what remain, both at their memory's rate.
+
+## 2026-11-27 — Inkling: blocks by acceptance, the kept checkpoint, and where decode stands against the 26B
+
+**Blocks by acceptance.** On a document's questions with thinking on, the draft keeps ~2.2 tokens a verify (GSM8K: 4.3-4.8),
+so blocks of 6 barely beat plain decoding (8k: 24.7 against 22.4 tok/s; 32k: 20.6 against 21.2). With no block asked for,
+each request now takes the block that gives the most tokens a unit of time at its own acceptance so far (`adaptive_block`:
+(1 - a^B) / (1 - a) over the verify's cost, 1 / 1.28 / 1.58 / 1.71 / 1.85 / 1.95 / 2.10 / 2.24 decode steps for 1-8 rows
+at 12k, plus 0.11 for the draft's block; a decayed estimate of a with a prior of 0.8). Through the server: 8k 25.2, 32k
+22.2 (plain 22.5 / 21.3); GSM8K chat requests at Inkling's sampling 32.9-37.1 tok/s (4.3-4.8 tokens a verify).
+
+**The kept checkpoint.** Each slot keeps one checkpoint where the prompt's system messages end (the first `<|message_user|>`,
+2,048 tokens in or more), replaced only by another such: a new conversation with the same system prompt and tools resumes
+there. 8k system prompt: a second conversation's first token 1.96 s against 8.58 s cold. A next turn resumes from its last
+prompt's end as before (or from the kept one when another conversation took the slot in between).
+
+**The decode MoE GEMV with EU fusion on: wrong, and no faster.** Like the prefill GEMM before 2026-11-25, all decode GEMV
+variants ran with fusion off (the early return past the tile list, the tile's row count picked under a branch, the K
+split's return). With work-groups past the list computing the last tile and the row count chosen by the host, fusion was
+on, but the outputs were wrong (rel L2 0.6-0.8 against the reference; each change alone with fusion still off was right;
+storing nothing past the list, or an even K split for down, did not help) and the call took 136 against 139 us: this
+kernel is not held by its thread count. Kept as it was.
+
+**Against the Gemma 4 26B A4B on this card** (2026-10-27, through the server): prefill 1,631 / 1,529 tok/s at 8k / 32k,
+decode 37.6 / 34.9 plain. Inkling now (2026-11-27, the same method, the draft loaded): prefill 1,531 / 1,415, decode plain
+22.5 / 21.3, with the draft 25.2 / 22.2 on thinking over a document and ~33-37 on GSM8K-like text. Its decode step is 48
+layer applications against 30: the card's own part is 30.5 ms a token (hot experts 10.6, the Q|R|gate/K/V projections
+4.9, attention 4.0, mixes, controllers and norms ~5.5, O 1.5, head 1.5), and the CPU's cold experts add ~10 ms that a
+single token's step cannot overlap (verify steps of 4 rows or more now do). The hot experts' decode call runs at ~260 GB/s
+in isolation (group 11 us, gather 9, gate_up 88, down 50, combine 12) and ~220 us a visit in the step.

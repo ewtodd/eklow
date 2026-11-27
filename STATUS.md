@@ -95,9 +95,11 @@ with its measurements); what eklow is and its numbers: `README.md`.
    chi-square through the server and the draft's card reservation; its nix package is in, and /etc/nixos 20e23c5e
    (eklow 2ba14da, the draft on fiona's instance) is committed and build-checked for the owner to deploy
    (`colmena apply --on fiona`). Decode (DECISIONS 2026-11-27): the sampler's full sort for top-p is gone, a verify's rows
-   are sampled in parallel, the cold path's round trips shrank (speculative greedy 34.0 -> 37.3 tok/s at 12k). Still open
-   from the README's run: the stream's usage carries no `speculation` for Inkling, and serve_perf's repeats on one
-   document with another question prefilled it again (0 cached: no checkpoint at the shared prefix). Attention: the full layers' band
+   are sampled in parallel, the cold path's round trips shrank (speculative greedy 34.0 -> 37.3 tok/s at 12k), blocks
+   follow each request's acceptance, and a kept checkpoint at the system prompt's end lets a new conversation skip it
+   (DECISIONS 2026-11-27). Decode is still ~60% of the Gemma 4 26B's plain (22 against 37 tok/s at 8k; ~35 with the draft
+   on GSM8K-like text): next, the hot experts' decode call (~220 us a visit, ~5 kernels), the projections, and a single
+   token's cold round trip. Attention: the full layers' band
    form without spills, P.V's occupancy; every Flash and FlashGroup kernel runs with EU fusion off (decode's attention,
    the sliding layers' prefill), and decode's sliding attention needs a new ESIMD kernel (33 us a call at ~127 GB/s).
 1. **The GPU regression of `cleanup/qwen-chat`** in a pause of `eklow-bolt` (fiona `~/bolt-ref/regress.sh`, ~15 minutes):
