@@ -950,7 +950,8 @@ struct SegQK128 {
         pmin = pmin == std::numeric_limits<int32_t>::max() ? 0 : pmin;
         esimd::simd<sycl::half, 128> A = esimd::block_load<sycl::half, 128>(rt + (h * tph + (r ? tb : ta)) * 128);
         const int32_t u0 = extent + kBiasPad - 1;
-#pragma unroll
+        // Rolled (a constant trip count keeps EU fusion): unrolled, the 16 table loads were all issued ahead and spilled 9.6 KB.
+#pragma unroll 1
         for (int sft = 0; sft < 4; ++sft) {
           const int32_t ps = pmin + sft;
           esimd::simd<sycl::half, 128> As;
