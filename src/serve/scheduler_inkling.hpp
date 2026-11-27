@@ -124,6 +124,7 @@ class Scheduler {
     std::string held;             // content held back while it could start a stop string
     bool called = false;          // a tool call came out
     std::mt19937_64 draft_rng;    // the draft's walk at the request's temperature
+    bool drafts = false;          // the request speculates: its rows go into the draft's context
     int64_t verifies = 0, drafted = 0, accepted = 0;
   };
 

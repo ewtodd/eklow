@@ -454,13 +454,21 @@ int main(int argc, char** argv) {
       std::vector<float> l(logits.end() - VO, logits.end());
       if (!block_time.empty() || dr) eng.checkpoint(0);
       std::vector<std::vector<float>> plain_rows;  // with --draft: plain decode's logits a position, for the comparison
+      // EKLOW_PLAIN_CAPTURE (with --draft): plain decode captures each token's features and injects them, as the server
+      // does for a request that speculates, to measure that cost apart
+      static const bool plain_capture = dr && std::getenv("EKLOW_PLAIN_CAPTURE");
       const auto tg = std::chrono::steady_clock::now();
       for (int64_t i = 0; i < generate; ++i) {
         const int32_t t = int32_t(std::max_element(l.begin(), l.end()) - l.begin());
         ids.push_back(t);
         if (dr) plain_rows.push_back(l);
         engine::inkling::Chunk c{0, n + i, {t}, 1};
+        if (plain_capture) c.capture_rows = 1;
         l = eng.step({c});
+        if (plain_capture) {
+          const auto& cap = eng.capture();
+          dr->inject(0, cap.data, n + i, 1);
+        }
       }
       const double dt = since(tg);
       std::printf("decode: %lld greedy steps in %.2f s (%.2f tok/s)\n", (long long)generate, dt, double(generate) / dt);
@@ -557,6 +565,7 @@ int main(int argc, char** argv) {
         for (const int64_t K : block_time) {
           if (!eng.rewind(0, n)) throw std::runtime_error("--block-time: no checkpoint at the prompt's end");
           const int64_t steps = generate / K;
+          prof.clear();
           const auto tb = std::chrono::steady_clock::now();
           for (int64_t s = 0; s < steps; ++s) {
             engine::inkling::Chunk c{0, n + s * K, std::vector<int32_t>(ids.begin() + s * K, ids.begin() + (s + 1) * K), K};
@@ -565,6 +574,8 @@ int main(int argc, char** argv) {
           const double ms = since(tb) * 1e3 / double(steps);
           std::printf("block %2lld tokens: %6.2f ms a step (%.2f x one token's), %lld steps\n", (long long)K, ms,
                       ms / (dt * 1e3 / double(generate)), (long long)steps);
+          if (profile && rep == 1)  // where a step's time goes, ms a step
+            for (const auto& [k, v] : prof) std::printf("  block %2lld %-14s %8.3f ms\n", (long long)K, k.c_str(), v * 1e3 / double(steps));
         }
       std::ofstream gj(out + "/generated.json");
       gj << "[";

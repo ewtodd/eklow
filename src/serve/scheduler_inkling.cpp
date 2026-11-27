@@ -205,6 +205,9 @@ void Scheduler::start(int s, std::shared_ptr<Request> r, int64_t lcp) {
   q.parser = std::make_unique<text::InklingOutputParser>(tok_, r->mode, std::span<const int32_t>(r->prefill));
   q.sampler = std::make_unique<Sampler>(r->sampling);
   q.draft_rng.seed(r->sampling.seed * 0x9e3779b97f4a7c15ull + 1);
+  // A request that never drafts (a block of 0, or a sampler whose next distribution cannot be stated) captures nothing:
+  // the draft's context for the slot then restarts where a later request's prefill captures from.
+  q.drafts = c_.draft && q.sampler->speculative() && (r->draft_block < 0 ? c_.draft_block : r->draft_block) >= 2;
   q.verifies = q.drafted = q.accepted = 0;
   q.sampler->accept(std::span<const int32_t>(r->prompt));  // llama-server's sampler has seen the prompt
   q.grammar = r->grammar ? std::make_unique<InklingToolGrammar>(vocab_, r->choice, r->tools, r->parallel) : nullptr;
@@ -361,7 +364,7 @@ void Scheduler::step() {
   if (c_.draft && !reading) {
     Timer timer(mu_, stats_.draft_s);
     auto block_of = [&](const Seq& q) {
-      if (!q.sampler->speculative()) return 0;  // a sampler whose next distribution cannot be stated decodes plain
+      if (!q.drafts) return 0;
       const int b = q.req->draft_block < 0 ? c_.draft_block : q.req->draft_block;
       return std::clamp(b, 0, 8);
     };
@@ -396,7 +399,7 @@ void Scheduler::step() {
       c.tokens.insert(c.tokens.end(), it.block.tokens.begin(), it.block.tokens.end());
       c.verify = true, c.logits_rows = B, c.capture_rows = B;
     } else {
-      c.capture_rows = c_.draft ? 1 : 0;
+      c.capture_rows = q.drafts ? 1 : 0;
     }
     budget -= int64_t(c.tokens.size());
     cap_left -= c.capture_rows;
@@ -433,7 +436,7 @@ void Scheduler::step() {
       // with a draft, the prompt's rows within its reach of the end are captured for its context: a chunk ends where the
       // step's capture is full (the rest waits for the next step)
       int64_t cap = 0;
-      if (c_.draft) {
+      if (q.drafts) {
         const int64_t from = std::max(fed, P - c_.draft->reach());
         cap = std::max<int64_t>(0, fed + n - from);
         if (cap > cap_left) {
