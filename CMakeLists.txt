@@ -278,6 +278,8 @@ target_sources(eklow_model PRIVATE src/kernels/ref_dflash.cpp src/kernels/dflash
 # The sampler and the acceptance of a drafted block (eklow_serve_gemma4 links them).
 add_library(eklow_spec STATIC src/serve/sampler.cpp src/serve/spec.cpp)
 target_link_libraries(eklow_spec PUBLIC eklow_host)
+# the draft (in eklow_model) walks its lattice with serve::walk
+target_link_libraries(eklow_model PUBLIC eklow_spec)
 
 # The acceptance's statistical test: host code over the sampler only.
 # The sampler against llama.cpp's own (tools/sampler_test: llama_ref.cpp is built against a libllama by build-llama-ref.sh).

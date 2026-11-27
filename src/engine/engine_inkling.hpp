@@ -61,6 +61,12 @@ struct Config {
   // The full layers' K/V in int8, a scale a 16 values (attention's Q8 kernels), half of fp16's bytes: the pool's memory goes
   // to experts. The sliding rings stay fp16.
   bool kv_int8 = false;
+  // Speculative decoding (a DFlash 2 draft; DECISIONS 2026-11-26, "Inkling M6"): the hidden states the draft reads, by layer
+  // visit in the order a step runs them (an id below the visit count, 48: the stream at that visit's input; the count
+  // itself: the final norm's output), for the rows a chunk asks for (Chunk::capture_rows), into a device buffer [row][ids x
+  // n_embd] fp32 in step order. Empty: no capture.
+  std::vector<int> capture_ids = {};
+  int64_t max_capture_rows = 2048;  // rows a step may capture
   // LoopCD's hidden-state form (arXiv 2610.02185; DECISIONS 2026-11-24): what the coda reads of the core, its two blocks'
   // outputs, becomes h + w (h - h_1), h_1 the same after the first pass. 0: the model as trained.
   float loopcd = 0.0f;
@@ -75,6 +81,12 @@ struct Chunk {
   // id; the server's are negative). The rows go in after the token norm, as llama.cpp's (an embeddings batch is not
   // normalized), and must outlive the step.
   std::vector<model::ImageRows> images = {};
+  // A verify chunk (a speculative block: the anchor and the drafted tokens, 16 at most): the convolutions' states after
+  // each of its tokens are kept, so that truncate(slot, start_pos + 1 + accepted) after the step can go back to any of
+  // them. Its logits rows are the caller's (logits_rows: all of them for a verify).
+  bool verify = false;
+  // The chunk's last capture_rows rows are captured (Config::capture_ids).
+  int64_t capture_rows = 0;
 };
 
 class Engine {
@@ -94,6 +106,27 @@ class Engine {
 
   // Forgets a slot's sequence (its pages, its convolution state and its checkpoints).
   void release(int slot);
+  // Drops a slot's positions from `length` on: a verify block's rejected tokens (the last step's verify chunk of the slot,
+  // length within it: its convolutions' state goes back to the one kept after that token; the K/V past it is written over
+  // by the next tokens) or, with length = the slot's length, nothing.
+  void truncate(int slot, int64_t length);
+  static constexpr int64_t kVerifyRows = 16;  // the most rows of a step with a verify chunk
+  // The hidden states of the last step's captured rows, valid until the next step: a device buffer [row][capture_ids x
+  // n_embd] fp32 in step order (chunk after chunk); ids[row] is the row's slot and position.
+  struct RowId {
+    int32_t slot;
+    int64_t pos;
+  };
+  struct Capture {
+    const float* data = nullptr;
+    int64_t rows = 0, width = 0;
+    std::vector<RowId> ids;
+  };
+  const Capture& capture() const { return capture_; }
+  // For a draft: the output head on the matrix units, and the token embedding table as the GGUF stores it (host memory:
+  // the file's mapping) with Inkling's padded rows.
+  const xmx::Weight& head_weight() const { return head_w_; }
+  ref::Weight embedding_table() const;
   // A slot's state beyond its K/V pages (the sliding rings and the convolution state) cannot be rewound by dropping pages:
   // checkpoint saves it to pinned host memory at the slot's current length (replacing its oldest checkpoint), and rewind
   // goes back to a checkpoint's position exactly (its rings and convolution state restored, later pages returned). The
@@ -230,6 +263,21 @@ class Engine {
   std::vector<Slot> slots_;
   // Convolution state: [seq slot][application][3][conv_channels] fp32.
   float* conv_ = nullptr;
+  // A verify step's convolution states after each of its rows (up to kSnapRows): [application][row][3][conv_channels], and
+  // per slot the last step's verify chunk (its first position and row, its tokens) that truncate goes back within.
+  static constexpr int64_t kSnapRows = 16;
+  float* snap_ = nullptr;
+  struct VerifyRows {
+    int64_t start_pos = -1, row = 0, n = 0;
+  };
+  std::vector<VerifyRows> verify_rows_;
+  // Capture (Config::capture_ids): the buffer, each id's column block, the step's captured rows (their step rows on the
+  // card, for the gathers).
+  Capture capture_;
+  float* capture_buf_ = nullptr;
+  int32_t* cap_idx_ = nullptr;
+  float* cap_scratch_ = nullptr;  // the output mix's rows for the final norm's feature, kCapChunk rows at a time
+  static constexpr int64_t kCapChunk = 256;
   uint64_t ckpt_bytes_ = 0, ckpt_age_ = 0;
   // The copies of a checkpoint, in order: (device pointer, bytes) for a slot.
   std::vector<std::pair<uint8_t*, uint64_t>> state_parts(int slot) const;

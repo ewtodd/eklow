@@ -287,7 +287,7 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   max_tiles_full_ = max_tiles_sliding_;
   tile_stride_s_ = 6 * max_tiles_sliding_, tile_stride_f_ = 6 * max_tiles_full_;
   // a step's arrays: tokens, slots, positions, bases, logit rows, every sub-batch's tiles, the page table
-  up_words_ = size_t(4 * S + c_.max_logits + subs * (tile_stride_s_ + tile_stride_f_) + int64_t(c_.n_slots) * max_pages_);
+  up_words_ = size_t(4 * S + c_.max_logits + subs * (tile_stride_s_ + tile_stride_f_) + int64_t(c_.n_slots) * max_pages_ + c_.max_capture_rows);
   up_host_ = sycl::malloc_host<int32_t>(up_words_, q_);
   if (!up_host_) throw std::runtime_error("inkling engine: out of pinned host memory for the step's arrays");
   owned_.push_back(up_host_);
@@ -302,6 +302,19 @@ Engine::Engine(sycl::queue& q, const gguf::File& f, const Config& cfg) : q_(q), 
   attn::reserve(q_, attn_scratch_, max_tiles_full_, c_.max_chunk * (H / HK), HK, D, H / HK, c_.max_ctx + attn::kPage, bias_extent);
   act_ = xmx::alloc_activations(q_, B, std::max<int64_t>({E, HD, 2 * E}));
   moe_scratch_ = moe::reserve(q_, S, cfg_.n_expert_used, E, cfg_.n_ff_exp);
+  // Speculative decoding: the capture and the verify snapshots (counted before the experts are placed)
+  verify_rows_.assign(size_t(c_.n_slots), VerifyRows{});
+  if (!c_.capture_ids.empty()) {
+    for (int id : c_.capture_ids)
+      if (id < 0 || id > NA) throw std::runtime_error("inkling engine: a capture id past the layer visits");
+    capture_.width = int64_t(c_.capture_ids.size()) * E;
+    capture_buf_ = dev(c_.max_capture_rows * capture_.width);
+    cap_scratch_ = dev(kCapChunk * E * 10);
+    snap_ = dev(int64_t(NA) * kSnapRows * 3 * CC);
+    cap_idx_ = sycl::malloc_device<int32_t>(size_t(c_.max_capture_rows), q_);
+    if (!cap_idx_) throw std::runtime_error("inkling engine: out of device memory for the capture");
+    owned_.push_back(cap_idx_);
+  }
   place_experts(f);
   // The cold path's buffers: the step's routing and expert inputs on the host (the card writes them there), the cold
   // experts' weighted rows back.
@@ -563,6 +576,31 @@ std::vector<int64_t> Engine::checkpoint_positions(int slot) const {
   return out;
 }
 
+void Engine::truncate(int slot, int64_t length) {
+  Slot& s = slots_.at(size_t(slot));
+  if (length == s.length) return;
+  VerifyRows& v = verify_rows_[size_t(slot)];
+  if (v.start_pos < 0 || s.length != v.start_pos + v.n || length <= v.start_pos || length > s.length)
+    throw std::runtime_error("inkling engine: truncate goes back only within the last step's verify chunk");
+  // the convolutions' state as it was after the kept chunk's last token, every application's
+  const int64_t CC = cfg_.conv_channels(), NA = cfg_.n_slot(), row = v.row + (length - v.start_pos) - 1;
+  const float* src = snap_ + row * 3 * CC;
+  float* dst = conv_ + int64_t(slot) * NA * 3 * CC;
+  q_.parallel_for(sycl::range<2>(size_t(NA), size_t(3 * CC)), [=](sycl::id<2> id) {
+    const int64_t a = int64_t(id[0]), i = int64_t(id[1]);
+    dst[a * 3 * CC + i] = src[a * kSnapRows * 3 * CC + i];
+  });
+  q_.wait();
+  s.length = length;
+  v.start_pos = -1;
+  for (auto& c : s.ckpt)
+    if (c.pos > length) c.pos = -1;
+}
+
+ref::Weight Engine::embedding_table() const {
+  return ref::Weight{embd_->type, cfg_.n_embd, int64_t(embd_->ne[1]), embd_->data, embd_row_bytes_};
+}
+
 void Engine::release(int slot) {
   Slot& s = slots_.at(size_t(slot));
   for (int32_t p : s.pages) free_pages_.push_back(p);
@@ -697,6 +735,10 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     const float* rows;
   };
   std::vector<Span> image_spans;  // the chunks' images, by their first row in the step
+  // Capture: the step rows of each chunk's last capture_rows rows, in step order; a verify chunk's rows for truncate.
+  std::vector<int32_t> cap_rows;
+  capture_.ids.clear(), capture_.rows = 0, capture_.data = capture_buf_;
+  bool verify_step = false;
   for (const auto& c : chunks) {
     if (c.slot < 0 || c.slot >= c_.n_slots) throw std::runtime_error("inkling engine: bad slot");
     if (c.start_pos != slots_[size_t(c.slot)].length + in_step[size_t(c.slot)])
@@ -717,6 +759,16 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       image_spans.push_back({int64_t(tok.size()) + im.offset, im.n, im.rows});
     }
     sb.ch.base[sb.ch.count] = int32_t(b), sb.ch.n[sb.ch.count] = int32_t(n), sb.ch.slot[sb.ch.count] = c.slot, ++sb.ch.count;
+    if (c.capture_rows > 0) {
+      if (c_.capture_ids.empty()) throw std::runtime_error("inkling engine: a capture without Config::capture_ids");
+      for (int64_t i = n - std::min(c.capture_rows, n); i < n; ++i)
+        cap_rows.push_back(int32_t(int64_t(tok.size()) + i)), capture_.ids.push_back({c.slot, c.start_pos + i});
+    }
+    if (c.verify) {
+      if (!snap_) throw std::runtime_error("inkling engine: a verify chunk without Config::capture_ids");
+      verify_step = true;
+      verify_rows_[size_t(c.slot)] = {c.start_pos, int64_t(tok.size()), n};
+    }
     for (int64_t i = 0; i < n; ++i) {
       tok.push_back(c.tokens[size_t(i)]);
       slot.push_back(c.slot);
@@ -732,6 +784,9 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   }
   const int64_t TA = int64_t(tok.size()), R = int64_t(logit_rows.size());
   if (TA == 0) return {};
+  if (int64_t(cap_rows.size()) > c_.max_capture_rows) throw std::runtime_error("inkling engine: more captured rows than max_capture_rows");
+  if (verify_step && TA > kSnapRows) throw std::runtime_error("inkling engine: a verify step of more than 16 tokens");
+  capture_.rows = int64_t(cap_rows.size());
   if (TA > max_step_) throw std::runtime_error("inkling engine: step larger than max_step");
   if (R > c_.max_logits) throw std::runtime_error("inkling engine: too many logits rows");
   if (subs.size() > 1 && (dump || teacher)) throw std::runtime_error("inkling engine: dumps and teachers take steps of one sub-batch");
@@ -762,6 +817,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       put(tiles_full_ + int64_t(g) * tile_stride_f_, tf.data(), tf.size());
     }
     put(page_table_, page_table_host_.data(), page_table_host_.size());
+    put(cap_idx_, cap_rows.data(), cap_rows.size());
     for (size_t i = 0; i < segs.size(); i += kcopy::kMaxSegs)
       kcopy::copy_segs(q_, segs.data() + i, int(std::min<size_t>(segs.size() - i, kcopy::kMaxSegs)));
   }
@@ -978,9 +1034,11 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     mark("proj");
     float* hist = conv_ + int64_t(app) * 3 * CC;
     const int64_t sstride = NA * 3 * CC;
+    // a verify step's states of this application's convolutions after each row (Engine::truncate), at a channel offset
+    auto snap_at = [&](int64_t off) -> float* { return verify_step ? snap_ + int64_t(app) * kSnapRows * 3 * CC + off : nullptr; };
     if (T <= 16) {
-      ik::short_conv2(q_, T, ch, sstride, CC, ik::ConvArgs{kr_, KD, KD, hist, L.k_conv, swa ? nullptr : kd_, HK, kb_},
-                      ik::ConvArgs{vr_, KD, KD, hist + KD, L.v_conv, swa ? nullptr : vd_, HK, vb_});
+      ik::short_conv2(q_, T, ch, sstride, CC, ik::ConvArgs{kr_, KD, KD, hist, L.k_conv, swa ? nullptr : kd_, HK, kb_, snap_at(0)},
+                      ik::ConvArgs{vr_, KD, KD, hist + KD, L.v_conv, swa ? nullptr : vd_, HK, vb_, snap_at(KD)});
       fine("conv.kv");
     } else {
       ik::short_conv(q_, kr_, KD, T, KD, ch, slot_d, base_d, hist, sstride, CC, L.k_conv, swa ? nullptr : kd_, HK, kb_);
@@ -1025,7 +1083,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     // the stream's residual added in the convolution, where nothing reads the attention's output alone
     const bool fuse_res = ip % cfg_.block != 0 && !dump;
     ik::short_conv(q_, o_, E, T, E, ch, slot_d, base_d, hist + 2 * KD, sstride, CC, L.attn_post_conv, nullptr, 0, fuse_res ? out : oc_,
-                   fuse_res ? x : nullptr);
+                   fuse_res ? x : nullptr, snap_at(2 * KD));
     mark("o");
     // A block's first layer starts a new stream; the others add to theirs. The stream goes to `out`.
     const float* cur;
@@ -1102,12 +1160,14 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     }
     emit("ffn_moe_out" + sl, f_, {E, T});
     if (dump) {
-      ik::short_conv(q_, f_, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_);
+      ik::short_conv(q_, f_, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, o_, nullptr,
+                     snap_at(2 * KD + E));
       fine("ffn.conv");
       emit("ffn_out" + sl, o_, {E, T});
       ref::add(q_, cur, o_, T * E, out);
     } else {
-      ik::short_conv(q_, f_, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, out, cur);
+      ik::short_conv(q_, f_, E, T, E, ch, slot_d, base_d, hist + 2 * KD + E, sstride, CC, L.ffn_post_conv, nullptr, 0, out, cur,
+                     snap_at(2 * KD + E));
       fine("ffn.conv");
     }
     if (teacher) {
@@ -1170,8 +1230,25 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   };
   std::vector<const float*> blocks;
   const float* x = e0;
+  // The draft's features: the stream at the input of a layer visit (in the order the step runs them) for the captured rows,
+  // into its column block of the capture.
+  std::vector<int> visit_col(size_t(NA) + 1, -1);
+  for (size_t i = 0; i < c_.capture_ids.size(); ++i) visit_col[size_t(c_.capture_ids[i])] = int(i);
+  int visit = 0;
+  auto tap = [&](const float* src) {
+    const int col = visit_col[size_t(visit++)];
+    if (capture_.rows == 0 || col < 0) return;
+    const int64_t W = capture_.width, C = capture_.rows;
+    float* dst = capture_buf_ + int64_t(col) * E;
+    const int32_t* idx = cap_idx_;
+    q_.parallel_for(sycl::range<2>(size_t(C), size_t(E)), [=](sycl::id<2> id) {
+      const int64_t r = int64_t(id[0]), e = int64_t(id[1]);
+      dst[r * W + e] = src[int64_t(idx[r]) * E + e];
+    });
+  };
   for (int l = 0; l < cfg_.core_start; ++l) {
     float* out = l == cfg_.core_start - 1 ? prelude : next_of(x);
+    tap(x);
     apply(l, l, x, blocks, nullptr, out, nullptr, nullptr);
     x = out;
   }
@@ -1189,6 +1266,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
       const int app = cfg_.slot(l, pass);
       // the core's two blocks end at layers 11 and 17: their outputs are a later block's input and the next pass's bank
       float* out = l == cfg_.core_end - 1 ? o17[pass % 2] : l == cfg_.core_start + cfg_.block - 1 ? o11[pass % 2] : next_of(x);
+      tap(x);
       if (pass == 0) apply(app, l, x, blocks, nullptr, out, nullptr, nullptr);
       else apply(app, l, x, blocks, &loops_[size_t(l - cfg_.core_start)], out, &bank, bank_out);
       x = out;
@@ -1207,10 +1285,34 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
   }
   for (int l = cfg_.core_end; l < cfg_.n_layer; ++l) {
     float* out = next_of(x);
+    tap(x);
     apply(l, l, x, blocks, nullptr, out, nullptr, nullptr);
     x = out;
   }
   T = TA;
+  if (visit != NA) throw std::runtime_error("inkling engine: the step's layer visits do not add up");
+  // The final norm's output for the captured rows (the last feature of an Inkling draft): the output's mix and norm, as
+  // for the logit rows, kCapChunk rows at a time.
+  if (capture_.rows > 0 && visit_col[size_t(NA)] >= 0) {
+    const int64_t W = capture_.width, C = capture_.rows;
+    for (int64_t r0 = 0; r0 < C; r0 += kCapChunk) {
+      const int64_t rc = std::min(kCapChunk, C - r0);
+      ik::States cs;
+      for (size_t i = 0; i <= blocks.size(); ++i) {
+        float* d = cap_scratch_ + int64_t(i) * kCapChunk * E;
+        ik::gather_rows(q_, i < blocks.size() ? blocks[i] : x, cap_idx_ + r0, rc, E, d);
+        cs.p[cs.n++] = d;
+      }
+      float* mixed = cap_scratch_ + int64_t(cs.n) * kCapChunk * E;
+      ik::depth_mix(q_, cs, output_res_query_, 1, rc, E, 1e-6f, mixed);
+      fast::rmsnorm(q_, mixed, output_norm_, rc, E, cfg_.eps, mixed);
+      float* dst = capture_buf_ + int64_t(visit_col[size_t(NA)]) * E + r0 * W;
+      q_.parallel_for(sycl::range<2>(size_t(rc), size_t(E)), [=](sycl::id<2> id) {
+        const int64_t r = int64_t(id[0]), e = int64_t(id[1]);
+        dst[r * W + e] = mixed[r * E + e];
+      });
+    }
+  }
   for (const auto& c : chunks) slots_[size_t(c.slot)].length += int64_t(c.tokens.size());
   if (R == 0) {
     q_.wait();

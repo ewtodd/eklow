@@ -35,6 +35,8 @@ struct ChatRequest {
   // The prompt's images (M5): each image part's placeholder (<|unused_200054|>, as the template writes it) became the
   // image's rows, ids below zero naming them (gemma4::image_row_id), in the order of the parts.
   std::vector<gemma4::ImageInput> images;
+  // "speculative": a block size (2 to 8), true (the server's), false or 0 (plain decode); -1 when not sent
+  int draft_block = -1;
 };
 
 // `body` as text::parse_llama_json reads it. Throws ApiError (400) for what llama-server refuses or the template raises.

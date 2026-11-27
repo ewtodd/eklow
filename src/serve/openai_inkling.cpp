@@ -108,6 +108,11 @@ ChatRequest parse_chat(const json::Value& body, const text::InklingTokenizer& to
       throw bad("stop must be a string or an array of strings");
     }
   }
+  if (const json::Value* v = field(body, "speculative"); v && !v->is_null()) {
+    if (v->is_int()) r.draft_block = int(std::max<double>(0, std::min<double>(8, number(*v, "speculative"))));
+    else r.draft_block = v->truthy() ? -1 : 0;
+    if (r.draft_block == 1) r.draft_block = 0;
+  }
   if (const json::Value* v = field(body, "stream"); v) r.stream = v->truthy();
   if (const json::Value* so = field(body, "stream_options"); so && so->is_object())
     if (const json::Value* u = so->find("include_usage")) r.include_usage = u->truthy();

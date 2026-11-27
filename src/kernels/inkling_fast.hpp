@@ -35,7 +35,10 @@ struct Chunks {
 // With `resid` ([T][channels], may be `out`), out = resid + the convolution's output (a residual add fused in).
 void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t channels, const Chunks& ch, const int32_t* slot,
                 const int32_t* base, float* conv, int64_t state_stride, int64_t hist_stride, const float* w, const float* dyn,
-                int64_t heads, float* out, const float* resid = nullptr);
+                int64_t heads, float* out, const float* resid = nullptr, float* snap = nullptr);
+// snap (steps of up to 16 tokens; a speculative verify): after token t the state (x[t-2], x[t-1], x[t]) goes to
+// snap[t * 3 * hist_stride + j * hist_stride + c], j = 0..2, as the state itself is laid out (conv offset by the same
+// channels), so that a rejected tail can be undone (Engine::truncate).
 // Two convolutions of the same step (K and V) in one launch, for steps of up to 16 tokens: each as short_conv's arguments.
 struct ConvArgs {
   const float* x;
@@ -45,6 +48,7 @@ struct ConvArgs {
   const float* dyn;
   int64_t heads;
   float* out;
+  float* snap = nullptr;  // as short_conv's snap
 };
 void short_conv2(sycl::queue& q, int64_t T, const Chunks& ch, int64_t state_stride, int64_t hist_stride, const ConvArgs& a, const ConvArgs& b);
 

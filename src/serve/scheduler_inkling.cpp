@@ -189,6 +189,10 @@ void Scheduler::start(int s, std::shared_ptr<Request> r, int64_t lcp) {
       keep = 0;
     }
   }
+  if (c_.draft) {
+    if (keep == 0) c_.draft->reset(s);
+    else if (c_.draft->context_end(s) > keep) c_.draft->truncate(s, keep);
+  }
   q.tokens.resize(size_t(keep));
   q.fed = size_t(keep);
   q.cached = keep;
@@ -200,6 +204,8 @@ void Scheduler::start(int s, std::shared_ptr<Request> r, int64_t lcp) {
   q.first_pushed = false;
   q.parser = std::make_unique<text::InklingOutputParser>(tok_, r->mode, std::span<const int32_t>(r->prefill));
   q.sampler = std::make_unique<Sampler>(r->sampling);
+  q.draft_rng.seed(r->sampling.seed * 0x9e3779b97f4a7c15ull + 1);
+  q.verifies = q.drafted = q.accepted = 0;
   q.sampler->accept(std::span<const int32_t>(r->prompt));  // llama-server's sampler has seen the prompt
   q.grammar = r->grammar ? std::make_unique<InklingToolGrammar>(vocab_, r->choice, r->tools, r->parallel) : nullptr;
   q.req = std::move(r);
@@ -298,6 +304,8 @@ void Scheduler::step() {
     bool prefill;
     int slot;
     int64_t rows;
+    bool verify = false;      // a speculative block: rows = its tokens
+    serve::DraftBlock block;  // its drafted tokens
   };
   std::vector<engine::inkling::Chunk> chunks;
   std::vector<Item> items;
@@ -342,13 +350,58 @@ void Scheduler::step() {
     if (victim >= 0) counted[size_t(victim)] = 0;
     if (!take(int(s), int64_t(q.tokens.size()) + 1)) finish(int(s), "length", "the K/V pool is full");
   }
-  // Generating slots first, a token each.
+  // Generating slots first: a verify block of the draft's (in a step that reads no prompt: the engine keeps the
+  // convolutions' states after each row of a step of up to 16) or a decode token each. With a draft every committed
+  // token's features go into its context: a decode token's row is captured too.
+  bool reading = false;
+  for (const Seq& q : seqs_) reading = reading || (q.req && q.next_token < 0);
+  std::vector<serve::DraftBlock> blocks(seqs_.size());
+  std::vector<int> speculate(seqs_.size(), 0);  // per slot: the block it verifies this step (0: a decode token)
+  int64_t cap_left = c_.draft ? eng_.config().max_capture_rows : 0;
+  if (c_.draft && !reading) {
+    Timer timer(mu_, stats_.draft_s);
+    auto block_of = [&](const Seq& q) {
+      if (!q.sampler->speculative()) return 0;  // a sampler whose next distribution cannot be stated decodes plain
+      const int b = q.req->draft_block < 0 ? c_.draft_block : q.req->draft_block;
+      return std::clamp(b, 0, 8);
+    };
+    int rows_left = int(engine::inkling::Engine::kVerifyRows);
+    for (int B = 2; B <= 8; ++B) {
+      std::vector<model::Dflash2::Request> reqs;
+      std::vector<int> who;
+      for (size_t s = 0; s < seqs_.size(); ++s) {
+        Seq& q = seqs_[s];
+        if (!q.req || q.next_token < 0 || block_of(q) != B) continue;
+        const int64_t pos = int64_t(q.tokens.size());
+        if (pos + B > c_.max_ctx || c_.draft->context_end(int(s)) != pos || B > rows_left || !take(int(s), pos + B)) continue;
+        reqs.push_back({int(s), q.next_token, pos}), who.push_back(int(s));
+        rows_left -= B;
+      }
+      if (reqs.empty()) continue;
+      const std::vector<serve::Lattice> lats = c_.draft->lattices(reqs, B);
+      for (size_t k = 0; k < reqs.size(); ++k) {
+        Seq& q = seqs_[size_t(who[k])];
+        blocks[size_t(who[k])] = serve::walk(lats[k], std::max(0.0f, q.req->sampling.temperature), q.draft_rng);
+        speculate[size_t(who[k])] = B;
+      }
+    }
+  }
   for (size_t s = 0; s < seqs_.size(); ++s) {
     Seq& q = seqs_[s];
     if (!q.req || q.next_token < 0) continue;
-    chunks.push_back({int(s), int64_t(q.tokens.size()), {q.next_token}, 1});
-    items.push_back({false, int(s), 1});
-    --budget;
+    engine::inkling::Chunk c{int(s), int64_t(q.tokens.size()), {q.next_token}, 1};
+    Item it{false, int(s), 1};
+    if (const int B = speculate[s]) {
+      it.verify = true, it.block = std::move(blocks[s]), it.rows = B;
+      c.tokens.insert(c.tokens.end(), it.block.tokens.begin(), it.block.tokens.end());
+      c.verify = true, c.logits_rows = B, c.capture_rows = B;
+    } else {
+      c.capture_rows = c_.draft ? 1 : 0;
+    }
+    budget -= int64_t(c.tokens.size());
+    cap_left -= c.capture_rows;
+    chunks.push_back(std::move(c));
+    items.push_back(std::move(it));
   }
   // Prefill chunks in what is left; a prefill-only request gets none while another request runs, and smaller chunks.
   bool others = false;
@@ -377,12 +430,25 @@ void Scheduler::step() {
       while ((eng_.pages_held(int(s)) + counted[s] + avail()) * attn::kPage - at < n && release_idle()) {
       }
       n = std::min<int64_t>(n, (eng_.pages_held(int(s)) + counted[s] + avail()) * attn::kPage - at);
+      // with a draft, the prompt's rows within its reach of the end are captured for its context: a chunk ends where the
+      // step's capture is full (the rest waits for the next step)
+      int64_t cap = 0;
+      if (c_.draft) {
+        const int64_t from = std::max(fed, P - c_.draft->reach());
+        cap = std::max<int64_t>(0, fed + n - from);
+        if (cap > cap_left) {
+          n = std::max<int64_t>(0, from + cap_left - fed);
+          cap = std::max<int64_t>(0, fed + n - from);
+        }
+      }
       if (n <= 0) break;
       take(int(s), at + n);
       const bool last = fed + n == P && !q.req->prefill_only;
       chunks.push_back({int(s), at,
                         std::vector<int32_t>(q.req->prompt.begin() + std::ptrdiff_t(fed), q.req->prompt.begin() + std::ptrdiff_t(fed + n)),
                         last ? 1 : 0});
+      chunks.back().capture_rows = cap;
+      cap_left -= cap;
       // the images' rows in the chunk: an image decodes causally, as text, so a chunk may hold part of one (a long image,
       // a step's end, a rewind to a checkpoint inside one)
       for (const auto& im : q.req->images) {
@@ -418,6 +484,14 @@ void Scheduler::step() {
     if (q.grammar->unconstrained()) return q.sampler->sample(l, nullptr, &vocab_->never);
     return q.sampler->sample(l, &q.grammar->allowed(), nullptr);
   };
+  // The draft's context: a chunk's captured rows (consecutive positions of one slot) from its first in the capture.
+  const auto& capture = eng_.capture();
+  int64_t cap_row = 0;
+  auto inject = [&](int64_t first, int64_t count) {
+    if (!c_.draft || count <= 0) return;
+    Timer timer(mu_, stats_.inject_s);
+    c_.draft->inject(capture.ids[size_t(first)].slot, capture.data + first * capture.width, capture.ids[size_t(first)].pos, count);
+  };
   size_t row = 0;
   for (size_t i = 0; i < chunks.size(); ++i) {
     const engine::inkling::Chunk& c = chunks[i];
@@ -425,9 +499,59 @@ void Scheduler::step() {
     Seq& q = seqs_[size_t(it.slot)];
     const size_t row0 = row;
     row += size_t(it.rows);
+    const int64_t cap0 = cap_row;
+    cap_row += c.capture_rows;
+    if (it.verify) {
+      // Row r of the logits follows the anchor and the first r drafted tokens: the tool grammar there is the request's
+      // advanced by them (clones, made as rows are asked for), so a drafted token it forbids has probability zero.
+      const serve::DraftBlock& block = it.block;
+      const int n = block.size();
+      std::vector<std::unique_ptr<InklingToolGrammar>> states(size_t(n) + 1);
+      const serve::ConstraintFn constraint = [&](int r, std::span<const int32_t> prefix) -> serve::RowConstraint {
+        if (!q.grammar) return {};
+        InklingToolGrammar* g = q.grammar.get();
+        if (r > 0) {
+          if (!states[size_t(r)]) {
+            int from = r - 1;  // the row whose state the new one extends (0: the request's own)
+            while (from > 0 && !states[size_t(from)]) --from;
+            auto st = std::make_unique<InklingToolGrammar>(from > 0 ? *states[size_t(from)] : *q.grammar);
+            for (int k = from; k < r; ++k) st->accept(prefix[size_t(k)]);
+            states[size_t(r)] = std::move(st);
+          }
+          g = states[size_t(r)].get();
+        }
+        if (g->unconstrained()) return {nullptr, &vocab_->never};
+        return {&g->allowed(), nullptr};
+      };
+      serve::VerifyResult res;
+      {
+        Timer timer(mu_, stats_.sample_s);
+        res = serve::verify(*q.sampler, block, [&](int r) { return std::span<const float>(logits.data() + (row0 + size_t(r)) * V, V); }, constraint);
+      }
+      {
+        std::lock_guard lk(mu_);
+        ++stats_.verifies, stats_.drafted += n, stats_.accepted += res.accepted;
+      }
+      ++q.verifies, q.drafted += n, q.accepted += res.accepted;
+      // The kept tokens are the anchor and d_0 .. d_{a-1}; what comes out is d_0 .. d_{a-1} and the next one (a stop ends
+      // the request at its token, the rest of the block dropped). The engine goes back to the kept tokens.
+      std::string why;
+      int fed = 0;
+      for (int j = 0; j <= res.accepted; ++j) {
+        q.tokens.push_back(c.tokens[size_t(j)]);
+        fed = j + 1;
+        why = on_token(it.slot, j < res.accepted ? block.tokens[size_t(j)] : res.next);
+        if (!why.empty()) break;
+      }
+      eng_.truncate(it.slot, int64_t(q.tokens.size()));
+      inject(cap0, fed);
+      if (!why.empty()) finish(it.slot, why);
+      continue;
+    }
     if (it.prefill) {
       q.tokens.insert(q.tokens.end(), c.tokens.begin(), c.tokens.end());
       q.fed += c.tokens.size();
+      inject(cap0, c.capture_rows);
       // A checkpoint before the prompt's last token (at its end for a prefill-only request): where a next turn that departs
       // from this answer resumes, or the same prompt again.
       if (q.fed + (q.req->prefill_only ? 0 : 1) == q.req->prompt.size()) eng_.checkpoint(it.slot);
@@ -437,6 +561,7 @@ void Scheduler::step() {
       }
     } else {
       q.tokens.push_back(c.tokens[0]);
+      inject(cap0, c.capture_rows);
     }
     const std::string why = on_token(it.slot, sample(q, row0));
     if (!why.empty()) finish(it.slot, why);
@@ -517,6 +642,7 @@ void Scheduler::finish(int slot, const std::string& reason, const std::string& e
     l.prompt_tokens = e.prompt_tokens, l.cached_tokens = e.cached_tokens, l.completion_tokens = e.completion_tokens;
     for (const auto& im : q.req->images) l.image_tokens += im.n;
     l.prefill_only = q.req->prefill_only, l.held = e.held;
+    l.verifies = q.verifies, l.drafted = q.drafted, l.accepted = q.accepted;
     if (q.req->prefill_only) l.prefill_s = seconds(now - q.admitted);
     l.queue_s = seconds(q.admitted - q.req->submitted);
     if (q.generated > 0) {

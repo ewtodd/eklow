@@ -268,7 +268,8 @@ void depth_mix(sycl::queue& q, const States& s, const float* query, int n_query,
 
 void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t channels, const Chunks& ch, const int32_t* slot,
                 const int32_t* base, float* conv, int64_t state_stride, int64_t hist_stride, const float* w, const float* dyn,
-                int64_t heads, float* out, const float* resid) {
+                int64_t heads, float* out, const float* resid, float* snap) {
+  if (snap && T > 16) throw std::runtime_error("inkling::short_conv: snapshots only in steps of up to 16 tokens");
   const bool has_dyn = dyn != nullptr;
   const float s = 1.0f / std::sqrt(float((has_dyn ? 2 : 1) * 4 + 1));
   const int64_t per_head = has_dyn ? channels / heads : 1;
@@ -294,6 +295,10 @@ void short_conv(sycl::queue& q, const float* x, int64_t ld_x, int64_t T, int64_t
         }
         out[t * channels + c] = (xt + acc) * s + (resid ? resid[t * channels + c] : 0.0f);
         h0 = h1, h1 = h2, h2 = xt;
+        if (snap) {
+          float* sp = snap + t * 3 * hist_stride + c;
+          sp[0] = h0, sp[hist_stride] = h1, sp[2 * hist_stride] = h2;
+        }
       }
       hist[c] = h0, hist[hist_stride + c] = h1, hist[2 * hist_stride + c] = h2;
     });
@@ -374,6 +379,10 @@ void short_conv2(sycl::queue& q, int64_t T, const Chunks& ch, int64_t state_stri
       }
       u.out[t * u.channels + c] = (xt + acc) * s;
       h0 = h1, h1 = h2, h2 = xt;
+      if (u.snap) {
+        float* sp = u.snap + t * 3 * hist_stride + c;
+        sp[0] = h0, sp[hist_stride] = h1, sp[2 * hist_stride] = h2;
+      }
     }
     hist[c] = h0, hist[hist_stride + c] = h1, hist[2 * hist_stride + c] = h2;
   });

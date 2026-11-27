@@ -39,6 +39,8 @@
 #include <sycl/ext/oneapi/backend/level_zero.hpp>
 #include <map>
 #include "engine/engine_inkling.hpp"
+#include "model/dflash2.hpp"
+#include "serve/spec.hpp"
 #include "model/vision_inkling2v.hpp"
 #include "image/inkling_image.hpp"
 #include "kernels/attention.hpp"
@@ -168,6 +170,11 @@ int main(int argc, char** argv) {
   // --block-time K,...: a speculative verify's cost: after --generate's tokens, rewind to the prompt's end and feed them
   // again in steps of K tokens (one slot), for each K, timing the steps
   std::vector<int64_t> block_time;
+  // --draft FILE [--spec-block B] (with --generate N): the DFlash 2 draft (M6). After the plain greedy tokens, rewind to the
+  // prompt's end and decode them again speculatively (blocks of B: the anchor and B - 1 drafted tokens, greedy acceptance);
+  // the two runs' tokens are compared and the tokens a verify step reported.
+  std::string draft_path;
+  int spec_block = 8;
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
     auto next = [&]() -> std::string { return i + 1 < argc ? argv[++i] : ""; };
@@ -189,6 +196,8 @@ int main(int argc, char** argv) {
     else if (a == "--teacher") teacher_dir = next();
     else if (a == "--gen-json") gen_json = next();
     else if (a == "--generate") generate = std::atoll(next().c_str());
+    else if (a == "--draft") draft_path = next();
+    else if (a == "--spec-block") spec_block = std::atoi(next().c_str());
     else if (a == "--block-time")
       for (const std::string& v : split(next(), ',')) block_time.push_back(std::atoll(v.c_str()));
     else if (a == "--profile") profile = true;
@@ -261,7 +270,34 @@ int main(int argc, char** argv) {
       if (image_pos < c.start_pos || image_pos + image_n > end) throw std::runtime_error("an image across chunks");
       c.images.push_back({image_pos - c.start_pos, image_n, image_rows.data()});
     };
+    std::unique_ptr<gguf::File> dfile;
+    if (!draft_path.empty()) {
+      dfile = std::make_unique<gguf::File>(gguf::File::open(draft_path));
+      cfg.capture_ids = model::Dflash2Config::from_gguf(*dfile).target_ids;
+    }
     engine::inkling::Engine eng(q, f, cfg);
+    std::unique_ptr<model::Dflash2> dr;
+    if (dfile) {
+      model::Dflash2::Options o;
+      o.slots = 2, o.max_block = 16;
+      dr = std::make_unique<model::Dflash2>(q, *dfile, model::Dflash2Target{eng.embedding_table(), eng.head_weight(), true}, o);
+      std::printf("draft: %s, %.0f MB on the card, block %d, reach %lld\n", draft_path.c_str(), double(dr->bytes()) / 1e6, spec_block,
+                  (long long)dr->reach());
+    }
+    // the draft's context: the chunk's rows within its reach of the prompt's end, injected after each step
+    auto capture = [&](engine::inkling::Chunk& c, int64_t prompt_end) {
+      if (!dr) return;
+      const int64_t end = c.start_pos + int64_t(c.tokens.size()), from = std::max(c.start_pos, prompt_end - dr->reach());
+      c.capture_rows = std::max<int64_t>(0, end - from);
+    };
+    auto inject = [&]() {
+      if (!dr || eng.capture().rows == 0) return;
+      const auto& cp = eng.capture();
+      std::vector<int32_t> sl;
+      std::vector<int64_t> ps;
+      for (const auto& id : cp.ids) sl.push_back(id.slot), ps.push_back(id.pos);
+      dr->inject_rows(cp.data, sl.data(), ps.data(), cp.rows);
+    };
     std::printf("engine: %.2f GiB of weights on %s, %lld cold experts (%.2f GiB) on the CPU, %.2f GiB of caches, %.2f GiB free "
                 "before the experts, %.1f s\n",
                 eng.weight_bytes() / 1073741824.0, q.get_device().get_info<sycl::info::device::name>().c_str(),
@@ -315,20 +351,24 @@ int main(int argc, char** argv) {
         const int64_t e = std::min(q + chunk, n - last);
         cs.push_back({0, q, std::vector<int32_t>(tokens.begin() + q, tokens.begin() + e), 0});
         attach(cs.back());
+        capture(cs.back(), n);
         q = e;
       }
       if (cs.size() > 1) {
         dumping = false;
         logits = eng.step(cs);
+        inject();
         p = q;
         continue;
       }
       const int64_t end = p < n - last ? std::min(p + chunk, n - last) : n;
       engine::inkling::Chunk c{0, p, std::vector<int32_t>(tokens.begin() + p, tokens.begin() + end), end == n ? last : 0};
       attach(c);
+      capture(c, n);
       dumping = end == n;
       from = p, rows = end - p;
       logits = eng.step({c}, &sink, teacher_dir.empty() ? nullptr : &teacher);
+      inject();
       p = end;
     }
     dumping = false;
@@ -412,16 +452,107 @@ int main(int argc, char** argv) {
       const int64_t VO = eng.model().n_vocab_out;
       std::vector<int32_t> ids;
       std::vector<float> l(logits.end() - VO, logits.end());
-      if (!block_time.empty()) eng.checkpoint(0);
+      if (!block_time.empty() || dr) eng.checkpoint(0);
+      std::vector<std::vector<float>> plain_rows;  // with --draft: plain decode's logits a position, for the comparison
       const auto tg = std::chrono::steady_clock::now();
       for (int64_t i = 0; i < generate; ++i) {
         const int32_t t = int32_t(std::max_element(l.begin(), l.end()) - l.begin());
         ids.push_back(t);
+        if (dr) plain_rows.push_back(l);
         engine::inkling::Chunk c{0, n + i, {t}, 1};
         l = eng.step({c});
       }
       const double dt = since(tg);
       std::printf("decode: %lld greedy steps in %.2f s (%.2f tok/s)\n", (long long)generate, dt, double(generate) / dt);
+      if (dr) {
+        // the speculative run from the prompt's end: greedy drafts, accepted while the target's argmax agrees
+        if (!eng.rewind(0, n)) throw std::runtime_error("--draft: no checkpoint at the prompt's end");
+        dr->truncate(0, n);
+        std::mt19937_64 rng(1);
+        auto argmax = [&](const float* r) { return int32_t(std::max_element(r, r + VO) - r); };
+        std::vector<int32_t> sids;
+        int32_t anchor = argmax(logits.data() + logits.size() - size_t(VO));
+        int64_t pos = n, steps = 0;
+        const int B = spec_block;
+        // each kept row's logits against plain decode's at its position while the two sequences agree
+        double kl_sum = 0, kl_max = 0;
+        int64_t kl_n = 0, top_same = 0;
+        int64_t first_far = -1;
+        auto compare = [&](const float* a, const std::vector<float>& b, int64_t at) {
+          double ma = -1e30, mb = -1e30;
+          for (int64_t v = 0; v < VO; ++v) ma = std::max(ma, double(a[v])), mb = std::max(mb, double(b[size_t(v)]));
+          double za = 0, zb = 0;
+          for (int64_t v = 0; v < VO; ++v) za += std::exp(double(a[v]) - ma), zb += std::exp(double(b[size_t(v)]) - mb);
+          double kl = 0;
+          for (int64_t v = 0; v < VO; ++v) {
+            const double pb = std::exp(double(b[size_t(v)]) - mb) / zb;
+            if (pb > 0) kl += pb * ((double(b[size_t(v)]) - mb - std::log(zb)) - (double(a[v]) - ma - std::log(za)));
+          }
+          kl_sum += kl, kl_max = std::max(kl_max, kl), ++kl_n;
+          top_same += int64_t(std::max_element(a, a + VO) - a) == int64_t(std::max_element(b.begin(), b.begin() + VO) - b.begin());
+          if (kl > 1e-2 && first_far < 0) first_far = at;
+        };
+        const auto ts = std::chrono::steady_clock::now();
+        double t_draft = 0, t_step = 0, t_trunc = 0, t_inject = 0;
+        while (int64_t(sids.size()) < generate) {
+          auto tp = std::chrono::steady_clock::now();
+          serve::DraftBlock blk = dr->draft(0, anchor, pos, B, 0.0f, rng);
+          t_draft += since(tp), tp = std::chrono::steady_clock::now();
+          // EKLOW_SPEC_ORACLE=1 (checks): the draft is plain decode's own next tokens (all accepted: only the batch shape
+          // differs); =2: the same, cut at a random point (a rollback every step, on tokens known to be right)
+          static const int oracle = std::getenv("EKLOW_SPEC_ORACLE") ? std::atoi(std::getenv("EKLOW_SPEC_ORACLE")) : 0;
+          int cut = B - 1;
+          if (oracle) {
+            for (int j = 0; j < B - 1; ++j) {
+              const int64_t at = pos - n + 1 + j;
+              blk.tokens[size_t(j)] = at < int64_t(ids.size()) ? ids[size_t(at)] : 0;
+            }
+            if (oracle >= 2) cut = int(rng() % uint64_t(B));
+            // =3: past the cut, other tokens (rejected, as wrong drafts are: what they wrote must not stay)
+            if (oracle == 3)
+              for (int j = cut; j < B - 1; ++j) blk.tokens[size_t(j)] = int32_t(1000 + rng() % 50000);
+          }
+          engine::inkling::Chunk c{0, pos, {anchor}, B};
+          c.tokens.insert(c.tokens.end(), blk.tokens.begin(), blk.tokens.end());
+          c.verify = true, c.capture_rows = B;
+          const std::vector<float> lv = eng.step({c});
+          t_step += since(tp);
+          int a = 0;
+          while (a < cut && argmax(lv.data() + size_t(a) * VO) == blk.tokens[size_t(a)]) ++a;
+          const int32_t next = argmax(lv.data() + size_t(a) * VO);
+          for (int j = 0; j <= a; ++j) {
+            // row j has fed the tokens up to index `at` of the sequence and predicts token at + 1: plain_rows[at + 1]
+            const int64_t at = pos - n + j;
+            bool agree = at + 1 < int64_t(plain_rows.size());
+            for (int64_t k = 0; agree && k <= at && k < int64_t(sids.size()) + j; ++k) {
+              const int32_t sk = k < int64_t(sids.size()) ? sids[size_t(k)] : (k == int64_t(sids.size()) ? anchor : blk.tokens[size_t(k - int64_t(sids.size()) - 1)]);
+              agree = sk == ids[size_t(k)];
+            }
+            if (agree) compare(lv.data() + size_t(j) * VO, plain_rows[size_t(at + 1)], at);
+          }
+          sids.push_back(anchor);
+          for (int j = 0; j < a; ++j) sids.push_back(blk.tokens[size_t(j)]);
+          tp = std::chrono::steady_clock::now();
+          eng.truncate(0, pos + a + 1);
+          t_trunc += since(tp), tp = std::chrono::steady_clock::now();
+          const auto& cp = eng.capture();
+          dr->inject(0, cp.data, pos, a + 1);
+          q.wait();
+          t_inject += since(tp);
+          pos += a + 1, anchor = next, ++steps;
+        }
+        const double st = since(ts);
+        sids.resize(size_t(generate));
+        int64_t same = 0;
+        while (same < generate && sids[size_t(same)] == ids[size_t(same)]) ++same;
+        std::printf("speculative: %lld tokens in %lld verify steps of %d (%.2f a step), %.2f s (%.2f tok/s); the first %lld of %lld equal to plain greedy's\n",
+                    (long long)generate, (long long)steps, B, double(generate) / double(steps), st, double(generate) / st, (long long)same,
+                    (long long)generate);
+        std::printf("speculative steps (ms each): draft %.2f, verify %.2f, truncate %.2f, inject %.2f\n", t_draft * 1e3 / double(steps),
+                    t_step * 1e3 / double(steps), t_trunc * 1e3 / double(steps), t_inject * 1e3 / double(steps));
+        std::printf("speculative rows against plain decode's at the same positions (%lld rows): KL mean %.2e, max %.2e, top-1 %lld of %lld; first row past KL 1e-2: %lld\n",
+                    (long long)kl_n, kl_n ? kl_sum / double(kl_n) : 0.0, kl_max, (long long)top_same, (long long)kl_n, (long long)first_far);
+      }
       for (int rep = 0; rep < 2; ++rep)
         for (const int64_t K : block_time) {
           if (!eng.rewind(0, n)) throw std::runtime_error("--block-time: no checkpoint at the prompt's end");

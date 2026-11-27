@@ -20,10 +20,12 @@
 #include <deque>
 #include <memory>
 #include <mutex>
+#include <random>
 #include <string>
 #include <vector>
 
 #include "engine/engine_inkling.hpp"
+#include "model/dflash2.hpp"
 #include "serve/sampler.hpp"
 #include "serve/scheduler_gemma4.hpp"
 #include "serve/tool_grammar_inkling.hpp"
@@ -53,6 +55,7 @@ class Request {
   std::vector<std::string> tools;
   bool parallel = true;
   std::string tag;                 // names the request in the log (the completion id)
+  int draft_block = -1;            // -1: the server's speculative block; 0: plain decode even with a draft; 2 to 8: this one
 
   bool next(Event& e, std::chrono::milliseconds wait);
   void cancel();
@@ -74,6 +77,11 @@ struct SchedulerConfig {
   std::function<void(const RequestLog&)> on_finish = {};
   int64_t prefill_only_chunk = 512;
   size_t max_prefill_only_waiting = 8;
+  // Speculative decoding (M6): the DFlash 2 draft (null: plain decode; the engine's Config::capture_ids must be its
+  // target ids) and the block B (the anchor and B - 1 drafted tokens; 2 to 8: two slots' blocks fill a 16-row verify
+  // step). Blocks run only in steps without a prompt being read.
+  model::Dflash2* draft = nullptr;
+  int draft_block = 6;
 };
 
 class Scheduler {
@@ -115,6 +123,8 @@ class Scheduler {
     bool first_pushed = false;
     std::string held;             // content held back while it could start a stop string
     bool called = false;          // a tool call came out
+    std::mt19937_64 draft_rng;    // the draft's walk at the request's temperature
+    int64_t verifies = 0, drafted = 0, accepted = 0;
   };
 
   bool admit();

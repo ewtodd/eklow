@@ -597,10 +597,12 @@ int main(int argc, char** argv) {
     std::unique_ptr<text::Tokenizer> gtok;
     std::unique_ptr<text::InklingTokenizer> itok;
     if (inkling) {
-      // M4 of the port (DECISIONS 2026-11-24): text and tools. Its vision is M5 and its MTP draft M6; it keeps no disk prefix
-      // cache (its sliding rings and convolution states are rewound from checkpoints, engine_inkling.hpp).
-      if (!draft_path.empty() || !prefix_dir.empty() || kv_int8 || preserve_thinking)
-        throw std::runtime_error("Inkling 2 Mini is served without --draft, --prefix-cache, --kv-int8 and --preserve-thinking");
+      // M4 of the port (DECISIONS 2026-11-24): text and tools; M5 vision; M6 speculative decoding with a DFlash 2 draft
+      // (--draft). It keeps no disk prefix cache (its sliding rings and convolution states are rewound from checkpoints,
+      // engine_inkling.hpp).
+      if (!prefix_dir.empty() || kv_int8 || preserve_thinking)
+        throw std::runtime_error("Inkling 2 Mini is served without --prefix-cache, --kv-int8 and --preserve-thinking");
+      if (draft_block > 8) throw std::runtime_error("--draft-block for Inkling 2 Mini is 2 to 8 (two slots' blocks fill a verify step of 16 rows)");
       if (!tmpl || !text::is_inkling_template(tmpl->as_string()))
         throw std::runtime_error(model_path + ": its chat template is not Inkling 2 Mini's, which eklow ports");
       if (const gguf::Value* n = file.find("inkling2_loop.context_length"); n && ctx > n->as_int())
@@ -630,7 +632,7 @@ int main(int argc, char** argv) {
     ec.int8_global_kv = kv_int8;
     std::unique_ptr<gguf::File> draft_file;
     model::Dflash2Config draft_cfg{};
-    if (!draft_path.empty()) {
+    if (!draft_path.empty() && !inkling) {
       draft_file = std::make_unique<gguf::File>(gguf::File::open(draft_path));
       draft_cfg = model::Dflash2Config::from_gguf(*draft_file);
       const model::Gemma4Config mcfg = model::Gemma4Config::from_gguf(file);
@@ -762,7 +764,34 @@ int main(int argc, char** argv) {
       // conversations share it and the card's memory goes to experts (DECISIONS "Inkling speed: the shared pool ...").
       ic.pool_positions = (kv_pool > 0 ? (kv_pool + attn::kPage - 1) / attn::kPage * attn::kPage : max_ctx);
       ic.loopcd = float(loopcd);
+      // The DFlash 2 draft (M6, DECISIONS 2026-11-26): the engine captures the target features it reads (layer visits 5,
+      // 23 and 41 and the final norm, for incoai's) for its verify blocks, decode tokens and the last `window` rows of a
+      // prompt; it goes on after the engine (it borrows the engine's head and token table), in room reserved for it.
+      if (!draft_path.empty()) {
+        draft_file = std::make_unique<gguf::File>(gguf::File::open(draft_path));
+        draft_cfg = model::Dflash2Config::from_gguf(*draft_file);
+        const model::Inkling2Config mc = model::Inkling2Config::from_gguf(file);
+        if (draft_cfg.plain || draft_cfg.n_embd != mc.n_embd || draft_cfg.target_ids.empty() || draft_cfg.target_ids.back() != mc.n_slot())
+          throw std::runtime_error(draft_path + ": not a DFlash 2 draft for Inkling 2 Mini (its target ids must end at the final norm's visit, " +
+                                   std::to_string(mc.n_slot()) + ")");
+        if (draft_block == 0) draft_block = 6;
+        ic.capture_ids = draft_cfg.target_ids;
+        ic.max_capture_rows = int64_t(draft_cfg.window) + int64_t(slots) * 8;
+        ic.max_logits = std::max<int64_t>(ic.max_logits, engine::inkling::Engine::kVerifyRows);
+        // the draft's weights as the file holds them, its window caches and scratch (748 MB for incoai's Q8_0 with 2 slots)
+        ic.card_reserve_bytes += uint64_t(std::filesystem::file_size(draft_path)) + (uint64_t(256) << 20);
+      }
       ieng = std::make_unique<engine::inkling::Engine>(q, file, ic);
+      if (draft_file) {
+        const model::Dflash2Target target{ieng->embedding_table(), ieng->head_weight(), true};
+        model::Dflash2::Options opt;
+        opt.slots = slots;
+        opt.max_block = 8;
+        draft = std::make_unique<model::Dflash2>(q, *draft_file, target, opt);
+        std::fprintf(stderr, "eklow-server: DFlash 2 draft %s: blocks of %d (trained for %d), window %d, %.0f MiB on the card; free card memory now %.2f GiB\n",
+                     draft_path.c_str(), draft_block, draft_cfg.block_size, draft->window(), double(draft->bytes()) / 1048576.0,
+                     rt::free_memory(q.get_device()).value_or(0) / GiB);
+      }
       if (ivision) {
         if (ivision->n_out() != ieng->model().n_embd)
           throw std::runtime_error(mmproj_path + ": projects to " + std::to_string(ivision->n_out()) + " but the model's width is " +
@@ -777,6 +806,8 @@ int main(int argc, char** argv) {
                    ieng->host_expert_bytes() / GiB, cpu_threads, ieng->cache_bytes() / GiB, slots, (long long)max_ctx,
                    std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
       serve::inkling::SchedulerConfig sc{ic.max_step, chunk, max_ctx, [](const serve::gemma4::RequestLog& l) { log_line(request_line(l)); }};
+      sc.draft = draft.get();
+      if (draft) sc.draft_block = draft_block;
       isched = std::make_unique<serve::inkling::Scheduler>(*ieng, *itok, sc);
       chat_stats = [&] { return isched->stats(); };
       hold = [&] { return std::static_pointer_cast<void>(std::make_shared<serve::inkling::Scheduler::Hold>(*isched)); };
@@ -969,6 +1000,7 @@ int main(int argc, char** argv) {
         r->max_tokens = cr.max_tokens;
         r->prefill_only = cr.prefill_only;
         r->stop = cr.stop;
+        r->draft_block = cr.draft_block;
         // llama-server samples a request with tools (tool_choice not none) under Inkling's tool grammar from its first token.
         r->grammar = cr.mode.use_tools();
         r->choice = cr.mode.tool_choice == text::InklingToolChoice::Required ? serve::InklingToolGrammar::Choice::Required
