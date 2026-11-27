@@ -67,7 +67,10 @@ struct VerifyResult {
 
 // Rows 0..n (n = block.size()) of the target's logits, `row(i)`. The kept tokens are block.tokens[0..accepted) then
 // `next`; the caller accepts them into the sampler (Sampler::accept) and the grammar. `sampler`'s generator supplies
-// the randomness, so a run is reproducible from its seed.
+// the randomness, so a run is reproducible from its seed. The rows' constraints are asked for in order, up front, as far
+// as each drafted token is allowed where it stands (past a forbidden one the block is rejected for sure), and must stay
+// valid until verify returns; the rows' distributions are then computed in parallel, on forks of `sampler` (at a full
+// vocabulary each is ~1 ms of exp and the chain, and a block's rows are otherwise serial on one core).
 VerifyResult verify(Sampler& sampler, const DraftBlock& block, const std::function<std::span<const float>(int)>& row,
                     const ConstraintFn& constraint = {});
 

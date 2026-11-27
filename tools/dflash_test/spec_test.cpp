@@ -9,6 +9,7 @@
 //
 //   eklow-spec-test [trials]
 #include <algorithm>
+#include <deque>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -48,13 +49,15 @@ struct Case {
 };
 
 // Constraint sets after a context: bans are fixed ({2}, and 5 once a 4 has been seen); the "grammar" allows the tokens
-// t with (t + last) % 3 != 0 (the first token: all but 0).
+// t with (t + last) % 3 != 0 (the first token: all but 0). Each call's sets are kept (a deque does not move them), as
+// verify's contract asks: valid until it returns. clear() forgets them between calls.
 struct Constraints {
   const Case* c;
-  std::vector<int32_t> allowed, banned;
+  std::deque<std::vector<int32_t>> allowed_, banned_;
+  void clear() { allowed_.clear(), banned_.clear(); }
   RowConstraint at(const std::vector<int32_t>& ctx) {
-    allowed.clear();
-    banned.clear();
+    std::vector<int32_t>& allowed = allowed_.emplace_back();
+    std::vector<int32_t>& banned = banned_.emplace_back();
     RowConstraint rc;
     if (c->bans) {
       banned.push_back(2);
@@ -197,6 +200,7 @@ std::vector<int32_t> spec_sequence(const Case& c, Sampler& sampler, std::mt19937
       keep = target_logits(h);
       return std::span<const float>(keep);
     };
+    cons.clear();
     ConstraintFn cf = [&](int i, std::span<const int32_t> prefix) {
       std::vector<int32_t> h = ctx;
       h.insert(h.end(), prefix.begin(), prefix.end());
@@ -222,6 +226,7 @@ std::vector<int32_t> plain_sequence(const Case& c, Sampler& sampler) {
   std::vector<int32_t> ctx;
   Constraints cons{&c, {}, {}};
   while (int(ctx.size()) < L) {
+    cons.clear();
     const RowConstraint rc = cons.at(ctx);
     ctx.push_back(sampler.sample(target_logits(ctx), rc.allowed, rc.banned));
     sampler.accept(ctx.back());

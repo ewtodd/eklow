@@ -81,6 +81,8 @@ class Sampler {
   // Whether distribution() describes the next pick: not under mirostat, whose state moves with each pick (such a request
   // decodes plain).
   bool speculative() const { return p_.mirostat == 0; }
+  // A copy for distribution() on another thread (the settings, the penalties' window), without the candidates' scratch.
+  Sampler fork() const { return Sampler(*this, 0); }
 
   struct Cand {
     int32_t id;
@@ -92,6 +94,7 @@ class Sampler {
   void run(std::span<const float> logits, const std::vector<int32_t>* allowed, const std::vector<int32_t>* banned,
            std::span<const int32_t> extra, int xtc);
   void final_probs(std::vector<std::pair<int32_t, double>>& out) const;
+  Sampler(const Sampler& o, int) : p_(o.p_), greedy_(o.greedy_), rng_(o.rng_), history_(o.history_), mu_(o.mu_) {}
 
   SamplingParams p_;
   bool greedy_ = false;
