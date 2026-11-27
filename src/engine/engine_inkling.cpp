@@ -650,10 +650,36 @@ int Engine::stage(int layer, int avoid) {
   return b;
 }
 
-void Engine::cold(const Layer& L, int64_t T, sycl::event packed) {
+void Engine::cold(const Layer& L, int64_t T, sycl::event packed, bool marked) {
   const int64_t E = cfg_.n_embd, NU = cfg_.n_expert_used, F = cfg_.n_ff_exp;
   const auto t_w0 = std::chrono::steady_clock::now();
-  packed.wait();
+  if (marked) {
+    // the queue's commands go to the card now: spinning makes no runtime call that would submit them
+    q_.ext_oneapi_prod();
+    // The pack's writes reach host memory as it runs, in no particular order, while its event is seen on the host only
+    // ~200 us later (DECISIONS 2026-11-27): every word it writes was marked with kColdMark (a NaN no activation, weight or
+    // id is), so the routing is here when none is left; checking each word needs no ordering between them. After 0.2 s,
+    // the event (a word that never arrives must not hang the step).
+    const size_t n[3] = {size_t(T * E), size_t(T * NU), size_t(T * NU)};
+    const uint32_t* w[3] = {reinterpret_cast<const uint32_t*>(hx_), reinterpret_cast<const uint32_t*>(hw_), reinterpret_cast<const uint32_t*>(hids_)};
+    bool timed_out = false;
+    for (int b = 0; b < 3 && !timed_out; ++b)
+      for (size_t i = 0, spins = 0; i < n[b];) {
+        if (__atomic_load_n(w[b] + i, __ATOMIC_RELAXED) != kColdMark) {
+          ++i;
+          continue;
+        }
+        __builtin_ia32_pause();
+        if ((++spins & 4095) == 0 && std::chrono::steady_clock::now() - t_w0 > std::chrono::milliseconds(200)) {
+          timed_out = true;
+          break;
+        }
+      }
+    std::atomic_thread_fence(std::memory_order_acquire);
+    if (timed_out) packed.wait();
+  } else {
+    packed.wait();
+  }
   const auto t_w1 = std::chrono::steady_clock::now();
   g_cold_wait_ms += std::chrono::duration<double, std::milli>(t_w1 - t_w0).count();
   struct CpuTime {
@@ -1147,6 +1173,16 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
     static const bool skip_cold = std::getenv("EKLOW_SKIP_COLD") != nullptr;
     const bool cold_cpu = !L.cold_ref.empty() && T <= c_.cpu_max_tokens && !skip_cold;
     const bool cold_card = !L.cold_ref.empty() && T > c_.cpu_max_tokens;
+    // Steps of 4 tokens or more (verify blocks) mark every word the pack writes and spin until none is left (cold()): their
+    // writes reach the host as the pack runs, its event only ~200 us later. A step of 1-3 tokens' writes arrive no sooner
+    // than the event (and were slower to watch): it waits on the event. EKLOW_COLD_SENTINEL=0: always the event.
+    static const bool sentinel_env = !std::getenv("EKLOW_COLD_SENTINEL") || std::atoi(std::getenv("EKLOW_COLD_SENTINEL")) != 0;
+    const bool sentinel = sentinel_env && T >= 4;
+    if (cold_cpu && sentinel) {
+      std::fill_n(reinterpret_cast<uint32_t*>(hx_), size_t(T * E), kColdMark);
+      std::fill_n(reinterpret_cast<uint32_t*>(hw_), size_t(T * NU), kColdMark);
+      std::fill_n(reinterpret_cast<uint32_t*>(hids_), size_t(T * NU), kColdMark);
+    }
     if (cold_cpu) packed = ik::pack_host(q_, ids_, wts_, h_[0], T, NU, E, hids_, hw_, hx_);
     if (cold_cpu) fine("pack");
     if (cold_card) {
@@ -1164,7 +1200,7 @@ std::vector<float> Engine::step(const std::vector<Chunk>& chunks, const model::D
              cold_card ? cr_ : nullptr);
     mark("moe");
     if (cold_cpu) {
-      cold(L, T, packed);
+      cold(L, T, packed, sentinel);
       mark("cold");
     }
     emit("ffn_moe_out" + sl, f_, {E, T});

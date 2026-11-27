@@ -208,7 +208,8 @@ class Engine {
   static cpu::QType cpu_type(gguf::Type t);
   // A layer application's cold pairs: on the host once `packed` (the routing and inputs in hids_, hw_, hx_) is done, then
   // their weighted rows added to f_.
-  void cold(const Layer& L, int64_t T, sycl::event packed);
+  void cold(const Layer& L, int64_t T, sycl::event packed, bool marked);
+  static constexpr uint32_t kColdMark = 0x7fc0dead;  // what cold() waits to see overwritten in the pack's host buffers
 
   sycl::queue& q_;
   Config c_;
