@@ -89,7 +89,12 @@ with its measurements); what eklow is and its numbers: `README.md`.
 
 ## Open, in order
 
-0. **Inkling's speed**: the owner deploys the v2 adapter (/etc/nixos 3241a67f, `colmena apply --on fiona`). Fusing
+0. **A crash to deploy the fix for** (2026-11-27 21:39, 21:41): with the draft, a verify's row past a drafted tool-call token
+   the target rejects could find the grammar allowing nothing; computed on a thread (since bd4b61e), its "sampler: no token
+   allowed" ended eklow-server (house chat saw EOF). Fixed in 09ddb12 (eklow-spec-test reproduces it); fiona builds with it
+   (`--override-input`, the /etc/nixos lock is not writable for the agent). Open: why that grammar state allows nothing (in
+   plain decoding the same state, if ever reached, fails the step's requests instead).
+   **Inkling's speed**: the owner deploys the v2 adapter (/etc/nixos 3241a67f, `colmena apply --on fiona`). Fusing
    decode's chains (llama.cpp PR 33060), batching independent kernels and int8 K/V were measured and are not on
    (DECISIONS 2026-11-26). M6 (the DFlash 2 draft) is left to finish: the block size at temperature 1, depth, the
    chi-square through the server and the draft's card reservation; its nix package is in, and /etc/nixos 20e23c5e
