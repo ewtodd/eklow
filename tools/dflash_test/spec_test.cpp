@@ -297,7 +297,24 @@ bool dead_end_check() {
     }
   }
   std::printf("dead end past a rejected token: %d of 200 rejected at the token and corrected: %s\n", ok, ok == 200 ? "ok" : "FAIL");
-  return ok == 200;
+  if (ok != 200) return false;
+  // The same constraint after a token the target is sure of: the row after it is needed, and its failure reaches the caller
+  // (which ends that request alone), as plain sampling's would.
+  b.tokens = {4, 5, 6};
+  b.cand = {4, 5, 6};
+  std::vector<float> sure(16, 0.0f);
+  sure[4] = 40.0f;
+  int raised = 0;
+  for (int k = 0; k < 200; ++k) {
+    try {
+      (void)verify(s, b, [&](int i) { return std::span<const float>(i == 0 ? sure : other); },
+                   [&](int i, std::span<const int32_t>) { return RowConstraint{i == 0 ? &all : &none, nullptr}; });
+    } catch (const std::runtime_error&) {
+      ++raised;
+    }
+  }
+  std::printf("a needed row that allows nothing: %d of 200 raised to the caller: %s\n", raised, raised == 200 ? "ok" : "FAIL");
+  return raised == 200;
 }
 
 int main(int argc, char** argv) {

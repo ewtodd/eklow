@@ -533,6 +533,15 @@ void Scheduler::step() {
     c_.draft->inject(capture.ids[size_t(first)].slot, capture.data + first * capture.width, capture.ids[size_t(first)].pos, count);
   };
   size_t row = 0;
+  // A request whose sampling fails (a constraint that leaves no token) ends with that error alone, its slot's sequence
+  // forgotten (the engine may hold a block it never kept): the step's other requests go on.
+  auto drop = [&](int slot, const char* what) {
+    std::fprintf(stderr, "eklow-server: sampling failed, the request ends: %s\n", what);
+    finish(slot, "stop", std::string("sampling failed: ") + what);
+    eng_.release(slot);
+    seqs_[size_t(slot)].tokens.clear();
+    if (c_.draft) c_.draft->reset(slot);
+  };
   for (size_t i = 0; i < chunks.size(); ++i) {
     const engine::inkling::Chunk& c = chunks[i];
     const Item& it = items[i];
@@ -560,13 +569,19 @@ void Scheduler::step() {
           }
           g = states[size_t(r)].get();
         }
+        // past an accepted end-of-generation token the grammar allows nothing; nothing there is kept either (on_token ends the
+        // request at that token), so such a row is not constrained (an empty set failed the step, 2026-11-27)
+        if (g->ended()) return {};
         if (g->unconstrained()) return {nullptr, &vocab_->never};
         return {&g->allowed(), nullptr};
       };
       serve::VerifyResult res;
-      {
+      try {
         Timer timer(mu_, stats_.sample_s);
         res = serve::verify(*q.sampler, block, [&](int r) { return std::span<const float>(logits.data() + (row0 + size_t(r)) * V, V); }, constraint);
+      } catch (const std::exception& e) {
+        drop(it.slot, e.what());
+        continue;
       }
       {
         std::lock_guard lk(mu_);
@@ -610,7 +625,14 @@ void Scheduler::step() {
       q.tokens.push_back(c.tokens[0]);
       inject(cap0, c.capture_rows);
     }
-    const std::string why = on_token(it.slot, sample(q, row0));
+    int32_t t = 0;
+    try {
+      t = sample(q, row0);
+    } catch (const std::exception& e) {
+      drop(it.slot, e.what());
+      continue;
+    }
+    const std::string why = on_token(it.slot, t);
     if (!why.empty()) finish(it.slot, why);
   }
 }
