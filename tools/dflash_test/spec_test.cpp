@@ -10,6 +10,7 @@
 //   eklow-spec-test [trials]
 #include <algorithm>
 #include <deque>
+#include <numeric>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -266,8 +267,42 @@ double chi_z(const std::map<std::vector<int32_t>, double>& exact, const std::map
 
 }  // namespace
 
+// A drafted token the constraint allows but the target never picks (logit -inf), after which the constraint allows
+// nothing: verify computes the rows up front, in parallel, and the row past the token fails; it is never needed (the token
+// is rejected for sure), so verify must return the correction instead of failing (a row's failure that left its thread
+// ended eklow-server, 2026-11-27).
+bool dead_end_check() {
+  SamplingParams sp;
+  sp.temperature = 1.0f, sp.top_k = 0, sp.top_p = 1.0f, sp.min_p = 0;
+  Sampler s(sp);
+  DraftBlock b;
+  b.top_k = 1;
+  b.tokens = {3, 5, 6};
+  b.cand = {3, 5, 6};
+  b.q = {1.0f, 1.0f, 1.0f};
+  std::vector<float> row0(16, 0.0f);
+  row0[3] = -INFINITY;
+  const std::vector<float> other(16, 0.0f);
+  std::vector<int32_t> all(16), none;
+  std::iota(all.begin(), all.end(), 0);
+  int ok = 0;
+  for (int k = 0; k < 200; ++k) {
+    try {
+      const VerifyResult r = verify(s, b, [&](int i) { return std::span<const float>(i == 0 ? row0 : other); },
+                                    [&](int i, std::span<const int32_t>) { return RowConstraint{i == 0 ? &all : &none, nullptr}; });
+      ok += r.accepted == 0 && r.next != 3;
+    } catch (const std::exception& e) {
+      std::printf("dead end past a rejected token: verify threw (%s): FAIL\n", e.what());
+      return false;
+    }
+  }
+  std::printf("dead end past a rejected token: %d of 200 rejected at the token and corrected: %s\n", ok, ok == 200 ? "ok" : "FAIL");
+  return ok == 200;
+}
+
 int main(int argc, char** argv) {
   const long trials = argc > 1 ? std::atol(argv[1]) : 200000;
+  if (!dead_end_check()) return 1;
   std::vector<Case> cases;
   auto mk = [&](const char* name, float temp, int top_k, float top_p, float min_p, float pres, float freq, bool bans, bool grammar) {
     Case c;

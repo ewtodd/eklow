@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <exception>
 #include <thread>
 
 namespace eklow::serve {
@@ -59,6 +60,7 @@ VerifyResult verify(Sampler& sampler, const DraftBlock& block, const std::functi
     cons.push_back(constraint ? constraint(i, prefix) : RowConstraint{});
     if (i == n) break;
     const RowConstraint& c = cons.back();
+    if (c.allowed && c.allowed->empty()) break;  // nothing can follow here: no row past it is ever needed
     const int32_t d = block.tokens[size_t(i)];
     const bool refused = (c.allowed && std::find(c.allowed->begin(), c.allowed->end(), d) == c.allowed->end()) ||
                          (c.banned && std::binary_search(c.banned->begin(), c.banned->end(), d));
@@ -66,9 +68,16 @@ VerifyResult verify(Sampler& sampler, const DraftBlock& block, const std::functi
   }
   const int m = int(cons.size());  // rows 0..m-1 have their constraints
   std::vector<std::vector<std::pair<int32_t, double>>> dists(static_cast<size_t>(m));
+  // A row's failure (a constraint that leaves no token) is kept and raised only if the row is needed: rows past the first
+  // rejection never are, and an exception must not leave a thread (that ends the process).
+  std::vector<std::exception_ptr> errs(static_cast<size_t>(m));
   auto compute = [&](Sampler& s, int i) {
-    s.distribution(row(i), cons[size_t(i)].allowed, cons[size_t(i)].banned, std::span<const int32_t>(block.tokens.data(), size_t(i)),
-                   dists[size_t(i)]);
+    try {
+      s.distribution(row(i), cons[size_t(i)].allowed, cons[size_t(i)].banned, std::span<const int32_t>(block.tokens.data(), size_t(i)),
+                     dists[size_t(i)]);
+    } catch (...) {
+      errs[size_t(i)] = std::current_exception();
+    }
   };
   if (m > 1 && !sampler.greedy()) {
     std::vector<Sampler> forks;
@@ -84,6 +93,7 @@ VerifyResult verify(Sampler& sampler, const DraftBlock& block, const std::functi
   std::vector<std::pair<int32_t, double>> dist;
   auto distribution_of = [&](int i) {
     if (i < m) {
+      if (errs[size_t(i)]) std::rethrow_exception(errs[size_t(i)]);
       dist.swap(dists[size_t(i)]);
       return;
     }
