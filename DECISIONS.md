@@ -5093,3 +5093,28 @@ layer applications against 30: the card's own part is 30.5 ms a token (hot exper
 4.9, attention 4.0, mixes, controllers and norms ~5.5, O 1.5, head 1.5), and the CPU's cold experts add ~10 ms that a
 single token's step cannot overlap (verify steps of 4 rows or more now do). The hot experts' decode call runs at ~260 GB/s
 in isolation (group 11 us, gather 9, gate_up 88, down 50, combine 12) and ~220 us a visit in the step.
+
+## 2026-11-27 — The end of a turn under the tool grammar, with the draft: two failures in production
+
+**What happened.** fiona ran eklow b0f7351 with the draft from ~21:30. At 21:39 and 21:41 eklow-server died ("terminate
+called after throwing ... sampler: no token allowed"; house chat saw EOF). After 09ddb12 (deployed 22:29) it stopped dying,
+but tool-using requests failed with the same message.
+
+**Why.** The draft proposes the end of a turn like any token. Inkling's tool grammar accepts an end-of-generation token
+(199999, 200006) where the turn may end and then allows nothing (`M_Done`). A verify asks for the row after each drafted
+token: past a *rejected* end token the row is never needed, but since bd4b61e the rows are computed up front on threads,
+and the empty set's exception left a thread (std::terminate); past an *accepted* one the row was needed, and its
+exception failed every request of the step (from 1ea66e4 on). Every house chat request carries tools, so nearly every
+turn that ended on a drafted end token failed.
+
+**Why the testing missed it.** Every check of the draft through the server ran without tools (GSM8K, document questions,
+the benchmarks, the kept checkpoint) but one request; without tools there is no grammar and no row that allows nothing.
+`eklow-spec-test`'s grammar is synthetic and has no ended state.
+
+**The fixes.** 09ddb12: a row's failure is kept and raised only if the row is needed. bb5b174: a row past an ended grammar
+is unconstrained (nothing there is kept: on_token ends the request at the end token, as plain decoding does), and a request
+whose sampling or verify fails ends with that error alone, the step's other requests going on.
+
+**The check that was missing**, now done: the sandboxed replay (real moments with son-of-anton's tools, played to their end)
+through eklow-server with production's own arguments. The deployed 09ddb12: 0 of 8 episodes (16 failed requests). bb5b174:
+47 of 48 pass (M4, without the draft: 40 of 41), 0 failed requests of 213, 3.91 tokens a verify.
